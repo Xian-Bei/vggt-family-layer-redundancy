@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Optional, Tuple, Union, List, Dict, Any, Callable, Set
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
@@ -181,7 +181,13 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        *,
+        return_layers: Optional[Set[int]] = None,
+        layer_callback: Optional[Callable[[int, torch.Tensor], None]] = None,
+    ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
@@ -233,6 +239,7 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
+        layer_idx_flat = 0
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
@@ -250,7 +257,11 @@ class Aggregator(nn.Module):
             for i in range(len(frame_intermediates)):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+                if layer_callback is not None:
+                    layer_callback(layer_idx_flat, concat_inter)
+                if return_layers is None or layer_idx_flat in return_layers:
+                    output_list.append(concat_inter)
+                layer_idx_flat += 1
 
         del concat_inter
         del frame_intermediates

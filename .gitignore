@@ -147,3 +147,7 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+
+data/
+analysis_outputs/

@@ -35,9 +35,13 @@ def unproject_depth_map_to_point_map(
 
     world_points_list = []
     for frame_idx in range(depth_map.shape[0]):
-        cur_world_points, _, _ = depth_to_world_coords_points(
-            depth_map[frame_idx].squeeze(-1), extrinsics_cam[frame_idx], intrinsics_cam[frame_idx]
-        )
+        dm = depth_map[frame_idx]
+        # Accept both (H,W) and (H,W,1) as documented.
+        if dm.ndim == 3 and dm.shape[-1] == 1:
+            dm = dm[..., 0]
+        elif dm.ndim != 2:
+            raise ValueError(f"Expected depth frame with shape (H,W) or (H,W,1), got {dm.shape}")
+        cur_world_points, _, _ = depth_to_world_coords_points(dm, extrinsics_cam[frame_idx], intrinsics_cam[frame_idx])
         world_points_list.append(cur_world_points)
     world_points_array = np.stack(world_points_list, axis=0)
 

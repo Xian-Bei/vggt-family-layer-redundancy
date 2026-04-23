@@ -5,3 +5,8 @@ Pillow
 huggingface_hub
 einops
 safetensors
+matplotlib
+# FastVGGT-aligned ScanNet eval (pose / geometry) plus depth eval helpers used by Stage 1 / Stage 3
+evo
+open3d
+scipy
