@@ -341,6 +341,12 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # Work around cuDNN convolution crashes observed on some CUDA driver/toolkit mixes.
+    # This keeps inference stable at a small performance cost.
+    if device == "cuda":
+        torch.backends.cudnn.enabled = False
+        print("cuDNN disabled for stability in demo_viser.")
+
     print("Initializing and loading VGGT model...")
     # model = VGGT.from_pretrained("facebook/VGGT-1B")
 

@@ -5,6 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+
+# Use a user-writable cache/temp directory for Gradio to avoid /tmp permission issues.
+_USER_GRADIO_TMP = os.path.join(os.path.expanduser("~"), ".cache", "gradio")
+os.makedirs(_USER_GRADIO_TMP, exist_ok=True)
+os.environ.setdefault("GRADIO_TEMP_DIR", _USER_GRADIO_TMP)
+os.environ.setdefault("TMPDIR", _USER_GRADIO_TMP)
+
 import cv2
 import torch
 import numpy as np
