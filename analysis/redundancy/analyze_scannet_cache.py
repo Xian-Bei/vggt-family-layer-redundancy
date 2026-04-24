@@ -28,6 +28,12 @@ and keep only depths in ``(1e-3m, 10m)`` before applying the StreamVGGT-style
 scale-only depth alignment.
 
 Both parts are exported as upper-triangle JSON + heatmaps.
+
+Per-scene similarity/skip JSON uses read-merge-write when a file already exists:
+``fusion_by_mode`` is deep-merged (new metric keys add; same metric name overwrites packed lists).
+``fusion_modes`` / ``fusion_similarity_metrics`` / ``scene_scores`` are unioned or updated.
+Full reports (``full_report_*.json``) and CSVs are always rebuilt from **all** ``per_scene/*.json``
+after each run so aggregates match the merged on-disk scene files.
 """
 
 from __future__ import annotations
@@ -299,12 +305,6 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Output directory for skip GT reports. Default: analysis_outputs/scannet_redundancy_skip.",
-    )
-    p.add_argument(
-        "--full-report-name",
-        type=str,
-        default="full_report_fusion.json",
-        help="(Deprecated) compatibility-only; split reports now use dedicated names.",
     )
     p.add_argument(
         "--per-scene-report-suffix",
@@ -604,7 +604,141 @@ def _finite_mean_packed(rows: Sequence[List[float]]) -> List[float]:
     return out
 
 
-def _aggregate_from_per_scene_split_outputs(
+def _merge_packed_metric_dict(old_d: Any, new_d: Any) -> Dict[str, List[float]]:
+    """Merge metric name -> packed list; **new_d overwrites** the same metric key."""
+    merged: Dict[str, List[float]] = {}
+    if isinstance(old_d, dict):
+        for k, v in old_d.items():
+            if isinstance(v, list):
+                merged[str(k)] = [float(x) for x in v]
+    if isinstance(new_d, dict):
+        for k, v in new_d.items():
+            if isinstance(v, list):
+                merged[str(k)] = [float(x) for x in v]
+    return merged
+
+
+def _merge_similarity_fusion_by_mode(old_fb: Any, new_fb: Any) -> Dict[str, Any]:
+    o = old_fb if isinstance(old_fb, dict) else {}
+    n = new_fb if isinstance(new_fb, dict) else {}
+    modes = set(str(k) for k in o.keys()) | set(str(k) for k in n.keys())
+    out: Dict[str, Any] = {}
+    for mode in sorted(modes):
+        om = o.get(mode, {})
+        nm = n.get(mode, {})
+        om = om if isinstance(om, dict) else {}
+        nm = nm if isinstance(nm, dict) else {}
+        po = om.get("global_patch_similarity_upper_by_metric", {})
+        pn = nm.get("global_patch_similarity_upper_by_metric", {})
+        so = om.get("global_special_similarity_upper_by_metric", {})
+        sn = nm.get("global_special_similarity_upper_by_metric", {})
+        merged_patch = _merge_packed_metric_dict(po, pn)
+        merged_spec = _merge_packed_metric_dict(so, sn)
+        payload: Dict[str, Any] = {}
+        if merged_patch:
+            payload["global_patch_similarity_upper_by_metric"] = merged_patch
+        if merged_spec:
+            payload["global_special_similarity_upper_by_metric"] = merged_spec
+        if payload:
+            out[mode] = payload
+    return out
+
+
+def _merge_skip_fusion_by_mode(old_fb: Any, new_fb: Any) -> Dict[str, Any]:
+    o = old_fb if isinstance(old_fb, dict) else {}
+    n = new_fb if isinstance(new_fb, dict) else {}
+    modes = set(str(k) for k in o.keys()) | set(str(k) for k in n.keys())
+    out: Dict[str, Any] = {}
+    for mode in sorted(modes):
+        om = o.get(mode, {})
+        nm = n.get(mode, {})
+        om = om if isinstance(om, dict) else {}
+        nm = nm if isinstance(nm, dict) else {}
+        go = om.get("gt_delta_upper_by_metric", {})
+        gn = nm.get("gt_delta_upper_by_metric", {})
+        merged_gt = _merge_packed_metric_dict(go, gn)
+        if merged_gt:
+            out[mode] = {"gt_delta_upper_by_metric": merged_gt}
+    return out
+
+
+def _merge_per_scene_similarity_report(existing: Dict[str, Any], computed: Dict[str, Any]) -> Dict[str, Any]:
+    if not existing:
+        return dict(computed)
+    out = dict(existing)
+    out["fusion_by_mode"] = _merge_similarity_fusion_by_mode(existing.get("fusion_by_mode"), computed.get("fusion_by_mode"))
+    fm_o = existing.get("fusion_modes", [])
+    fm_n = computed.get("fusion_modes", [])
+    out["fusion_modes"] = sorted(
+        {str(x) for x in fm_o if x is not None} | {str(x) for x in fm_n if x is not None}
+    )
+    sm_o = existing.get("fusion_similarity_metrics", [])
+    sm_n = computed.get("fusion_similarity_metrics", [])
+    out["fusion_similarity_metrics"] = sorted({str(x) for x in sm_o} | {str(x) for x in sm_n})
+    for key in ("num_layers", "fusion_storage", "fusion_max_span", "scene_id"):
+        if key in computed:
+            out[key] = computed[key]
+    eo = existing.get("scene_scores")
+    en = computed.get("scene_scores")
+    if isinstance(eo, dict) or isinstance(en, dict):
+        scores: Dict[str, Any] = dict(eo) if isinstance(eo, dict) else {}
+        if isinstance(en, dict):
+            scores.update(en)
+        out["scene_scores"] = scores
+    out["report_kind"] = "similarity"
+    return out
+
+
+def _merge_per_scene_skip_report(existing: Dict[str, Any], computed: Dict[str, Any]) -> Dict[str, Any]:
+    if not existing:
+        return dict(computed)
+    out = dict(existing)
+    out["fusion_by_mode"] = _merge_skip_fusion_by_mode(existing.get("fusion_by_mode"), computed.get("fusion_by_mode"))
+    fm_o = existing.get("fusion_modes", [])
+    fm_n = computed.get("fusion_modes", [])
+    out["fusion_modes"] = sorted(
+        {str(x) for x in fm_o if x is not None} | {str(x) for x in fm_n if x is not None}
+    )
+    for key in ("num_layers", "fusion_storage", "fusion_max_span", "scene_id"):
+        if key in computed:
+            out[key] = computed[key]
+    eo = existing.get("scene_scores")
+    en = computed.get("scene_scores")
+    if isinstance(eo, dict) or isinstance(en, dict):
+        scores: Dict[str, Any] = dict(eo) if isinstance(eo, dict) else {}
+        if isinstance(en, dict):
+            scores.update(en)
+        out["scene_scores"] = scores
+    out["report_kind"] = "skip"
+    return out
+
+
+def _discover_similarity_metric_keys_from_rows(
+    sim_rows_by_scene: Dict[str, Dict[str, Any]],
+    mode_list: Sequence[str],
+) -> set[str]:
+    keys: set[str] = set()
+    modeset = {str(m) for m in mode_list}
+    for row in sim_rows_by_scene.values():
+        if not isinstance(row, dict):
+            continue
+        fb = row.get("fusion_by_mode", {})
+        if not isinstance(fb, dict):
+            continue
+        for mode in modeset:
+            mm = fb.get(mode, {})
+            if not isinstance(mm, dict):
+                continue
+            for sub in ("global_patch_similarity_upper_by_metric", "global_special_similarity_upper_by_metric"):
+                d = mm.get(sub, {})
+                if isinstance(d, dict):
+                    for k, v in d.items():
+                        if isinstance(v, list):
+                            keys.add(str(k))
+    return keys
+
+
+def _write_fusion_full_reports_from_per_scene_json(
     similarity_out_dir: Path,
     skip_out_dir: Path,
     *,
@@ -620,6 +754,8 @@ def _aggregate_from_per_scene_split_outputs(
     fusion_num_procs: int,
     analysis_device: torch.device,
     skip_gt_eval: bool,
+    fusion_save_per_scene: bool,
+    timing_main: Optional[float] = None,
 ) -> None:
     if not save_similarity_output and not save_skip_output:
         raise SystemExit("Both similarity and skip outputs are disabled; nothing to aggregate.")
@@ -657,7 +793,7 @@ def _aggregate_from_per_scene_split_outputs(
         if first_row is not None:
             break
     if first_row is None:
-        raise SystemExit("Failed to infer metadata from per-scene JSON files.")
+        raise SystemExit("Failed to infer metadata from per-scene files.")
     num_layers = int(first_row.get("num_layers", 0))
     if num_layers <= 0:
         raise SystemExit("Invalid or missing num_layers in per-scene files.")
@@ -680,6 +816,10 @@ def _aggregate_from_per_scene_split_outputs(
     if not mode_list:
         raise SystemExit("Failed to infer fusion_modes from per-scene files.")
 
+    sim_metrics_effective = sorted(
+        {str(m) for m in sim_metrics} | _discover_similarity_metric_keys_from_rows(sim_rows_by_scene, mode_list)
+    )
+
     sim_fusion_by_mode: Dict[str, Dict[str, Any]] = {}
     skip_fusion_by_mode: Dict[str, Dict[str, Any]] = {}
     for mode in mode_list:
@@ -687,7 +827,7 @@ def _aggregate_from_per_scene_split_outputs(
         mode_sim_special: Dict[str, List[float]] = {}
         mode_skip_gt: Dict[str, List[float]] = {}
 
-        for mk in sim_metrics:
+        for mk in sim_metrics_effective:
             patch_rows: List[List[float]] = []
             special_rows: List[List[float]] = []
             for sid in scene_ids:
@@ -740,12 +880,12 @@ def _aggregate_from_per_scene_split_outputs(
         "fusion_storage": "upper_triangle_row_major_including_diagonal",
         "fusion_max_span": int(first_row.get("fusion_max_span", 0)),
         "fusion_modes": mode_list,
-        "fusion_similarity_metrics": list(sim_metrics),
-        "fusion_compute_similarity": bool(sim_metrics),
+        "fusion_similarity_metrics": list(sim_metrics_effective),
+        "fusion_compute_similarity": bool(sim_metrics_effective),
         "fusion_num_procs": fusion_num_procs,
         "analysis_device": str(analysis_device),
         "skip_gt_eval": skip_gt_eval,
-        "fusion_save_per_scene": True,
+        "fusion_save_per_scene": fusion_save_per_scene,
         "save_heatmap_png": bool(save_heatmap_png),
         "heatmap_lower_triangle_fill": fill_json if fill_json is not None else "nan",
     }
@@ -769,7 +909,7 @@ def _aggregate_from_per_scene_split_outputs(
     for mode in mode_list:
         mode_sim = sim_fusion_by_mode[mode]
         mode_skip = skip_fusion_by_mode[mode]
-        for mk in sim_metrics:
+        for mk in sim_metrics_effective:
             if mk in mode_sim["global_patch_similarity_upper_by_metric"]:
                 similarity_summary_rows.append(
                     {
@@ -849,7 +989,7 @@ def _aggregate_from_per_scene_split_outputs(
         for mode in mode_list:
             mode_sim = sim_fusion_by_mode[mode]
             mode_skip = skip_fusion_by_mode[mode]
-            if save_similarity_output and sim_metrics:
+            if save_similarity_output and sim_metrics_effective:
                 _write_redundancy_heatmaps(
                     mode_sim["global_patch_similarity_upper_by_metric"],
                     mode_sim["global_special_similarity_upper_by_metric"],
@@ -875,6 +1015,49 @@ def _aggregate_from_per_scene_split_outputs(
                         fname_prefix="",
                         mode_suffix=f"_{mode}",
                     )
+    if timing_main is not None:
+        print(
+            f"[timing] fusion aggregate-from-disk: {time.perf_counter() - timing_main:.2f}s",
+            flush=True,
+        )
+
+
+def _aggregate_from_per_scene_split_outputs(
+    similarity_out_dir: Path,
+    skip_out_dir: Path,
+    *,
+    similarity_report_name: str,
+    skip_report_name: str,
+    save_similarity_output: bool,
+    save_skip_output: bool,
+    fusion_modes: Sequence[str],
+    sim_metrics: Sequence[str],
+    save_heatmap_png: bool,
+    fill_value: float,
+    compute_pwcca: bool,
+    fusion_num_procs: int,
+    analysis_device: torch.device,
+    skip_gt_eval: bool,
+) -> None:
+    _write_fusion_full_reports_from_per_scene_json(
+        similarity_out_dir,
+        skip_out_dir,
+        similarity_report_name=similarity_report_name,
+        skip_report_name=skip_report_name,
+        save_similarity_output=save_similarity_output,
+        save_skip_output=save_skip_output,
+        fusion_modes=fusion_modes,
+        sim_metrics=sim_metrics,
+        save_heatmap_png=save_heatmap_png,
+        fill_value=fill_value,
+        compute_pwcca=compute_pwcca,
+        fusion_num_procs=fusion_num_procs,
+        analysis_device=analysis_device,
+        skip_gt_eval=skip_gt_eval,
+        fusion_save_per_scene=True,
+        timing_main=None,
+    )
+
 
 def _extract_skip_loss_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     by_mode = report.get("global_skip_range_loss_by_mode")
@@ -2087,38 +2270,11 @@ def main() -> None:
     num_layers = _infer_num_layers_from_manifest(args.cache_dir, scenes_meta)
     model = VGGT.from_pretrained(args.hf_model).to(skip_loss_device).eval()
 
-    num_pairs = num_layers * (num_layers + 1) // 2
-    sim_sum_patch: Dict[str, Dict[str, Optional[torch.Tensor]]] = {
-        mode: {m: None for m in sim_metrics} for mode in fusion_modes
-    }
-    sim_cnt_patch: Dict[str, Dict[str, Optional[torch.Tensor]]] = {
-        mode: {m: None for m in sim_metrics} for mode in fusion_modes
-    }
-    sim_sum_special: Dict[str, Dict[str, Optional[torch.Tensor]]] = {
-        mode: {m: None for m in sim_metrics} for mode in fusion_modes
-    }
-    sim_cnt_special: Dict[str, Dict[str, Optional[torch.Tensor]]] = {
-        mode: {m: None for m in sim_metrics} for mode in fusion_modes
-    }
-    gt_sum: Dict[str, Dict[str, Optional[torch.Tensor]]] = {
-        mode: {k: None for k in GT_KEYS_FOR_SKIP} for mode in fusion_modes
-    }
-    gt_cnt: Dict[str, Dict[str, Optional[torch.Tensor]]] = {
-        mode: {k: None for k in GT_KEYS_FOR_SKIP} for mode in fusion_modes
-    }
-
-    scene_ids: List[str] = []
-    scene_score_dicts: List[Dict[str, Any]] = []
-    score_keys_set: set[str] = set()
-
     for si, (item, scene, stage1_eval_row) in enumerate(selected):
         sid = str(item.get("scene_id", ""))
         print(f"[fusion] scene {si + 1}/{len(selected)}: {sid}", flush=True)
-        scene_ids.append(sid)
         scene_scores_raw = item.get("scene_scores", {})
         scene_scores = dict(scene_scores_raw) if isinstance(scene_scores_raw, dict) else {}
-        scene_score_dicts.append(scene_scores)
-        score_keys_set.update(scene_scores.keys())
 
         replay_concat_layers = _load_scene_replay_cache(args.cache_dir, item, num_layers)
         patch_start_idx = int(item.get("patch_start_idx", model.aggregator.patch_start_idx))
@@ -2358,37 +2514,6 @@ def main() -> None:
                 "gt_delta_upper_by_metric": scene_gt_upper_by_metric,
             }
 
-            for m in sim_metrics:
-                pt = torch.tensor(scene_patch_upper_by_metric[m], dtype=torch.float64)
-                st = torch.tensor(scene_special_upper_by_metric[m], dtype=torch.float64)
-                pt_mask = torch.isfinite(pt).to(torch.float64)
-                st_mask = torch.isfinite(st).to(torch.float64)
-                pt_clean = torch.nan_to_num(pt, nan=0.0)
-                st_clean = torch.nan_to_num(st, nan=0.0)
-                if sim_sum_patch[mode][m] is None:
-                    sim_sum_patch[mode][m] = pt_clean
-                    sim_cnt_patch[mode][m] = pt_mask
-                else:
-                    sim_sum_patch[mode][m] = sim_sum_patch[mode][m] + pt_clean  # type: ignore[operator]
-                    sim_cnt_patch[mode][m] = sim_cnt_patch[mode][m] + pt_mask  # type: ignore[operator]
-                if sim_sum_special[mode][m] is None:
-                    sim_sum_special[mode][m] = st_clean
-                    sim_cnt_special[mode][m] = st_mask
-                else:
-                    sim_sum_special[mode][m] = sim_sum_special[mode][m] + st_clean  # type: ignore[operator]
-                    sim_cnt_special[mode][m] = sim_cnt_special[mode][m] + st_mask  # type: ignore[operator]
-
-            for k in GT_KEYS_FOR_SKIP:
-                gt_t = torch.tensor(scene_gt_upper_by_metric[k], dtype=torch.float64)
-                gt_mask = torch.isfinite(gt_t).to(torch.float64)
-                gt_clean = torch.nan_to_num(gt_t, nan=0.0)
-                if gt_sum[mode][k] is None:
-                    gt_sum[mode][k] = gt_clean
-                    gt_cnt[mode][k] = gt_mask
-                else:
-                    gt_sum[mode][k] = gt_sum[mode][k] + gt_clean  # type: ignore[operator]
-                    gt_cnt[mode][k] = gt_cnt[mode][k] + gt_mask  # type: ignore[operator]
-
         if save_per_scene:
             scene_report = {
                 "scene_id": sid,
@@ -2436,14 +2561,16 @@ def main() -> None:
             safe_id = sid.replace("/", "_")
             if save_similarity_output:
                 assert per_scene_similarity_dir is not None
-                (per_scene_similarity_dir / f"{safe_id}{similarity_per_scene_suffix}").write_text(
-                    json.dumps(similarity_scene_report, indent=2), encoding="utf-8"
-                )
+                sim_path = per_scene_similarity_dir / f"{safe_id}{similarity_per_scene_suffix}"
+                prev_sim = _read_json_if_exists(sim_path)
+                merged_sim = _merge_per_scene_similarity_report(prev_sim, similarity_scene_report)
+                sim_path.write_text(json.dumps(merged_sim, indent=2), encoding="utf-8")
             if save_skip_output:
                 assert per_scene_skip_dir is not None
-                (per_scene_skip_dir / f"{safe_id}{skip_per_scene_suffix}").write_text(
-                    json.dumps(skip_scene_report, indent=2), encoding="utf-8"
-                )
+                skip_path = per_scene_skip_dir / f"{safe_id}{skip_per_scene_suffix}"
+                prev_skip = _read_json_if_exists(skip_path)
+                merged_skip = _merge_per_scene_skip_report(prev_skip, skip_scene_report)
+                skip_path.write_text(json.dumps(merged_skip, indent=2), encoding="utf-8")
             if args.save_heatmap_png and isinstance(scene_modes, dict):
                 for mode, mode_map in scene_modes.items():
                     if not isinstance(mode_map, dict):
@@ -2490,167 +2617,29 @@ def main() -> None:
         )
         return
 
-    fusion_by_mode: Dict[str, Dict[str, Any]] = {}
-    for mode in fusion_modes:
-        mode_patch_avg: Dict[str, List[float]] = {}
-        mode_special_avg: Dict[str, List[float]] = {}
-        mode_gt_avg: Dict[str, List[float]] = {}
-        for m in sim_metrics:
-            spt = sim_sum_patch[mode][m]
-            cpt = sim_cnt_patch[mode][m]
-            sst = sim_sum_special[mode][m]
-            cst = sim_cnt_special[mode][m]
-            mode_patch_avg[m] = _finite_mean_upper(spt, cpt) if spt is not None and cpt is not None else [float("nan")] * num_pairs
-            mode_special_avg[m] = _finite_mean_upper(sst, cst) if sst is not None and cst is not None else [float("nan")] * num_pairs
-        for k in GT_KEYS_FOR_SKIP:
-            sgt = gt_sum[mode][k]
-            cgt = gt_cnt[mode][k]
-            mode_gt_avg[k] = _finite_mean_upper(sgt, cgt) if sgt is not None and cgt is not None else [float("nan")] * num_pairs
-        fusion_by_mode[mode] = {
-            "num_scenes_used": n_scenes,
-            "global_patch_similarity_upper_by_metric": mode_patch_avg,
-            "global_special_similarity_upper_by_metric": mode_special_avg,
-            "gt_delta_upper_by_metric": mode_gt_avg,
-        }
-
-    fill_json = None if math.isnan(fill_value) else fill_value
-    report_common: Dict[str, Any] = {
-        "num_scenes": n_scenes,
-        "scene_ids": scene_ids,
-        "aggregation": "finite_mean_upper_packed_per_scene",
-        "num_layers": num_layers,
-        "fusion_storage": "upper_triangle_row_major_including_diagonal",
-        "fusion_max_span": fusion_max_span,
-        "fusion_modes": fusion_modes,
-        "fusion_similarity_metrics": sim_metrics,
-        "fusion_compute_similarity": compute_similarity,
-        "fusion_num_procs": fusion_num_procs,
-        "analysis_device": str(analysis_device),
-        "skip_gt_eval": skip_gt_eval,
-        "fusion_save_per_scene": save_per_scene,
-        "save_heatmap_png": bool(args.save_heatmap_png),
-        "heatmap_lower_triangle_fill": fill_json if fill_json is not None else "nan",
-    }
-    similarity_fusion_by_mode: Dict[str, Dict[str, Any]] = {}
-    skip_fusion_by_mode: Dict[str, Dict[str, Any]] = {}
-    for mode in fusion_modes:
-        mode_report = fusion_by_mode[mode]
-        similarity_fusion_by_mode[mode] = {
-            "num_scenes_used": mode_report["num_scenes_used"],
-            "global_patch_similarity_upper_by_metric": mode_report["global_patch_similarity_upper_by_metric"],
-            "global_special_similarity_upper_by_metric": mode_report["global_special_similarity_upper_by_metric"],
-        }
-        skip_fusion_by_mode[mode] = {
-            "num_scenes_used": mode_report["num_scenes_used"],
-            "gt_delta_upper_by_metric": mode_report["gt_delta_upper_by_metric"],
-        }
-
-    similarity_report: Dict[str, Any] = dict(report_common)
-    similarity_report["report_kind"] = "similarity"
-    similarity_report["fusion_by_mode"] = similarity_fusion_by_mode
-    skip_report: Dict[str, Any] = dict(report_common)
-    skip_report["report_kind"] = "skip"
-    skip_report["fusion_by_mode"] = skip_fusion_by_mode
-
-    n = num_layers
-    if args.save_heatmap_png:
-        for mode in fusion_modes:
-            mode_report = fusion_by_mode[mode]
-            if save_similarity_output and compute_similarity:
-                _write_redundancy_heatmaps(
-                    mode_report["global_patch_similarity_upper_by_metric"],
-                    mode_report["global_special_similarity_upper_by_metric"],
-                    similarity_out_dir,
-                    n,
-                    fill_value,
-                    compute_pwcca,
-                    similarity_mode="intra_layer_frame_vs_global",
-                    title_suffix=f" (mean, {mode})",
-                    fname_prefix=f"{mode}_",
-                )
-            if save_skip_output:
-                for k in GT_KEYS_FOR_SKIP:
-                    _write_skip_loss_heatmap(
-                        mode_report["gt_delta_upper_by_metric"][k],
-                        skip_out_dir,
-                        n,
-                        fill_value,
-                        metric_key=k,
-                        title_suffix=f" (mean, {mode})",
-                        fname_prefix="",
-                        mode_suffix=f"_{mode}",
-                    )
-
-    similarity_summary_rows: List[Dict[str, Any]] = []
-    skip_summary_rows: List[Dict[str, Any]] = []
-    for mode in fusion_modes:
-        mode_report = fusion_by_mode[mode]
-        for m in sim_metrics:
-            similarity_summary_rows.append(
-                {
-                    "metric": f"fusion_global_patch_{m}_{mode}_mean_finite",
-                    "value": _nanmean_finite(mode_report["global_patch_similarity_upper_by_metric"][m]),
-                }
-            )
-            similarity_summary_rows.append(
-                {
-                    "metric": f"fusion_global_special_{m}_{mode}_mean_finite",
-                    "value": _nanmean_finite(mode_report["global_special_similarity_upper_by_metric"][m]),
-                }
-            )
-        for k in GT_KEYS_FOR_SKIP:
-            skip_summary_rows.append(
-                {
-                    "metric": f"fusion_gt_delta_{k}_{mode}_mean_finite",
-                    "value": _nanmean_finite(mode_report["gt_delta_upper_by_metric"][k]),
-                }
-            )
-
-    score_keys = sorted(score_keys_set)
-    per_scene_rows_final: List[Dict[str, Any]] = [
-        {"scene_id": scene_ids[i], **{k: scene_score_dicts[i].get(k, "") for k in score_keys}}
-        for i in range(n_scenes)
-    ]
-    for k in score_keys:
-        vals = [float(r[k]) for r in per_scene_rows_final if r.get(k) not in ("", None) and str(r[k]).strip() != ""]
-        if vals:
-            mean_v = sum(vals) / len(vals)
-            similarity_summary_rows.append({"metric": f"scene_avg_{k}", "value": mean_v})
-            skip_summary_rows.append({"metric": f"scene_avg_{k}", "value": mean_v})
-
-    if save_similarity_output:
-        with (similarity_out_dir / "summary_metrics_similarity.csv").open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["metric", "value"])
-            w.writeheader()
-            for row in similarity_summary_rows:
-                w.writerow(row)
-    if save_skip_output:
-        with (skip_out_dir / "summary_metrics_skip.csv").open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["metric", "value"])
-            w.writeheader()
-            for row in skip_summary_rows:
-                w.writerow(row)
-
-    if save_similarity_output:
-        with (similarity_out_dir / "per_scene_scores_similarity.csv").open("w", newline="", encoding="utf-8") as f:
-            fields = ["scene_id"] + score_keys
-            w = csv.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            w.writerows(per_scene_rows_final)
-    if save_skip_output:
-        with (skip_out_dir / "per_scene_scores_skip.csv").open("w", newline="", encoding="utf-8") as f:
-            fields = ["scene_id"] + score_keys
-            w = csv.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            w.writerows(per_scene_rows_final)
-
     written_reports: List[str] = []
     if save_similarity_output:
-        similarity_report_path.write_text(json.dumps(similarity_report, indent=2), encoding="utf-8")
         written_reports.append(str(similarity_report_path))
     if save_skip_output:
-        skip_report_path.write_text(json.dumps(skip_report, indent=2), encoding="utf-8")
         written_reports.append(str(skip_report_path))
+    _write_fusion_full_reports_from_per_scene_json(
+        similarity_out_dir,
+        skip_out_dir,
+        similarity_report_name=similarity_report_name,
+        skip_report_name=skip_report_name,
+        save_similarity_output=save_similarity_output,
+        save_skip_output=save_skip_output,
+        fusion_modes=fusion_modes,
+        sim_metrics=sim_metrics,
+        save_heatmap_png=bool(args.save_heatmap_png),
+        fill_value=fill_value,
+        compute_pwcca=compute_pwcca,
+        fusion_num_procs=fusion_num_procs,
+        analysis_device=analysis_device,
+        skip_gt_eval=skip_gt_eval,
+        fusion_save_per_scene=save_per_scene,
+        timing_main=None,
+    )
     if args.timing:
         print(
             f"[timing] fusion total: {time.perf_counter() - t_main_start:.2f}s",
@@ -2658,7 +2647,8 @@ def main() -> None:
         )
     print(
         f"Wrote split fusion reports to {', '.join(written_reports)} "
-        f"(heatmap PNGs {'enabled' if args.save_heatmap_png else 'disabled'})"
+        f"(heatmap PNGs {'enabled' if args.save_heatmap_png else 'disabled'}; "
+        f"full reports and CSV rebuilt from all per-scene JSON on disk)"
     )
 
 

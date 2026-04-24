@@ -18,7 +18,7 @@
 #            For each (i,j) and each skip mode, replay from layer i frame cache,
 #            skip global blocks i..j, compare j-layer global outputs (new vs Stage1 cached),
 #            then continue to heads and compute GT deltas vs Stage1.
-# Stage 4: Reserved for future baseline implementations (currently placeholder).
+# Stage 4 has been moved to standalone script: run_fastvggt_eval.sh
 #
 # Usage (from repo root):
 #   chmod +x run_scannet_redundancy.sh
@@ -37,7 +37,6 @@
 STAGE0="${STAGE0:-0}"
 STAGE1="${STAGE1:-0}"
 STAGE2="${STAGE2:-1}"
-STAGE4="${STAGE4:-0}"
 
 set -euo pipefail
 
@@ -101,13 +100,13 @@ FUSION_SIMILARITY_DIR="${FUSION_SIMILARITY_DIR:-analysis_outputs/scannet_redunda
 FUSION_SKIP_DIR="${FUSION_SKIP_DIR:-analysis_outputs/scannet_redundancy_skip}"
 FUSION_MAX_SPAN="${FUSION_MAX_SPAN:-24}"
 FUSION_MODES="${FUSION_MODES:-identity,special_only,patch_special}"
-FUSION_SIMILARITY_METRICS="${FUSION_SIMILARITY_METRICS:-cosine,cka}"
+FUSION_SIMILARITY_METRICS="${FUSION_SIMILARITY_METRICS:-neg_mse}"
 TIMING="${TIMING:-1}"
 HEATMAP_FILL="${HEATMAP_FILL:-nan}"
 ANALYSIS_DEVICE="${ANALYSIS_DEVICE:-${DEVICE}}"
 SAVE_PER_SCENE_STAGE2="${SAVE_PER_SCENE_STAGE2:-1}"
 SAVE_HEATMAP_PNG_STAGE2="${SAVE_HEATMAP_PNG_STAGE2:-0}"
-FUSION_NUM_PROCS="${FUSION_NUM_PROCS:-4}"
+FUSION_NUM_PROCS="${FUSION_NUM_PROCS:-2}"
 EXPORT_VIS_FUSION="${EXPORT_VIS_FUSION:-0}"
 FUSION_VIS_DIR="${FUSION_VIS_DIR:-${FUSION_SIMILARITY_DIR}/visualization}"
 STAGE2_ENABLE_SIMILARITY="${STAGE2_ENABLE_SIMILARITY:-1}"
@@ -116,13 +115,6 @@ STAGE1_SANITY_CHECK="${STAGE1_SANITY_CHECK:-1}"
 STAGE1_SANITY_ATOL="${STAGE1_SANITY_ATOL:-1e-6}"
 STAGE1_SANITY_RTOL="${STAGE1_SANITY_RTOL:-1e-6}"
 
-# [Stage 4: reserved placeholder]
-# Parameters kept for compatibility with older baseline flow; Stage4 is currently no-op.
-BASELINE_DIR="${BASELINE_DIR:-analysis_outputs/scannet_baseline}"
-SCHEMES_JSON="${SCHEMES_JSON:-analysis/redundancy/schemes.example.json}"
-SCHEME_NAME="${SCHEME_NAME:-}"
-BASELINE_RECOVERY_STEPS="${BASELINE_RECOVERY_STEPS:-0}"
-BASELINE_RECOVERY_LR="${BASELINE_RECOVERY_LR:-1e-5}"
 if ! [[ "${STAGE1_CACHE_DIR+set}" == "set" ]]; then
   STAGE1_CACHE_DIR="${CACHE_DIR}"
 fi
@@ -385,14 +377,6 @@ PY
   fi
 fi
 
-# -----------------------------------------------------------------------------
-# Stage 4 — placeholder (future baseline implementations)
-# -----------------------------------------------------------------------------
-if [[ "${STAGE4}" == "1" || "${STAGE4}" == "true" ]]; then
-  echo "== Stage 4: placeholder (no-op for now) =="
-  echo "    Stage 4 baseline runner is intentionally disabled."
-fi
-
 echo "== Done =="
 echo "    Weight report:        ${WEIGHT_ANALYSIS_DIR}/weight_report.json"
 echo "    Per-scene caches:     ${CACHE_DIR}/*.pt"
@@ -438,9 +422,6 @@ if [[ "${SAVE_PER_SCENE_STAGE2}" == "1" || "${SAVE_PER_SCENE_STAGE2}" == "true" 
       fi
     fi
   fi
-fi
-if [[ "${STAGE4}" == "1" || "${STAGE4}" == "true" ]]; then
-  echo "    Stage4:                placeholder only (no outputs yet)"
 fi
 if [[ "${STAGE1}" == "1" || "${STAGE1}" == "true" ]]; then
   echo "    GT eval (Stage1):      ${CACHE_DIR}/eval_scannet.json"

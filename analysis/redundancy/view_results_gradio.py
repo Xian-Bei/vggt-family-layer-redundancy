@@ -18,7 +18,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -387,6 +387,31 @@ def _gallery_update(items: List[np.ndarray]):
     return gr.update(value=items, columns=max(1, len(items)))
 
 
+STAGE2_METRIC_ROW_POSE = "pose"
+STAGE2_METRIC_ROW_POINT = "point"
+STAGE2_TOKEN_ROW_SPECIAL = "special"
+STAGE2_TOKEN_ROW_PATCH = "patch"
+
+
+def _stage2_row_visibility_flags(
+    mode_order: List[str],
+    selected_modes: List[str],
+    metric_rows: List[str],
+    token_rows: List[str],
+) -> List[bool]:
+    active_modes = {str(m) for m in selected_modes}
+    metrics = {str(m) for m in metric_rows}
+    tokens = {str(t) for t in token_rows}
+    out: List[bool] = []
+    for mode in mode_order:
+        on = mode in active_modes
+        out.append(on and STAGE2_METRIC_ROW_POSE in metrics)
+        out.append(on and STAGE2_TOKEN_ROW_SPECIAL in tokens)
+        out.append(on and STAGE2_METRIC_ROW_POINT in metrics)
+        out.append(on and STAGE2_TOKEN_ROW_PATCH in tokens)
+    return out
+
+
 def _coerce_packed(values: Any) -> Optional[List[float]]:
     if not isinstance(values, list):
         return None
@@ -510,7 +535,7 @@ def _discover_skip_modes(skip_reports: Dict[str, Stage2SceneReport]) -> List[str
 
     def _add(mode: str) -> None:
         key = str(mode).strip()
-        if key and key not in ordered:
+        if key and not key.endswith("_nomlp") and key not in ordered:
             ordered.append(key)
 
     mean_report = skip_reports.get("mean")
@@ -530,17 +555,41 @@ def _discover_skip_modes(skip_reports: Dict[str, Stage2SceneReport]) -> List[str
     return ordered
 
 
-def _packed_nanmean(packed_list: List[List[float]]) -> Optional[List[float]]:
-    if not packed_list:
+def _mean_stage1_baseline_for_metric(
+    stage1_by_scene: Dict[str, Dict[str, Any]],
+    metric_key: str,
+    scene_ids: Optional[Sequence[str]],
+) -> Optional[float]:
+    if scene_ids:
+        ids = [str(s).strip() for s in scene_ids if str(s).strip()]
+    else:
+        ids = list(stage1_by_scene.keys())
+    vals: List[float] = []
+    for sid in ids:
+        row = stage1_by_scene.get(sid)
+        if row is None or metric_key not in row:
+            continue
+        try:
+            v = float(row[metric_key])
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(v):
+            continue
+        vals.append(v)
+    if not vals:
         return None
-    size = len(packed_list[0])
-    if any(len(packed) != size for packed in packed_list):
-        raise gr.Error("Stage2 packed heatmap lengths do not match across scenes.")
-    out: List[float] = []
-    for idx in range(size):
-        vals = [float(packed[idx]) for packed in packed_list if not math.isnan(float(packed[idx]))]
-        out.append(float(sum(vals) / len(vals)) if vals else float("nan"))
-    return out
+    return float(sum(vals) / len(vals))
+
+
+def _similarity_maps_for_skip_mode(
+    similarity_by_mode: Dict[str, Dict[str, Dict[str, List[float]]]],
+    skip_mode: str,
+) -> Dict[str, Dict[str, List[float]]]:
+    if skip_mode in similarity_by_mode:
+        return similarity_by_mode[skip_mode]
+    if "default" in similarity_by_mode:
+        return similarity_by_mode["default"]
+    return {"patch": {}, "special": {}}
 
 
 def _packed_delta_to_pct(
@@ -580,17 +629,24 @@ def _heatmap_rgb_from_packed(
     if np.any(np.isnan(arr)):
         arr = np.ma.masked_invalid(arr)
 
-    fig, ax = plt.subplots(figsize=(8, 7))
+    title_fs, label_fs, tick_fs = 18, 16, 14
+    fig, ax = plt.subplots(figsize=(9, 8))
     imshow_kw: Dict[str, Any] = {"cmap": "viridis"}
     if vmin is not None:
         imshow_kw["vmin"] = vmin
     if vmax is not None:
         imshow_kw["vmax"] = vmax
     im = ax.imshow(arr, **imshow_kw)
-    ax.set_title(title)
-    ax.set_xlabel("layer j")
-    ax.set_ylabel("layer i")
+    ax.set_title(title, fontsize=title_fs, fontweight="bold", pad=12)
+    ax.set_xlabel("layer j", fontsize=label_fs, fontweight="bold")
+    ax.set_ylabel("layer i", fontsize=label_fs, fontweight="bold")
+    ax.tick_params(axis="both", which="major", labelsize=tick_fs, width=2.0, length=6)
+    for lb in ax.get_xticklabels() + ax.get_yticklabels():
+        lb.set_fontweight("bold")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=tick_fs, width=2.0, length=6)
+    for lb in cbar.ax.get_yticklabels():
+        lb.set_fontweight("bold")
     data_min = float(vmin) if vmin is not None else (float(finite_vals.min()) if finite_vals.size else None)
     data_max = float(vmax) if vmax is not None else (float(finite_vals.max()) if finite_vals.size else None)
     if data_min is not None and data_max is not None:
@@ -608,6 +664,8 @@ def _heatmap_rgb_from_packed(
                 else:
                     labels.append(f"{tick_val:.1f}{tick_suffix}")
             cbar.set_ticklabels(labels)
+            for lb in cbar.ax.get_yticklabels():
+                lb.set_fontweight("bold")
     fig.tight_layout()
 
     buf = io.BytesIO()
@@ -629,10 +687,11 @@ def _render_similarity_gallery(
     similarity_upper: Dict[str, Any],
     num_layers: int,
     *,
-    base_label: str,
-    title_suffix: str,
+    role_short: str,
 ) -> List[np.ndarray]:
+    """role_short: one-letter tag, e.g. S (special) / P (patch)."""
     images: List[np.ndarray] = []
+    tag = (role_short or "?").strip()[:1].upper()
     for metric_key, metric_label in SIMILARITY_METRICS:
         packed = _coerce_packed(similarity_upper.get(metric_key))
         if packed is None:
@@ -643,7 +702,7 @@ def _render_similarity_gallery(
             _heatmap_rgb_from_packed(
                 packed,
                 num_layers,
-                f"{base_label} {metric_label}{title_suffix}",
+                f"{tag}·{metric_label}",
                 vmin=vmin,
                 vmax=vmax,
             )
@@ -656,9 +715,7 @@ def _render_skip_gallery(
     num_layers: int,
     metrics: List[Tuple[str, str]],
     *,
-    title_suffix: str,
     value_mode: str,
-    pct_clip_percent: float,
 ) -> List[np.ndarray]:
     images: List[np.ndarray] = []
     for metric_key, metric_label in metrics:
@@ -666,13 +723,9 @@ def _render_skip_gallery(
         if packed is None:
             continue
         if value_mode == "pct":
-            title = (
-                "Global skip-range loss "
-                f"({metric_key}, higher means less drop, pct floor at -{pct_clip_percent:.0f}%, no upper cap)"
-                f"{title_suffix}"
-            )
+            title = f"{metric_label} %"
         else:
-            title = f"Global skip-range loss ({metric_key}, higher means less drop){title_suffix}"
+            title = metric_label
         images.append(
             _heatmap_rgb_from_packed(
                 packed,
@@ -793,7 +846,6 @@ def _build_stage2_skip_maps(
     scene_id: str,
     value_mode: str,
     pct_clip_percent: float,
-    mode_order: List[str],
 ) -> Tuple[Dict[str, Dict[str, List[float]]], str]:
     skip_report_entry = controller.get_skip_report(scene_id)
     if skip_report_entry is None:
@@ -804,35 +856,47 @@ def _build_stage2_skip_maps(
         return skip_by_mode, "skip rows use saved absolute delta"
 
     if scene_id == "mean":
-        per_scene_reports = {sid: entry.report for sid, entry in controller.skip_reports.items() if sid != "mean"}
-        if not per_scene_reports:
-            raise gr.Error("Mean pct view needs per-scene skip JSON under analysis_outputs/.../per_scene.")
+        if not skip_by_mode:
+            raise gr.Error(
+                "Mean skip view needs aggregated skip data in full_report_skip.json "
+                "(e.g. fusion_by_mode / gt_delta_upper_by_metric)."
+            )
+        raw_scene_ids = report.get("scene_ids")
+        scene_ids_list: Optional[List[str]] = None
+        if isinstance(raw_scene_ids, list) and raw_scene_ids:
+            scene_ids_list = [str(s).strip() for s in raw_scene_ids if str(s).strip()]
+        try:
+            n_fused = int(report.get("num_scenes", 0))
+        except (TypeError, ValueError):
+            n_fused = 0
+        if n_fused <= 0 and scene_ids_list:
+            n_fused = len(scene_ids_list)
         pct_by_mode: Dict[str, Dict[str, List[float]]] = {}
-        for mode in mode_order:
-            metric_map: Dict[str, List[float]] = {}
-            for metric_key, _metric_label in [*SKIP_MAIN_METRICS, *SKIP_DEPTH_METRICS]:
-                packed_list: List[List[float]] = []
-                for sid, scene_report in per_scene_reports.items():
-                    baseline_row = controller.stage1_eval_by_scene.get(sid)
-                    if baseline_row is None or metric_key not in baseline_row:
-                        continue
-                    scene_skip_by_mode = _extract_skip_metric_maps_by_mode(scene_report)
-                    packed = scene_skip_by_mode.get(mode, {}).get(metric_key)
-                    if packed is None:
-                        continue
-                    packed_list.append(
-                        _packed_delta_to_pct(
-                            packed,
-                            float(baseline_row[metric_key]),
-                            clip_percent=pct_clip_percent,
-                        )
-                    )
-                mean_packed = _packed_nanmean(packed_list)
-                if mean_packed is not None:
-                    metric_map[metric_key] = mean_packed
-            if metric_map:
-                pct_by_mode[mode] = metric_map
-        return pct_by_mode, f"skip rows use on-the-fly mean pct over {len(per_scene_reports)} scenes"
+        for mode, metric_map in skip_by_mode.items():
+            pct_metric_map: Dict[str, List[float]] = {}
+            for metric_key, packed in metric_map.items():
+                baseline = _mean_stage1_baseline_for_metric(
+                    controller.stage1_eval_by_scene,
+                    metric_key,
+                    scene_ids_list,
+                )
+                if baseline is None:
+                    continue
+                pct_metric_map[metric_key] = _packed_delta_to_pct(
+                    packed,
+                    baseline,
+                    clip_percent=pct_clip_percent,
+                )
+            if pct_metric_map:
+                pct_by_mode[mode] = pct_metric_map
+        if not pct_by_mode:
+            raise gr.Error(
+                "Mean pct view: no skip heatmaps built. "
+                f"Check {controller.cache_dir / 'eval_scannet.json'} has Stage1 metrics for "
+                f"scene_ids in full_report_skip.json."
+            )
+        detail = f"{n_fused} scenes" if n_fused > 0 else "full_report"
+        return pct_by_mode, f"mean Δ from full_report, pct+clip vs mean Stage1 ({detail})"
 
     baseline_row = controller.stage1_eval_by_scene.get(scene_id)
     if baseline_row is None:
@@ -854,12 +918,6 @@ def _build_stage2_skip_maps(
     return pct_by_mode, "skip rows use on-the-fly pct vs Stage1 baseline"
 
 
-def _skip_title_suffix(scene_id: str, mode: str, value_mode: str) -> str:
-    if value_mode == "pct":
-        return f" ({scene_id}, {mode}, pct)" if scene_id != "mean" else f" (mean, {mode}, pct)"
-    return f" ({scene_id}, {mode})" if scene_id != "mean" else f" (mean, {mode})"
-
-
 def _prepare_stage2_render(
     controller: PairAttentionController,
     scene_id: str,
@@ -879,81 +937,45 @@ def _prepare_stage2_render(
     if num_layers <= 0:
         raise gr.Error(f"No similarity/skip report with num_layers found for {scene_id!r}.")
 
-    similarity_mode = str((similarity_report.report if similarity_report is not None else {}).get("similarity_mode", "intra_layer_frame_vs_global"))
-    if similarity_mode == "intra_layer_frame_vs_global":
-        patch_label = "Global patch intra-layer (frame_i vs global_i)"
-        special_label = "Global special intra-layer (frame_i vs global_i)"
-    else:
-        patch_label = "Legacy global patch inter-layer"
-        special_label = "Legacy global special inter-layer"
-    title_suffix = " (mean)" if scene_id == "mean" else f" ({scene_id})"
-
-    selected_similarity_mode = "n/a"
+    similarity_by_mode: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
     if similarity_report is not None:
         similarity_by_mode = _extract_similarity_metric_maps_by_mode(similarity_report.report)
-        mode_candidates = list(mode_order) + sorted(k for k in similarity_by_mode.keys() if k not in mode_order)
-        selected_map: Optional[Dict[str, Dict[str, List[float]]]] = None
-        for mode in mode_candidates:
-            candidate = similarity_by_mode.get(mode)
-            if candidate is None:
-                continue
-            selected_similarity_mode = mode
-            selected_map = candidate
-            break
-        if selected_map is None and similarity_by_mode:
-            selected_similarity_mode, selected_map = next(iter(similarity_by_mode.items()))
-        if selected_map is None:
-            patch_similarity = []
-            special_similarity = []
-        else:
-            patch_similarity = _render_similarity_gallery(
-                selected_map.get("patch", {}),
-                num_layers,
-                base_label=patch_label,
-                title_suffix=f"{title_suffix}, mode={selected_similarity_mode}",
-            )
-            special_similarity = _render_similarity_gallery(
-                selected_map.get("special", {}),
-                num_layers,
-                base_label=special_label,
-                title_suffix=f"{title_suffix}, mode={selected_similarity_mode}",
-            )
-    else:
-        patch_similarity = []
-        special_similarity = []
-    skip_by_mode, skip_source = _build_stage2_skip_maps(controller, scene_id, value_mode, float(clip_key), mode_order)
 
-    galleries: Dict[str, List[np.ndarray]] = {
-        "special_similarity": special_similarity,
-        "patch_similarity": patch_similarity,
-    }
+    skip_by_mode, skip_source = _build_stage2_skip_maps(controller, scene_id, value_mode, float(clip_key))
+
+    galleries: Dict[str, List[np.ndarray]] = {}
     for mode in mode_order:
         galleries[f"skip_{mode}_main"] = _render_skip_gallery(
             skip_by_mode.get(mode, {}),
             num_layers,
             SKIP_MAIN_METRICS,
-            title_suffix=_skip_title_suffix(scene_id, mode, value_mode),
             value_mode=value_mode,
-            pct_clip_percent=float(clip_key),
+        )
+        sim_entry = _similarity_maps_for_skip_mode(similarity_by_mode, mode)
+        galleries[f"sim_{mode}_special"] = _render_similarity_gallery(
+            sim_entry.get("special", {}),
+            num_layers,
+            role_short="S",
         )
         galleries[f"skip_{mode}_depth"] = _render_skip_gallery(
             skip_by_mode.get(mode, {}),
             num_layers,
             SKIP_DEPTH_METRICS,
-            title_suffix=_skip_title_suffix(scene_id, mode, value_mode),
             value_mode=value_mode,
-            pct_clip_percent=float(clip_key),
+        )
+        galleries[f"sim_{mode}_patch"] = _render_similarity_gallery(
+            sim_entry.get("patch", {}),
+            num_layers,
+            role_short="P",
         )
 
     mode_summaries = " | ".join(
-        f"{mode}(main/depth)={len(galleries[f'skip_{mode}_main'])}/{len(galleries[f'skip_{mode}_depth'])}"
+        f"{mode}: skip {len(galleries[f'skip_{mode}_main'])+len(galleries[f'skip_{mode}_depth'])}, "
+        f"sim {len(galleries[f'sim_{mode}_special'])+len(galleries[f'sim_{mode}_patch'])}"
         for mode in mode_order
     )
     info = (
-        f"scene={scene_id} | view={value_mode} | "
-        f"patch={len(patch_similarity)} | special={len(special_similarity)} | "
-        f"{mode_summaries} | "
-        f"{skip_source} | sim_mode={selected_similarity_mode} | pct_clip={clip_key}%"
+        f"scene={scene_id} | view={value_mode} | {mode_summaries} | {skip_source} | pct_clip={clip_key}%"
     )
     controller.stage2_render_cache[cache_key] = (galleries, info)
     return galleries, info
@@ -1060,15 +1082,31 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             frame_b_info,
         )
 
-    def _refresh_stage2(scene_id: str, value_mode: str, pct_clip_percent: float):
+    def _refresh_stage2_full(
+        scene_id: str,
+        value_mode: str,
+        pct_clip_percent: float,
+        filter_modes: List[str] | None,
+        filter_metric_rows: List[str] | None,
+        filter_token_rows: List[str] | None,
+    ):
         galleries, details = _prepare_stage2_render(
             controller, scene_id, value_mode, pct_clip_percent, stage2_skip_modes
         )
-        main_updates = [_gallery_update(galleries[f"skip_{mode}_main"]) for mode in stage2_skip_modes]
-        depth_updates = [_gallery_update(galleries[f"skip_{mode}_depth"]) for mode in stage2_skip_modes]
-        return tuple(
-            [*main_updates, _gallery_update(galleries["special_similarity"]), *depth_updates, _gallery_update(galleries["patch_similarity"]), details]
+        block_updates: List[Any] = []
+        for mode in stage2_skip_modes:
+            block_updates.append(_gallery_update(galleries[f"skip_{mode}_main"]))
+            block_updates.append(_gallery_update(galleries[f"sim_{mode}_special"]))
+            block_updates.append(_gallery_update(galleries[f"skip_{mode}_depth"]))
+            block_updates.append(_gallery_update(galleries[f"sim_{mode}_patch"]))
+        vis_flags = _stage2_row_visibility_flags(
+            stage2_skip_modes,
+            list(filter_modes or []),
+            list(filter_metric_rows or []),
+            list(filter_token_rows or []),
         )
+        vis_updates = [gr.update(visible=bool(v)) for v in vis_flags]
+        return tuple([*block_updates, *vis_updates, details])
 
     stage2_scene_ids = controller.stage2_scene_ids()
     initial_stage2_scene = stage2_scene_ids[0] if stage2_scene_ids else None
@@ -1144,6 +1182,32 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         .stage2-right {
             gap: 8px !important;
         }
+        .stage2-gallery-row {
+            align-items: flex-start;
+        }
+        .stage2-heatmap-gallery.wrap {
+            min-height: 0 !important;
+            height: auto !important;
+        }
+        .stage2-heatmap-gallery .grid-wrap,
+        .stage2-heatmap-gallery [class*="grid"] {
+            min-height: 0 !important;
+            height: auto !important;
+            align-content: start !important;
+        }
+        .stage2-heatmap-gallery .thumbnail-item,
+        .stage2-heatmap-gallery .thumbnail-small,
+        .stage2-heatmap-gallery button.thumbnail-item {
+            height: auto !important;
+            min-height: 0 !important;
+        }
+        .stage2-heatmap-gallery .thumbnail-item img,
+        .stage2-heatmap-gallery img {
+            display: block !important;
+            height: auto !important;
+            max-height: none !important;
+            vertical-align: bottom !important;
+        }
         """,
     ) as demo:
         with gr.Tab("Pair Attention"):
@@ -1208,8 +1272,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         with gr.Tab("Stage2 Heatmaps"):
             gr.Markdown("## Stage2 Heatmaps")
             gr.Markdown(
-                "Choose `mean` or a specific scene to render Stage2 heatmaps directly from JSON. "
-                "`pct` only changes the skip-loss rows; similarity rows stay unchanged."
+                "Choose `mean` or a scene. Per skip mode: pose → special sim → depth → patch sim. "
+                "Use the **left filters** to show or hide fusion modes and row groups. "
+                "`pct` applies to skip rows only (mean uses full_report Δ then pct+clip vs mean Stage1)."
             )
             with gr.Row():
                 with gr.Column(scale=1):
@@ -1226,74 +1291,64 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         value=100,
                         step=1,
                     )
+                    stage2_mode_filter = gr.CheckboxGroup(
+                        label="Fusion / skip modes",
+                        choices=list(stage2_skip_modes),
+                        value=list(stage2_skip_modes),
+                    )
+                    stage2_metric_rows_filter = gr.CheckboxGroup(
+                        label="Skip Δ rows",
+                        choices=[STAGE2_METRIC_ROW_POSE, STAGE2_METRIC_ROW_POINT],
+                        value=[STAGE2_METRIC_ROW_POSE, STAGE2_METRIC_ROW_POINT],
+                        info="pose: ARE/ATE/RPE. point: depth & Chamfer.",
+                    )
+                    stage2_token_rows_filter = gr.CheckboxGroup(
+                        label="Token similarity rows",
+                        choices=[STAGE2_TOKEN_ROW_SPECIAL, STAGE2_TOKEN_ROW_PATCH],
+                        value=[STAGE2_TOKEN_ROW_SPECIAL, STAGE2_TOKEN_ROW_PATCH],
+                        info="special- vs patch-token heatmaps.",
+                    )
                     stage2_info = gr.Textbox(label="Displayed counts", interactive=False)
                 with gr.Column(scale=5, elem_classes=["stage2-right"]):
-                    stage2_skip_main_galleries: List[gr.Gallery] = []
+                    stage2_mode_galleries: List[gr.Gallery] = []
+                    stage2_row_body_cols: List[gr.Column] = []
                     for mode in stage2_skip_modes:
-                        stage2_skip_main_galleries.append(
-                            gr.Gallery(
-                                label=f"{mode}: ARE / ATE / RPE_rot / RPE_trans",
-                                columns=4,
-                                height="auto",
-                                object_fit="contain",
-                                elem_classes=["results-gallery"],
-                            )
-                        )
-                    stage2_special_similarity = gr.Gallery(
-                        label="Special token similarity metrics",
-                        columns=4,
-                        height="auto",
-                        object_fit="contain",
-                        elem_classes=["results-gallery"],
-                    )
-                    stage2_skip_depth_galleries: List[gr.Gallery] = []
-                    for mode in stage2_skip_modes:
-                        stage2_skip_depth_galleries.append(
-                            gr.Gallery(
-                                label=f"{mode}: depth_abs_rel / depth_delta1 / CD",
-                                columns=3,
-                                height="auto",
-                                object_fit="contain",
-                                elem_classes=["results-gallery"],
-                            )
-                        )
-                    stage2_patch_similarity = gr.Gallery(
-                        label="Patch token similarity metrics",
-                        columns=4,
-                        height="auto",
-                        object_fit="contain",
-                        elem_classes=["results-gallery"],
-                    )
+                        for label, n_columns in (
+                            (f"{mode}: pose", 4),
+                            (f"{mode}: sim · special", 4),
+                            (f"{mode}: depth", 3),
+                            (f"{mode}: sim · patch", 4),
+                        ):
+                            with gr.Row(elem_classes=["stage2-gallery-row"], equal_height=False):
+                                with gr.Column(scale=1, min_width=280) as row_body:
+                                    gal = gr.Gallery(
+                                        label=label,
+                                        columns=n_columns,
+                                        height="auto",
+                                        object_fit="contain",
+                                        elem_classes=["results-gallery", "stage2-heatmap-gallery"],
+                                    )
+                                stage2_row_body_cols.append(row_body)
+                                stage2_mode_galleries.append(gal)
 
-            stage2_outputs = [
-                *stage2_skip_main_galleries,
-                stage2_special_similarity,
-                *stage2_skip_depth_galleries,
-                stage2_patch_similarity,
-                stage2_info,
+            stage2_inputs = [
+                stage2_scene_dd,
+                stage2_value_mode,
+                stage2_pct_clip_slider,
+                stage2_mode_filter,
+                stage2_metric_rows_filter,
+                stage2_token_rows_filter,
             ]
+            stage2_outputs = [*stage2_mode_galleries, *stage2_row_body_cols, stage2_info]
 
             if stage2_scene_ids:
-                stage2_scene_dd.change(
-                    _refresh_stage2,
-                    inputs=[stage2_scene_dd, stage2_value_mode, stage2_pct_clip_slider],
-                    outputs=stage2_outputs,
-                )
-                stage2_value_mode.change(
-                    _refresh_stage2,
-                    inputs=[stage2_scene_dd, stage2_value_mode, stage2_pct_clip_slider],
-                    outputs=stage2_outputs,
-                )
-                stage2_pct_clip_slider.change(
-                    _refresh_stage2,
-                    inputs=[stage2_scene_dd, stage2_value_mode, stage2_pct_clip_slider],
-                    outputs=stage2_outputs,
-                )
-                demo.load(
-                    _refresh_stage2,
-                    inputs=[stage2_scene_dd, stage2_value_mode, stage2_pct_clip_slider],
-                    outputs=stage2_outputs,
-                )
+                stage2_scene_dd.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
+                stage2_value_mode.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
+                stage2_pct_clip_slider.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
+                stage2_mode_filter.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
+                stage2_metric_rows_filter.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
+                stage2_token_rows_filter.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
+                demo.load(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
             else:
                 stage2_info.value = (
                     f"No Stage2/Stage3 reports found under "
@@ -1320,7 +1375,7 @@ def main() -> None:
         device_arg=args.device,
     )
     demo = _build_ui(controller)
-    demo.queue().launch(server_name=args.server_name, server_port=args.server_port, show_error=True)
+    demo.queue().launch(server_name=args.server_name, server_port=args.server_port, show_error=True, share=True)
 
 
 if __name__ == "__main__":
