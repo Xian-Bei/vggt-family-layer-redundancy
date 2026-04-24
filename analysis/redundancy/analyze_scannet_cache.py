@@ -610,6 +610,8 @@ def _aggregate_from_per_scene_split_outputs(
     *,
     similarity_report_name: str,
     skip_report_name: str,
+    save_similarity_output: bool,
+    save_skip_output: bool,
     fusion_modes: Sequence[str],
     sim_metrics: Sequence[str],
     save_heatmap_png: bool,
@@ -619,15 +621,16 @@ def _aggregate_from_per_scene_split_outputs(
     analysis_device: torch.device,
     skip_gt_eval: bool,
 ) -> None:
+    if not save_similarity_output and not save_skip_output:
+        raise SystemExit("Both similarity and skip outputs are disabled; nothing to aggregate.")
     sim_per_scene_dir = similarity_out_dir / "per_scene"
     skip_per_scene_dir = skip_out_dir / "per_scene"
-    if not sim_per_scene_dir.exists() or not skip_per_scene_dir.exists():
-        raise SystemExit(
-            "Per-scene directories are missing. Expected both "
-            f"{sim_per_scene_dir} and {skip_per_scene_dir}."
-        )
-    sim_files = sorted(sim_per_scene_dir.glob("*.json"))
-    skip_files = sorted(skip_per_scene_dir.glob("*.json"))
+    if save_similarity_output and not sim_per_scene_dir.exists():
+        raise SystemExit(f"Per-scene similarity directory is missing: {sim_per_scene_dir}")
+    if save_skip_output and not skip_per_scene_dir.exists():
+        raise SystemExit(f"Per-scene skip directory is missing: {skip_per_scene_dir}")
+    sim_files = sorted(sim_per_scene_dir.glob("*.json")) if save_similarity_output else []
+    skip_files = sorted(skip_per_scene_dir.glob("*.json")) if save_skip_output else []
     if not sim_files and not skip_files:
         raise SystemExit("No per-scene JSON files found for aggregation.")
 
@@ -754,10 +757,12 @@ def _aggregate_from_per_scene_split_outputs(
     skip_report["report_kind"] = "skip"
     skip_report["fusion_by_mode"] = skip_fusion_by_mode
 
-    similarity_out_dir.mkdir(parents=True, exist_ok=True)
-    skip_out_dir.mkdir(parents=True, exist_ok=True)
-    (similarity_out_dir / similarity_report_name).write_text(json.dumps(sim_report, indent=2), encoding="utf-8")
-    (skip_out_dir / skip_report_name).write_text(json.dumps(skip_report, indent=2), encoding="utf-8")
+    if save_similarity_output:
+        similarity_out_dir.mkdir(parents=True, exist_ok=True)
+        (similarity_out_dir / similarity_report_name).write_text(json.dumps(sim_report, indent=2), encoding="utf-8")
+    if save_skip_output:
+        skip_out_dir.mkdir(parents=True, exist_ok=True)
+        (skip_out_dir / skip_report_name).write_text(json.dumps(skip_report, indent=2), encoding="utf-8")
 
     similarity_summary_rows: List[Dict[str, Any]] = []
     skip_summary_rows: List[Dict[str, Any]] = []
@@ -814,33 +819,37 @@ def _aggregate_from_per_scene_split_outputs(
             similarity_summary_rows.append({"metric": f"scene_avg_{k}", "value": mean_v})
             skip_summary_rows.append({"metric": f"scene_avg_{k}", "value": mean_v})
 
-    with (similarity_out_dir / "summary_metrics_similarity.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["metric", "value"])
-        w.writeheader()
-        for row in similarity_summary_rows:
-            w.writerow(row)
-    with (skip_out_dir / "summary_metrics_skip.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["metric", "value"])
-        w.writeheader()
-        for row in skip_summary_rows:
-            w.writerow(row)
+    if save_similarity_output:
+        with (similarity_out_dir / "summary_metrics_similarity.csv").open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["metric", "value"])
+            w.writeheader()
+            for row in similarity_summary_rows:
+                w.writerow(row)
+    if save_skip_output:
+        with (skip_out_dir / "summary_metrics_skip.csv").open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["metric", "value"])
+            w.writeheader()
+            for row in skip_summary_rows:
+                w.writerow(row)
 
-    with (similarity_out_dir / "per_scene_scores_similarity.csv").open("w", newline="", encoding="utf-8") as f:
-        fields = ["scene_id"] + score_keys
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(per_scene_rows_final)
-    with (skip_out_dir / "per_scene_scores_skip.csv").open("w", newline="", encoding="utf-8") as f:
-        fields = ["scene_id"] + score_keys
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(per_scene_rows_final)
+    if save_similarity_output:
+        with (similarity_out_dir / "per_scene_scores_similarity.csv").open("w", newline="", encoding="utf-8") as f:
+            fields = ["scene_id"] + score_keys
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(per_scene_rows_final)
+    if save_skip_output:
+        with (skip_out_dir / "per_scene_scores_skip.csv").open("w", newline="", encoding="utf-8") as f:
+            fields = ["scene_id"] + score_keys
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(per_scene_rows_final)
 
     if save_heatmap_png:
         for mode in mode_list:
             mode_sim = sim_fusion_by_mode[mode]
             mode_skip = skip_fusion_by_mode[mode]
-            if sim_metrics:
+            if save_similarity_output and sim_metrics:
                 _write_redundancy_heatmaps(
                     mode_sim["global_patch_similarity_upper_by_metric"],
                     mode_sim["global_special_similarity_upper_by_metric"],
@@ -852,19 +861,20 @@ def _aggregate_from_per_scene_split_outputs(
                     title_suffix=f" (mean, {mode})",
                     fname_prefix=f"{mode}_",
                 )
-            for gk in GT_KEYS_FOR_SKIP:
-                if gk not in mode_skip["gt_delta_upper_by_metric"]:
-                    continue
-                _write_skip_loss_heatmap(
-                    mode_skip["gt_delta_upper_by_metric"][gk],
-                    skip_out_dir,
-                    num_layers,
-                    fill_value,
-                    metric_key=gk,
-                    title_suffix=f" (mean, {mode})",
-                    fname_prefix="",
-                    mode_suffix=f"_{mode}",
-                )
+            if save_skip_output:
+                for gk in GT_KEYS_FOR_SKIP:
+                    if gk not in mode_skip["gt_delta_upper_by_metric"]:
+                        continue
+                    _write_skip_loss_heatmap(
+                        mode_skip["gt_delta_upper_by_metric"][gk],
+                        skip_out_dir,
+                        num_layers,
+                        fill_value,
+                        metric_key=gk,
+                        title_suffix=f" (mean, {mode})",
+                        fname_prefix="",
+                        mode_suffix=f"_{mode}",
+                    )
 
 def _extract_skip_loss_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     by_mode = report.get("global_skip_range_loss_by_mode")
@@ -1972,6 +1982,10 @@ def main() -> None:
     compute_pwcca = compute_similarity and ("pwcca" in sim_metrics)
     write_aggregate = bool(args.fusion_write_aggregate)
     skip_gt_eval = bool(args.skip_gt_eval)
+    save_similarity_output = bool(compute_similarity)
+    save_skip_output = not bool(skip_gt_eval)
+    if not save_similarity_output and not save_skip_output:
+        raise SystemExit("Both similarity and skip outputs are disabled; nothing to save.")
 
     if bool(args.fusion_aggregate_from_per_scene):
         _aggregate_from_per_scene_split_outputs(
@@ -1979,6 +1993,8 @@ def main() -> None:
             skip_out_dir,
             similarity_report_name=similarity_report_name,
             skip_report_name=skip_report_name,
+            save_similarity_output=save_similarity_output,
+            save_skip_output=save_skip_output,
             fusion_modes=fusion_modes,
             sim_metrics=sim_metrics,
             save_heatmap_png=bool(args.save_heatmap_png),
@@ -1988,9 +2004,12 @@ def main() -> None:
             analysis_device=analysis_device,
             skip_gt_eval=skip_gt_eval,
         )
-        print(
-            f"Aggregated split fusion reports from per-scene files into {similarity_report_path} and {skip_report_path}"
-        )
+        paths: List[str] = []
+        if save_similarity_output:
+            paths.append(str(similarity_report_path))
+        if save_skip_output:
+            paths.append(str(skip_report_path))
+        print(f"Aggregated split fusion reports from per-scene files into {', '.join(paths)}")
         return
 
     scenes_meta = _read_manifest(args.cache_dir)
@@ -2007,11 +2026,15 @@ def main() -> None:
         scenes_meta = [item for item in scenes_meta if str(item.get("scene_id", "")).strip() in wanted]
         if not scenes_meta:
             raise SystemExit(f"No manifest scenes matched scene_ids_file: {args.scene_ids_file}")
-    similarity_out_dir.mkdir(parents=True, exist_ok=True)
-    skip_out_dir.mkdir(parents=True, exist_ok=True)
+    if save_similarity_output:
+        similarity_out_dir.mkdir(parents=True, exist_ok=True)
+    if save_skip_output:
+        skip_out_dir.mkdir(parents=True, exist_ok=True)
     save_per_scene = bool(args.fusion_save_per_scene)
-    per_scene_similarity_dir: Optional[Path] = similarity_out_dir / "per_scene" if save_per_scene else None
-    per_scene_skip_dir: Optional[Path] = skip_out_dir / "per_scene" if save_per_scene else None
+    per_scene_similarity_dir: Optional[Path] = (
+        similarity_out_dir / "per_scene" if (save_per_scene and save_similarity_output) else None
+    )
+    per_scene_skip_dir: Optional[Path] = skip_out_dir / "per_scene" if (save_per_scene and save_skip_output) else None
     if per_scene_similarity_dir is not None:
         per_scene_similarity_dir.mkdir(parents=True, exist_ok=True)
     if per_scene_skip_dir is not None:
@@ -2367,8 +2390,6 @@ def main() -> None:
                     gt_cnt[mode][k] = gt_cnt[mode][k] + gt_mask  # type: ignore[operator]
 
         if save_per_scene:
-            assert per_scene_similarity_dir is not None
-            assert per_scene_skip_dir is not None
             scene_report = {
                 "scene_id": sid,
                 "num_layers": num_layers,
@@ -2413,17 +2434,22 @@ def main() -> None:
                 },
             }
             safe_id = sid.replace("/", "_")
-            (per_scene_similarity_dir / f"{safe_id}{similarity_per_scene_suffix}").write_text(
-                json.dumps(similarity_scene_report, indent=2), encoding="utf-8"
-            )
-            (per_scene_skip_dir / f"{safe_id}{skip_per_scene_suffix}").write_text(
-                json.dumps(skip_scene_report, indent=2), encoding="utf-8"
-            )
+            if save_similarity_output:
+                assert per_scene_similarity_dir is not None
+                (per_scene_similarity_dir / f"{safe_id}{similarity_per_scene_suffix}").write_text(
+                    json.dumps(similarity_scene_report, indent=2), encoding="utf-8"
+                )
+            if save_skip_output:
+                assert per_scene_skip_dir is not None
+                (per_scene_skip_dir / f"{safe_id}{skip_per_scene_suffix}").write_text(
+                    json.dumps(skip_scene_report, indent=2), encoding="utf-8"
+                )
             if args.save_heatmap_png and isinstance(scene_modes, dict):
                 for mode, mode_map in scene_modes.items():
                     if not isinstance(mode_map, dict):
                         continue
-                    if compute_similarity:
+                    if save_similarity_output and compute_similarity:
+                        assert per_scene_similarity_dir is not None
                         _write_redundancy_heatmaps(
                             mode_map["global_patch_similarity_upper_by_metric"],
                             mode_map["global_special_similarity_upper_by_metric"],
@@ -2435,25 +2461,32 @@ def main() -> None:
                             title_suffix=f" ({sid}, {mode})",
                             fname_prefix=f"{safe_id}_{mode}_",
                         )
-                    for k in GT_KEYS_FOR_SKIP:
-                        _write_skip_loss_heatmap(
-                            mode_map["gt_delta_upper_by_metric"][k],
-                            per_scene_skip_dir,
-                            num_layers,
-                            fill_value,
-                            metric_key=k,
-                            title_suffix=f" ({sid}, {mode})",
-                            fname_prefix=f"{safe_id}_{mode}_",
-                            mode_suffix=f"_{mode}",
-                        )
+                    if save_skip_output:
+                        assert per_scene_skip_dir is not None
+                        for k in GT_KEYS_FOR_SKIP:
+                            _write_skip_loss_heatmap(
+                                mode_map["gt_delta_upper_by_metric"][k],
+                                per_scene_skip_dir,
+                                num_layers,
+                                fill_value,
+                                metric_key=k,
+                                title_suffix=f" ({sid}, {mode})",
+                                fname_prefix=f"{safe_id}_{mode}_",
+                                mode_suffix=f"_{mode}",
+                            )
 
     n_scenes = len(selected)
     if n_scenes == 0:
         raise SystemExit("No scenes processed.")
     if not write_aggregate:
+        per_scene_targets: List[str] = []
+        if per_scene_similarity_dir is not None:
+            per_scene_targets.append(str(per_scene_similarity_dir))
+        if per_scene_skip_dir is not None:
+            per_scene_targets.append(str(per_scene_skip_dir))
         print(
             f"Finished Stage2 scene processing only (no aggregate write). "
-            f"Per-scene outputs are under {per_scene_similarity_dir} and {per_scene_skip_dir}."
+            f"Per-scene outputs are under {', '.join(per_scene_targets)}."
         )
         return
 
@@ -2523,7 +2556,7 @@ def main() -> None:
     if args.save_heatmap_png:
         for mode in fusion_modes:
             mode_report = fusion_by_mode[mode]
-            if compute_similarity:
+            if save_similarity_output and compute_similarity:
                 _write_redundancy_heatmaps(
                     mode_report["global_patch_similarity_upper_by_metric"],
                     mode_report["global_special_similarity_upper_by_metric"],
@@ -2535,17 +2568,18 @@ def main() -> None:
                     title_suffix=f" (mean, {mode})",
                     fname_prefix=f"{mode}_",
                 )
-            for k in GT_KEYS_FOR_SKIP:
-                _write_skip_loss_heatmap(
-                    mode_report["gt_delta_upper_by_metric"][k],
-                    skip_out_dir,
-                    n,
-                    fill_value,
-                    metric_key=k,
-                    title_suffix=f" (mean, {mode})",
-                    fname_prefix="",
-                    mode_suffix=f"_{mode}",
-                )
+            if save_skip_output:
+                for k in GT_KEYS_FOR_SKIP:
+                    _write_skip_loss_heatmap(
+                        mode_report["gt_delta_upper_by_metric"][k],
+                        skip_out_dir,
+                        n,
+                        fill_value,
+                        metric_key=k,
+                        title_suffix=f" (mean, {mode})",
+                        fname_prefix="",
+                        mode_suffix=f"_{mode}",
+                    )
 
     similarity_summary_rows: List[Dict[str, Any]] = []
     skip_summary_rows: List[Dict[str, Any]] = []
@@ -2584,37 +2618,46 @@ def main() -> None:
             similarity_summary_rows.append({"metric": f"scene_avg_{k}", "value": mean_v})
             skip_summary_rows.append({"metric": f"scene_avg_{k}", "value": mean_v})
 
-    with (similarity_out_dir / "summary_metrics_similarity.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["metric", "value"])
-        w.writeheader()
-        for row in similarity_summary_rows:
-            w.writerow(row)
-    with (skip_out_dir / "summary_metrics_skip.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["metric", "value"])
-        w.writeheader()
-        for row in skip_summary_rows:
-            w.writerow(row)
+    if save_similarity_output:
+        with (similarity_out_dir / "summary_metrics_similarity.csv").open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["metric", "value"])
+            w.writeheader()
+            for row in similarity_summary_rows:
+                w.writerow(row)
+    if save_skip_output:
+        with (skip_out_dir / "summary_metrics_skip.csv").open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["metric", "value"])
+            w.writeheader()
+            for row in skip_summary_rows:
+                w.writerow(row)
 
-    with (similarity_out_dir / "per_scene_scores_similarity.csv").open("w", newline="", encoding="utf-8") as f:
-        fields = ["scene_id"] + score_keys
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(per_scene_rows_final)
-    with (skip_out_dir / "per_scene_scores_skip.csv").open("w", newline="", encoding="utf-8") as f:
-        fields = ["scene_id"] + score_keys
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(per_scene_rows_final)
+    if save_similarity_output:
+        with (similarity_out_dir / "per_scene_scores_similarity.csv").open("w", newline="", encoding="utf-8") as f:
+            fields = ["scene_id"] + score_keys
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(per_scene_rows_final)
+    if save_skip_output:
+        with (skip_out_dir / "per_scene_scores_skip.csv").open("w", newline="", encoding="utf-8") as f:
+            fields = ["scene_id"] + score_keys
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(per_scene_rows_final)
 
-    similarity_report_path.write_text(json.dumps(similarity_report, indent=2), encoding="utf-8")
-    skip_report_path.write_text(json.dumps(skip_report, indent=2), encoding="utf-8")
+    written_reports: List[str] = []
+    if save_similarity_output:
+        similarity_report_path.write_text(json.dumps(similarity_report, indent=2), encoding="utf-8")
+        written_reports.append(str(similarity_report_path))
+    if save_skip_output:
+        skip_report_path.write_text(json.dumps(skip_report, indent=2), encoding="utf-8")
+        written_reports.append(str(skip_report_path))
     if args.timing:
         print(
             f"[timing] fusion total: {time.perf_counter() - t_main_start:.2f}s",
             flush=True,
         )
     print(
-        f"Wrote split fusion reports to {similarity_report_path} and {skip_report_path} "
+        f"Wrote split fusion reports to {', '.join(written_reports)} "
         f"(heatmap PNGs {'enabled' if args.save_heatmap_png else 'disabled'})"
     )
 

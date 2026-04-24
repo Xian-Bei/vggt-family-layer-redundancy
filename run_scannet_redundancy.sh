@@ -288,7 +288,7 @@ if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
   )
 
   if [[ "${STAGE2_PROC_COUNT}" -le 1 ]]; then
-    python -m analysis.redundancy.analyze_scannet_fusion "${COMMON_FUSION_ARGS[@]}"
+    python -m analysis.redundancy.analyze_scannet_cache "${COMMON_FUSION_ARGS[@]}"
   else
     echo "    Running Stage2 with ${STAGE2_PROC_COUNT} scene-sharded worker processes."
     SHARD_SCENE_ROOT="${FUSION_SKIP_DIR}/.scene_shards"
@@ -356,12 +356,12 @@ PY
       if [[ "${GPU_COUNT}" -gt 0 ]]; then
         gpu_id="${GPU_IDS[$((worker_idx % GPU_COUNT))]}"
         gpu_msg="gpu:${gpu_id}"
-        CUDA_VISIBLE_DEVICES="${gpu_id}" python -m analysis.redundancy.analyze_scannet_fusion \
+        CUDA_VISIBLE_DEVICES="${gpu_id}" python -m analysis.redundancy.analyze_scannet_cache \
           "${COMMON_FUSION_ARGS[@]}" \
           --scene-ids-file "${scene_file}" \
           --no-fusion-write-aggregate &
       else
-        python -m analysis.redundancy.analyze_scannet_fusion \
+        python -m analysis.redundancy.analyze_scannet_cache \
           "${COMMON_FUSION_ARGS[@]}" \
           --scene-ids-file "${scene_file}" \
           --no-fusion-write-aggregate &
@@ -378,7 +378,7 @@ PY
       fi
     done
 
-    python -m analysis.redundancy.analyze_scannet_fusion \
+    python -m analysis.redundancy.analyze_scannet_cache \
       "${COMMON_FUSION_ARGS[@]}" \
       --fusion-aggregate-from-per-scene
     rm -rf "${SHARD_SCENE_ROOT}"
@@ -398,26 +398,44 @@ echo "    Weight report:        ${WEIGHT_ANALYSIS_DIR}/weight_report.json"
 echo "    Per-scene caches:     ${CACHE_DIR}/*.pt"
 echo "    Manifest:             ${CACHE_DIR}/manifest.json"
 if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
-  echo "    Similarity summary:    ${FUSION_SIMILARITY_DIR}/summary_metrics_similarity.csv"
-  echo "    Similarity scene CSV:  ${FUSION_SIMILARITY_DIR}/per_scene_scores_similarity.csv"
-  echo "    Similarity report:     ${FUSION_SIMILARITY_DIR}/full_report_similarity.json"
-  echo "    Skip summary:          ${FUSION_SKIP_DIR}/summary_metrics_skip.csv"
-  echo "    Skip scene CSV:        ${FUSION_SKIP_DIR}/per_scene_scores_skip.csv"
-  echo "    Skip report:           ${FUSION_SKIP_DIR}/full_report_skip.json"
+  if [[ "${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true" ]]; then
+    echo "    Similarity summary:    ${FUSION_SIMILARITY_DIR}/summary_metrics_similarity.csv"
+    echo "    Similarity scene CSV:  ${FUSION_SIMILARITY_DIR}/per_scene_scores_similarity.csv"
+    echo "    Similarity report:     ${FUSION_SIMILARITY_DIR}/full_report_similarity.json"
+  fi
+  if [[ "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "1" || "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "true" ]]; then
+    echo "    Skip summary:          ${FUSION_SKIP_DIR}/summary_metrics_skip.csv"
+    echo "    Skip scene CSV:        ${FUSION_SKIP_DIR}/per_scene_scores_skip.csv"
+    echo "    Skip report:           ${FUSION_SKIP_DIR}/full_report_skip.json"
+  fi
 fi
 if [[ "${SAVE_HEATMAP_PNG_STAGE2}" == "1" || "${SAVE_HEATMAP_PNG_STAGE2}" == "true" ]]; then
-  echo "    Similarity figures:    ${FUSION_SIMILARITY_DIR}/*.png"
-  echo "    Skip figures:          ${FUSION_SKIP_DIR}/*.png"
+  if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
+    if [[ "${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true" ]]; then
+      echo "    Similarity figures:    ${FUSION_SIMILARITY_DIR}/*.png"
+    fi
+    if [[ "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "1" || "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "true" ]]; then
+      echo "    Skip figures:          ${FUSION_SKIP_DIR}/*.png"
+    fi
+  fi
 fi
 if [[ "${SAVE_PER_SCENE_STAGE2}" == "1" || "${SAVE_PER_SCENE_STAGE2}" == "true" ]]; then
   if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
-    echo "    Similarity per-scene:  ${FUSION_SIMILARITY_DIR}/per_scene/*_similarity.json"
-    echo "    Skip per-scene:        ${FUSION_SKIP_DIR}/per_scene/*_skip.json"
+    if [[ "${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true" ]]; then
+      echo "    Similarity per-scene:  ${FUSION_SIMILARITY_DIR}/per_scene/*_similarity.json"
+    fi
+    if [[ "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "1" || "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "true" ]]; then
+      echo "    Skip per-scene:        ${FUSION_SKIP_DIR}/per_scene/*_skip.json"
+    fi
   fi
   if [[ "${SAVE_HEATMAP_PNG_STAGE2}" == "1" || "${SAVE_HEATMAP_PNG_STAGE2}" == "true" ]]; then
     if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
-      echo "    Similarity per-scene figs: ${FUSION_SIMILARITY_DIR}/per_scene/*.png"
-      echo "    Skip per-scene figs:       ${FUSION_SKIP_DIR}/per_scene/*.png"
+      if [[ "${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true" ]]; then
+        echo "    Similarity per-scene figs: ${FUSION_SIMILARITY_DIR}/per_scene/*.png"
+      fi
+      if [[ "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "1" || "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "true" ]]; then
+        echo "    Skip per-scene figs:       ${FUSION_SKIP_DIR}/per_scene/*.png"
+      fi
     fi
   fi
 fi

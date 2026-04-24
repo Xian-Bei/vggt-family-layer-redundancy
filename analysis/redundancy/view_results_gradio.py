@@ -402,6 +402,18 @@ def _coerce_packed(values: Any) -> Optional[List[float]]:
 def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[str, List[float]]]:
     out: Dict[str, Dict[str, List[float]]] = {}
 
+    fusion_by_mode = report.get("fusion_by_mode")
+    if isinstance(fusion_by_mode, dict):
+        for mode, mode_payload in fusion_by_mode.items():
+            if not isinstance(mode_payload, dict):
+                continue
+            metric_map = mode_payload.get("gt_delta_upper_by_metric")
+            if not isinstance(metric_map, dict):
+                continue
+            clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items()) if packed is not None}
+            if clean:
+                out[str(mode)] = clean
+
     by_mode = report.get("global_skip_range_loss_by_mode")
     if isinstance(by_mode, dict):
         for mode, payload in by_mode.items():
@@ -442,6 +454,57 @@ def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[
     return out
 
 
+def _extract_similarity_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
+    out: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
+
+    fusion_by_mode = report.get("fusion_by_mode")
+    if isinstance(fusion_by_mode, dict):
+        for mode, mode_payload in fusion_by_mode.items():
+            if not isinstance(mode_payload, dict):
+                continue
+            patch_map = mode_payload.get("global_patch_similarity_upper_by_metric")
+            special_map = mode_payload.get("global_special_similarity_upper_by_metric")
+            patch_clean = (
+                {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in patch_map.items()) if packed is not None}
+                if isinstance(patch_map, dict)
+                else {}
+            )
+            special_clean = (
+                {
+                    str(k): packed
+                    for k, packed in ((k, _coerce_packed(v)) for k, v in special_map.items())
+                    if packed is not None
+                }
+                if isinstance(special_map, dict)
+                else {}
+            )
+            if patch_clean or special_clean:
+                out[str(mode)] = {"patch": patch_clean, "special": special_clean}
+
+    # Legacy fallback: single-mode top-level similarity maps.
+    legacy_patch = report.get("global_patch_similarity_upper")
+    legacy_special = report.get("global_special_similarity_upper")
+    if isinstance(legacy_patch, dict) or isinstance(legacy_special, dict):
+        patch_clean = (
+            {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in legacy_patch.items()) if packed is not None}
+            if isinstance(legacy_patch, dict)
+            else {}
+        )
+        special_clean = (
+            {
+                str(k): packed
+                for k, packed in ((k, _coerce_packed(v)) for k, v in legacy_special.items())
+                if packed is not None
+            }
+            if isinstance(legacy_special, dict)
+            else {}
+        )
+        if patch_clean or special_clean:
+            out.setdefault("default", {"patch": patch_clean, "special": special_clean})
+
+    return out
+
+
 def _discover_skip_modes(skip_reports: Dict[str, Stage2SceneReport]) -> List[str]:
     ordered: List[str] = []
 
@@ -452,6 +515,8 @@ def _discover_skip_modes(skip_reports: Dict[str, Stage2SceneReport]) -> List[str
 
     mean_report = skip_reports.get("mean")
     if mean_report is not None:
+        for mode in mean_report.report.get("fusion_modes", []):
+            _add(str(mode))
         for mode in mean_report.report.get("skipped_global_modes", []):
             _add(str(mode))
 
@@ -823,19 +888,36 @@ def _prepare_stage2_render(
         special_label = "Legacy global special inter-layer"
     title_suffix = " (mean)" if scene_id == "mean" else f" ({scene_id})"
 
+    selected_similarity_mode = "n/a"
     if similarity_report is not None:
-        patch_similarity = _render_similarity_gallery(
-            similarity_report.report.get("global_patch_similarity_upper", {}),
-            num_layers,
-            base_label=patch_label,
-            title_suffix=title_suffix,
-        )
-        special_similarity = _render_similarity_gallery(
-            similarity_report.report.get("global_special_similarity_upper", {}),
-            num_layers,
-            base_label=special_label,
-            title_suffix=title_suffix,
-        )
+        similarity_by_mode = _extract_similarity_metric_maps_by_mode(similarity_report.report)
+        mode_candidates = list(mode_order) + sorted(k for k in similarity_by_mode.keys() if k not in mode_order)
+        selected_map: Optional[Dict[str, Dict[str, List[float]]]] = None
+        for mode in mode_candidates:
+            candidate = similarity_by_mode.get(mode)
+            if candidate is None:
+                continue
+            selected_similarity_mode = mode
+            selected_map = candidate
+            break
+        if selected_map is None and similarity_by_mode:
+            selected_similarity_mode, selected_map = next(iter(similarity_by_mode.items()))
+        if selected_map is None:
+            patch_similarity = []
+            special_similarity = []
+        else:
+            patch_similarity = _render_similarity_gallery(
+                selected_map.get("patch", {}),
+                num_layers,
+                base_label=patch_label,
+                title_suffix=f"{title_suffix}, mode={selected_similarity_mode}",
+            )
+            special_similarity = _render_similarity_gallery(
+                selected_map.get("special", {}),
+                num_layers,
+                base_label=special_label,
+                title_suffix=f"{title_suffix}, mode={selected_similarity_mode}",
+            )
     else:
         patch_similarity = []
         special_similarity = []
@@ -871,7 +953,7 @@ def _prepare_stage2_render(
         f"scene={scene_id} | view={value_mode} | "
         f"patch={len(patch_similarity)} | special={len(special_similarity)} | "
         f"{mode_summaries} | "
-        f"{skip_source} | pct_clip={clip_key}%"
+        f"{skip_source} | sim_mode={selected_similarity_mode} | pct_clip={clip_key}%"
     )
     controller.stage2_render_cache[cache_key] = (galleries, info)
     return galleries, info
