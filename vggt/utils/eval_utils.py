@@ -355,10 +355,8 @@ def load_poses(path):
         path.glob("*.txt"), key=lambda x: int(x.stem)
     )  # Sort by numerical order
 
-    # Check if pose files exist
     if len(pose_files) == 0:
-        print(f"Warning: No pose files (.txt) found in directory {path}")
-        return None, None, None
+        raise FileNotFoundError(f"No pose files (.txt) found in directory {path}")
 
     c2ws = []
     available_frame_ids = []
@@ -380,8 +378,7 @@ def load_poses(path):
             continue
 
     if len(c2ws) == 0:
-        print(f"Warning: No valid pose files found in directory {path}")
-        return None, None, None
+        raise ValueError(f"No valid pose files found in directory {path}")
 
     c2ws = np.stack(c2ws)
     available_frame_ids = np.array(available_frame_ids)
@@ -640,6 +637,29 @@ def compute_original_coords(
     return original_coords
 
 
+def _required_prediction_layers_for_sparse_heads(model, num_layers):
+    required = set()
+    if getattr(model, "camera_head", None) is not None and num_layers > 0:
+        required.add(num_layers - 1)
+    if getattr(model, "depth_head", None) is not None:
+        required.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
+    if getattr(model, "point_head", None) is not None:
+        required.update(int(i) for i in getattr(model.point_head, "intermediate_layer_idx", []))
+    return sorted(i for i in required if 0 <= i < num_layers)
+
+
+def _forward_vggt_sparse_heads(model, images_batched):
+    num_layers = len(model.aggregator.global_blocks)
+    required_layers = _required_prediction_layers_for_sparse_heads(model, num_layers)
+    selected_outputs, patch_start_idx = model.aggregator(images_batched, return_layers=set(required_layers))
+    sparse_layers = [None] * num_layers
+    for idx, tensor in zip(required_layers, selected_outputs):
+        sparse_layers[idx] = tensor
+    if getattr(model, "camera_head", None) is not None and sparse_layers[-1] is None:
+        raise RuntimeError("Sparse forward missing final layer required by camera head.")
+    return model.forward_from_aggregated_tokens(sparse_layers, patch_start_idx, images_batched)
+
+
 @torch.no_grad()
 def infer_vggt_and_reconstruct(
     model: torch.nn.Module,
@@ -659,10 +679,13 @@ def infer_vggt_and_reconstruct(
     start = time.time()
     with torch.cuda.amp.autocast(dtype=dtype):
         vgg_input_cuda = vgg_input.cuda().to(dtype)
-        try:
-            predictions = model(vgg_input_cuda, image_paths=image_paths)
-        except TypeError:
-            predictions = model(vgg_input_cuda)
+        if vgg_input_cuda.dim() == 4:
+            images_batched = vgg_input_cuda.unsqueeze(0)
+        elif vgg_input_cuda.dim() == 5:
+            images_batched = vgg_input_cuda
+        else:
+            raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_input_cuda.shape)}")
+        predictions = _forward_vggt_sparse_heads(model, images_batched)
     torch.cuda.synchronize()
     end = time.time()
     inference_time_ms = (end - start) * 1000.0
@@ -812,24 +835,16 @@ def compute_average_metrics_and_save(
     for metric_name, values in average_metrics_list.items():
         average_metrics[metric_name] = float(np.mean(values)) if values else 0.0
 
-    all_scenes_metrics["average"] = average_metrics
     output_path.mkdir(parents=True, exist_ok=True)
 
     input_frame_dir = output_path / f"input_frame_{input_frame}"
     input_frame_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(input_frame_dir / "all_scenes_metrics.json", "w") as f:
-        import json
-
-        json.dump(all_scenes_metrics, f, indent=4)
 
     with open(input_frame_dir / "average_metrics.json", "w") as f:
         import json
 
         json.dump(average_metrics, f, indent=4)
 
-    print("\nAverage metrics:")
-    for metric_name, value in average_metrics.items():
-        print(f"{metric_name}: {value:.6f}")
+    
 
     return average_metrics

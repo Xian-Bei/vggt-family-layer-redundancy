@@ -127,21 +127,12 @@ if __name__ == "__main__":
     for scene in scannet_scenes:
         scene_dir = args.data_dir / f"{scene}"
         output_scene_dir = args.output_path / f"input_frame_{args.input_frame}" / scene
-        if (output_scene_dir / "metrics.json").exists():
-            continue
 
         # Load scene data
         images_dir = scene_dir / "color"
         pose_path = scene_dir / "pose"
         image_paths = get_sorted_image_paths(images_dir)
         poses_gt, first_gt_pose, available_pose_frame_ids = load_poses(pose_path)
-        if (
-            poses_gt is None
-            or first_gt_pose is None
-            or available_pose_frame_ids is None
-        ):
-            print(f"Skipping scene {scene}: no pose data")
-            continue
 
         # Frame filtering
         selected_frame_ids, selected_image_paths, selected_pose_indices = (
@@ -236,8 +227,11 @@ if __name__ == "__main__":
             traceback.print_exc()
 
     # Summarize average metrics and save
-    compute_average_metrics_and_save(
+    average_metrics = compute_average_metrics_and_save(
         all_scenes_metrics,
         args.output_path,
         args.input_frame,
     )
+    print("\nAverage metrics:")
+    for metric_name, value in average_metrics.items():
+        print(f"{metric_name}: {value:.6f}")

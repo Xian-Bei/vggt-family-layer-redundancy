@@ -809,16 +809,10 @@ def compute_average_metrics_and_save(
     for metric_name, values in average_metrics_list.items():
         average_metrics[metric_name] = float(np.mean(values)) if values else 0.0
 
-    all_scenes_metrics["average"] = average_metrics
     output_path.mkdir(parents=True, exist_ok=True)
 
     input_frame_dir = output_path / f"input_frame_{input_frame}"
     input_frame_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(input_frame_dir / "all_scenes_metrics.json", "w") as f:
-        import json
-
-        json.dump(all_scenes_metrics, f, indent=4)
 
     with open(input_frame_dir / "average_metrics.json", "w") as f:
         import json

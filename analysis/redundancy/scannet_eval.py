@@ -84,14 +84,6 @@ def load_scene_images(scene: SceneData, mode: str = "crop") -> torch.Tensor:
     return load_and_preprocess_images(image_list, mode=mode)
 
 
-def _legacy_subsample_paths(paths: List[Path], max_frames: int) -> List[Path]:
-    """Previous vggtlayer behavior: uniform stride over sorted paths (no pose intersection)."""
-    if max_frames <= 0 or len(paths) <= max_frames:
-        return paths
-    step = max(1, len(paths) // max_frames)
-    return paths[::step][:max_frames]
-
-
 def build_frame_selection(
     image_paths: List[Path],
     available_pose_frame_ids: np.ndarray,
@@ -138,26 +130,21 @@ def select_scene_image_paths_fastvggt(scene: SceneData, max_frames: int) -> Scen
     """
     Pick RGB frames the same way as FastVGGT ``eval_scannet.py``: require ``scene_dir/pose/``,
     ``load_poses`` (skip inf/nan), then :func:`build_frame_selection`.
-
-    If ``pose/`` is missing or has no valid poses, falls back to :func:`_legacy_subsample_paths`
-    so non-ScanNet layouts still run.
     """
     pose_path = scene.scene_dir / "pose"
     if not pose_path.is_dir():
-        paths = _legacy_subsample_paths(scene.image_paths, max_frames)
-        return SceneData(scene_id=scene.scene_id, scene_dir=scene.scene_dir, image_paths=paths)
+        raise FileNotFoundError(
+            f"Scene {scene.scene_id} is missing required pose directory: {pose_path}"
+        )
 
     from .fastvggt_scannet_eval import load_poses
 
-    loaded = load_poses(pose_path)
-    if loaded[0] is None or loaded[2] is None or len(loaded[2]) == 0:
-        paths = _legacy_subsample_paths(scene.image_paths, max_frames)
-        return SceneData(scene_id=scene.scene_id, scene_dir=scene.scene_dir, image_paths=paths)
-
-    _, _, available = loaded
+    _, _, available = load_poses(pose_path)
     _ids, selected_paths, _ = build_frame_selection(scene.image_paths, available, max_frames)
     if not selected_paths:
-        return SceneData(scene_id=scene.scene_id, scene_dir=scene.scene_dir, image_paths=[])
+        raise ValueError(
+            f"Scene {scene.scene_id} has no frames after pose/image intersection."
+        )
     return SceneData(scene_id=scene.scene_id, scene_dir=scene.scene_dir, image_paths=selected_paths)
 
 

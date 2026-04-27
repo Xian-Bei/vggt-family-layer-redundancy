@@ -1,0 +1,18 @@
+{
+  "intervals": [
+    {
+      "l": 3,
+      "r": 8,
+      "skip_frame_in_interval": true,
+      "inject_prev": "global",
+      "inject_frame_inside_interval": false
+    },
+    {
+      "l": 17,
+      "r": 23,
+      "skip_frame_in_interval": false,
+      "inject_prev": "global",
+      "inject_frame_inside_interval": true
+    }
+  ]
+}

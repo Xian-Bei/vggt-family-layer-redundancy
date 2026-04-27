@@ -121,12 +121,12 @@ class PairAttentionController:
         if not manifest_path.exists():
             raise SystemExit(f"Missing {manifest_path}; run Stage1 first.")
         self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        cache_files = {path.name for path in cache_dir.glob("*.pt")}
         self.scene_items: Dict[str, Dict[str, Any]] = {}
         for item in self.manifest.get("scenes", []):
-            cache_file = str(item.get("file", "")).strip()
             scene_id = str(item.get("scene_id", "")).strip()
-            if scene_id and cache_file and cache_file in cache_files:
+            has_dir = str(item.get("dir", "")).strip() != ""
+            has_file = str(item.get("file", "")).strip() != ""
+            if scene_id and (has_dir or has_file):
                 self.scene_items[scene_id] = item
         if not self.scene_items:
             raise SystemExit(f"No cached scenes found in {cache_dir}.")
@@ -190,7 +190,7 @@ class PairAttentionController:
         frame_ids = [int(x) for x in item.get("frame_ids", [])]
         if not frame_ids:
             raise SystemExit(f"Manifest entry for {scene_id!r} lacks frame_ids.")
-        row = _load_cache_row(self.cache_dir, str(item["file"]))
+        row = _load_cache_row(self.cache_dir, item)
         replay_layers = row.get("aggregated_concat_per_layer")
         if not isinstance(replay_layers, list) or not replay_layers:
             raise SystemExit(f"Scene {scene_id!r} cache lacks aggregated_concat_per_layer. Please rerun Stage1.")
@@ -424,6 +424,13 @@ def _coerce_packed(values: Any) -> Optional[List[float]]:
     return out
 
 
+def _canonical_skip_mode(mode: str) -> str:
+    key = str(mode).strip()
+    if key == "patch_special_bipartite":
+        return "patch_special"
+    return key
+
+
 def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[str, List[float]]]:
     out: Dict[str, Dict[str, List[float]]] = {}
 
@@ -437,7 +444,7 @@ def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[
                 continue
             clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items()) if packed is not None}
             if clean:
-                out[str(mode)] = clean
+                out[_canonical_skip_mode(str(mode))] = clean
 
     by_mode = report.get("global_skip_range_loss_by_mode")
     if isinstance(by_mode, dict):
@@ -446,10 +453,13 @@ def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[
                 continue
             metric_map = payload.get("skip_range_loss_upper_by_metric")
             if not isinstance(metric_map, dict):
+                # Some legacy reports used this alternative key name.
+                metric_map = payload.get("global_skip_range_loss_upper_by_metric")
+            if not isinstance(metric_map, dict):
                 continue
             clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items()) if packed is not None}
             if clean:
-                out[str(mode)] = clean
+                out[_canonical_skip_mode(str(mode))] = clean
 
     by_mode = report.get("global_skip_range_loss_upper_by_metric_by_mode")
     if isinstance(by_mode, dict):
@@ -458,18 +468,20 @@ def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[
                 continue
             clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items()) if packed is not None}
             if clean:
-                out[str(mode)] = clean
+                out[_canonical_skip_mode(str(mode))] = clean
 
     single = report.get("global_skip_range_loss")
     if isinstance(single, dict):
-        mode = str(single.get("skipped_global_mode", "")).strip()
+        mode = _canonical_skip_mode(str(single.get("skipped_global_mode", "")).strip())
         metric_map = single.get("skip_range_loss_upper_by_metric")
+        if not isinstance(metric_map, dict):
+            metric_map = single.get("global_skip_range_loss_upper_by_metric")
         if mode and isinstance(metric_map, dict):
             clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items()) if packed is not None}
             if clean:
                 out[mode] = clean
 
-    single_mode = str(report.get("skipped_global_mode", "")).strip()
+    single_mode = _canonical_skip_mode(str(report.get("skipped_global_mode", "")).strip())
     single_metric_map = report.get("global_skip_range_loss_upper_by_metric")
     if single_mode and isinstance(single_metric_map, dict):
         clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in single_metric_map.items()) if packed is not None}

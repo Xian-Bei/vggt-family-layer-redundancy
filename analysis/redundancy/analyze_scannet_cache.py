@@ -67,6 +67,7 @@ from .prediction_eval import (
 from .scannet_eval import SceneData, discover_scannet_scenes, load_scene_images, select_scene_image_paths_fastvggt
 from .prediction_save import build_scene_prediction_payload
 from .visualization_export import export_scene_visualization_assets
+from .cache_layout import build_scene_row_compat, load_scene_metadata, load_scene_replay_layers
 
 
 def _read_manifest(cache_dir: Path) -> List[Dict[str, Any]]:
@@ -135,8 +136,8 @@ def _split_concat_branch_tuples(
 
     assert expected_n is not None
     if max_tokens_per_layer > 0 and expected_n > max_tokens_per_layer:
-        g = torch.Generator(device="cpu")
-        g.manual_seed(int(seed) & 0x7FFFFFFF)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed) & 0x7FFFFFFF)
         idx = torch.randperm(expected_n, generator=g)[:max_tokens_per_layer]
         frame_layers = [t[idx] for t in frame_layers]
         global_layers = [t[idx] for t in global_layers]
@@ -366,6 +367,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=("identity", "special_only", "special_only_nomlp", "patch_special", "patch_special_nomlp"),
         choices=(
             "identity",
+            "both",
             "special_only",
             "special_only_nomlp",
             "patch_special",
@@ -798,27 +800,29 @@ def _write_fusion_full_reports_from_per_scene_json(
     if num_layers <= 0:
         raise SystemExit("Invalid or missing num_layers in per-scene files.")
 
-    mode_list = list(fusion_modes) if fusion_modes else []
-    if not mode_list:
-        mode_seen: set[str] = set()
-        for sid in scene_ids:
-            for row in (sim_rows_by_scene.get(sid), skip_rows_by_scene.get(sid)):
-                if not isinstance(row, dict):
-                    continue
-                by_mode = row.get("fusion_by_mode", {})
-                if not isinstance(by_mode, dict):
-                    continue
-                for m in by_mode.keys():
-                    ms = str(m)
-                    if ms and ms not in mode_seen:
-                        mode_seen.add(ms)
-                        mode_list.append(ms)
+    # Always aggregate over all modes actually present in per-scene JSON.
+    # Do not treat CLI fusion_modes as a filter here; this keeps aggregate
+    # outputs consistent with on-disk per-scene data during incremental reruns.
+    mode_list: List[str] = []
+    mode_seen: set[str] = set()
+    for sid in scene_ids:
+        for row in (sim_rows_by_scene.get(sid), skip_rows_by_scene.get(sid)):
+            if not isinstance(row, dict):
+                continue
+            by_mode = row.get("fusion_by_mode", {})
+            if not isinstance(by_mode, dict):
+                continue
+            for m in by_mode.keys():
+                ms = str(m)
+                if ms and ms not in mode_seen:
+                    mode_seen.add(ms)
+                    mode_list.append(ms)
     if not mode_list:
         raise SystemExit("Failed to infer fusion_modes from per-scene files.")
 
-    sim_metrics_effective = sorted(
-        {str(m) for m in sim_metrics} | _discover_similarity_metric_keys_from_rows(sim_rows_by_scene, mode_list)
-    )
+    # Always aggregate over all similarity metrics actually present in per-scene
+    # similarity JSON (no CLI filtering).
+    sim_metrics_effective = sorted(_discover_similarity_metric_keys_from_rows(sim_rows_by_scene, mode_list))
 
     sim_fusion_by_mode: Dict[str, Dict[str, Any]] = {}
     skip_fusion_by_mode: Dict[str, Dict[str, Any]] = {}
@@ -961,8 +965,8 @@ def _write_fusion_full_reports_from_per_scene_json(
 
     if save_similarity_output:
         with (similarity_out_dir / "summary_metrics_similarity.csv").open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["metric", "value"])
-            w.writeheader()
+        w = csv.DictWriter(f, fieldnames=["metric", "value"])
+        w.writeheader()
             for row in similarity_summary_rows:
                 w.writerow(row)
     if save_skip_output:
@@ -970,7 +974,7 @@ def _write_fusion_full_reports_from_per_scene_json(
             w = csv.DictWriter(f, fieldnames=["metric", "value"])
             w.writeheader()
             for row in skip_summary_rows:
-                w.writerow(row)
+            w.writerow(row)
 
     if save_similarity_output:
         with (similarity_out_dir / "per_scene_scores_similarity.csv").open("w", newline="", encoding="utf-8") as f:
@@ -980,10 +984,10 @@ def _write_fusion_full_reports_from_per_scene_json(
             w.writerows(per_scene_rows_final)
     if save_skip_output:
         with (skip_out_dir / "per_scene_scores_skip.csv").open("w", newline="", encoding="utf-8") as f:
-            fields = ["scene_id"] + score_keys
-            w = csv.DictWriter(f, fieldnames=fields)
-            w.writeheader()
-            w.writerows(per_scene_rows_final)
+        fields = ["scene_id"] + score_keys
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(per_scene_rows_final)
 
     if save_heatmap_png:
         for mode in mode_list:
@@ -1251,36 +1255,11 @@ def _check_stage1_noop_metrics_match(
 
 
 def _load_scene_replay_cache(cache_dir: Path, item: Dict[str, Any], num_layers: int) -> List[torch.Tensor]:
-    path = cache_dir / str(item["file"])
-    try:
-        row = torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        row = torch.load(path, map_location="cpu")
-    replay_layers = row.get("aggregated_concat_per_layer")
-    if not isinstance(replay_layers, list) or len(replay_layers) != num_layers:
-        raise SystemExit(
-            f"Skip replay requires Stage1 cache field 'aggregated_concat_per_layer' "
-            f"with {num_layers} layers in {path}. Please rerun Stage1 with the updated code."
-        )
-    out: List[torch.Tensor] = []
-    for idx, t in enumerate(replay_layers):
-        if not isinstance(t, torch.Tensor) or t.dim() != 4:
-            raise SystemExit(
-                f"Invalid replay cache tensor at layer {idx} in {path}: expected 4D tensor, got {type(t).__name__}."
-            )
-        out.append(t.contiguous())
-    return out
+    return load_scene_replay_layers(cache_dir, item, expected_num_layers=num_layers)
 
 
 def _load_scene_cache_row(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, Any]:
-    path = cache_dir / str(item["file"])
-    try:
-        row = torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        row = torch.load(path, map_location="cpu")
-    if not isinstance(row, dict):
-        raise SystemExit(f"Invalid cache row in {path}: expected dict, got {type(row).__name__}.")
-    return row
+    return load_scene_metadata(cache_dir, item)
 
 
 def _infer_image_hw_for_replay(
@@ -1319,16 +1298,11 @@ def _infer_image_hw_for_replay(
 
 def _infer_num_layers_from_manifest(cache_dir: Path, scenes_meta: Sequence[Dict[str, Any]]) -> int:
     for item in scenes_meta:
-        scene_file = item.get("file")
-        if not isinstance(scene_file, str) or not scene_file.strip():
-            continue
-        path = cache_dir / scene_file
         try:
-            row = torch.load(path, map_location="cpu", weights_only=False)
-        except TypeError:
-            row = torch.load(path, map_location="cpu")
-        replay_layers = row.get("aggregated_concat_per_layer")
-        if isinstance(replay_layers, list) and replay_layers:
+            replay_layers = load_scene_replay_layers(cache_dir, item)
+        except SystemExit:
+            continue
+        if replay_layers:
             return len(replay_layers)
     raise SystemExit(
         "Could not infer num_layers from cache manifest: missing valid aggregated_concat_per_layer in all scenes."
@@ -1612,7 +1586,7 @@ def _apply_skipped_global_mode(
     tokens_per_frame: int,
     pos_global: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    if skipped_global_mode == "identity":
+    if skipped_global_mode in ("identity", "both"):
         return global_in
     if skipped_global_mode == "special_only":
         return _special_only_global_block_forward(
@@ -1740,6 +1714,15 @@ def _forward_with_suffix_replay(
             selected_layers[layer_idx] = concat_tokens
         if layer_idx + 1 >= num_layers:
             break
+        skip_next_frame_block = (
+            skipped_global_mode == "both"
+            and skip_start is not None
+            and skip_end is not None
+            and skip_start <= (layer_idx + 1) <= skip_end
+        )
+        if skip_next_frame_block:
+            del global_in, global_out, global_view, concat_tokens
+            continue
         frame_in = global_out.view(bsz * seq_len, p, c)
         frame_out = model.aggregator.frame_blocks[layer_idx + 1](frame_in, pos=pos_frame)
         frame_view = frame_out.view(bsz, seq_len, p, c)
@@ -1810,6 +1793,11 @@ def _replay_global_output_at_layer(
         global_view = global_out.view(bsz, seq_len, p, c)
         if layer_idx == target_layer:
             return global_view
+        skip_next_frame_block = (
+            skipped_global_mode == "both" and skip_start <= (layer_idx + 1) <= skip_end
+        )
+        if skip_next_frame_block:
+            continue
         frame_in = global_out.view(bsz * seq_len, p, c)
         frame_out = model.aggregator.frame_blocks[layer_idx + 1](frame_in, pos=pos_frame)
         frame_view = frame_out.view(bsz, seq_len, p, c)
@@ -2378,11 +2366,11 @@ def main() -> None:
 
         scene_fusion_by_mode: Dict[str, Dict[str, Any]] = {}
         for mi, mode in enumerate(fusion_modes):
-            if args.timing:
-                print(
+    if args.timing:
+        print(
                     f"[timing] fusion scene {si + 1}/{len(selected)} {sid} | mode {mi + 1}/{len(fusion_modes)}: {mode}",
-                    flush=True,
-                )
+            flush=True,
+        )
             scene_patch_upper_by_metric = {m: [] for m in sim_metrics}
             scene_special_upper_by_metric = {m: [] for m in sim_metrics}
             scene_gt_upper_by_metric = {k: [] for k in GT_KEYS_FOR_SKIP}

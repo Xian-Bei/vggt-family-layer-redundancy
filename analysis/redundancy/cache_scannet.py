@@ -44,6 +44,20 @@ from .scannet_eval import discover_scannet_scenes, load_scene_images, select_sce
 from .visualization_export import export_scene_visualization_assets
 
 
+def _normalize_scene_pred_for_cache(predictions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Keep a compact per-scene prediction subset in cache payload."""
+    out: Dict[str, torch.Tensor] = {}
+    for key in ("pose_enc", "depth", "depth_conf", "world_points", "world_points_conf"):
+        value = predictions.get(key)
+        if value is None or not isinstance(value, torch.Tensor):
+            continue
+        t = value.detach().cpu()
+        if t.dim() > 0 and int(t.shape[0]) == 1:
+            t = t.squeeze(0)
+        out[key] = t.contiguous()
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Cache global-block activations for all scenes under data/.")
     p.add_argument("--data-root", type=Path, default=Path("data/scannetv2"), help="Root containing scans/ or scene folders.")
@@ -124,7 +138,10 @@ def main() -> None:
         print(f"Processing scene {si} of {len(scenes)}: {scene.scene_id}")
         scene_eff = select_scene_image_paths_fastvggt(scene, args.max_frames)
         safe_id = scene.scene_id.replace("/", "_")
-        cache_path = out_dir / f"{safe_id}.pt"
+        scene_dir = out_dir / safe_id
+        layers_dir = scene_dir / "layers"
+        metadata_path = scene_dir / "metadata.json"
+        pred_path = scene_dir / "pred.pt"
         if not scene_eff.image_paths:
             if args.skip_gt_eval:
                 print(f"Skipping scene {scene.scene_id}: no frames after pose/image intersection (or empty paths)")
@@ -154,8 +171,22 @@ def main() -> None:
             "replay_cache_format": "aggregated_concat_per_layer_v1",
             "scene_scores": batch.scene_scores,
             "aggregated_concat_per_layer": [t.detach().cpu().contiguous() for t in batch.aggregated_concat_tokens],
+            "pred": _normalize_scene_pred_for_cache(batch.predictions),
         }
-        torch.save(payload, cache_path)
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        layers_dir.mkdir(parents=True, exist_ok=True)
+        for layer_idx, layer_tensor in enumerate(payload["aggregated_concat_per_layer"]):
+            torch.save(layer_tensor, layers_dir / f"layer_{layer_idx:02d}.pt")
+        metadata = {
+            "scene_id": payload["scene_id"],
+            "num_frames": payload["num_frames"],
+            "image_hw": payload["image_hw"],
+            "patch_start_idx": payload["patch_start_idx"],
+            "replay_cache_format": payload["replay_cache_format"],
+            "scene_scores": payload["scene_scores"],
+        }
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        torch.save(payload["pred"], pred_path)
         pred_payload = build_scene_prediction_payload(batch.predictions, (int(images.shape[-2]), int(images.shape[-1])))
         if args.export_visualization:
             vis_dir = export_scene_visualization_assets(
@@ -171,7 +202,7 @@ def main() -> None:
         manifest.append(
             {
                 "scene_id": scene.scene_id,
-                "file": f"{safe_id}.pt",
+                "dir": safe_id,
                 "num_frames": payload["num_frames"],
                 "frame_ids": [int(p.stem) for p in scene_eff.image_paths],
             }

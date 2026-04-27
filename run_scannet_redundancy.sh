@@ -14,11 +14,10 @@
 #          preprocessing used by VGGT, clipped to the FastVGGT-valid indoor range
 #          (1e-3m, 10m),
 #          and aggregated across scenes by direct mean (FastVGGT-style).
-# Stage 2: fused replay analysis:
+# Stage 2: skip eval + similarity analysis:
 #            For each (i,j) and each skip mode, replay from layer i frame cache,
 #            skip global blocks i..j, compare j-layer global outputs (new vs Stage1 cached),
 #            then continue to heads and compute GT deltas vs Stage1.
-# Stage 4 has been moved to standalone script: run_fastvggt_eval.sh
 #
 # Usage (from repo root):
 #   chmod +x run_scannet_redundancy.sh
@@ -35,8 +34,8 @@
 
 # Set 0 to skip 
 STAGE0="${STAGE0:-0}"
-STAGE1="${STAGE1:-0}"
-STAGE2="${STAGE2:-1}"
+STAGE1="${STAGE1:-1}"
+STAGE2="${STAGE2:-0}"
 
 set -euo pipefail
 
@@ -86,29 +85,29 @@ MAX_TOKENS_PER_LAYER="${MAX_TOKENS_PER_LAYER:-0}"
 EXPORT_VIS_STAGE1="${EXPORT_VIS_STAGE1:-0}"
 STAGE1_VIS_DIR="${STAGE1_VIS_DIR:-${CACHE_DIR}/visualization}"
 
-# [Stage 2: fused replay-similarity + GT analysis]
-# FUSION_SIMILARITY_DIR / FUSION_SKIP_DIR: separated Stage2 outputs.
-# FUSION_MAX_SPAN caps fusion span for (i,j) pairs.
-# FUSION_MODES controls skipped global approximations, comma-separated.
-# FUSION_SIMILARITY_METRICS controls metrics for comparing Stage1 vs replayed j-layer global outputs.
-# STAGE2_ENABLE_SIMILARITY controls whether Stage2 computes fusion similarity.
+# [Stage 2: skip eval + similarity analysis]
+# STAGE2_SIMILARITY_DIR / STAGE2_SKIP_DIR: separated Stage2 outputs.
+# STAGE2_MAX_SPAN caps replay span for (i,j) pairs.
+# STAGE2_MODES controls skipped-global approximations, comma-separated.
+# STAGE2_SIMILARITY_METRICS controls metrics for comparing Stage1 vs replayed j-layer global outputs.
+# STAGE2_ENABLE_SIMILARITY controls whether Stage2 computes similarity.
 # STAGE2_ENABLE_SKIP_GT_EVAL controls whether Stage2 computes skip-layer GT deltas.
-# SAVE_PER_SCENE_STAGE2 controls whether per-scene fusion JSON is written (default ON).
+# SAVE_PER_SCENE_STAGE2 controls whether per-scene Stage2 JSON is written (default ON).
 # SAVE_HEATMAP_PNG_STAGE2 controls PNG heatmap generation (default OFF).
-# FUSION_NUM_PROCS controls Stage2 multiprocessing (scene-sharded workers).
-FUSION_SIMILARITY_DIR="${FUSION_SIMILARITY_DIR:-analysis_outputs/scannet_redundancy_similarity}"
-FUSION_SKIP_DIR="${FUSION_SKIP_DIR:-analysis_outputs/scannet_redundancy_skip}"
-FUSION_MAX_SPAN="${FUSION_MAX_SPAN:-24}"
-FUSION_MODES="${FUSION_MODES:-identity,special_only,patch_special}"
-FUSION_SIMILARITY_METRICS="${FUSION_SIMILARITY_METRICS:-neg_mse}"
+# STAGE2_NUM_PROCS controls Stage2 multiprocessing (scene-sharded workers).
+STAGE2_SIMILARITY_DIR="${STAGE2_SIMILARITY_DIR:-analysis_outputs/scannet_redundancy_similarity}"
+STAGE2_SKIP_DIR="${STAGE2_SKIP_DIR:-analysis_outputs/scannet_redundancy_skip}"
+STAGE2_MAX_SPAN="${STAGE2_MAX_SPAN:-24}"
+STAGE2_MODES="${STAGE2_MODES:-both}"
+STAGE2_SIMILARITY_METRICS="${STAGE2_SIMILARITY_METRICS:-cka,cosine,neg_mse}"
 TIMING="${TIMING:-1}"
 HEATMAP_FILL="${HEATMAP_FILL:-nan}"
 ANALYSIS_DEVICE="${ANALYSIS_DEVICE:-${DEVICE}}"
 SAVE_PER_SCENE_STAGE2="${SAVE_PER_SCENE_STAGE2:-1}"
 SAVE_HEATMAP_PNG_STAGE2="${SAVE_HEATMAP_PNG_STAGE2:-0}"
-FUSION_NUM_PROCS="${FUSION_NUM_PROCS:-2}"
-EXPORT_VIS_FUSION="${EXPORT_VIS_FUSION:-0}"
-FUSION_VIS_DIR="${FUSION_VIS_DIR:-${FUSION_SIMILARITY_DIR}/visualization}"
+STAGE2_NUM_PROCS="${STAGE2_NUM_PROCS:-1}"
+EXPORT_VIS_STAGE2="${EXPORT_VIS_STAGE2:-0}"
+STAGE2_VIS_DIR="${STAGE2_VIS_DIR:-${STAGE2_SIMILARITY_DIR}/visualization}"
 STAGE2_ENABLE_SIMILARITY="${STAGE2_ENABLE_SIMILARITY:-1}"
 STAGE2_ENABLE_SKIP_GT_EVAL="${STAGE2_ENABLE_SKIP_GT_EVAL:-0}"
 STAGE1_SANITY_CHECK="${STAGE1_SANITY_CHECK:-1}"
@@ -166,16 +165,16 @@ fi
 
 
 # -----------------------------------------------------------------------------
-# Stage 2 — fused replay similarity + GT evaluation
+# Stage 2 — skip eval + similarity analysis
 # -----------------------------------------------------------------------------
 if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
-  echo "== Stage 2: fused replay similarity + GT evaluation =="
+  echo "== Stage 2: skip eval + similarity analysis =="
   echo "    CACHE_DIR=${CACHE_DIR}"
-  echo "    FUSION_SIMILARITY_DIR=${FUSION_SIMILARITY_DIR}"
-  echo "    FUSION_SKIP_DIR=${FUSION_SKIP_DIR}"
+  echo "    STAGE2_SIMILARITY_DIR=${STAGE2_SIMILARITY_DIR}"
+  echo "    STAGE2_SKIP_DIR=${STAGE2_SKIP_DIR}"
   echo "    ANALYSIS_DEVICE=${ANALYSIS_DEVICE}"
-  echo "    FUSION_MODES=${FUSION_MODES}"
-  echo "    FUSION_SIMILARITY_METRICS=${FUSION_SIMILARITY_METRICS}"
+  echo "    STAGE2_MODES=${STAGE2_MODES}"
+  echo "    STAGE2_SIMILARITY_METRICS=${STAGE2_SIMILARITY_METRICS}"
   echo "    STAGE2_ENABLE_SIMILARITY=${STAGE2_ENABLE_SIMILARITY}"
   echo "    STAGE2_ENABLE_SKIP_GT_EVAL=${STAGE2_ENABLE_SKIP_GT_EVAL}"
 
@@ -184,83 +183,83 @@ if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
     TIMING_ARGS=(--timing)
   fi
 
-  FUSION_EXTRA=()
+  STAGE2_EXTRA_ARGS=()
   if [[ -n "${GT_PLY_DIR}" ]]; then
-    FUSION_EXTRA+=(--gt-ply-dir "${GT_PLY_DIR}")
+    STAGE2_EXTRA_ARGS+=(--gt-ply-dir "${GT_PLY_DIR}")
   fi
   if [[ "${STAGE2_ENABLE_SKIP_GT_EVAL}" != "1" && "${STAGE2_ENABLE_SKIP_GT_EVAL}" != "true" ]]; then
-    FUSION_EXTRA+=(--skip-gt-eval)
+    STAGE2_EXTRA_ARGS+=(--skip-gt-eval)
   fi
   if [[ "${STAGE2_ENABLE_SIMILARITY}" != "1" && "${STAGE2_ENABLE_SIMILARITY}" != "true" ]]; then
-    FUSION_EXTRA+=(--no-fusion-compute-similarity)
+    STAGE2_EXTRA_ARGS+=(--no-fusion-compute-similarity)
   fi
-  if [[ "${EXPORT_VIS_FUSION}" == "1" || "${EXPORT_VIS_FUSION}" == "true" ]]; then
-    FUSION_EXTRA+=(--export-visualization --visualization-dir "${FUSION_VIS_DIR}")
+  if [[ "${EXPORT_VIS_STAGE2}" == "1" || "${EXPORT_VIS_STAGE2}" == "true" ]]; then
+    STAGE2_EXTRA_ARGS+=(--export-visualization --visualization-dir "${STAGE2_VIS_DIR}")
   fi
   if [[ "${SAVE_HEATMAP_PNG_STAGE2}" == "1" || "${SAVE_HEATMAP_PNG_STAGE2}" == "true" ]]; then
-    FUSION_EXTRA+=(--save-heatmap-png)
+    STAGE2_EXTRA_ARGS+=(--save-heatmap-png)
   fi
   if [[ ! "${STAGE1_SANITY_CHECK}" == "1" && ! "${STAGE1_SANITY_CHECK}" == "true" ]]; then
-    FUSION_EXTRA+=(--disable-stage1-sanity-check)
+    STAGE2_EXTRA_ARGS+=(--disable-stage1-sanity-check)
   else
-    FUSION_EXTRA+=(--stage1-sanity-atol "${STAGE1_SANITY_ATOL}" --stage1-sanity-rtol "${STAGE1_SANITY_RTOL}")
+    STAGE2_EXTRA_ARGS+=(--stage1-sanity-atol "${STAGE1_SANITY_ATOL}" --stage1-sanity-rtol "${STAGE1_SANITY_RTOL}")
   fi
 
-  FUSION_MODES_RAW="${FUSION_MODES#[}"
-  FUSION_MODES_RAW="${FUSION_MODES_RAW%]}"
-  IFS=',' read -r -a FUSION_MODES_ARR <<< "${FUSION_MODES_RAW}"
-  FUSION_MODE_ARGS=()
-  for mode in "${FUSION_MODES_ARR[@]}"; do
+  STAGE2_MODES_RAW="${STAGE2_MODES#[}"
+  STAGE2_MODES_RAW="${STAGE2_MODES_RAW%]}"
+  IFS=',' read -r -a STAGE2_MODES_ARR <<< "${STAGE2_MODES_RAW}"
+  STAGE2_MODE_ARGS=()
+  for mode in "${STAGE2_MODES_ARR[@]}"; do
     mode="${mode// /}"
     if [[ -n "${mode}" ]]; then
-      FUSION_MODE_ARGS+=("${mode}")
+      STAGE2_MODE_ARGS+=("${mode}")
     fi
   done
-  if [[ "${#FUSION_MODE_ARGS[@]}" -eq 0 ]]; then
-    echo "    [error] FUSION_MODES must contain at least one mode." >&2
+  if [[ "${#STAGE2_MODE_ARGS[@]}" -eq 0 ]]; then
+    echo "    [error] STAGE2_MODES must contain at least one mode." >&2
     exit 1
   fi
 
-  FUSION_METRICS_RAW="${FUSION_SIMILARITY_METRICS#[}"
-  FUSION_METRICS_RAW="${FUSION_METRICS_RAW%]}"
-  IFS=',' read -r -a FUSION_METRICS_ARR <<< "${FUSION_METRICS_RAW}"
-  FUSION_METRIC_ARGS=()
-  for metric in "${FUSION_METRICS_ARR[@]}"; do
+  STAGE2_METRICS_RAW="${STAGE2_SIMILARITY_METRICS#[}"
+  STAGE2_METRICS_RAW="${STAGE2_METRICS_RAW%]}"
+  IFS=',' read -r -a STAGE2_METRICS_ARR <<< "${STAGE2_METRICS_RAW}"
+  STAGE2_METRIC_ARGS=()
+  for metric in "${STAGE2_METRICS_ARR[@]}"; do
     metric="${metric// /}"
     if [[ -n "${metric}" ]]; then
-      FUSION_METRIC_ARGS+=("${metric}")
+      STAGE2_METRIC_ARGS+=("${metric}")
     fi
   done
-  if [[ ("${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true") && "${#FUSION_METRIC_ARGS[@]}" -eq 0 ]]; then
-    echo "    [error] FUSION_SIMILARITY_METRICS must contain at least one metric." >&2
+  if [[ ("${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true") && "${#STAGE2_METRIC_ARGS[@]}" -eq 0 ]]; then
+    echo "    [error] STAGE2_SIMILARITY_METRICS must contain at least one metric." >&2
     exit 1
   fi
 
-  FUSION_SAVE_ARGS=()
+  STAGE2_SAVE_ARGS=()
   if [[ "${SAVE_PER_SCENE_STAGE2}" == "1" || "${SAVE_PER_SCENE_STAGE2}" == "true" ]]; then
-    FUSION_SAVE_ARGS+=(--fusion-save-per-scene)
+    STAGE2_SAVE_ARGS+=(--fusion-save-per-scene)
   else
-    FUSION_SAVE_ARGS+=(--no-fusion-save-per-scene)
+    STAGE2_SAVE_ARGS+=(--no-fusion-save-per-scene)
   fi
 
-  if ! [[ "${FUSION_NUM_PROCS}" =~ ^[0-9]+$ ]]; then
-    echo "    [error] FUSION_NUM_PROCS must be a positive integer, got: ${FUSION_NUM_PROCS}" >&2
+  if ! [[ "${STAGE2_NUM_PROCS}" =~ ^[0-9]+$ ]]; then
+    echo "    [error] STAGE2_NUM_PROCS must be a positive integer, got: ${STAGE2_NUM_PROCS}" >&2
     exit 1
   fi
-  STAGE2_PROC_COUNT="${FUSION_NUM_PROCS}"
+  STAGE2_PROC_COUNT="${STAGE2_NUM_PROCS}"
   if [[ "${STAGE2_PROC_COUNT}" -lt 1 ]]; then
     STAGE2_PROC_COUNT=1
   fi
-  FUSION_MODE_CLI_ARGS=(--fusion-modes "${FUSION_MODE_ARGS[@]}")
-  FUSION_METRIC_CLI_ARGS=()
-  if [[ "${#FUSION_METRIC_ARGS[@]}" -gt 0 ]]; then
-    FUSION_METRIC_CLI_ARGS=(--fusion-similarity-metrics "${FUSION_METRIC_ARGS[@]}")
+  STAGE2_MODE_CLI_ARGS=(--fusion-modes "${STAGE2_MODE_ARGS[@]}")
+  STAGE2_METRIC_CLI_ARGS=()
+  if [[ "${#STAGE2_METRIC_ARGS[@]}" -gt 0 ]]; then
+    STAGE2_METRIC_CLI_ARGS=(--fusion-similarity-metrics "${STAGE2_METRIC_ARGS[@]}")
   fi
 
-  COMMON_FUSION_ARGS=(
+  COMMON_STAGE2_ARGS=(
     --cache-dir "${CACHE_DIR}"
-    --similarity-output-dir "${FUSION_SIMILARITY_DIR}"
-    --skip-output-dir "${FUSION_SKIP_DIR}"
+    --similarity-output-dir "${STAGE2_SIMILARITY_DIR}"
+    --skip-output-dir "${STAGE2_SKIP_DIR}"
     --data-root "${DATA_ROOT}"
     --hf-model "${HF_MODEL}"
     --max-frames "${MAX_FRAMES}"
@@ -270,30 +269,23 @@ if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
     --heatmap-fill "${HEATMAP_FILL}"
     --chamfer-max-dist "${CHAMFER_MAX_DIST}"
     --depth-conf-thresh "${DEPTH_CONF_THRESH}"
-    --fusion-max-span "${FUSION_MAX_SPAN}"
-    --fusion-num-procs "${FUSION_NUM_PROCS}"
-    "${FUSION_MODE_CLI_ARGS[@]}"
-    "${FUSION_METRIC_CLI_ARGS[@]}"
-    "${FUSION_SAVE_ARGS[@]}"
-    "${FUSION_EXTRA[@]}"
+    --fusion-max-span "${STAGE2_MAX_SPAN}"
+    --fusion-num-procs "${STAGE2_NUM_PROCS}"
+    "${STAGE2_MODE_CLI_ARGS[@]}"
+    "${STAGE2_METRIC_CLI_ARGS[@]}"
+    "${STAGE2_SAVE_ARGS[@]}"
+    "${STAGE2_EXTRA_ARGS[@]}"
     "${TIMING_ARGS[@]}"
   )
 
   if [[ "${STAGE2_PROC_COUNT}" -le 1 ]]; then
-    python -m analysis.redundancy.analyze_scannet_cache "${COMMON_FUSION_ARGS[@]}"
+    python -m analysis.redundancy.analyze_scannet_cache "${COMMON_STAGE2_ARGS[@]}"
   else
     echo "    Running Stage2 with ${STAGE2_PROC_COUNT} scene-sharded worker processes."
-    SHARD_SCENE_ROOT="${FUSION_SKIP_DIR}/.scene_shards"
+    SHARD_SCENE_ROOT="${STAGE2_SKIP_DIR}/.scene_shards"
     rm -rf "${SHARD_SCENE_ROOT}"
     mkdir -p "${SHARD_SCENE_ROOT}"
-    mkdir -p "${FUSION_SIMILARITY_DIR}/per_scene" "${FUSION_SKIP_DIR}/per_scene"
-    rm -f "${FUSION_SIMILARITY_DIR}/full_report_similarity.json" \
-      "${FUSION_SIMILARITY_DIR}/summary_metrics_similarity.csv" \
-      "${FUSION_SIMILARITY_DIR}/per_scene_scores_similarity.csv" \
-      "${FUSION_SKIP_DIR}/full_report_skip.json" \
-      "${FUSION_SKIP_DIR}/summary_metrics_skip.csv" \
-      "${FUSION_SKIP_DIR}/per_scene_scores_skip.csv"
-    rm -f "${FUSION_SIMILARITY_DIR}/per_scene/"*_similarity.json "${FUSION_SKIP_DIR}/per_scene/"*_skip.json 2>/dev/null || true
+    mkdir -p "${STAGE2_SIMILARITY_DIR}/per_scene" "${STAGE2_SKIP_DIR}/per_scene"
 
     mapfile -t STAGE2_SCENE_IDS < <(CACHE_DIR_ENV="${CACHE_DIR}" python - <<'PY'
 import json
@@ -349,12 +341,12 @@ PY
         gpu_id="${GPU_IDS[$((worker_idx % GPU_COUNT))]}"
         gpu_msg="gpu:${gpu_id}"
         CUDA_VISIBLE_DEVICES="${gpu_id}" python -m analysis.redundancy.analyze_scannet_cache \
-          "${COMMON_FUSION_ARGS[@]}" \
+          "${COMMON_STAGE2_ARGS[@]}" \
           --scene-ids-file "${scene_file}" \
           --no-fusion-write-aggregate &
       else
         python -m analysis.redundancy.analyze_scannet_cache \
-          "${COMMON_FUSION_ARGS[@]}" \
+          "${COMMON_STAGE2_ARGS[@]}" \
           --scene-ids-file "${scene_file}" \
           --no-fusion-write-aggregate &
       fi
@@ -371,7 +363,7 @@ PY
     done
 
     python -m analysis.redundancy.analyze_scannet_cache \
-      "${COMMON_FUSION_ARGS[@]}" \
+      "${COMMON_STAGE2_ARGS[@]}" \
       --fusion-aggregate-from-per-scene
     rm -rf "${SHARD_SCENE_ROOT}"
   fi
@@ -379,46 +371,46 @@ fi
 
 echo "== Done =="
 echo "    Weight report:        ${WEIGHT_ANALYSIS_DIR}/weight_report.json"
-echo "    Per-scene caches:     ${CACHE_DIR}/*.pt"
+echo "    Per-scene caches:     ${CACHE_DIR}/<scene_id>/ (metadata.json, layers/layer_*.pt, pred.pt)"
 echo "    Manifest:             ${CACHE_DIR}/manifest.json"
 if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
   if [[ "${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true" ]]; then
-    echo "    Similarity summary:    ${FUSION_SIMILARITY_DIR}/summary_metrics_similarity.csv"
-    echo "    Similarity scene CSV:  ${FUSION_SIMILARITY_DIR}/per_scene_scores_similarity.csv"
-    echo "    Similarity report:     ${FUSION_SIMILARITY_DIR}/full_report_similarity.json"
+    echo "    Similarity summary:    ${STAGE2_SIMILARITY_DIR}/summary_metrics_similarity.csv"
+    echo "    Similarity scene CSV:  ${STAGE2_SIMILARITY_DIR}/per_scene_scores_similarity.csv"
+    echo "    Similarity report:     ${STAGE2_SIMILARITY_DIR}/full_report_similarity.json"
   fi
   if [[ "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "1" || "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "true" ]]; then
-    echo "    Skip summary:          ${FUSION_SKIP_DIR}/summary_metrics_skip.csv"
-    echo "    Skip scene CSV:        ${FUSION_SKIP_DIR}/per_scene_scores_skip.csv"
-    echo "    Skip report:           ${FUSION_SKIP_DIR}/full_report_skip.json"
+    echo "    Skip summary:          ${STAGE2_SKIP_DIR}/summary_metrics_skip.csv"
+    echo "    Skip scene CSV:        ${STAGE2_SKIP_DIR}/per_scene_scores_skip.csv"
+    echo "    Skip report:           ${STAGE2_SKIP_DIR}/full_report_skip.json"
   fi
 fi
 if [[ "${SAVE_HEATMAP_PNG_STAGE2}" == "1" || "${SAVE_HEATMAP_PNG_STAGE2}" == "true" ]]; then
   if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
     if [[ "${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true" ]]; then
-      echo "    Similarity figures:    ${FUSION_SIMILARITY_DIR}/*.png"
+      echo "    Similarity figures:    ${STAGE2_SIMILARITY_DIR}/*.png"
     fi
     if [[ "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "1" || "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "true" ]]; then
-      echo "    Skip figures:          ${FUSION_SKIP_DIR}/*.png"
+      echo "    Skip figures:          ${STAGE2_SKIP_DIR}/*.png"
     fi
   fi
 fi
 if [[ "${SAVE_PER_SCENE_STAGE2}" == "1" || "${SAVE_PER_SCENE_STAGE2}" == "true" ]]; then
   if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
     if [[ "${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true" ]]; then
-      echo "    Similarity per-scene:  ${FUSION_SIMILARITY_DIR}/per_scene/*_similarity.json"
+      echo "    Similarity per-scene:  ${STAGE2_SIMILARITY_DIR}/per_scene/*_similarity.json"
     fi
     if [[ "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "1" || "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "true" ]]; then
-      echo "    Skip per-scene:        ${FUSION_SKIP_DIR}/per_scene/*_skip.json"
+      echo "    Skip per-scene:        ${STAGE2_SKIP_DIR}/per_scene/*_skip.json"
     fi
   fi
   if [[ "${SAVE_HEATMAP_PNG_STAGE2}" == "1" || "${SAVE_HEATMAP_PNG_STAGE2}" == "true" ]]; then
     if [[ "${STAGE2}" == "1" || "${STAGE2}" == "true" ]]; then
       if [[ "${STAGE2_ENABLE_SIMILARITY}" == "1" || "${STAGE2_ENABLE_SIMILARITY}" == "true" ]]; then
-        echo "    Similarity per-scene figs: ${FUSION_SIMILARITY_DIR}/per_scene/*.png"
+        echo "    Similarity per-scene figs: ${STAGE2_SIMILARITY_DIR}/per_scene/*.png"
       fi
       if [[ "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "1" || "${STAGE2_ENABLE_SKIP_GT_EVAL}" == "true" ]]; then
-        echo "    Skip per-scene figs:       ${FUSION_SKIP_DIR}/per_scene/*.png"
+        echo "    Skip per-scene figs:       ${STAGE2_SKIP_DIR}/per_scene/*.png"
       fi
     fi
   fi

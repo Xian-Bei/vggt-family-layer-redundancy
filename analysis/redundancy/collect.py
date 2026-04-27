@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -131,6 +131,7 @@ def collect_batch(
     images: torch.Tensor,
     *,
     keep_activations_on_gpu: bool = False,
+    collect_full_cache: bool = True,
 ) -> RedundancyBatchResult:
     if images.dim() == 4:
         images = images.unsqueeze(0)
@@ -141,19 +142,24 @@ def collect_batch(
     required_layers = _required_prediction_layers(model, num_layers)
     selected_layer_set = set(required_layers)
     selected_layer_tensors: Dict[int, torch.Tensor] = {}
-    aggregated_concat_tokens_cpu: List[torch.Tensor] = [None] * num_layers  # type: ignore[list-item]
+    aggregated_concat_tokens_cpu: Optional[List[Optional[torch.Tensor]]] = (
+        [None] * num_layers if collect_full_cache else None
+    )
 
     def _layer_callback(layer_idx: int, concat_tokens: torch.Tensor) -> None:
+        if not collect_full_cache:
+            return
         t = concat_tokens.detach()
+        assert aggregated_concat_tokens_cpu is not None
         aggregated_concat_tokens_cpu[layer_idx] = t.cpu().contiguous()
         if layer_idx in selected_layer_set:
-            selected_layer_tensors[layer_idx] = t if keep_activations_on_gpu else t
+            selected_layer_tensors[layer_idx] = t
 
     with torch.no_grad():
         selected_outputs, patch_start_idx = model.aggregator(
             images,
             return_layers=selected_layer_set,
-            layer_callback=_layer_callback,
+            layer_callback=_layer_callback if collect_full_cache else None,
         )
         if len(selected_outputs) != len(required_layers):
             raise RuntimeError(
@@ -168,29 +174,29 @@ def collect_batch(
             images,
         )
 
-    bsz, seq_len = infer_bs_and_seq_len(images)
     frame_tokens: List[torch.Tensor] = []
     global_tokens: List[torch.Tensor] = []
     aggregated_concat_tokens: List[torch.Tensor] = []
     global_patch_tokens: List[torch.Tensor] = []
     global_special_tokens: List[torch.Tensor] = []
-    for concat_t in aggregated_concat_tokens_cpu:
-        if concat_t is None:
-            raise RuntimeError("Missing cached aggregated layer from aggregator callback.")
-        if concat_t.dim() != 4:
-            raise RuntimeError(f"Expected cached aggregated tensor [B,S,P,2C], got shape {tuple(concat_t.shape)}")
-        two_c = int(concat_t.shape[-1])
-        if two_c % 2 != 0:
-            raise RuntimeError(f"Invalid channel count in cached aggregated tensor: {two_c}")
-        c = two_c // 2
-        frame_view = concat_t[..., :c]
-        global_view = concat_t[..., c:]
-        _, _, p, gc = global_view.shape
-        frame_tokens.append(frame_view)
-        global_tokens.append(global_view)
-        aggregated_concat_tokens.append(concat_t)
-        global_patch_tokens.append(global_view[:, :, patch_start_idx:, :])
-        global_special_tokens.append(global_view[:, :, :patch_start_idx, :])
+    if collect_full_cache:
+        assert aggregated_concat_tokens_cpu is not None
+        for concat_t in aggregated_concat_tokens_cpu:
+            if concat_t is None:
+                raise RuntimeError("Missing cached aggregated layer from aggregator callback.")
+            if concat_t.dim() != 4:
+                raise RuntimeError(f"Expected cached aggregated tensor [B,S,P,2C], got shape {tuple(concat_t.shape)}")
+            two_c = int(concat_t.shape[-1])
+            if two_c % 2 != 0:
+                raise RuntimeError(f"Invalid channel count in cached aggregated tensor: {two_c}")
+            c = two_c // 2
+            frame_view = concat_t[..., :c]
+            global_view = concat_t[..., c:]
+            frame_tokens.append(frame_view)
+            global_tokens.append(global_view)
+            aggregated_concat_tokens.append(concat_t)
+            global_patch_tokens.append(global_view[:, :, patch_start_idx:, :])
+            global_special_tokens.append(global_view[:, :, :patch_start_idx, :])
 
     scene_scores: Dict[str, float] = {}
     if "depth_conf" in preds:

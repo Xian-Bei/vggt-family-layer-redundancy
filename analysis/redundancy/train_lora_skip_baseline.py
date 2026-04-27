@@ -1,0 +1,1541 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import random
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from tqdm.auto import tqdm
+
+# Keep OpenCV/Matplotlib in headless mode for eval_utils imports.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("MPLBACKEND", "Agg")
+
+from vggt.models.vggt import VGGT
+from vggt.utils.eval_utils import (
+    build_frame_selection,
+    evaluate_scene_and_save,
+    get_all_scenes,
+    get_sorted_image_paths,
+    get_vgg_input_imgs,
+    infer_vggt_and_reconstruct,
+    load_images_rgb,
+    load_poses,
+)
+from .collect import collect_batch
+from .cache_layout import (
+    load_scene_metadata,
+    load_scene_pred,
+    load_scene_replay_layer,
+)
+from .prediction_eval import (
+    build_fastvggt_scene_eval_context,
+    build_scannet_eval_row_from_payload_with_context,
+    write_eval_scannet_json,
+)
+from .prediction_save import build_scene_prediction_payload
+from .scannet_eval import aggregate_metric_dict, discover_scannet_scenes, load_scene_images, select_scene_image_paths_fastvggt
+
+
+@dataclass(frozen=True)
+class IntervalRule:
+    l: int
+    r: int
+    skip_frame_in_interval: bool
+    inject_prev: Literal["global", "frame_global"]
+    inject_frame_inside_interval: bool
+
+    @property
+    def prev_layer(self) -> int:
+        return int(self.l) - 1
+
+    @property
+    def has_frame_lora(self) -> bool:
+        return bool(self.inject_prev == "frame_global" or self.inject_frame_inside_interval)
+
+
+def _load_interval_rules(path: Path) -> List[IntervalRule]:
+    if not path.exists():
+        raise SystemExit(f"Missing --interval-config-file: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rules_raw: Any = payload.get("intervals") if isinstance(payload, dict) else payload
+    if not isinstance(rules_raw, list) or not rules_raw:
+        raise SystemExit("Interval config must be a non-empty list (or {\"intervals\": [...]}).")
+
+    parsed: List[IntervalRule] = []
+    for i, item in enumerate(rules_raw):
+        if not isinstance(item, dict):
+            raise SystemExit(f"intervals[{i}] must be an object.")
+        try:
+            l = int(item["l"])
+            r = int(item["r"])
+        except Exception as e:
+            raise SystemExit(f"intervals[{i}] must provide integer l/r: {e}") from e
+        if l < 0 or r < 0 or l > r:
+            raise SystemExit(f"intervals[{i}] invalid range [{l},{r}]")
+        inject_prev = str(item.get("inject_prev", "global"))
+        if inject_prev not in ("global", "frame_global"):
+            raise SystemExit(f"intervals[{i}].inject_prev must be 'global' or 'frame_global'.")
+        skip_frame = bool(item.get("skip_frame_in_interval", True))
+        inject_inside = bool(item.get("inject_frame_inside_interval", False))
+        if skip_frame and inject_inside:
+            raise SystemExit(
+                f"intervals[{i}] has skip_frame_in_interval=true and inject_frame_inside_interval=true; incompatible."
+            )
+        parsed.append(
+            IntervalRule(
+                l=l,
+                r=r,
+                skip_frame_in_interval=skip_frame,
+                inject_prev=inject_prev,  # type: ignore[arg-type]
+                inject_frame_inside_interval=inject_inside,
+            )
+        )
+    parsed = sorted(parsed, key=lambda x: (int(x.l), int(x.r)))
+    for i in range(1, len(parsed)):
+        pl, pr = int(parsed[i - 1].l), int(parsed[i - 1].r)
+        l, r = int(parsed[i].l), int(parsed[i].r)
+        if l <= pr:
+            raise SystemExit(f"Overlapped intervals in config: [{pl},{pr}] and [{l},{r}]")
+    return parsed
+
+
+def _intervals_from_rules(rules: Sequence[IntervalRule]) -> List[Tuple[int, int]]:
+    return [(int(x.l), int(x.r)) for x in rules]
+
+
+def _global_skip_intervals_from_rules(rules: Sequence[IntervalRule]) -> List[Tuple[int, int]]:
+    return _intervals_from_rules(rules)
+
+
+def _frame_skip_intervals_from_rules(rules: Sequence[IntervalRule]) -> List[Tuple[int, int]]:
+    return [(int(x.l), int(x.r)) for x in rules if bool(x.skip_frame_in_interval)]
+
+
+def _lora_injection_plan_from_rules(
+    rules: Sequence[IntervalRule],
+) -> Tuple[List[int], List[int]]:
+    frame_idxs: set[int] = set()
+    global_idxs: set[int] = set()
+    for rule in rules:
+        pidx = int(rule.prev_layer)
+        global_idxs.add(pidx)
+        if rule.inject_prev == "frame_global":
+            frame_idxs.add(pidx)
+        if (not rule.skip_frame_in_interval) and bool(rule.inject_frame_inside_interval):
+            frame_idxs.update(range(int(rule.l), int(rule.r) + 1))
+    return sorted(frame_idxs), sorted(global_idxs)
+
+
+def _load_manifest(cache_dir: Path) -> List[Dict[str, Any]]:
+    p = cache_dir / "manifest.json"
+    if not p.exists():
+        raise SystemExit(f"Missing cache manifest: {p}")
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    scenes = payload.get("scenes", [])
+    if not isinstance(scenes, list) or not scenes:
+        raise SystemExit(f"Manifest has no scenes: {p}")
+    return scenes
+
+
+def _load_scene_cache_row(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, Any]:
+    row = dict(load_scene_metadata(cache_dir, item))
+    row["pred"] = load_scene_pred(cache_dir, item)
+    return row
+
+
+def _split_concat(layer_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # [B,S,P,2C] -> [B,S,P,C] frame/global
+    if layer_t.dim() != 4:
+        raise ValueError(f"Expected 4D tensor, got {tuple(layer_t.shape)}")
+    two_c = int(layer_t.shape[-1])
+    if two_c % 2 != 0:
+        raise ValueError(f"Expected even channel dimension, got {two_c}")
+    c = two_c // 2
+    return layer_t[..., :c], layer_t[..., c:]
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, rank: int, alpha: float, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.rank = int(rank)
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / max(self.rank, 1)
+        self.dropout = nn.Dropout(float(dropout)) if float(dropout) > 0 else nn.Identity()
+
+        in_f = int(base.in_features)
+        out_f = int(base.out_features)
+        self.lora_A = nn.Linear(in_f, self.rank, bias=False)
+        self.lora_B = nn.Linear(self.rank, out_f, bias=False)
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+        # Keep LoRA params on the same device/dtype as wrapped base layer.
+        self.lora_A.to(device=base.weight.device, dtype=base.weight.dtype)
+        self.lora_B.to(device=base.weight.device, dtype=base.weight.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+
+
+class SkipIdentityBlock(nn.Module):
+    """
+    Identity block that is API-compatible with transformer blocks (accepts pos kwarg).
+    Used to physically replace skipped layers while keeping module list indices unchanged.
+    """
+
+    def forward(self, x: torch.Tensor, pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return x
+
+
+def _inject_lora_attn(block: nn.Module, rank: int, alpha: float, dropout: float) -> List[nn.Parameter]:
+    trainable: List[nn.Parameter] = []
+    attn = getattr(block, "attn", None)
+    if attn is None:
+        return trainable
+    for name in ("qkv", "proj"):
+        mod = getattr(attn, name, None)
+        if isinstance(mod, nn.Linear):
+            lora_mod = LoRALinear(mod, rank=rank, alpha=alpha, dropout=dropout)
+            setattr(attn, name, lora_mod)
+            trainable.extend([p for p in lora_mod.parameters() if p.requires_grad])
+    return trainable
+
+
+def _is_skipped(layer_idx: int, intervals: Sequence[Tuple[int, int]]) -> bool:
+    for l, r in intervals:
+        if l <= layer_idx <= r:
+            return True
+    return False
+
+
+def _replace_skipped_layers_with_identity(
+    model: VGGT,
+    *,
+    frame_intervals: Sequence[Tuple[int, int]],
+    global_intervals: Sequence[Tuple[int, int]],
+) -> None:
+    depth = len(model.aggregator.frame_blocks)
+    for l, r in frame_intervals:
+        for idx in range(int(l), int(r) + 1):
+            if idx < 0 or idx >= depth:
+                raise SystemExit(f"Skip layer index {idx} out of range for model depth {depth}.")
+            model.aggregator.frame_blocks[idx] = SkipIdentityBlock()
+    for l, r in global_intervals:
+        for idx in range(int(l), int(r) + 1):
+            if idx < 0 or idx >= depth:
+                raise SystemExit(f"Skip layer index {idx} out of range for model depth {depth}.")
+            model.aggregator.global_blocks[idx] = SkipIdentityBlock()
+
+
+def _build_pos(model: VGGT, images: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    agg = model.aggregator
+    if agg.rope is None:
+        return None, None
+    if images.dim() == 4:
+        images = images.unsqueeze(0)
+    if images.dim() != 5:
+        raise ValueError(f"Expected [B,S,3,H,W], got {tuple(images.shape)}")
+    bsz, seq_len, _, h, w = images.shape
+    ph = h // int(agg.patch_size)
+    pw = w // int(agg.patch_size)
+    pos = agg.position_getter(bsz * seq_len, ph, pw, device=images.device)
+    if int(agg.patch_start_idx) > 0:
+        pos = pos + 1
+        pos_special = torch.zeros(bsz * seq_len, int(agg.patch_start_idx), 2, device=images.device, dtype=pos.dtype)
+        pos = torch.cat([pos_special, pos], dim=1)
+    p = int(pos.shape[1])
+    pos_frame = pos.view(bsz * seq_len, p, 2)
+    pos_global = pos_frame.view(bsz, seq_len, p, 2).view(bsz, seq_len * p, 2)
+    return pos_frame, pos_global
+
+
+def _run_block_with_checkpoint(
+    block: nn.Module,
+    x: torch.Tensor,
+    *,
+    pos: Optional[torch.Tensor],
+    training: bool,
+    use_checkpoint: bool,
+    use_reentrant: bool,
+) -> torch.Tensor:
+    """
+    Match official aggregator behavior: training-time checkpointing with use_reentrant=False.
+    """
+    if (not training) or (not use_checkpoint):
+        return block(x, pos=pos)
+    if pos is None:
+        return checkpoint(lambda _x: block(_x, pos=None), x, use_reentrant=use_reentrant)
+    return checkpoint(lambda _x, _p: block(_x, pos=_p), x, pos, use_reentrant=use_reentrant)
+
+
+def _required_head_layers(model: VGGT, num_layers: int) -> List[int]:
+    keep: set[int] = set()
+    if model.camera_head is not None and num_layers > 0:
+        keep.add(num_layers - 1)
+    if model.depth_head is not None:
+        keep.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
+    if model.point_head is not None:
+        keep.update(int(i) for i in getattr(model.point_head, "intermediate_layer_idx", []))
+    if model.track_head is not None:
+        keep.update(int(i) for i in getattr(model.track_head.feature_extractor, "intermediate_layer_idx", []))
+    return sorted(i for i in keep if 0 <= i < num_layers)
+
+
+@dataclass
+class ReplayResult:
+    concat_by_layer: Dict[int, torch.Tensor]
+    pred: Dict[str, torch.Tensor]
+
+
+def _replay_student_cache_first(
+    model: VGGT,
+    get_layer_cpu: Callable[[int], torch.Tensor],
+    num_layers: int,
+    *,
+    frame_skip_intervals: Sequence[Tuple[int, int]],
+    global_skip_intervals: Sequence[Tuple[int, int]],
+    lora_anchor_prev_layers: Sequence[int],
+    use_checkpoint: bool,
+    device: torch.device,
+    dummy_images: torch.Tensor,
+) -> ReplayResult:
+    _get_layer_cpu = get_layer_cpu
+    if num_layers <= 0:
+        raise ValueError("Replay cache is empty.")
+    start_layer = min(int(x) for x in lora_anchor_prev_layers)
+    if start_layer <= 0:
+        raise ValueError(f"Expected start_layer>0, got {start_layer}")
+    if start_layer >= num_layers:
+        raise ValueError(f"start_layer={start_layer} out of range for num_layers={num_layers}")
+
+    # Seed from cached global of layer start-1
+    seed_concat = _get_layer_cpu(start_layer - 1).to(device=device, non_blocking=(device.type == "cuda"))
+    _, seed_global = _split_concat(seed_concat)
+    bsz, seq_len, p, c = seed_global.shape
+
+    pos_frame, pos_global = _build_pos(model, dummy_images)
+    if pos_frame is not None and pos_frame.shape[0] != bsz * seq_len:
+        raise RuntimeError(
+            f"Position mismatch: pos_frame={tuple(pos_frame.shape)}, replay b*s={bsz*seq_len}"
+        )
+
+    required = set(_required_head_layers(model, num_layers))
+    required.update(int(x) for x in lora_anchor_prev_layers)
+    concat_out: Dict[int, torch.Tensor] = {}
+
+    global_prev = seed_global.view(bsz, seq_len * p, c)
+    use_reentrant = bool(getattr(model.aggregator, "use_reentrant", False))
+    for layer_idx in range(start_layer, num_layers):
+        frame_in = global_prev.view(bsz * seq_len, p, c)
+        if _is_skipped(layer_idx, frame_skip_intervals):
+            frame_out = frame_in
+        else:
+            frame_out = _run_block_with_checkpoint(
+                model.aggregator.frame_blocks[layer_idx],
+                frame_in,
+                pos=pos_frame,
+                training=bool(model.training),
+                use_checkpoint=use_checkpoint,
+                use_reentrant=use_reentrant,
+            )
+        frame_view = frame_out.view(bsz, seq_len, p, c)
+
+        global_in = frame_view.view(bsz, seq_len * p, c)
+        if _is_skipped(layer_idx, global_skip_intervals):
+            global_out = global_in
+        else:
+            global_out = _run_block_with_checkpoint(
+                model.aggregator.global_blocks[layer_idx],
+                global_in,
+                pos=pos_global,
+                training=bool(model.training),
+                use_checkpoint=use_checkpoint,
+                use_reentrant=use_reentrant,
+            )
+        if layer_idx in required:
+            global_view = global_out.view(bsz, seq_len, p, c)
+            concat_out[layer_idx] = torch.cat([frame_view, global_view], dim=-1)
+        global_prev = global_out
+
+    selected: Dict[int, torch.Tensor] = {}
+    for idx in required:
+        if idx < start_layer:
+            selected[idx] = _get_layer_cpu(idx).to(device=device, non_blocking=(device.type == "cuda"))
+        else:
+            if idx not in concat_out:
+                raise RuntimeError(f"Missing replay output at required layer {idx}")
+            selected[idx] = concat_out[idx]
+    agg_list: List[torch.Tensor] = [None] * num_layers  # type: ignore[list-item]
+    for idx, t in selected.items():
+        agg_list[idx] = t
+    pred = model.forward_from_aggregated_tokens(
+        agg_list,
+        int(model.aggregator.patch_start_idx),
+        dummy_images,
+    )
+    return ReplayResult(concat_by_layer=concat_out, pred=pred)
+
+
+def _loss_mse_cos(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
+    mse = F.mse_loss(a, b)
+    af = a.reshape(-1, a.shape[-1]).float()
+    bf = b.reshape(-1, b.shape[-1]).float()
+    af = af / (af.norm(dim=-1, keepdim=True) + eps)
+    bf = bf / (bf.norm(dim=-1, keepdim=True) + eps)
+    cos = 1.0 - (af * bf).sum(dim=-1).mean()
+    return mse, cos
+
+
+def _spatial_grad_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # Supports [B,S,H,W,C] or [B,S,H,W]
+    if pred.dim() == 5:
+        p = pred.permute(0, 1, 4, 2, 3).contiguous()
+        t = target.permute(0, 1, 4, 2, 3).contiguous()
+    elif pred.dim() == 4:
+        p = pred.unsqueeze(2)
+        t = target.unsqueeze(2)
+    else:
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+    if p.shape[-2] < 2 or p.shape[-1] < 2:
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+    px = p[..., 1:, :] - p[..., :-1, :]
+    tx = t[..., 1:, :] - t[..., :-1, :]
+    py = p[..., :, 1:] - p[..., :, :-1]
+    ty = t[..., :, 1:] - t[..., :, :-1]
+    return 0.5 * (F.l1_loss(px, tx) + F.l1_loss(py, ty))
+
+
+def _teacher_pred_to_map(pred: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in pred.items():
+        if isinstance(v, torch.Tensor):
+            # Keep teacher targets on CPU to reduce persistent GPU memory.
+            t = v.contiguous()
+            if t.dim() >= 1 and t.shape[0] != 1:
+                t = t.unsqueeze(0)
+            out[k] = t
+    return out
+
+
+def _prediction_distill(
+    student_pred: Dict[str, torch.Tensor],
+    teacher_pred: Dict[str, torch.Tensor],
+    *,
+    w_camera: float,
+    w_depth: float,
+    w_point: float,
+    w_depth_grad: float,
+    w_point_grad: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    device = next(iter(student_pred.values())).device
+    total = torch.zeros((), device=device)
+    logs: Dict[str, float] = {}
+
+    if "pose_enc" in student_pred and "pose_enc" in teacher_pred:
+        sp = student_pred["pose_enc"].float()
+        tp = teacher_pred["pose_enc"].float().to(device)
+        l_cam = F.l1_loss(sp, tp)
+        total = total + float(w_camera) * l_cam
+        logs["loss_pred_camera"] = float(l_cam.detach().item())
+        logs["loss_pred_camera_term"] = float((float(w_camera) * l_cam).detach().item())
+
+    if "depth" in student_pred and "depth" in teacher_pred:
+        sd = student_pred["depth"].float()
+        td = teacher_pred["depth"].float().to(device)
+        l_reg = F.l1_loss(sd, td)
+        l_conf = torch.zeros((), device=device)
+        if "depth_conf" in student_pred and "depth_conf" in teacher_pred:
+            l_conf = F.l1_loss(student_pred["depth_conf"].float(), teacher_pred["depth_conf"].float().to(device))
+        l_grad = _spatial_grad_loss(sd, td)
+        l_depth = l_reg + l_conf + float(w_depth_grad) * l_grad
+        total = total + float(w_depth) * l_depth
+        logs["loss_pred_depth_reg"] = float(l_reg.detach().item())
+        logs["loss_pred_depth_conf"] = float(l_conf.detach().item())
+        logs["loss_pred_depth_grad"] = float(l_grad.detach().item())
+        logs["loss_pred_depth_reg_term"] = float((float(w_depth) * l_reg).detach().item())
+        logs["loss_pred_depth_conf_term"] = float((float(w_depth) * l_conf).detach().item())
+        logs["loss_pred_depth_grad_term"] = float((float(w_depth) * float(w_depth_grad) * l_grad).detach().item())
+
+    if "world_points" in student_pred and "world_points" in teacher_pred:
+        sp = student_pred["world_points"].float()
+        tp = teacher_pred["world_points"].float().to(device)
+        l_reg = F.l1_loss(sp, tp)
+        l_conf = torch.zeros((), device=device)
+        if "world_points_conf" in student_pred and "world_points_conf" in teacher_pred:
+            l_conf = F.l1_loss(
+                student_pred["world_points_conf"].float(),
+                teacher_pred["world_points_conf"].float().to(device),
+            )
+        l_grad = _spatial_grad_loss(sp, tp)
+        l_point = l_reg + l_conf + float(w_point_grad) * l_grad
+        total = total + float(w_point) * l_point
+        logs["loss_pred_point_reg"] = float(l_reg.detach().item())
+        logs["loss_pred_point_conf"] = float(l_conf.detach().item())
+        logs["loss_pred_point_grad"] = float(l_grad.detach().item())
+        logs["loss_pred_point_reg_term"] = float((float(w_point) * l_reg).detach().item())
+        logs["loss_pred_point_conf_term"] = float((float(w_point) * l_conf).detach().item())
+        logs["loss_pred_point_grad_term"] = float((float(w_point) * float(w_point_grad) * l_grad).detach().item())
+
+    return total, logs
+
+
+def _compute_total_steps(num_scenes: int, epochs: int, max_steps: int) -> int:
+    natural = max(0, int(num_scenes) * int(epochs))
+    if max_steps > 0:
+        return min(natural, int(max_steps))
+    return natural
+
+
+def _build_skipped_layer_indices(intervals: Sequence[Tuple[int, int]]) -> List[int]:
+    out: List[int] = []
+    for l, r in intervals:
+        out.extend(range(int(l), int(r) + 1))
+    return sorted(set(out))
+
+
+def _count_unique_params(modules: Sequence[nn.Module]) -> int:
+    seen: set[int] = set()
+    total = 0
+    for m in modules:
+        for p in m.parameters(recurse=True):
+            pid = id(p)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            total += int(p.numel())
+    return total
+
+
+def _format_param_count(n: int) -> str:
+    v = float(n)
+    if v >= 1e9:
+        return f"{v / 1e9:.2f}B"
+    if v >= 1e6:
+        return f"{v / 1e6:.2f}M"
+    if v >= 1e3:
+        return f"{v / 1e3:.2f}K"
+    return str(int(v))
+
+
+def _validate_schema(row: Dict[str, Any], num_layers: int) -> None:
+    pred = row.get("pred")
+    if not isinstance(pred, dict):
+        raise SystemExit("Invalid cache row: missing dict key 'pred'.")
+    required = ("pose_enc", "depth", "depth_conf", "world_points", "world_points_conf")
+    missing = [k for k in required if k not in pred]
+    if missing:
+        raise SystemExit(f"Invalid cache row pred: missing keys {missing}")
+
+
+def _infer_num_layers(cache_dir: Path, scenes: Sequence[Dict[str, Any]]) -> int:
+    for item in scenes:
+        scene_dir_name = str(item.get("dir", "")).strip()
+        if not scene_dir_name:
+            sid = str(item.get("scene_id", "")).strip()
+            scene_dir_name = sid.replace("/", "_") if sid else ""
+        if not scene_dir_name:
+            continue
+        layers_dir = cache_dir / scene_dir_name / "layers"
+        if not layers_dir.exists():
+            continue
+        layer_files = sorted(layers_dir.glob("layer_*.pt"))
+        if layer_files:
+            return len(layer_files)
+    raise SystemExit("Could not infer num_layers from cache.")
+
+
+def _write_curves(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    fields = sorted({k for r in rows for k in r.keys()})
+    with (out_dir / "train_curves.csv").open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    numeric_keys = sorted(
+        {
+            str(k)
+            for r in rows
+            for k, v in r.items()
+            if k != "epoch" and isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+    )
+    epoch_buckets: Dict[int, Dict[str, float]] = {}
+    epoch_counts: Dict[int, int] = {}
+    for r in rows:
+        ep = int(r.get("epoch", 0))
+        if ep not in epoch_buckets:
+            epoch_buckets[ep] = {k: 0.0 for k in numeric_keys}
+            epoch_counts[ep] = 0
+        for k in numeric_keys:
+            epoch_buckets[ep][k] += float(r.get(k, 0.0))
+        epoch_counts[ep] += 1
+
+    epoch_rows: List[Dict[str, Any]] = []
+    for ep in sorted(epoch_buckets.keys()):
+        c = max(1, epoch_counts[ep])
+        row: Dict[str, Any] = {"epoch": ep, "steps_in_epoch": c}
+        for k in numeric_keys:
+            row[f"mean_{k}"] = epoch_buckets[ep][k] / c
+        epoch_rows.append(row)
+    with (out_dir / "train_curves_epoch_avg.csv").open("w", encoding="utf-8", newline="") as f:
+        epoch_fields = sorted({k for r in epoch_rows for k in r.keys()})
+        w = csv.DictWriter(f, fieldnames=epoch_fields)
+        w.writeheader()
+        for r in epoch_rows:
+            w.writerow(r)
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+
+        epochs = [int(r.get("epoch", 0)) for r in epoch_rows]
+        total = [float(r.get("mean_loss_total", float("nan"))) for r in epoch_rows]
+        align = [float(r.get("mean_loss_align", float("nan"))) for r in epoch_rows]
+        pred = [float(r.get("mean_loss_pred", float("nan"))) for r in epoch_rows]
+        plt.figure(figsize=(9, 5))
+        plt.plot(epochs, total, label="mean_loss_total")
+        plt.plot(epochs, align, label="mean_loss_align")
+        plt.plot(epochs, pred, label="mean_loss_pred")
+        plt.xlabel("epoch")
+        plt.ylabel("loss")
+        plt.title("Train Curves (epoch average, scans_dev50)")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_dir / "train_curves.png", dpi=150)
+        plt.close()
+
+        # Component plots: each weighted loss term gets its own figure.
+        component_dir = out_dir / "train_loss_components"
+        component_dir.mkdir(parents=True, exist_ok=True)
+        component_cols = [
+            str(k)
+            for k in sorted({k for r in epoch_rows for k in r.keys()})
+            if k.startswith("mean_loss_")
+        ]
+        for col in component_cols:
+            ys = [float(r.get(col, float("nan"))) for r in epoch_rows]
+            if not any(np.isfinite(y) for y in ys):
+                continue
+            plt.figure(figsize=(9, 5))
+            plt.plot(epochs, ys, label=col)
+            plt.xlabel("epoch")
+            plt.ylabel("loss")
+            plt.title(col.replace("mean_", ""))
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(component_dir / f"{col}.png", dpi=150)
+            plt.close()
+    except Exception:
+        pass
+
+
+def _float_metrics_from_aggregate(agg: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for k, v in agg.items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = float(v)
+    return out
+
+
+def _evaluate_dev_stage1_style(
+    *,
+    model: VGGT,
+    data_root: Path,
+    out_dir: Path,
+    max_scenes: int,
+    max_frames: int,
+    depth_conf_thresh: float,
+    chamfer_max_dist: float,
+    eval_amp_dtype: torch.dtype,
+    write_json: bool = True,
+) -> Dict[str, float]:
+    scenes = discover_scannet_scenes(data_root)
+    if max_scenes > 0:
+        scenes = scenes[:max_scenes]
+    if not scenes:
+        raise RuntimeError(f"No scenes found under {data_root}")
+    eval_rows: List[Dict[str, Any]] = []
+    was_training = bool(model.training)
+    model.eval()
+    t_eval0 = time.perf_counter()
+    try:
+        for scene in scenes:
+            scene_eff = select_scene_image_paths_fastvggt(scene, max_frames)
+            if not scene_eff.image_paths:
+                continue
+            images = load_scene_images(scene_eff, mode="crop")
+            if images.dim() == 3:
+                images = images.unsqueeze(0)
+            images = images.to(next(model.parameters()).device)
+            use_amp = images.device.type == "cuda"
+            t0 = time.perf_counter()
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=eval_amp_dtype, enabled=use_amp):
+                batch = collect_batch(model, images, keep_activations_on_gpu=False, collect_full_cache=False)
+            infer_ms = (time.perf_counter() - t0) * 1000.0
+            pred_payload = build_scene_prediction_payload(
+                batch.predictions,
+                (int(images.shape[-2]), int(images.shape[-1])),
+            )
+            ctx = build_fastvggt_scene_eval_context(
+                scene_eff,
+                data_root,
+                data_root,
+                image_hw=(int(images.shape[-2]), int(images.shape[-1])),
+            )
+            eval_rows.append(
+                build_scannet_eval_row_from_payload_with_context(
+                    pred_payload,
+                    scene_eff,
+                    ctx,
+                    depth_conf_thresh=depth_conf_thresh,
+                    chamfer_max_dist=chamfer_max_dist,
+                    inference_time_ms=infer_ms,
+                )
+            )
+    finally:
+        if was_training:
+            model.train()
+    if not eval_rows:
+        raise RuntimeError("No dev evaluation rows produced.")
+    aggregate = aggregate_metric_dict(
+        [{k: v for k, v in row.items() if k != "scene_id" and isinstance(v, (int, float))} for row in eval_rows]
+    )
+    if write_json:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_eval_scannet_json(
+            out_dir,
+            eval_rows,
+            extra_top_level={
+                "stage": "lora_skip_baseline_eval_dev",
+                "elapsed_seconds": float(time.perf_counter() - t_eval0),
+            },
+        )
+    return _float_metrics_from_aggregate(aggregate)
+
+
+def _evaluate_test_run_eval_style(
+    *,
+    model: VGGT,
+    data_dir: Path,
+    gt_ply_dir: Path,
+    out_dir: Path,
+    input_frame: int,
+    num_scenes: int,
+    depth_conf_thresh: float,
+    chamfer_max_dist: float,
+    eval_amp_dtype: torch.dtype,
+) -> Dict[str, float]:
+    scene_names = get_all_scenes(data_dir, num_scenes) if num_scenes > 0 else [
+        line.strip()
+        for line in (Path(__file__).resolve().parents[1] / "eval" / "scannet_50.yaml").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    all_scenes_metrics: Dict[str, Dict[str, float]] = {}
+    was_training = bool(model.training)
+    model.eval()
+    try:
+        for scene in scene_names:
+            scene_dir = data_dir / f"{scene}"
+            images_dir = scene_dir / "color"
+            pose_path = scene_dir / "pose"
+            image_paths = get_sorted_image_paths(images_dir)
+            poses_gt, first_gt_pose, available_pose_frame_ids = load_poses(pose_path)
+            selected_frame_ids, selected_image_paths, selected_pose_indices = build_frame_selection(
+                image_paths,
+                available_pose_frame_ids,
+                input_frame,
+            )
+            c2ws = poses_gt[selected_pose_indices]
+            if len(selected_image_paths) == 0:
+                continue
+            images = load_images_rgb(selected_image_paths)
+            if not images or len(images) < 3:
+                continue
+            images_array = np.stack(images)
+            vgg_input, patch_width, patch_height = get_vgg_input_imgs(images_array)
+            if hasattr(model, "update_patch_dimensions"):
+                model.update_patch_dimensions(patch_width, patch_height)
+            # Reuse run_eval/eval_scannet.py reconstruction path.
+            _, _, all_world_points, _, all_cam_to_world_mat, inference_time_ms = infer_vggt_and_reconstruct(
+                model,
+                vgg_input,
+                eval_amp_dtype,
+                depth_conf_thresh,
+                selected_image_paths,
+            )
+            with tempfile.TemporaryDirectory(prefix="lora_eval_scannet_") as tmpd:
+                metrics = evaluate_scene_and_save(
+                    scene,
+                    c2ws,
+                    first_gt_pose,
+                    selected_frame_ids,
+                    all_cam_to_world_mat,
+                    all_world_points,
+                    Path(tmpd),
+                    gt_ply_dir,
+                    chamfer_max_dist,
+                    inference_time_ms,
+                    False,
+                )
+            if metrics is not None:
+                all_scenes_metrics[scene] = {
+                    key: float(value)
+                    for key, value in metrics.items()
+                    if key in ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "inference_time_ms")
+                }
+    finally:
+        if was_training:
+            model.train()
+    if not all_scenes_metrics:
+        raise RuntimeError("No test evaluation rows produced.")
+    keys = sorted({k for row in all_scenes_metrics.values() for k in row.keys()})
+    avg: Dict[str, float] = {}
+    for k in keys:
+        vals = [float(row[k]) for row in all_scenes_metrics.values() if k in row]
+        if vals:
+            avg[k] = float(sum(vals) / len(vals))
+    return avg
+
+
+def _run_stage1_upper_sanity_check(
+    *,
+    dev_upper_metrics: Dict[str, float],
+    cache_dir: Path,
+    rtol: float,
+    atol: float,
+) -> None:
+    path = cache_dir / "eval_scannet.json"
+    if not path.exists():
+        raise SystemExit(f"Stage1 sanity check failed: missing {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    ref = _float_metrics_from_aggregate(payload.get("aggregate", {}))
+    keys = ("ate", "are", "rpe_rot", "rpe_trans", "chamfer_distance", "depth_abs_rel", "depth_delta1")
+    missing = [k for k in keys if k not in dev_upper_metrics or k not in ref]
+    if missing:
+        raise SystemExit(f"Stage1 sanity check failed: missing metrics {missing}")
+    mismatch: List[str] = []
+    for k in keys:
+        a = float(dev_upper_metrics[k])
+        b = float(ref[k])
+        if not math.isclose(a, b, rel_tol=rtol, abs_tol=atol):
+            mismatch.append(f"{k}: upper={a:.8f} stage1={b:.8f}")
+    if mismatch:
+        msg = "\n".join(mismatch)
+        raise SystemExit(f"Stage1 sanity check failed (upper(dev) != stage1 eval):\n{msg}")
+
+
+def _run_test_upper_sanity_check(
+    *,
+    test_upper_metrics: Dict[str, float],
+    ref_average_metrics_path: Path,
+    rtol: float,
+    atol: float,
+) -> None:
+    if not ref_average_metrics_path.exists():
+        raise SystemExit(f"Test sanity check failed: missing {ref_average_metrics_path}")
+    ref_payload = json.loads(ref_average_metrics_path.read_text(encoding="utf-8"))
+    ref = _float_metrics_from_aggregate(ref_payload)
+    # Keep sanity focused on quality metrics; inference latency is environment-sensitive.
+    keys = ("ate", "are", "rpe_rot", "rpe_trans", "chamfer_distance")
+    missing = [k for k in keys if k not in test_upper_metrics or k not in ref]
+    if missing:
+        raise SystemExit(f"Test sanity check failed: missing metrics {missing}")
+    mismatch: List[str] = []
+    for k in keys:
+        a = float(test_upper_metrics[k])
+        b = float(ref[k])
+        if not math.isclose(a, b, rel_tol=rtol, abs_tol=atol):
+            mismatch.append(f"{k}: upper={a:.8f} run_eval={b:.8f}")
+    if mismatch:
+        msg = "\n".join(mismatch)
+        raise SystemExit(f"Test sanity check failed (upper(test) != run_eval average):\n{msg}")
+
+
+def _append_eval_history(
+    history_rows: List[Dict[str, Any]],
+    *,
+    epoch: int,
+    split: str,
+    tag: str,
+    metrics: Dict[str, float],
+) -> None:
+    for k, v in metrics.items():
+        history_rows.append({"epoch": int(epoch), "split": str(split), "tag": str(tag), "metric": str(k), "value": float(v)})
+
+
+def _write_eval_artifacts(out_dir: Path, bounds: Dict[str, Dict[str, float]], history_rows: List[Dict[str, Any]]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "eval_bounds.json").write_text(json.dumps(bounds, indent=2), encoding="utf-8")
+    with (out_dir / "eval_metrics_history.csv").open("w", encoding="utf-8", newline="") as f:
+        fields = ["epoch", "split", "tag", "metric", "value"]
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in history_rows:
+            w.writerow(r)
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+
+        metrics = sorted({str(r["metric"]) for r in history_rows if str(r.get("tag", "")) == "train"})
+        for split in ("dev", "test"):
+            split_rows = [r for r in history_rows if str(r.get("split", "")) == split and str(r.get("tag", "")) == "train"]
+            for metric in metrics:
+                rows_m = [r for r in split_rows if str(r.get("metric", "")) == metric]
+                if not rows_m:
+                    continue
+                xs = [int(r["epoch"]) for r in rows_m]
+                ys = [float(r["value"]) for r in rows_m]
+                plt.figure(figsize=(9, 5))
+                plt.plot(xs, ys, marker="o", label=f"{split}_{metric}")
+                ub = bounds.get(split, {}).get("upper", {}).get(metric)
+                lb = bounds.get(split, {}).get("lower", {}).get(metric)
+                if ub is not None:
+                    plt.axhline(float(ub), linestyle="--", label="upper")
+                if lb is not None:
+                    plt.axhline(float(lb), linestyle="--", label="lower")
+                plt.xlabel("epoch")
+                plt.ylabel(metric)
+                plt.title(f"{split} {metric}")
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(out_dir / f"eval_plot_{split}_{metric}.png", dpi=150)
+                plt.close()
+    except Exception:
+        pass
+
+
+def _fmt_metric_brief(metrics: Dict[str, float], keys: Sequence[str]) -> str:
+    parts: List[str] = []
+    for k in keys:
+        if k in metrics:
+            parts.append(f"{k}={metrics[k]:.6f}")
+    return " ".join(parts)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser("Train cache-first multi-interval skip+LoRA baseline.")
+    p.add_argument("--cache-dir", type=Path, required=True)
+    p.add_argument("--hf-model", type=str, default="facebook/VGGT-1B")
+    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--interval-config-file", type=Path, required=True, help="JSON file path for interval rules.")
+    p.add_argument(
+        "--variant",
+        type=str,
+        default="multi_interval_config",
+        choices=("multi_interval_config",),
+    )
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--dtype", type=str, default="float32", choices=("float32", "bfloat16", "float16"))
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--max-scenes", type=int, default=0, help="0 means all scenes.")
+    p.add_argument("--max-steps", type=int, default=0, help="0 means no early stop.")
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--save-every-epoch", type=int, default=10)
+    p.add_argument("--resume-from", type=Path, default=None, help="Path to checkpoint to resume from.")
+    p.add_argument(
+        "--bounds-cache-file",
+        type=Path,
+        default=None,
+        help="Shared upper/lower summary cache JSON path; when exists, skip pre-train bound eval.",
+    )
+    p.add_argument("--eval-epoch", type=int, default=0, help="Run dev/test eval every N epochs. 0 disables periodic eval.")
+    p.add_argument("--dev-data-root", type=Path, default=Path("data/scans_dev50"))
+    p.add_argument("--test-data-dir", type=Path, default=Path("data/scans_test50"))
+    p.add_argument("--test-gt-ply-dir", type=Path, default=Path("data/scans_test50"))
+    p.add_argument(
+        "--test-sanity-average-metrics-file",
+        type=Path,
+        default=None,
+        help="Path to run_eval ScanNet baseline average_metrics.json used for upper(test) sanity check.",
+    )
+    p.add_argument("--eval-max-scenes", type=int, default=0, help="0 means full split.")
+    p.add_argument("--eval-input-frame", type=int, default=30)
+    p.add_argument("--stage1-sanity-atol", type=float, default=1e-6)
+    p.add_argument("--stage1-sanity-rtol", type=float, default=1e-6)
+    p.add_argument(
+        "--test-sanity-atol",
+        type=float,
+        default=5e-3,
+        help="Absolute tolerance for upper(test) vs run_eval average sanity check.",
+    )
+    p.add_argument(
+        "--test-sanity-rtol",
+        type=float,
+        default=1e-2,
+        help="Relative tolerance for upper(test) vs run_eval average sanity check.",
+    )
+    p.add_argument("--lora-rank", type=int, default=8)
+    p.add_argument("--lora-alpha", type=float, default=16.0)
+    p.add_argument("--lora-dropout", type=float, default=0.0)
+    p.add_argument("--w-align", type=float, default=1.0)
+    p.add_argument("--w-align-mse", type=float, default=1.0)
+    p.add_argument("--w-align-cos", type=float, default=1.0)
+    p.add_argument("--w-pred", type=float, default=1.0)
+    p.add_argument("--w-camera", type=float, default=1.0)
+    p.add_argument("--w-depth", type=float, default=1.0)
+    p.add_argument("--w-point", type=float, default=1.0)
+    p.add_argument("--w-depth-grad", type=float, default=1.0)
+    p.add_argument("--w-point-grad", type=float, default=1.0)
+    p.add_argument("--w-reg", type=float, default=0.0)
+    p.add_argument(
+        "--use-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable activation checkpointing for replayed frame/global blocks.",
+    )
+    p.add_argument(
+        "--print-step-timing",
+        action="store_true",
+        help="Print per-step timing breakdown to help identify bottlenecks.",
+    )
+    return p
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
+    torch.manual_seed(int(args.seed))
+    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    amp_dtype = dtype_map[str(args.dtype)]
+    use_amp = device.type == "cuda" and str(args.dtype) in ("float16", "bfloat16")
+    test_sanity_avg_path = (
+        Path(args.test_sanity_average_metrics_file)
+        if args.test_sanity_average_metrics_file is not None
+        else Path("analysis_outputs/evaluation/scannet/baseline") / f"input_frame_{int(args.eval_input_frame)}" / "average_metrics.json"
+    )
+
+    rules = _load_interval_rules(args.interval_config_file)
+    intervals = _intervals_from_rules(rules)
+    global_skip_intervals = _global_skip_intervals_from_rules(rules)
+    frame_skip_intervals = _frame_skip_intervals_from_rules(rules)
+    prev_layers = [int(x.prev_layer) for x in rules]
+    if any(p < 0 for p in prev_layers):
+        raise SystemExit(f"Interval starts must be >0: {intervals}")
+
+    scenes = _load_manifest(args.cache_dir)
+    if int(args.max_scenes) > 0:
+        scenes = scenes[: int(args.max_scenes)]
+    if not scenes:
+        raise SystemExit("No scenes selected from cache.")
+
+    num_layers = _infer_num_layers(args.cache_dir, scenes)
+    if any(r >= num_layers for (_l, r) in intervals):
+        raise SystemExit(f"Interval out of range for num_layers={num_layers}: {intervals}")
+
+    out_dir: Path = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    (out_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "cache_dir": str(args.cache_dir),
+                "hf_model": args.hf_model,
+                "intervals": intervals,
+                "interval_rules": [vars(x) for x in rules],
+                "variant": args.variant,
+                "epochs": int(args.epochs),
+                "max_scenes": int(args.max_scenes),
+                "max_steps": int(args.max_steps),
+                "save_every_epoch": int(args.save_every_epoch),
+                "eval_epoch": int(args.eval_epoch),
+                "eval_max_scenes": int(args.eval_max_scenes),
+                "eval_input_frame": int(args.eval_input_frame),
+                "dev_data_root": str(args.dev_data_root),
+                "test_data_dir": str(args.test_data_dir),
+                "test_gt_ply_dir": str(args.test_gt_ply_dir),
+                "bounds_cache_file": str(args.bounds_cache_file) if args.bounds_cache_file else None,
+                "test_sanity_average_metrics_file": (
+                    str(args.test_sanity_average_metrics_file) if args.test_sanity_average_metrics_file else None
+                ),
+                "test_sanity_atol": float(args.test_sanity_atol),
+                "test_sanity_rtol": float(args.test_sanity_rtol),
+                "resume_from": str(args.resume_from) if args.resume_from else None,
+                "interval_config_file": str(args.interval_config_file),
+                "device": str(device),
+                "dtype": str(args.dtype),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    log_file = (out_dir / "train.log").open("a", encoding="utf-8")
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
+        log_file.write(msg + "\n")
+        log_file.flush()
+
+    skipped_global_idxs = _build_skipped_layer_indices(global_skip_intervals)
+    skipped_frame_idxs = _build_skipped_layer_indices(frame_skip_intervals)
+    skipped_idxs = sorted(set(skipped_global_idxs).union(skipped_frame_idxs))
+    eval_dir = out_dir
+    bounds_path = Path(args.bounds_cache_file) if args.bounds_cache_file is not None else (out_dir / "bounds_summary.json")
+    eval_history_rows: List[Dict[str, Any]] = []
+    bounds: Dict[str, Dict[str, Dict[str, float]]] = {"dev": {"upper": {}, "lower": {}}, "test": {"upper": {}, "lower": {}}}
+
+    def _build_model_variant(*, prune: bool, inject_lora: bool) -> Tuple[VGGT, List[nn.Parameter], int, int]:
+        m = VGGT.from_pretrained(args.hf_model).to(device).train()
+        for pp in m.parameters():
+            pp.requires_grad_(False)
+        skipped_modules_before: List[nn.Module] = []
+        for idx in skipped_frame_idxs:
+            if idx < 0 or idx >= len(m.aggregator.frame_blocks):
+                raise SystemExit(f"Invalid skipped frame index {idx} for model depth {len(m.aggregator.frame_blocks)}")
+            skipped_modules_before.append(m.aggregator.frame_blocks[idx])
+        for idx in skipped_global_idxs:
+            if idx < 0 or idx >= len(m.aggregator.global_blocks):
+                raise SystemExit(f"Invalid skipped global index {idx} for model depth {len(m.aggregator.global_blocks)}")
+            skipped_modules_before.append(m.aggregator.global_blocks[idx])
+        pre_total = sum(p.numel() for p in m.parameters())
+        removed = _count_unique_params(skipped_modules_before) if prune else 0
+        if prune:
+            _replace_skipped_layers_with_identity(
+                m,
+                frame_intervals=frame_skip_intervals,
+                global_intervals=global_skip_intervals,
+            )
+        trainable_local: List[nn.Parameter] = []
+        if inject_lora:
+            frame_lora_idxs, global_lora_idxs = _lora_injection_plan_from_rules(rules)
+            for pidx in frame_lora_idxs:
+                trainable_local.extend(
+                    _inject_lora_attn(
+                        m.aggregator.frame_blocks[pidx],
+                        rank=int(args.lora_rank),
+                        alpha=float(args.lora_alpha),
+                        dropout=float(args.lora_dropout),
+                    )
+                )
+            for pidx in global_lora_idxs:
+                trainable_local.extend(
+                    _inject_lora_attn(
+                        m.aggregator.global_blocks[pidx],
+                        rank=int(args.lora_rank),
+                        alpha=float(args.lora_alpha),
+                        dropout=float(args.lora_dropout),
+                    )
+                )
+        return m, trainable_local, pre_total, removed
+
+    # Baseline bounds: upper=original model, lower=pruned model without LoRA.
+    if bounds_path.exists():
+        bounds = json.loads(bounds_path.read_text(encoding="utf-8"))
+        _log(f"[eval] reuse existing bounds from {bounds_path}")
+    else:
+        _log("[eval] computing upper/lower bounds on dev/test")
+        upper_model, _, _, _ = _build_model_variant(prune=False, inject_lora=False)
+        try:
+            t_upper_dev0 = time.perf_counter()
+            upper_dev = _evaluate_dev_stage1_style(
+                model=upper_model,
+                data_root=args.dev_data_root,
+                out_dir=eval_dir / "eval_upper_bound_dev",
+                max_scenes=int(args.eval_max_scenes),
+                max_frames=int(args.eval_input_frame),
+                depth_conf_thresh=1.0,
+                chamfer_max_dist=0.5,
+                eval_amp_dtype=amp_dtype,
+                write_json=False,
+            )
+            _log(f"[eval][upper][scans_dev50] elapsed={time.perf_counter() - t_upper_dev0:.2f}s")
+            _log(
+                "[eval][upper][scans_dev50] "
+                + _fmt_metric_brief(
+                    upper_dev,
+                    ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "depth_abs_rel", "depth_delta1"),
+                )
+            )
+            _run_stage1_upper_sanity_check(
+                dev_upper_metrics=upper_dev,
+                cache_dir=args.cache_dir,
+                rtol=float(args.stage1_sanity_rtol),
+                atol=float(args.stage1_sanity_atol),
+            )
+            _log("[eval][upper][scans_dev50] stage1 sanity check: PASSED")
+            t_upper_test0 = time.perf_counter()
+            upper_test = _evaluate_test_run_eval_style(
+                model=upper_model,
+                data_dir=args.test_data_dir,
+                gt_ply_dir=args.test_gt_ply_dir,
+                out_dir=eval_dir / "eval_upper_bound_test",
+                input_frame=int(args.eval_input_frame),
+                num_scenes=int(args.eval_max_scenes),
+                depth_conf_thresh=1.0,
+                chamfer_max_dist=0.5,
+                eval_amp_dtype=amp_dtype,
+            )
+            _log(f"[eval][upper][scans_test50] elapsed={time.perf_counter() - t_upper_test0:.2f}s")
+            _run_test_upper_sanity_check(
+                test_upper_metrics=upper_test,
+                ref_average_metrics_path=test_sanity_avg_path,
+                rtol=float(args.test_sanity_rtol),
+                atol=float(args.test_sanity_atol),
+            )
+            _log(
+                f"[eval][upper][scans_test50] run_eval sanity check: PASSED "
+                f"(ref={test_sanity_avg_path})"
+            )
+            _log(
+                "[eval][upper][scans_test50] "
+                + _fmt_metric_brief(upper_test, ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "inference_time_ms"))
+            )
+        finally:
+            del upper_model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        lower_model, _, _, _ = _build_model_variant(prune=True, inject_lora=False)
+        try:
+            t_lower_dev0 = time.perf_counter()
+            lower_dev = _evaluate_dev_stage1_style(
+                model=lower_model,
+                data_root=args.dev_data_root,
+                out_dir=eval_dir / "eval_lower_bound_dev",
+                max_scenes=int(args.eval_max_scenes),
+                max_frames=int(args.eval_input_frame),
+                depth_conf_thresh=1.0,
+                chamfer_max_dist=0.5,
+                eval_amp_dtype=amp_dtype,
+                write_json=False,
+            )
+            _log(f"[eval][lower][scans_dev50] elapsed={time.perf_counter() - t_lower_dev0:.2f}s")
+            _log(
+                "[eval][lower][scans_dev50] "
+                + _fmt_metric_brief(
+                    lower_dev,
+                    ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "depth_abs_rel", "depth_delta1"),
+                )
+            )
+            t_lower_test0 = time.perf_counter()
+            lower_test = _evaluate_test_run_eval_style(
+                model=lower_model,
+                data_dir=args.test_data_dir,
+                gt_ply_dir=args.test_gt_ply_dir,
+                out_dir=eval_dir / "eval_lower_bound_test",
+                input_frame=int(args.eval_input_frame),
+                num_scenes=int(args.eval_max_scenes),
+                depth_conf_thresh=1.0,
+                chamfer_max_dist=0.5,
+                eval_amp_dtype=amp_dtype,
+            )
+            _log(f"[eval][lower][scans_test50] elapsed={time.perf_counter() - t_lower_test0:.2f}s")
+            _log(
+                "[eval][lower][scans_test50] "
+                + _fmt_metric_brief(lower_test, ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "inference_time_ms"))
+            )
+        finally:
+            del lower_model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        bounds = {"dev": {"upper": upper_dev, "lower": lower_dev}, "test": {"upper": upper_test, "lower": lower_test}}
+        bounds_path.parent.mkdir(parents=True, exist_ok=True)
+        bounds_path.write_text(json.dumps(bounds, indent=2), encoding="utf-8")
+        _write_eval_artifacts(out_dir, bounds, eval_history_rows)
+
+    model, trainable, pre_prune_total_params, removed_params = _build_model_variant(prune=True, inject_lora=True)
+    if not trainable:
+        raise SystemExit("No LoRA parameters were injected; nothing to train.")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    post_vs_pre_ratio = (100.0 * total_params / pre_prune_total_params) if pre_prune_total_params > 0 else 0.0
+    frozen_ratio = (100.0 * frozen_params / total_params) if total_params > 0 else 0.0
+    train_ratio = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
+    _log(
+        f"[params] pre_prune={_format_param_count(pre_prune_total_params)} "
+        f"post_prune={_format_param_count(total_params)} ({post_vs_pre_ratio:.2f}% of pre-prune) "
+        f"frozen={_format_param_count(frozen_params)} ({frozen_ratio:.2f}% of post-prune) "
+        f"trainable={_format_param_count(trainable_params)} ({train_ratio:.2f}% of post-prune) "
+        f"skipped {len(skipped_idxs)} layers"
+    )
+
+    optim = torch.optim.AdamW(trainable, lr=float(args.lr), weight_decay=float(args.weight_decay))
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    rows: List[Dict[str, Any]] = []
+    global_step = 0
+    start_epoch = 0
+
+    if args.resume_from is not None:
+        ckpt_path = Path(args.resume_from)
+        if not ckpt_path.exists():
+            raise SystemExit(f"--resume-from not found: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        optim.load_state_dict(ckpt["optimizer_state_dict"])
+        scaler_state = ckpt.get("scaler_state_dict")
+        if scaler_state is not None:
+            scaler.load_state_dict(scaler_state)
+        global_step = int(ckpt.get("global_step", 0))
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        _log(f"[resume] from={ckpt_path} start_epoch={start_epoch} global_step={global_step}")
+    t0_train = time.perf_counter()
+    remaining_epochs = max(0, int(args.epochs) - int(start_epoch))
+    total_steps = _compute_total_steps(len(scenes), remaining_epochs, int(args.max_steps))
+    pbar = tqdm(total=total_steps if total_steps > 0 else None, desc="train", dynamic_ncols=True)
+    def _save_checkpoint(ckpt_path: Path, epoch_idx: int) -> None:
+        torch.save(
+            {
+                "global_step": global_step,
+                "epoch": int(epoch_idx),
+                "epochs": int(args.epochs),
+                "intervals": intervals,
+                "interval_rules": [vars(x) for x in rules],
+                "variant": args.variant,
+                "save_every_epoch": int(args.save_every_epoch),
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optim.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "args": vars(args),
+            },
+            ckpt_path,
+        )
+
+    for epoch in range(start_epoch, int(args.epochs)):
+        epoch_scenes = list(scenes)
+        random.Random(int(args.seed) + epoch).shuffle(epoch_scenes)
+        for si, item in enumerate(epoch_scenes):
+            t_step0 = time.perf_counter()
+            sid = str(item.get("scene_id", ""))
+            t_load0 = time.perf_counter()
+            row = _load_scene_cache_row(args.cache_dir, item)
+            _validate_schema(row, num_layers=num_layers)
+            teacher_pred = _teacher_pred_to_map(row["pred"])
+            layer_cpu_cache: Dict[int, torch.Tensor] = {}
+
+            def _get_layer_cpu(idx: int) -> torch.Tensor:
+                cached = layer_cpu_cache.get(idx)
+                if cached is not None:
+                    return cached
+                t = load_scene_replay_layer(
+                    args.cache_dir,
+                    item,
+                    int(idx),
+                    expected_num_layers=num_layers,
+                )
+                layer_cpu_cache[idx] = t
+                return t
+
+            hw = row.get("image_hw", [518, 518])
+            h = int(hw[0])
+            w = int(hw[1])
+            seq_len = int(row.get("num_frames", _get_layer_cpu(0).shape[1]))
+            dummy_images = torch.zeros((1, seq_len, 3, h, w), device=device, dtype=torch.float32)
+            t_load = time.perf_counter() - t_load0
+
+            t_replay = 0.0
+            t_align = 0.0
+            t_pred = 0.0
+            t_backward = 0.0
+            t_optim = 0.0
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                t_replay0 = time.perf_counter()
+                replay = _replay_student_cache_first(
+                    model,
+                    get_layer_cpu=_get_layer_cpu,
+                    num_layers=int(num_layers),
+                    frame_skip_intervals=frame_skip_intervals,
+                    global_skip_intervals=global_skip_intervals,
+                    lora_anchor_prev_layers=prev_layers,
+                    use_checkpoint=bool(args.use_checkpoint),
+                    device=device,
+                    dummy_images=dummy_images,
+                )
+                t_replay = time.perf_counter() - t_replay0
+
+                loss_align = torch.zeros((), device=device)
+                align_mse = torch.zeros((), device=device)
+                align_cos = torch.zeros((), device=device)
+                n_terms = 0
+                t_align0 = time.perf_counter()
+                for rule in rules:
+                    pidx = int(rule.prev_layer)
+                    s_concat = replay.concat_by_layer[pidx]
+                    t_concat = _get_layer_cpu(int(rule.r)).to(device=device, non_blocking=(device.type == "cuda"))
+                    sf, sg = _split_concat(s_concat)
+                    tf, tg = _split_concat(t_concat)
+                    mg, cg = _loss_mse_cos(sg, tg)
+                    mse_i = mg
+                    cos_i = cg
+                    if bool(rule.has_frame_lora):
+                        mf, cf = _loss_mse_cos(sf, tf)
+                        mse_i = mse_i + mf
+                        cos_i = cos_i + cf
+                    loss_align = loss_align + float(args.w_align_mse) * mse_i + float(args.w_align_cos) * cos_i
+                    align_mse = align_mse + mse_i
+                    align_cos = align_cos + cos_i
+                    n_terms += 1
+                if n_terms > 0:
+                    loss_align = loss_align / n_terms
+                    align_mse = align_mse / n_terms
+                    align_cos = align_cos / n_terms
+                t_align = time.perf_counter() - t_align0
+                loss_align_mse_term = float(args.w_align) * float(args.w_align_mse) * align_mse
+                loss_align_cos_term = float(args.w_align) * float(args.w_align_cos) * align_cos
+
+                t_pred0 = time.perf_counter()
+                loss_pred, pred_logs = _prediction_distill(
+                    replay.pred,
+                    teacher_pred,
+                    w_camera=float(args.w_camera),
+                    w_depth=float(args.w_depth),
+                    w_point=float(args.w_point),
+                    w_depth_grad=float(args.w_depth_grad),
+                    w_point_grad=float(args.w_point_grad),
+                )
+                t_pred = time.perf_counter() - t_pred0
+
+                loss_reg = torch.zeros((), device=device)
+                if float(args.w_reg) > 0:
+                    for p in trainable:
+                        loss_reg = loss_reg + p.float().pow(2).mean()
+
+                loss_total = (
+                    float(args.w_align) * loss_align
+                    + float(args.w_pred) * loss_pred
+                    + float(args.w_reg) * loss_reg
+                )
+
+            optim.zero_grad(set_to_none=True)
+            t_bw0 = time.perf_counter()
+            scaler.scale(loss_total).backward()
+            t_backward = time.perf_counter() - t_bw0
+            t_opt0 = time.perf_counter()
+            scaler.step(optim)
+            scaler.update()
+            t_optim = time.perf_counter() - t_opt0
+
+            global_step += 1
+            step_s = time.perf_counter() - t_step0
+            log_row: Dict[str, Any] = {
+                "epoch": epoch,
+                "scene_idx": si,
+                "scene_id": sid,
+                "global_step": global_step,
+                "loss_total": float(loss_total.detach().item()),
+                "loss_align": float(loss_align.detach().item()),
+                "loss_align_mse": float(align_mse.detach().item()),
+                "loss_align_cos": float(align_cos.detach().item()),
+                "loss_align_mse_term": float(loss_align_mse_term.detach().item()),
+                "loss_align_cos_term": float(loss_align_cos_term.detach().item()),
+                "loss_pred": float(loss_pred.detach().item()),
+                "loss_pred_term": float((float(args.w_pred) * loss_pred).detach().item()),
+                "loss_reg": float(loss_reg.detach().item()),
+                "loss_reg_term": float((float(args.w_reg) * loss_reg).detach().item()),
+                "step_seconds": step_s,
+                "time_load_s": t_load,
+                "time_replay_s": t_replay,
+                "time_align_s": t_align,
+                "time_pred_s": t_pred,
+                "time_backward_s": t_backward,
+                "time_optim_s": t_optim,
+            }
+            log_row.update(pred_logs)
+            for k, v in pred_logs.items():
+                if k.endswith("_term"):
+                    log_row[f"{k}_contrib"] = float(args.w_pred) * float(v)
+            rows.append(log_row)
+            pbar.update(1)
+            pbar.set_postfix(
+                {
+                    "epoch": f"{epoch+1}/{int(args.epochs)}",
+                    "scene": sid,
+                    "loss": f"{log_row['loss_total']:.2f}",
+                    "align_loss": f"{log_row['loss_align']:.2f}",
+                    "prd_loss": f"{log_row['loss_pred']:.2f}",
+                    # "step_s": f"{step_s:.1f}",
+                    "rep": f"{t_replay:.1f}s",
+                    "align": f"{t_align:.1f}s",
+                    "prd": f"{t_pred:.1f}s",
+                    "bw": f"{t_backward:.1f}s",
+                    "opt": f"{t_optim:.1f}s",
+                },
+                refresh=False,
+            )
+            if bool(args.print_step_timing):
+                _log(
+                    f"[timing] step={global_step} load={t_load:.2f}s replay={t_replay:.2f}s "
+                    f"align={t_align:.2f}s pred={t_pred:.2f}s backward={t_backward:.2f}s "
+                    f"optim={t_optim:.2f}s total={step_s:.2f}s"
+                )
+
+            if int(args.max_steps) > 0 and global_step >= int(args.max_steps):
+                break
+        if int(args.save_every_epoch) > 0 and (((epoch + 1) % int(args.save_every_epoch)) == 0):
+            _save_checkpoint(out_dir / "checkpoints" / f"epoch_{epoch+1}.pt", epoch)
+        _save_checkpoint(out_dir / "checkpoints" / "latest.pt", epoch)
+        _write_curves(out_dir, rows)
+        if int(args.eval_epoch) > 0 and (((epoch + 1) % int(args.eval_epoch)) == 0):
+            _log(f"[eval] epoch={epoch+1}: evaluating current LoRA model on dev/test")
+            t_eval_dev0 = time.perf_counter()
+            dev_metrics = _evaluate_dev_stage1_style(
+                model=model,
+                data_root=args.dev_data_root,
+                out_dir=out_dir / f"eval_epoch_{epoch+1:04d}_dev",
+                max_scenes=int(args.eval_max_scenes),
+                max_frames=int(args.eval_input_frame),
+                depth_conf_thresh=1.0,
+                chamfer_max_dist=0.5,
+                eval_amp_dtype=amp_dtype,
+            )
+            _log(f"[eval][epoch={epoch+1}][scans_dev50] elapsed={time.perf_counter() - t_eval_dev0:.2f}s")
+            t_eval_test0 = time.perf_counter()
+            test_metrics = _evaluate_test_run_eval_style(
+                model=model,
+                data_dir=args.test_data_dir,
+                gt_ply_dir=args.test_gt_ply_dir,
+                out_dir=out_dir / f"eval_epoch_{epoch+1:04d}_test",
+                input_frame=int(args.eval_input_frame),
+                num_scenes=int(args.eval_max_scenes),
+                depth_conf_thresh=1.0,
+                chamfer_max_dist=0.5,
+                eval_amp_dtype=amp_dtype,
+            )
+            _log(f"[eval][epoch={epoch+1}][scans_test50] elapsed={time.perf_counter() - t_eval_test0:.2f}s")
+            _append_eval_history(eval_history_rows, epoch=epoch + 1, split="dev", tag="train", metrics=dev_metrics)
+            _append_eval_history(eval_history_rows, epoch=epoch + 1, split="test", tag="train", metrics=test_metrics)
+            _write_eval_artifacts(out_dir, bounds, eval_history_rows)
+        if int(args.max_steps) > 0 and global_step >= int(args.max_steps):
+            break
+    pbar.close()
+
+    if int(args.epochs) == 0 or start_epoch >= int(args.epochs):
+        _save_checkpoint(out_dir / "checkpoints" / "latest.pt", max(0, start_epoch - 1))
+    best = min(rows, key=lambda x: float(x.get("loss_total", float("inf")))) if rows else {}
+    summary = {
+        "global_steps": global_step,
+        "elapsed_seconds": time.perf_counter() - t0_train,
+        "best_train_loss_total": best.get("loss_total"),
+        "best_train_step": best.get("global_step"),
+        "num_scenes": len(scenes),
+        "intervals": intervals,
+        "interval_rules": [vars(x) for x in rules],
+        "variant": args.variant,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _write_curves(out_dir, rows)
+    _log(f"[done] out_dir={out_dir} steps={global_step}")
+    log_file.close()
+
+
+if __name__ == "__main__":
+    main()
+

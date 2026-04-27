@@ -253,8 +253,7 @@ def eval_trajectory(
 def load_poses(path: Path):
     pose_files = sorted(path.glob("*.txt"), key=lambda x: int(x.stem))
     if len(pose_files) == 0:
-        print(f"Warning: No pose files (.txt) found in directory {path}")
-        return None, None, None
+        raise FileNotFoundError(f"No pose files (.txt) found in directory {path}")
 
     c2ws = []
     available_frame_ids = []
@@ -270,7 +269,7 @@ def load_poses(path: Path):
             continue
 
     if len(c2ws) == 0:
-        return None, None, None
+        raise ValueError(f"No valid pose files found in directory {path}")
 
     c2ws = np.stack(c2ws)
     available_frame_ids = np.array(available_frame_ids)

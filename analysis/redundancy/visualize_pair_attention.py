@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 from vggt.models.vggt import VGGT
 
+from .cache_layout import build_scene_row_compat
 from .scannet_eval import SceneData, discover_scannet_scenes, load_scene_images
 
 
@@ -80,12 +81,8 @@ def _resolve_scene_from_manifest(data_root: Path, scene_id: str, frame_ids: List
     return SceneData(scene_id=scene.scene_id, scene_dir=scene.scene_dir, image_paths=selected_paths)
 
 
-def _load_cache_row(cache_dir: Path, cache_file: str) -> Dict[str, Any]:
-    path = cache_dir / cache_file
-    try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
+def _load_cache_row(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, Any]:
+    return build_scene_row_compat(cache_dir, item, include_pred=False)
 
 
 def _build_global_positions(model: VGGT, *, num_frames: int, image_hw: Tuple[int, int], device: torch.device) -> torch.Tensor | None:
@@ -264,7 +261,7 @@ def main() -> None:
             f"num_frames={len(frame_ids)}, got a={args.frame_a_index}, b={args.frame_b_index}"
         )
 
-    row = _load_cache_row(args.cache_dir, str(item["file"]))
+    row = _load_cache_row(args.cache_dir, item)
     replay_layers = row.get("aggregated_concat_per_layer")
     if not isinstance(replay_layers, list) or not replay_layers:
         raise SystemExit("Cache row lacks aggregated_concat_per_layer. Please rerun Stage1.")
