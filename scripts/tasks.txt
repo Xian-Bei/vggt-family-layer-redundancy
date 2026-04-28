@@ -1,0 +1,4 @@
+python scripts/run.py --n 80000 --dtype fp16 --sleep 0.5
+python scripts/run.py --n 80000 --dtype fp16 --sleep 0.5
+python scripts/run.py --n 80000 --dtype fp16 --sleep 0.5
+python scripts/run.py --n 80000 --dtype fp16 --sleep 0.5
