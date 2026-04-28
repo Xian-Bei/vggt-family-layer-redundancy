@@ -34,14 +34,25 @@ except ImportError as exc:  # pragma: no cover - import guard for optional demo 
 
 from vggt.models.vggt import VGGT
 
-from .metrics import upper_triangle_unpack_for_heatmap
-from .scannet_eval import SceneData, discover_scannet_scenes, load_scene_images
-from .visualize_pair_attention import _build_global_positions, _load_cache_row, _overlay_patch_map, _reconstruct_qk
+from .redundancy.metrics import upper_triangle_unpack_for_heatmap
+from .redundancy.scannet_eval import SceneData, discover_scannet_scenes, load_scene_images
+from .redundancy.visualize_pair_attention import (
+    _build_global_positions,
+    _load_cache_row,
+    _overlay_patch_map,
+    _reconstruct_qk,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Interactive browser panel for pair attention.")
     p.add_argument("--cache-dir", type=Path, default=Path("analysis_outputs/scannet_cache"))
+    p.add_argument(
+        "--lora-dir",
+        type=Path,
+        default=Path("analysis_outputs/lora_skip_baseline"),
+        help="Directory containing LoRA experiment subfolders (each subfolder is one run).",
+    )
     p.add_argument(
         "--analysis-dir",
         type=Path,
@@ -393,6 +404,61 @@ STAGE2_TOKEN_ROW_SPECIAL = "special"
 STAGE2_TOKEN_ROW_PATCH = "patch"
 
 
+def _discover_lora_experiments(root: Path) -> List[str]:
+    if not root.exists():
+        return []
+    exps: List[str] = []
+    for entry in sorted(root.iterdir(), key=lambda p: p.name):
+        if entry.is_dir():
+            exps.append(entry.name)
+    return exps
+
+
+def _load_image_if_exists(path: Path) -> Optional[np.ndarray]:
+    if not path.exists():
+        return None
+    try:
+        arr = plt.imread(path)
+    except Exception:
+        return None
+    if isinstance(arr, np.ndarray) and arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    if isinstance(arr, np.ndarray) and arr.ndim == 3 and arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    if isinstance(arr, np.ndarray) and arr.dtype != np.uint8:
+        arr = (np.asarray(arr, dtype=np.float32) * 255.0).clip(0, 255).round().astype(np.uint8)
+    return np.asarray(arr, dtype=np.uint8)
+
+
+def _first_existing(paths: Sequence[Path]) -> Path:
+    for p in paths:
+        if p.exists():
+            return p
+    return paths[0]
+
+
+def _lora_expected_plot_paths(exp_dir: Path) -> Dict[str, Path]:
+    return {
+        # Row 1
+        "eval_plot_are": exp_dir / "eval_plot_are.png",
+        "eval_plot_ate": exp_dir / "eval_plot_ate.png",
+        "eval_plot_rpe_rot": exp_dir / "eval_plot_rpe_rot.png",
+        "eval_plot_rpe_trans": exp_dir / "eval_plot_rpe_trans.png",
+        # Row 2
+        # Accept both legacy and current filenames.
+        "eval_plot_depth_abs_abs_rel": _first_existing(
+            [exp_dir / "eval_plot_depth_abs_abs_rel.png", exp_dir / "eval_plot_depth_abs_rel.png"]
+        ),
+        "eval_plot_depth_abs_delta1": _first_existing(
+            [exp_dir / "eval_plot_depth_abs_delta1.png", exp_dir / "eval_plot_depth_delta1.png"]
+        ),
+        "eval_plot_chamfer_distance": exp_dir / "eval_plot_chamfer_distance.png",
+        # Row 3
+        "train_curves": exp_dir / "train_curves.png",
+        "train_loss_weighted_components": exp_dir / "train_loss_weighted_components.png",
+    }
+
+
 def _stage2_row_visibility_flags(
     mode_order: List[str],
     selected_modes: List[str],
@@ -442,7 +508,11 @@ def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[
             metric_map = mode_payload.get("gt_delta_upper_by_metric")
             if not isinstance(metric_map, dict):
                 continue
-            clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items()) if packed is not None}
+            clean = {
+                str(k): packed
+                for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items())
+                if packed is not None
+            }
             if clean:
                 out[_canonical_skip_mode(str(mode))] = clean
 
@@ -457,7 +527,11 @@ def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[
                 metric_map = payload.get("global_skip_range_loss_upper_by_metric")
             if not isinstance(metric_map, dict):
                 continue
-            clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items()) if packed is not None}
+            clean = {
+                str(k): packed
+                for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items())
+                if packed is not None
+            }
             if clean:
                 out[_canonical_skip_mode(str(mode))] = clean
 
@@ -466,7 +540,11 @@ def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[
         for mode, metric_map in by_mode.items():
             if not isinstance(metric_map, dict):
                 continue
-            clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items()) if packed is not None}
+            clean = {
+                str(k): packed
+                for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items())
+                if packed is not None
+            }
             if clean:
                 out[_canonical_skip_mode(str(mode))] = clean
 
@@ -477,14 +555,22 @@ def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[
         if not isinstance(metric_map, dict):
             metric_map = single.get("global_skip_range_loss_upper_by_metric")
         if mode and isinstance(metric_map, dict):
-            clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items()) if packed is not None}
+            clean = {
+                str(k): packed
+                for k, packed in ((k, _coerce_packed(v)) for k, v in metric_map.items())
+                if packed is not None
+            }
             if clean:
                 out[mode] = clean
 
     single_mode = _canonical_skip_mode(str(report.get("skipped_global_mode", "")).strip())
     single_metric_map = report.get("global_skip_range_loss_upper_by_metric")
     if single_mode and isinstance(single_metric_map, dict):
-        clean = {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in single_metric_map.items()) if packed is not None}
+        clean = {
+            str(k): packed
+            for k, packed in ((k, _coerce_packed(v)) for k, v in single_metric_map.items())
+            if packed is not None
+        }
         if clean:
             out[single_mode] = clean
 
@@ -502,7 +588,11 @@ def _extract_similarity_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str,
             patch_map = mode_payload.get("global_patch_similarity_upper_by_metric")
             special_map = mode_payload.get("global_special_similarity_upper_by_metric")
             patch_clean = (
-                {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in patch_map.items()) if packed is not None}
+                {
+                    str(k): packed
+                    for k, packed in ((k, _coerce_packed(v)) for k, v in patch_map.items())
+                    if packed is not None
+                }
                 if isinstance(patch_map, dict)
                 else {}
             )
@@ -523,7 +613,11 @@ def _extract_similarity_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str,
     legacy_special = report.get("global_special_similarity_upper")
     if isinstance(legacy_patch, dict) or isinstance(legacy_special, dict):
         patch_clean = (
-            {str(k): packed for k, packed in ((k, _coerce_packed(v)) for k, v in legacy_patch.items()) if packed is not None}
+            {
+                str(k): packed
+                for k, packed in ((k, _coerce_packed(v)) for k, v in legacy_patch.items())
+                if packed is not None
+            }
             if isinstance(legacy_patch, dict)
             else {}
         )
@@ -986,9 +1080,7 @@ def _prepare_stage2_render(
         f"sim {len(galleries[f'sim_{mode}_special'])+len(galleries[f'sim_{mode}_patch'])}"
         for mode in mode_order
     )
-    info = (
-        f"scene={scene_id} | view={value_mode} | {mode_summaries} | {skip_source} | pct_clip={clip_key}%"
-    )
+    info = f"scene={scene_id} | view={value_mode} | {mode_summaries} | {skip_source} | pct_clip={clip_key}%"
     controller.stage2_render_cache[cache_key] = (galleries, info)
     return galleries, info
 
@@ -1001,6 +1093,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     initial_frame_b = min(1, len(frame_labels) - 1) if frame_labels else 0
     num_heads = controller.num_heads()
     stage2_skip_modes = _discover_skip_modes(controller.skip_reports)
+    lora_root = getattr(controller, "lora_root", Path("analysis_outputs/lora_skip_baseline"))
+    lora_exps = _discover_lora_experiments(Path(lora_root))
+    initial_lora_exp = lora_exps[0] if lora_exps else None
 
     def _refresh_outputs(
         scene_id: str,
@@ -1102,9 +1197,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         filter_metric_rows: List[str] | None,
         filter_token_rows: List[str] | None,
     ):
-        galleries, details = _prepare_stage2_render(
-            controller, scene_id, value_mode, pct_clip_percent, stage2_skip_modes
-        )
+        galleries, details = _prepare_stage2_render(controller, scene_id, value_mode, pct_clip_percent, stage2_skip_modes)
         block_updates: List[Any] = []
         for mode in stage2_skip_modes:
             block_updates.append(_gallery_update(galleries[f"skip_{mode}_main"]))
@@ -1222,6 +1315,78 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         }
         """,
     ) as demo:
+        with gr.Tab("LoRA results"):
+            gr.Markdown("## LoRA results")
+            gr.Markdown(
+                "Each subfolder under `--lora-dir` is treated as one experiment run. "
+                "Select one on the left to display its saved plots on the right."
+            )
+
+            def _refresh_lora(exp_name: str):
+                exp_name = str(exp_name or "").strip()
+                if not exp_name:
+                    empty: List[Any] = [None] * 9
+                    return (*empty, "No experiment selected.")
+                exp_dir = Path(lora_root) / exp_name
+                paths = _lora_expected_plot_paths(exp_dir)
+                images: Dict[str, Optional[np.ndarray]] = {k: _load_image_if_exists(p) for k, p in paths.items()}
+                missing = [k for k, v in images.items() if v is None]
+                details = f"exp={exp_name} | dir={exp_dir}"
+                details += " | all plots found" if not missing else f" | missing: {', '.join(missing)}"
+                return (
+                    images["eval_plot_are"],
+                    images["eval_plot_ate"],
+                    images["eval_plot_rpe_rot"],
+                    images["eval_plot_rpe_trans"],
+                    images["eval_plot_depth_abs_delta1"],
+                    images["eval_plot_depth_abs_abs_rel"],
+                    images["eval_plot_chamfer_distance"],
+                    images["train_curves"],
+                    images["train_loss_weighted_components"],
+                    details,
+                )
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    lora_exp_dd = gr.Dropdown(label="Experiment", choices=lora_exps, value=initial_lora_exp)
+                    lora_info = gr.Textbox(label="Status", interactive=False)
+                with gr.Column(scale=5):
+                    with gr.Row():
+                        lora_eval_are = gr.Image(label="eval_plot_are", type="numpy", elem_classes=["results-media"])
+                        lora_eval_ate = gr.Image(label="eval_plot_ate", type="numpy", elem_classes=["results-media"])
+                        lora_eval_rpe_rot = gr.Image(label="eval_plot_rpe_rot", type="numpy", elem_classes=["results-media"])
+                        lora_eval_rpe_trans = gr.Image(label="eval_plot_rpe_trans", type="numpy", elem_classes=["results-media"])
+                    with gr.Row():
+                        lora_eval_depth_delta1 = gr.Image(
+                            label="eval_plot_depth_abs_delta1", type="numpy", elem_classes=["results-media"]
+                        )
+                        lora_eval_depth_abs_rel = gr.Image(
+                            label="eval_plot_depth_abs_abs_rel", type="numpy", elem_classes=["results-media"]
+                        )
+                        lora_eval_chamfer = gr.Image(
+                            label="eval_plot_chamfer_distance", type="numpy", elem_classes=["results-media"]
+                        )
+                    with gr.Row():
+                        lora_train_curves = gr.Image(label="train_curves.png", type="numpy", elem_classes=["results-media"])
+                        lora_train_components = gr.Image(
+                            label="train_loss_weighted_components.png", type="numpy", elem_classes=["results-media"]
+                        )
+
+            lora_outputs = [
+                lora_eval_are,
+                lora_eval_ate,
+                lora_eval_rpe_rot,
+                lora_eval_rpe_trans,
+                lora_eval_depth_delta1,
+                lora_eval_depth_abs_rel,
+                lora_eval_chamfer,
+                lora_train_curves,
+                lora_train_components,
+                lora_info,
+            ]
+            lora_exp_dd.change(_refresh_lora, inputs=[lora_exp_dd], outputs=lora_outputs)
+            demo.load(_refresh_lora, inputs=[lora_exp_dd], outputs=lora_outputs)
+
         with gr.Tab("Pair Attention"):
             gr.Markdown("## Pair Attention Panel")
             gr.Markdown(
@@ -1386,9 +1551,11 @@ def main() -> None:
         hf_model=args.hf_model,
         device_arg=args.device,
     )
+    setattr(controller, "lora_root", args.lora_dir)
     demo = _build_ui(controller)
     demo.queue().launch(server_name=args.server_name, server_port=args.server_port, show_error=True, share=True)
 
 
 if __name__ == "__main__":
     main()
+

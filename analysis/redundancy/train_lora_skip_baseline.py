@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -16,12 +17,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from torch.utils.checkpoint import checkpoint
 from tqdm.auto import tqdm
 
 # Keep OpenCV/Matplotlib in headless mode for eval_utils imports.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MPLBACKEND", "Agg")
+
+_TRAINING_DIR = Path(__file__).resolve().parents[2] / "training"
+if str(_TRAINING_DIR) not in sys.path:
+    sys.path.append(str(_TRAINING_DIR))
 
 from vggt.models.vggt import VGGT
 from analysis.eval.eval_utils import (
@@ -42,6 +48,7 @@ from .cache_layout import (
 )
 from analysis.eval.prediction_eval import (
     _depth_or_conf_to_shw,
+    _load_gt_depth_for_scene,
     build_fastvggt_scene_eval_context,
     build_scannet_eval_row_from_payload_with_context,
     write_eval_scannet_json,
@@ -54,6 +61,8 @@ from .scannet_eval import (
     load_scene_images,
     select_scene_image_paths_fastvggt,
 )
+from training.loss import compute_camera_loss, compute_depth_loss
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
 @dataclass(frozen=True)
@@ -296,10 +305,6 @@ def _required_head_layers(model: VGGT, num_layers: int) -> List[int]:
         keep.add(num_layers - 1)
     if model.depth_head is not None:
         keep.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
-    if model.point_head is not None:
-        keep.update(int(i) for i in getattr(model.point_head, "intermediate_layer_idx", []))
-    if model.track_head is not None:
-        keep.update(int(i) for i in getattr(model.track_head.feature_extractor, "intermediate_layer_idx", []))
     return sorted(i for i in keep if 0 <= i < num_layers)
 
 
@@ -439,66 +444,226 @@ def _teacher_pred_to_map(pred: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     return out
 
 
-def _prediction_distill(
-    student_pred: Dict[str, torch.Tensor],
+def _depth_to_bshw(depth: torch.Tensor) -> torch.Tensor:
+    if depth.dim() == 5 and depth.shape[-1] == 1:
+        return depth[..., 0]
+    if depth.dim() == 5 and depth.shape[2] == 1:
+        return depth[:, :, 0]
+    if depth.dim() == 4:
+        return depth
+    raise ValueError(f"Unsupported depth shape: {tuple(depth.shape)}")
+
+
+def _mask_from_depth(depth_bshw: torch.Tensor) -> torch.Tensor:
+    return torch.isfinite(depth_bshw) & (depth_bshw > 1e-6)
+
+
+def _load_scannet_intrinsics(scene_dir: Path) -> np.ndarray:
+    intrinsic_dir = scene_dir / "intrinsic"
+    candidates = [
+        intrinsic_dir / "intrinsic_color.txt",
+        intrinsic_dir / "intrinsic_depth.txt",
+        scene_dir / "intrinsic.txt",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        vals: List[List[float]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                vals.append([float(x) for x in line.split()])
+        arr = np.array(vals, dtype=np.float32)
+        if arr.shape == (4, 4):
+            return arr[:3, :3].copy()
+        if arr.shape == (3, 3):
+            return arr.copy()
+    raise FileNotFoundError(f"Cannot find ScanNet intrinsics under {scene_dir}")
+
+
+def _resize_intrinsics_like_vgg_input(
+    k: np.ndarray,
+    *,
+    rgb_width: int,
+    rgb_height: int,
+    new_width: int = 518,
+) -> np.ndarray:
+    k = k.astype(np.float32, copy=True)
+    scale = float(new_width) / float(rgb_width)
+    new_height = round(rgb_height * scale / 14) * 14
+    k[0, 0] *= scale
+    k[1, 1] *= scale
+    k[0, 2] *= scale
+    k[1, 2] *= scale
+    if new_height > 518:
+        start_y = (new_height - 518) // 2
+        k[1, 2] -= float(start_y)
+    return k
+
+
+def _build_target_batch_from_teacher(
     teacher_pred: Dict[str, torch.Tensor],
+    *,
+    images_batched: torch.Tensor,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    if "pose_enc" not in teacher_pred or "depth" not in teacher_pred:
+        raise RuntimeError("teacher target mode requires teacher keys: pose_enc and depth")
+    h = int(images_batched.shape[-2])
+    w = int(images_batched.shape[-1])
+    t_pose = teacher_pred["pose_enc"].float().to(device)
+    extrinsics, intrinsics = pose_encoding_to_extri_intri(t_pose, (h, w))
+    t_depth = _depth_to_bshw(teacher_pred["depth"].float().to(device))
+    point_masks = _mask_from_depth(t_depth)
+    return {
+        "images": images_batched.float(),
+        "extrinsics": extrinsics.float(),
+        "intrinsics": intrinsics.float(),
+        "depths": t_depth.float(),
+        "point_masks": point_masks.bool(),
+    }
+
+
+def _select_scannet_scene_with_frames(
+    scene: SceneData,
+    *,
+    max_frames: int,
+) -> SceneData:
+    selected = select_scene_image_paths_fastvggt(scene, max_frames=max_frames)
+    return selected
+
+
+def _build_target_batch_from_dataset(
+    *,
+    scene: SceneData,
+    expected_seq_len: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    selected = _select_scannet_scene_with_frames(scene, max_frames=expected_seq_len)
+    if len(selected.image_paths) != int(expected_seq_len):
+        raise RuntimeError(
+            f"Scene {scene.scene_id} selected {len(selected.image_paths)} frames, expected {expected_seq_len}"
+        )
+
+    images_np = load_images_rgb(selected.image_paths)
+    vgg_input, _pw, _ph = get_vgg_input_imgs(np.array(images_np))
+    image_hw = (int(vgg_input.shape[-2]), int(vgg_input.shape[-1]))
+    gt_depth_np = _load_gt_depth_for_scene(selected, image_hw=image_hw)
+    if gt_depth_np is None:
+        raise RuntimeError(f"Failed to load GT depth for scene {scene.scene_id}")
+
+    pose_dir = selected.scene_dir / "pose"
+    if not pose_dir.is_dir():
+        raise RuntimeError(f"Missing pose dir for scene {scene.scene_id}: {pose_dir}")
+    c2ws_all, _first_gt_pose, available_frame_ids = load_poses(pose_dir)
+    pose_frame_to_idx = {int(fid): idx for idx, fid in enumerate(available_frame_ids.tolist())}
+    frame_ids = [int(p.stem) for p in selected.image_paths]
+    indices = [pose_frame_to_idx[int(fid)] for fid in frame_ids]
+    c2ws = c2ws_all[np.array(indices, dtype=np.int64)]
+    w2cs = np.linalg.inv(c2ws)[:, :3, :4].astype(np.float32, copy=False)
+
+    k_src = _load_scannet_intrinsics(selected.scene_dir)
+    k_list: List[np.ndarray] = []
+    for p in selected.image_paths:
+        with Image.open(p) as im:
+            rgb_w, rgb_h = im.size
+        k_list.append(
+            _resize_intrinsics_like_vgg_input(
+                k_src,
+                rgb_width=int(rgb_w),
+                rgb_height=int(rgb_h),
+                new_width=int(image_hw[1]),
+            )
+        )
+    intrinsics = np.stack(k_list, axis=0).astype(np.float32, copy=False)
+
+    depths = torch.from_numpy(gt_depth_np).float().unsqueeze(0).to(device)
+    images = vgg_input.float().unsqueeze(0).to(device)
+    point_masks = _mask_from_depth(depths)
+    return {
+        "images": images,
+        "extrinsics": torch.from_numpy(w2cs).float().unsqueeze(0).to(device),
+        "intrinsics": torch.from_numpy(intrinsics).float().unsqueeze(0).to(device),
+        "depths": depths,
+        "point_masks": point_masks.bool(),
+    }
+
+
+def _prediction_official_camera_depth(
+    student_pred: Dict[str, torch.Tensor],
+    target_batch: Dict[str, torch.Tensor],
     *,
     w_camera: float,
     w_depth: float,
-    w_point: float,
     w_depth_grad: float,
-    w_point_grad: float,
+    camera_loss_type: str,
+    depth_valid_range: float,
+    depth_gradient_loss_fn: str,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     device = next(iter(student_pred.values())).device
     total = torch.zeros((), device=device)
     logs: Dict[str, float] = {}
 
-    if "pose_enc" in student_pred and "pose_enc" in teacher_pred:
-        sp = student_pred["pose_enc"].float()
-        tp = teacher_pred["pose_enc"].float().to(device)
-        l_cam = F.l1_loss(sp, tp)
-        total = total + float(w_camera) * l_cam
-        logs["loss_pred_camera"] = float(l_cam.detach().item())
-        logs["loss_pred_camera_term"] = float((float(w_camera) * l_cam).detach().item())
+    if "pose_enc_list" in student_pred:
+        camera_loss_dict = compute_camera_loss(
+            {"pose_enc_list": student_pred["pose_enc_list"]},
+            target_batch,
+            loss_type=camera_loss_type,
+        )
+        l_camera = camera_loss_dict["loss_camera"]
+        total = total + float(w_camera) * l_camera
+        logs["loss_camera"] = float(l_camera.detach().item())
+        logs["loss_T"] = float(camera_loss_dict["loss_T"].detach().item())
+        logs["loss_R"] = float(camera_loss_dict["loss_R"].detach().item())
+        logs["loss_FL"] = float(camera_loss_dict["loss_FL"].detach().item())
+        logs["loss_camera_term"] = float((float(w_camera) * l_camera).detach().item())
 
-    if "depth" in student_pred and "depth" in teacher_pred:
-        sd = student_pred["depth"].float()
-        td = teacher_pred["depth"].float().to(device)
-        l_reg = F.l1_loss(sd, td)
-        l_conf = torch.zeros((), device=device)
-        if "depth_conf" in student_pred and "depth_conf" in teacher_pred:
-            l_conf = F.l1_loss(student_pred["depth_conf"].float(), teacher_pred["depth_conf"].float().to(device))
-        l_grad = _spatial_grad_loss(sd, td)
-        l_depth = l_reg + l_conf + float(w_depth_grad) * l_grad
+    if "depth" in student_pred and "depth_conf" in student_pred:
+        depth_loss_dict = compute_depth_loss(
+            {"depth": student_pred["depth"], "depth_conf": student_pred["depth_conf"]},
+            target_batch,
+            gradient_loss_fn=depth_gradient_loss_fn,
+            valid_range=depth_valid_range,
+        )
+        l_conf = depth_loss_dict["loss_conf_depth"]
+        l_reg = depth_loss_dict["loss_reg_depth"]
+        l_grad = depth_loss_dict["loss_grad_depth"]
+        l_depth = l_conf + l_reg + float(w_depth_grad) * l_grad
         total = total + float(w_depth) * l_depth
-        logs["loss_pred_depth_reg"] = float(l_reg.detach().item())
-        logs["loss_pred_depth_conf"] = float(l_conf.detach().item())
-        logs["loss_pred_depth_grad"] = float(l_grad.detach().item())
-        logs["loss_pred_depth_reg_term"] = float((float(w_depth) * l_reg).detach().item())
-        logs["loss_pred_depth_conf_term"] = float((float(w_depth) * l_conf).detach().item())
-        logs["loss_pred_depth_grad_term"] = float((float(w_depth) * float(w_depth_grad) * l_grad).detach().item())
-
-    if "world_points" in student_pred and "world_points" in teacher_pred:
-        sp = student_pred["world_points"].float()
-        tp = teacher_pred["world_points"].float().to(device)
-        l_reg = F.l1_loss(sp, tp)
-        l_conf = torch.zeros((), device=device)
-        if "world_points_conf" in student_pred and "world_points_conf" in teacher_pred:
-            l_conf = F.l1_loss(
-                student_pred["world_points_conf"].float(),
-                teacher_pred["world_points_conf"].float().to(device),
-            )
-        l_grad = _spatial_grad_loss(sp, tp)
-        l_point = l_reg + l_conf + float(w_point_grad) * l_grad
-        total = total + float(w_point) * l_point
-        logs["loss_pred_point_reg"] = float(l_reg.detach().item())
-        logs["loss_pred_point_conf"] = float(l_conf.detach().item())
-        logs["loss_pred_point_grad"] = float(l_grad.detach().item())
-        logs["loss_pred_point_reg_term"] = float((float(w_point) * l_reg).detach().item())
-        logs["loss_pred_point_conf_term"] = float((float(w_point) * l_conf).detach().item())
-        logs["loss_pred_point_grad_term"] = float((float(w_point) * float(w_point_grad) * l_grad).detach().item())
+        logs["loss_conf_depth"] = float(l_conf.detach().item())
+        logs["loss_reg_depth"] = float(l_reg.detach().item())
+        logs["loss_grad_depth"] = float(l_grad.detach().item())
+        logs["loss_depth_term"] = float((float(w_depth) * l_depth).detach().item())
+        logs["loss_depth_conf_term"] = float((float(w_depth) * l_conf).detach().item())
+        logs["loss_depth_reg_term"] = float((float(w_depth) * l_reg).detach().item())
+        logs["loss_depth_grad_term"] = float(
+            (float(w_depth) * float(w_depth_grad) * l_grad).detach().item()
+        )
 
     return total, logs
+
+
+def _lr_with_warmup_cosine(
+    *,
+    where: float,
+    base_lr: float,
+    min_lr: float,
+    warmup_ratio: float,
+) -> float:
+    where = float(max(0.0, min(1.0, where)))
+    warmup_ratio = float(max(0.0, min(1.0, warmup_ratio)))
+    if warmup_ratio > 0.0 and where < warmup_ratio:
+        t = where / max(warmup_ratio, 1e-12)
+        return float(min_lr + t * (base_lr - min_lr))
+    if where >= 1.0:
+        return float(min_lr)
+    if warmup_ratio >= 1.0:
+        return float(base_lr)
+    t = (where - warmup_ratio) / max(1.0 - warmup_ratio, 1e-12)
+    cos_decay = 0.5 * (1.0 + math.cos(math.pi * t))
+    return float(min_lr + (base_lr - min_lr) * cos_decay)
 
 
 def _compute_total_steps(num_scenes: int, epochs: int, max_steps: int) -> int:
@@ -543,7 +708,7 @@ def _validate_schema(row: Dict[str, Any], num_layers: int) -> None:
     pred = row.get("pred")
     if not isinstance(pred, dict):
         raise SystemExit("Invalid cache row: missing dict key 'pred'.")
-    required = ("pose_enc", "depth", "depth_conf", "world_points", "world_points_conf")
+    required = ("pose_enc", "depth", "depth_conf")
     missing = [k for k in required if k not in pred]
     if missing:
         raise SystemExit(f"Invalid cache row pred: missing keys {missing}")
@@ -632,13 +797,10 @@ def _write_curves(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
             ("mean_loss_align_mse_term", "align_mse"),
             ("mean_loss_align_cos_term", "align_cos"),
             # Prediction weighted parts (outer w_pred already applied in *_contrib)
-            ("mean_loss_pred_camera_term_contrib", "pred_camera"),
-            ("mean_loss_pred_depth_reg_term_contrib", "pred_depth_reg"),
-            ("mean_loss_pred_depth_conf_term_contrib", "pred_depth_conf"),
-            ("mean_loss_pred_depth_grad_term_contrib", "pred_depth_grad"),
-            ("mean_loss_pred_point_reg_term_contrib", "pred_point_reg"),
-            ("mean_loss_pred_point_conf_term_contrib", "pred_point_conf"),
-            ("mean_loss_pred_point_grad_term_contrib", "pred_point_grad"),
+            ("mean_loss_camera_term_contrib", "pred_camera"),
+            ("mean_loss_depth_reg_term_contrib", "pred_depth_reg"),
+            ("mean_loss_depth_conf_term_contrib", "pred_depth_conf"),
+            ("mean_loss_depth_grad_term_contrib", "pred_depth_grad"),
         ]
         plt.figure(figsize=(11, 6))
         any_plotted = False
@@ -1083,6 +1245,42 @@ def _fmt_metric_brief(metrics: Dict[str, float], keys: Sequence[str]) -> str:
     return " ".join(parts)
 
 
+def _resolve_bounds_cache_paths(bounds_cache_file: Optional[Path], out_dir: Path) -> Tuple[Path, Path, Path]:
+    combined_path = Path(bounds_cache_file) if bounds_cache_file is not None else (out_dir / "bounds_summary.json")
+    suffix = combined_path.suffix if combined_path.suffix else ".json"
+    upper_path = combined_path.with_name(f"{combined_path.stem}_upper{suffix}")
+    lower_path = combined_path.with_name(f"{combined_path.stem}_lower{suffix}")
+    return combined_path, upper_path, lower_path
+
+
+def _extract_bound_payload(bounds: Dict[str, Dict[str, Dict[str, float]]], tag: Literal["upper", "lower"]) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for split in ("dev", "test"):
+        out[split] = dict(bounds.get(split, {}).get(tag, {}))
+    return out
+
+
+def _load_bound_payload(path: Path) -> Dict[str, Dict[str, float]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit(f"Invalid bounds payload (expect object): {path}")
+    out: Dict[str, Dict[str, float]] = {}
+    for split in ("dev", "test"):
+        split_payload = payload.get(split, {})
+        if split_payload is None:
+            split_payload = {}
+        if not isinstance(split_payload, dict):
+            raise SystemExit(f"Invalid bounds payload split '{split}' (expect object): {path}")
+        casted: Dict[str, float] = {}
+        for k, v in split_payload.items():
+            try:
+                casted[str(k)] = float(v)
+            except Exception:
+                continue
+        out[split] = casted
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("Train cache-first multi-interval skip+LoRA baseline.")
     p.add_argument("--cache-dir", type=Path, required=True)
@@ -1096,20 +1294,27 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("multi_interval_config",),
     )
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--dtype", type=str, default="float32", choices=("float32", "bfloat16", "float16"))
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=("float32", "bfloat16", "float16"))
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--max-scenes", type=int, default=0, help="0 means all scenes.")
     p.add_argument("--max-steps", type=int, default=0, help="0 means no early stop.")
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--weight-decay", type=float, default=0.05)
+    p.add_argument("--min-lr", type=float, default=1e-8)
+    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--grad-clip-max-norm", type=float, default=1.0)
     p.add_argument("--save-every-epoch", type=int, default=10)
     p.add_argument("--resume-from", type=Path, default=None, help="Path to checkpoint to resume from.")
     p.add_argument(
         "--bounds-cache-file",
         type=Path,
         default=None,
-        help="Shared upper/lower summary cache JSON path; when exists, skip pre-train bound eval.",
+        help=(
+            "Base cache JSON path. Script now reads/writes split files "
+            "('<stem>_upper.json' and '<stem>_lower.json'); "
+            "legacy combined file is still used as fallback."
+        ),
     )
     p.add_argument("--eval-epoch", type=int, default=0, help="Run dev/test eval every N epochs. 0 disables periodic eval.")
     p.add_argument("--dev-data-root", type=Path, default=Path("data/scans_dev50"))
@@ -1146,9 +1351,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--w-pred", type=float, default=1.0)
     p.add_argument("--w-camera", type=float, default=1.0)
     p.add_argument("--w-depth", type=float, default=1.0)
-    p.add_argument("--w-point", type=float, default=1.0)
     p.add_argument("--w-depth-grad", type=float, default=1.0)
-    p.add_argument("--w-point-grad", type=float, default=1.0)
+    p.add_argument("--depth-valid-range", type=float, default=0.98)
+    p.add_argument("--depth-gradient-loss-fn", type=str, default="grad")
+    p.add_argument("--camera-loss-type", type=str, default="l1", choices=("l1", "l2"))
+    p.add_argument("--target-source", type=str, default="teacher", choices=("teacher", "dataset"))
+    p.add_argument(
+        "--gt-data-root",
+        type=Path,
+        default=Path("data/scans_dev50"),
+        help="ScanNet-style GT root for --target-source=dataset.",
+    )
     p.add_argument("--w-reg", type=float, default=0.0)
     p.add_argument(
         "--use-checkpoint",
@@ -1243,12 +1456,14 @@ def main() -> None:
     skipped_frame_idxs = _build_skipped_layer_indices(frame_skip_intervals)
     skipped_idxs = sorted(set(skipped_global_idxs).union(skipped_frame_idxs))
     eval_dir = out_dir
-    bounds_path = Path(args.bounds_cache_file) if args.bounds_cache_file is not None else (out_dir / "bounds_summary.json")
+    bounds_path, bounds_upper_path, bounds_lower_path = _resolve_bounds_cache_paths(args.bounds_cache_file, out_dir)
     eval_history_rows: List[Dict[str, Any]] = []
     bounds: Dict[str, Dict[str, Dict[str, float]]] = {"dev": {"upper": {}, "lower": {}}, "test": {"upper": {}, "lower": {}}}
 
     def _build_model_variant(*, prune: bool, inject_lora: bool) -> Tuple[VGGT, List[nn.Parameter], int, int]:
         m = VGGT.from_pretrained(args.hf_model).to(device).train()
+        # We never train/evaluate point in this script path.
+        m.point_head = None
         for pp in m.parameters():
             pp.requires_grad_(False)
         skipped_modules_before: List[nn.Module] = []
@@ -1291,12 +1506,59 @@ def main() -> None:
                 )
         return m, trainable_local, pre_total, removed
 
-    # Baseline bounds: upper=original model, lower=pruned model without LoRA.
+    has_upper = False
+    has_lower = False
+    if bounds_upper_path.exists():
+        upper_payload = _load_bound_payload(bounds_upper_path)
+        bounds["dev"]["upper"] = upper_payload.get("dev", {})
+        bounds["test"]["upper"] = upper_payload.get("test", {})
+        has_upper = True
+        _log(f"[eval] reuse existing upper bound from {bounds_upper_path}")
+    if bounds_lower_path.exists():
+        lower_payload = _load_bound_payload(bounds_lower_path)
+        bounds["dev"]["lower"] = lower_payload.get("dev", {})
+        bounds["test"]["lower"] = lower_payload.get("test", {})
+        has_lower = True
+        _log(f"[eval] reuse existing lower bound from {bounds_lower_path}")
     if bounds_path.exists():
-        bounds = json.loads(bounds_path.read_text(encoding="utf-8"))
-        _log(f"[eval] reuse existing bounds from {bounds_path}")
+        legacy_bounds = json.loads(bounds_path.read_text(encoding="utf-8"))
+        for split in ("dev", "test"):
+            split_payload = legacy_bounds.get(split, {}) if isinstance(legacy_bounds, dict) else {}
+            if not isinstance(split_payload, dict):
+                continue
+            if not has_upper and isinstance(split_payload.get("upper"), dict):
+                bounds["dev" if split == "dev" else "test"]["upper"] = {
+                    str(k): float(v) for k, v in split_payload["upper"].items()
+                }
+            if not has_lower and isinstance(split_payload.get("lower"), dict):
+                bounds["dev" if split == "dev" else "test"]["lower"] = {
+                    str(k): float(v) for k, v in split_payload["lower"].items()
+                }
+        if not has_upper and bounds["dev"]["upper"] and bounds["test"]["upper"]:
+            has_upper = True
+            bounds_upper_path.parent.mkdir(parents=True, exist_ok=True)
+            bounds_upper_path.write_text(json.dumps(_extract_bound_payload(bounds, "upper"), indent=2), encoding="utf-8")
+            _log(f"[eval] hydrated upper bound cache from legacy file -> {bounds_upper_path}")
+        if not has_lower and bounds["dev"]["lower"] and bounds["test"]["lower"]:
+            has_lower = True
+            bounds_lower_path.parent.mkdir(parents=True, exist_ok=True)
+            bounds_lower_path.write_text(json.dumps(_extract_bound_payload(bounds, "lower"), indent=2), encoding="utf-8")
+            _log(f"[eval] hydrated lower bound cache from legacy file -> {bounds_lower_path}")
+
+    # Baseline bounds: upper=original model, lower=pruned model without LoRA.
+    need_upper = not has_upper
+    need_lower = not has_lower
+    if need_upper or need_lower:
+        missing = []
+        if need_upper:
+            missing.append("upper")
+        if need_lower:
+            missing.append("lower")
+        _log(f"[eval] computing missing bounds on dev/test: {','.join(missing)}")
     else:
-        _log("[eval] computing upper/lower bounds on dev/test")
+        _log(f"[eval] reuse existing split bounds from {bounds_upper_path} and {bounds_lower_path}")
+
+    if need_upper:
         upper_model, _, _, _ = _build_model_variant(prune=False, inject_lora=False)
         try:
             t_upper_dev0 = time.perf_counter()
@@ -1357,7 +1619,13 @@ def main() -> None:
             del upper_model
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+        bounds["dev"]["upper"] = upper_dev
+        bounds["test"]["upper"] = upper_test
+        bounds_upper_path.parent.mkdir(parents=True, exist_ok=True)
+        bounds_upper_path.write_text(json.dumps(_extract_bound_payload(bounds, "upper"), indent=2), encoding="utf-8")
+        _log(f"[eval] wrote upper bound cache to {bounds_upper_path}")
 
+    if need_lower:
         lower_model, _, _, _ = _build_model_variant(prune=True, inject_lora=False)
         try:
             t_lower_dev0 = time.perf_counter()
@@ -1401,7 +1669,13 @@ def main() -> None:
             del lower_model
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-        bounds = {"dev": {"upper": upper_dev, "lower": lower_dev}, "test": {"upper": upper_test, "lower": lower_test}}
+        bounds["dev"]["lower"] = lower_dev
+        bounds["test"]["lower"] = lower_test
+        bounds_lower_path.parent.mkdir(parents=True, exist_ok=True)
+        bounds_lower_path.write_text(json.dumps(_extract_bound_payload(bounds, "lower"), indent=2), encoding="utf-8")
+        _log(f"[eval] wrote lower bound cache to {bounds_lower_path}")
+
+    if need_upper or need_lower:
         bounds_path.parent.mkdir(parents=True, exist_ok=True)
         bounds_path.write_text(json.dumps(bounds, indent=2), encoding="utf-8")
         _write_eval_artifacts(out_dir, bounds, eval_history_rows)
@@ -1409,6 +1683,12 @@ def main() -> None:
     model, trainable, pre_prune_total_params, removed_params = _build_model_variant(prune=True, inject_lora=True)
     if not trainable:
         raise SystemExit("No LoRA parameters were injected; nothing to train.")
+    gt_scene_map: Dict[str, SceneData] = {}
+    if str(args.target_source) == "dataset":
+        gt_scenes = discover_scannet_scenes(Path(args.gt_data_root))
+        gt_scene_map = {str(s.scene_id): s for s in gt_scenes}
+        if not gt_scene_map:
+            raise SystemExit(f"No GT scenes discovered under --gt-data-root={args.gt_data_root}")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1549,14 +1829,32 @@ def main() -> None:
                 loss_align_cos_term = float(args.w_align) * float(args.w_align_cos) * align_cos
 
                 t_pred0 = time.perf_counter()
-                loss_pred, pred_logs = _prediction_distill(
+                if str(args.target_source) == "teacher":
+                    target_batch = _build_target_batch_from_teacher(
+                        teacher_pred,
+                        images_batched=dummy_images,
+                        device=device,
+                    )
+                else:
+                    if sid not in gt_scene_map:
+                        raise RuntimeError(
+                            f"Scene {sid} not found under --gt-data-root={args.gt_data_root} "
+                            f"for --target-source=dataset"
+                        )
+                    target_batch = _build_target_batch_from_dataset(
+                        scene=gt_scene_map[sid],
+                        expected_seq_len=int(seq_len),
+                        device=device,
+                    )
+                loss_pred, pred_logs = _prediction_official_camera_depth(
                     replay.pred,
-                    teacher_pred,
+                    target_batch,
                     w_camera=float(args.w_camera),
                     w_depth=float(args.w_depth),
-                    w_point=float(args.w_point),
                     w_depth_grad=float(args.w_depth_grad),
-                    w_point_grad=float(args.w_point_grad),
+                    camera_loss_type=str(args.camera_loss_type),
+                    depth_valid_range=float(args.depth_valid_range),
+                    depth_gradient_loss_fn=str(args.depth_gradient_loss_fn),
                 )
                 t_pred = time.perf_counter() - t_pred0
 
@@ -1576,6 +1874,19 @@ def main() -> None:
             scaler.scale(loss_total).backward()
             t_backward = time.perf_counter() - t_bw0
             t_opt0 = time.perf_counter()
+            where = float(global_step) / max(float(total_steps), 1.0)
+            lr_now = _lr_with_warmup_cosine(
+                where=where,
+                base_lr=float(args.lr),
+                min_lr=float(args.min_lr),
+                warmup_ratio=float(args.warmup_ratio),
+            )
+            for pg in optim.param_groups:
+                pg["lr"] = lr_now
+            grad_norm = torch.tensor(0.0, device=device)
+            if float(args.grad_clip_max_norm) > 0:
+                scaler.unscale_(optim)
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable, max_norm=float(args.grad_clip_max_norm))
             scaler.step(optim)
             scaler.update()
             t_optim = time.perf_counter() - t_opt0
@@ -1604,6 +1915,8 @@ def main() -> None:
                 "time_pred_s": t_pred,
                 "time_backward_s": t_backward,
                 "time_optim_s": t_optim,
+                "optim_lr": float(lr_now),
+                "grad_norm": float(grad_norm.detach().item()) if torch.is_tensor(grad_norm) else float(grad_norm),
             }
             log_row.update(pred_logs)
             for k, v in pred_logs.items():

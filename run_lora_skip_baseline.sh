@@ -18,13 +18,13 @@ HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
 OUT_DIR="${OUT_DIR:-analysis_outputs/lora_skip_baseline}"
 # Hyperparam search config (enable one at a time, in recommended order):
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/01_lr.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/02_rank_alpha_tuple.json}"
+SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/02_rank_alpha_tuple.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/03_lora_dropout.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/04_weight_decay.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/05_align_pred_tuple.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/06_align_mse_cos_tuple.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/07_depth_point_grad_tuple.json}"
-SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/01_lr.json}"
+# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/07_depth_grad_tuple.json}"
+# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/01_lr.json}"
 INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/redundancy/interval_config.template.json}"
 VARIANT="${VARIANT:-multi_interval_config}"
 DEVICE="${DEVICE:-cuda}"
@@ -34,8 +34,11 @@ SEED="${SEED:-0}"
 EPOCHS="${EPOCHS:-100}"
 MAX_SCENES="${MAX_SCENES:-0}"
 MAX_STEPS="${MAX_STEPS:-0}"
-LR="${LR:-1e-4}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
+LR="${LR:-5e-5}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
+MIN_LR="${MIN_LR:-1e-8}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
+GRAD_CLIP_MAX_NORM="${GRAD_CLIP_MAX_NORM:-1.0}"
 SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-10}"
 RESUME_FROM="${RESUME_FROM:-}"
 LORA_RANK="${LORA_RANK:-8}"
@@ -46,11 +49,14 @@ W_ALIGN="${W_ALIGN:-1.0}"
 W_ALIGN_MSE="${W_ALIGN_MSE:-1.0}"
 W_ALIGN_COS="${W_ALIGN_COS:-1.0}"
 W_PRED="${W_PRED:-1.0}"
-W_CAMERA="${W_CAMERA:-1.0}"
+W_CAMERA="${W_CAMERA:-5.0}"
 W_DEPTH="${W_DEPTH:-1.0}"
-W_POINT="${W_POINT:-1.0}"
 W_DEPTH_GRAD="${W_DEPTH_GRAD:-1.0}"
-W_POINT_GRAD="${W_POINT_GRAD:-1.0}"
+DEPTH_VALID_RANGE="${DEPTH_VALID_RANGE:-0.98}"
+DEPTH_GRADIENT_LOSS_FN="${DEPTH_GRADIENT_LOSS_FN:-grad}"
+CAMERA_LOSS_TYPE="${CAMERA_LOSS_TYPE:-l1}"
+TARGET_SOURCE="${TARGET_SOURCE:-teacher}"   # teacher | dataset
+GT_DATA_ROOT="${GT_DATA_ROOT:-data/scans_dev50}"
 W_REG="${W_REG:-0.0}"
 USE_CHECKPOINT="${USE_CHECKPOINT:-1}"
 PRINT_STEP_TIMING="${PRINT_STEP_TIMING:-0}"
@@ -98,6 +104,9 @@ run_one_trial() {
     --max-steps "${MAX_STEPS}" \
     --lr "${LR}" \
     --weight-decay "${WEIGHT_DECAY}" \
+    --min-lr "${MIN_LR}" \
+    --warmup-ratio "${WARMUP_RATIO}" \
+    --grad-clip-max-norm "${GRAD_CLIP_MAX_NORM}" \
     --save-every-epoch "${SAVE_EVERY_EPOCH}" \
     --lora-rank "${LORA_RANK}" \
     --lora-alpha "${LORA_ALPHA}" \
@@ -108,9 +117,12 @@ run_one_trial() {
     --w-pred "${W_PRED}" \
     --w-camera "${W_CAMERA}" \
     --w-depth "${W_DEPTH}" \
-    --w-point "${W_POINT}" \
     --w-depth-grad "${W_DEPTH_GRAD}" \
-    --w-point-grad "${W_POINT_GRAD}" \
+    --depth-valid-range "${DEPTH_VALID_RANGE}" \
+    --depth-gradient-loss-fn "${DEPTH_GRADIENT_LOSS_FN}" \
+    --camera-loss-type "${CAMERA_LOSS_TYPE}" \
+    --target-source "${TARGET_SOURCE}" \
+    --gt-data-root "${GT_DATA_ROOT}" \
     --w-reg "${W_REG}" \
     --eval-epoch "${EVAL_EPOCH}" \
     --dev-data-root "${DEV_DATA_ROOT}" \

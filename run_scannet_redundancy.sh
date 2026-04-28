@@ -161,7 +161,7 @@ if [[ "${STAGE1}" == "1" || "${STAGE1}" == "true" ]]; then
 fi
 
 # python -m analysis.redundancy.view_scene_viser --vis-root analysis_outputs/scannet_cache/visualization --scene-id scene0000_00 --port 8080
-# python -m analysis.redundancy.view_results_gradio
+# python -m analysis.view_results_gradio
 
 
 # -----------------------------------------------------------------------------
