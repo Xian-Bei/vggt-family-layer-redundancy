@@ -58,7 +58,7 @@ from .metrics import (
     upper_triangle_pack,
     upper_triangle_unpack_for_heatmap,
 )
-from .prediction_eval import (
+from analysis.eval.prediction_eval import (
     build_fastvggt_scene_eval_context,
     build_scannet_eval_row_from_payload_with_context,
     metrics_float_dict,
@@ -136,8 +136,8 @@ def _split_concat_branch_tuples(
 
     assert expected_n is not None
     if max_tokens_per_layer > 0 and expected_n > max_tokens_per_layer:
-    g = torch.Generator(device="cpu")
-    g.manual_seed(int(seed) & 0x7FFFFFFF)
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(seed) & 0x7FFFFFFF)
         idx = torch.randperm(expected_n, generator=g)[:max_tokens_per_layer]
         frame_layers = [t[idx] for t in frame_layers]
         global_layers = [t[idx] for t in global_layers]
@@ -965,8 +965,8 @@ def _write_fusion_full_reports_from_per_scene_json(
 
     if save_similarity_output:
         with (similarity_out_dir / "summary_metrics_similarity.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["metric", "value"])
-        w.writeheader()
+            w = csv.DictWriter(f, fieldnames=["metric", "value"])
+            w.writeheader()
             for row in similarity_summary_rows:
                 w.writerow(row)
     if save_skip_output:
@@ -974,7 +974,7 @@ def _write_fusion_full_reports_from_per_scene_json(
             w = csv.DictWriter(f, fieldnames=["metric", "value"])
             w.writeheader()
             for row in skip_summary_rows:
-            w.writerow(row)
+                w.writerow(row)
 
     if save_similarity_output:
         with (similarity_out_dir / "per_scene_scores_similarity.csv").open("w", newline="", encoding="utf-8") as f:
@@ -984,10 +984,10 @@ def _write_fusion_full_reports_from_per_scene_json(
             w.writerows(per_scene_rows_final)
     if save_skip_output:
         with (skip_out_dir / "per_scene_scores_skip.csv").open("w", newline="", encoding="utf-8") as f:
-        fields = ["scene_id"] + score_keys
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(per_scene_rows_final)
+            fields = ["scene_id"] + score_keys
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            w.writerows(per_scene_rows_final)
 
     if save_heatmap_png:
         for mode in mode_list:
@@ -2366,11 +2366,11 @@ def main() -> None:
 
         scene_fusion_by_mode: Dict[str, Dict[str, Any]] = {}
         for mi, mode in enumerate(fusion_modes):
-    if args.timing:
-        print(
+            if args.timing:
+                print(
                     f"[timing] fusion scene {si + 1}/{len(selected)} {sid} | mode {mi + 1}/{len(fusion_modes)}: {mode}",
-            flush=True,
-        )
+                    flush=True,
+                )
             scene_patch_upper_by_metric = {m: [] for m in sim_metrics}
             scene_special_upper_by_metric = {m: [] for m in sim_metrics}
             scene_gt_upper_by_metric = {k: [] for k in GT_KEYS_FOR_SKIP}

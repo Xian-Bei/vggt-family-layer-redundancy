@@ -12,6 +12,9 @@ Depth GT handling follows the current redundancy pipeline protocol:
 - apply StreamVGGT-style scale-only alignment before computing depth metrics
 
 Scene aggregates are plain per-scene means (FastVGGT-style), not valid-pixel-weighted means.
+
+This module lives under ``analysis.eval``; :class:`SceneData` and aggregation helpers come from
+``analysis.redundancy.scannet_eval`` (dataset layout / scene discovery).
 """
 
 from __future__ import annotations
@@ -22,15 +25,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 from PIL import Image
 
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 
-from .scannet_eval import SceneData, aggregate_metric_dict
+from analysis.redundancy.scannet_eval import SceneData, aggregate_metric_dict
 
-
-STREAMVGGT_DEPTH_MAX = 10.0
+from .scannet_scene_metrics import (
+    STREAMVGGT_DEPTH_MAX,
+    evaluate_depth_metrics_streamvggt,
+    evaluate_scene_metrics_fastvggt,
+    merge_numeric_metrics_into,
+)
 
 
 def _squeeze_batch_to_ndim(arr: np.ndarray, target_ndim: int) -> np.ndarray:
@@ -66,7 +72,7 @@ def prediction_payload_to_fastvggt_reconstruction(
     payload: Dict[str, Any],
     depth_conf_thresh: float,
 ) -> Tuple[np.ndarray, List[np.ndarray], List[np.ndarray]]:
-    from .fastvggt_scannet_eval import to_homogeneous
+    from .eval_utils import to_homogeneous
 
     if "extrinsic" not in payload or "depth" not in payload or "intrinsic" not in payload:
         raise ValueError("FastVGGT eval requires extrinsic, depth, intrinsic in prediction file")
@@ -239,51 +245,6 @@ def _load_gt_depth_for_scene(scene: SceneData, image_hw: Tuple[int, int]) -> Opt
     return np.stack(depth_maps, axis=0).astype(np.float32, copy=False)
 
 
-def evaluate_depth_metrics_streamvggt(
-    pred_depth: np.ndarray,
-    gt_depth: np.ndarray,
-    *,
-    max_depth: float = STREAMVGGT_DEPTH_MAX,
-) -> Dict[str, float]:
-    """Compute the two retained depth metrics using StreamVGGT-style scale alignment.
-
-    The valid mask is derived directly from GT depth values in the current aligned depth map.
-    """
-    pred = torch.from_numpy(np.asarray(pred_depth, dtype=np.float32))
-    gt = torch.from_numpy(np.asarray(gt_depth, dtype=np.float32))
-    if pred.shape != gt.shape:
-        raise ValueError(f"Pred depth shape {pred.shape} != GT depth shape {gt.shape}")
-    if pred.dim() == 3:
-        _, _, w = pred.shape
-        pred = pred.view(-1, w)
-        gt = gt.view(-1, w)
-    mask = (gt > 0) & (gt < max_depth)
-    valid_pixels = int(mask.sum().item())
-    if valid_pixels <= 0:
-        return {}
-    pred_valid = pred[mask]
-    gt_valid = gt[mask]
-
-    # StreamVGGT video depth defaults to scale alignment.
-    s = torch.nanmean(gt_valid) / torch.clamp(torch.nanmean(pred_valid), min=1e-8)
-    for _ in range(10):
-        residuals = s * pred_valid - gt_valid
-        weights = 1.0 / (residuals.abs() + 1e-8)
-        numerator = torch.sum(weights * pred_valid * gt_valid)
-        denominator = torch.sum(weights * pred_valid.square()).clamp(min=1e-8)
-        s = (numerator / denominator).clamp(min=1e-3).detach()
-    pred_valid = pred_valid * s
-
-    abs_rel = torch.mean(torch.abs(pred_valid - gt_valid) / gt_valid).item()
-    max_ratio = torch.maximum(pred_valid / gt_valid, gt_valid / pred_valid.clamp(min=1e-5))
-    delta1 = torch.mean((max_ratio < 1.25).float()).item()
-    return {
-        "depth_abs_rel": float(abs_rel),
-        "depth_delta1": float(delta1),
-        "depth_valid_pixels": float(valid_pixels),
-    }
-
-
 def build_fastvggt_scene_eval_context(
     scene: SceneData,
     data_root: Path,
@@ -291,7 +252,7 @@ def build_fastvggt_scene_eval_context(
     *,
     image_hw: Optional[Tuple[int, int]] = None,
 ) -> FastVggtSceneEvalContext:
-    from .fastvggt_scannet_eval import dependencies_available, load_gt_pointcloud, load_poses
+    from .eval_utils import dependencies_available, load_gt_pointcloud, load_poses
 
     if not dependencies_available():
         raise RuntimeError("ScanNet eval requires: pip install evo open3d scipy")
@@ -353,9 +314,7 @@ def build_scannet_eval_row_from_payload_with_context(
 
     Returns pose / geometry and dense-depth metrics. Missing GT is treated as an error.
     """
-    from .fastvggt_scannet_eval import evaluate_scene_metrics_fastvggt
-
-    row: Dict[str, Any] = {"scene_id": scene.scene_id, "infer_time_ms": float(inference_time_ms)}
+    row: Dict[str, Any] = {"scene_id": scene.scene_id}
     try:
         extr, cam_mats, pts_list = prediction_payload_to_fastvggt_reconstruction(payload, depth_conf_thresh)
     except Exception as e:
@@ -366,6 +325,9 @@ def build_scannet_eval_row_from_payload_with_context(
             f"Frame count mismatch: pred S={extr.shape[0]} vs images={len(ctx.frame_ids)} ({scene.scene_id})"
         )
 
+    pred_depth = None
+    if ctx.gt_depth is not None and "depth" in payload:
+        pred_depth = _depth_or_conf_to_shw(payload["depth"].float().numpy(), "depth")
     m = evaluate_scene_metrics_fastvggt(
         scene.scene_id,
         ctx.c2ws,
@@ -379,16 +341,12 @@ def build_scannet_eval_row_from_payload_with_context(
         plot_trajectory=False,
         plot_path=None,
         gt_point_cloud=ctx.gt_point_cloud,
+        pred_depth=pred_depth,
+        gt_depth=ctx.gt_depth,
     )
     if m is None:
         raise RuntimeError(f"FastVGGT evaluate_scene_metrics_fastvggt returned None for {scene.scene_id}")
-    for k, v in m.items():
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            row[k] = float(v)
-    if ctx.gt_depth is not None and "depth" in payload:
-        pred_depth = _depth_or_conf_to_shw(payload["depth"].float().numpy(), "depth")
-        for k, v in evaluate_depth_metrics_streamvggt(pred_depth, ctx.gt_depth).items():
-            row[k] = float(v)
+    merge_numeric_metrics_into(row, m)
     row["protocol"] = "fastvggt_scannet"
     return row
 
@@ -396,11 +354,7 @@ def build_scannet_eval_row_from_payload_with_context(
 def metrics_float_dict(row: Dict[str, Any]) -> Dict[str, float]:
     skip = {"scene_id", "protocol", "infer_time_ms", "depth_valid_pixels"}
     out: Dict[str, float] = {}
-    for k, v in row.items():
-        if k in skip:
-            continue
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            out[k] = float(v)
+    merge_numeric_metrics_into(out, {k: v for k, v in row.items() if k not in skip})
     return out
 
 

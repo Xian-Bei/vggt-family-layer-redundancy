@@ -33,8 +33,8 @@ import torch
 from vggt.models.vggt import VGGT
 
 from .collect import collect_batch, infer_bs_and_seq_len
-from .fastvggt_scannet_eval import dependencies_available
-from .prediction_eval import (
+from analysis.eval.eval_utils import dependencies_available
+from analysis.eval.prediction_eval import (
     build_fastvggt_scene_eval_context,
     build_scannet_eval_row_from_payload_with_context,
     write_eval_scannet_json,
@@ -233,7 +233,7 @@ def main() -> None:
         manifest_payload["eval_scannet_file"] = "eval_scannet.json"
     (out_dir / "manifest.json").write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
     if eval_rows:
-        from .prediction_eval import resolve_gt_ply_dir
+        from analysis.eval.prediction_eval import resolve_gt_ply_dir
 
         resolved_ply = resolve_gt_ply_dir(args.data_root, args.gt_ply_dir)
         write_eval_scannet_json(

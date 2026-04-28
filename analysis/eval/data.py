@@ -5,7 +5,7 @@ import os.path as osp
 from collections import deque
 from base import BaseStereoViewDataset
 import dataset_utils.cropping as cropping
-from vggt.utils.eval_utils import imread_cv2, shuffle_deque
+from analysis.eval.eval_utils import imread_cv2, shuffle_deque
 
 
 class SevenScenes(BaseStereoViewDataset):

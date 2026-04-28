@@ -754,7 +754,7 @@ def evaluate_scene_and_save(
             )
             world_points_raw = np.dot(homogeneous_points, first_gt_pose.T)[:, :3]
 
-            world_points_scaled, scale_factor = align_point_clouds_scale(
+            world_points_scaled, _ = align_point_clouds_scale(
                 world_points_raw, gt_point_cloud
             )
 
@@ -762,13 +762,10 @@ def evaluate_scene_and_save(
                 world_points_scaled, gt_point_cloud, max_dist=chamfer_max_dist
             )
             stats_aligned["chamfer_distance"] = float(cd_value)
-            stats_aligned["scale_factor"] = float(scale_factor)
     except Exception as e:
         print(f"Error computing Chamfer Distance for {scene}: {e}")
 
     all_metrics: Dict[str, float] = deepcopy(stats_aligned)
-    for metric_name, metric_value in list(stats_aligned.items()):
-        all_metrics[f"aligned_{metric_name}"] = metric_value
     all_metrics["inference_time_ms"] = float(inference_time_ms)
 
     with open(output_scene_dir / "metrics.json", "w") as f:

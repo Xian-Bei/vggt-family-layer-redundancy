@@ -24,11 +24,13 @@ MERGING="${MERGING:-0}"
 MERGE_RATIO="${MERGE_RATIO:-0.9}"
 DEPTH_CONF_THRESH="${DEPTH_CONF_THRESH:-1.0}"
 CHAMFER_MAX_DIST="${CHAMFER_MAX_DIST:-0.5}"
+# Set to 1 to pass --skip_depth_eval (no depth_abs_rel / depth_delta1 vs ScanNet GT).
+SKIP_DEPTH_EVAL="${SKIP_DEPTH_EVAL:-0}"
 BASELINE_BACKEND="${BASELINE_BACKEND:-vggt}"
 FAST_BACKEND="${FAST_BACKEND:-fastvggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
 SCANNET_MODELS="${SCANNET_MODELS:-baseline(vggt),fastvggt(fastvggt)}"
-MODELS_7ANDN="${MODELS_7ANDN:-baseline(vggt),fastvggt(fastvggt)}"
+MODELS_7ANDN="${MODELS_7ANDN:-fastvggt(fastvggt)}"
 RUN_SCANNET="${RUN_SCANNET:-1}"
 RUN_7ANDN="${RUN_7ANDN:-0}"
 RUN_SUMMARY="${RUN_SUMMARY:-1}"
@@ -68,7 +70,7 @@ set_backend_pythonpath() {
 run_scannet() {
   local model_name="$1"
   local backend="$2"
-  local out_dir="${OUTPUT_DIR}/scannet/${model_name}"
+  local out_dir="${OUTPUT_DIR}/scans_test50/${model_name}"
   local num_scenes_arg="${NUM_SCENES}"
   local input_frame_arg="${INPUT_FRAME}"
 
@@ -90,6 +92,9 @@ run_scannet() {
   fi
   if [[ "${model_name}" == "fastvggt" ]]; then
     args+=(--merging "${MERGING}" --merge_ratio "${MERGE_RATIO}")
+  fi
+  if [[ "${SKIP_DEPTH_EVAL}" == "1" || "${SKIP_DEPTH_EVAL}" == "true" ]]; then
+    args+=(--skip_depth_eval)
   fi
 
   set_backend_pythonpath "${backend}"
@@ -162,7 +167,8 @@ def latest_input_frame_dir(base: Path):
     return sorted(candidates, key=key_fn)[-1]
 
 def read_scannet(mode: str):
-    p = latest_input_frame_dir(root / "scannet" / mode)
+    # Must match run_scannet() output: ${OUTPUT_DIR}/scans_test50/<model>
+    p = latest_input_frame_dir(root / "scans_test50" / mode)
     if p is None:
         return {}
     avg = p / "average_metrics.json"
@@ -190,37 +196,72 @@ def parse_7n_logs(path: Path):
             pass
     return out
 
-rows = []
-scannet_metrics = ["chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "inference_time_ms"]
+scannet_metric_keys = [
+    "chamfer_distance",
+    "ate",
+    "are",
+    "rpe_rot",
+    "rpe_trans",
+    "inference_time_ms",
+    "depth_abs_rel",
+    "depth_delta1",
+]
+scannet_rows = []
 for spec in scannet_models:
     mode = parse_model_name(spec)
     d = read_scannet(mode)
-    rows.append(["scannet", mode] + [d.get(k, float("nan")) for k in scannet_metrics])
+    scannet_rows.append((mode, d))
 
+seven_metric_keys = ["acc", "comp", "nc", "acc_med", "comp_med", "nc_med"]
+seven_rows = []
+nrgbd_rows = []
 for spec in models_7andn:
     mode = parse_model_name(spec)
-    for ds in ["7scenes", "NRGBD"]:
-        log_path = root / "7andn" / mode
-        kf_dirs = sorted([p for p in log_path.glob("*") if p.is_dir()])
-        d = {}
-        if kf_dirs:
-            d = parse_7n_logs(kf_dirs[-1] / ds / "logs_all.txt")
-        rows.append([ds.lower(), mode, d.get("acc", float("nan")), d.get("comp", float("nan")), d.get("nc", float("nan")), d.get("acc_med", float("nan")), d.get("comp_med", float("nan")), d.get("nc_med", float("nan"))])
+    log_path = root / "7andn" / mode
+    kf_dirs = sorted([p for p in log_path.glob("*") if p.is_dir()])
+    d7 = {}
+    dn = {}
+    if kf_dirs:
+        d7 = parse_7n_logs(kf_dirs[-1] / "7scenes" / "logs_all.txt")
+        dn = parse_7n_logs(kf_dirs[-1] / "NRGBD" / "logs_all.txt")
+    seven_rows.append((mode, d7))
+    nrgbd_rows.append((mode, dn))
 
-summary_lines = []
-summary_lines.append("| dataset | mode | m1 | m2 | m3 | m4 | m5 | m6 |")
-summary_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
-for r in rows[:2]:
-    summary_lines.append(f"| {r[0]} | {r[1]} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]:.6f} | {r[6]:.6f} | {r[7]:.6f} |")
-for r in rows[2:]:
-    summary_lines.append(f"| {r[0]} | {r[1]} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]:.6f} | {r[6]:.6f} | {r[7]:.6f} |")
 
-legend = [
-    "",
-    "ScanNet: m1=chamfer_distance, m2=ate, m3=are, m4=rpe_rot, m5=rpe_trans, m6=inference_time_ms",
-    "7Scenes/NRGBD: m1=acc, m2=comp, m3=nc, m4=acc_med, m5=comp_med, m6=nc_med",
-]
-summary = "\n".join(summary_lines + legend) + "\n"
+def fmt_cell(v: float) -> str:
+    if isinstance(v, float) and v != v:
+        return "nan"
+    return f"{float(v):.6f}"
+
+
+def md_metric_table(title: str, mode_col: str, metric_keys: list, rows: list) -> list:
+    """Return markdown lines for one block (title + table), or empty if rows is empty."""
+    if not rows:
+        return []
+    lines = [f"### {title}", ""]
+    header = "| " + " | ".join([mode_col] + metric_keys) + " |"
+    sep = "| " + " | ".join([":---"] + ["---:"] * len(metric_keys)) + " |"
+    lines.extend([header, sep])
+    for mode, d in rows:
+        vals = [fmt_cell(d.get(k, float("nan"))) for k in metric_keys]
+        lines.append("| " + " | ".join([mode] + vals) + " |")
+    lines.append("")
+    return lines
+
+
+summary_lines = ["# Evaluation summary", ""]
+summary_lines.extend(
+    md_metric_table("ScanNet", "mode", scannet_metric_keys, scannet_rows)
+)
+summary_lines.extend(
+    md_metric_table("7Scenes", "mode", seven_metric_keys, seven_rows)
+)
+summary_lines.extend(
+    md_metric_table("NRGBD", "mode", seven_metric_keys, nrgbd_rows)
+)
+while summary_lines and summary_lines[-1] == "":
+    summary_lines.pop()
+summary = "\n".join(summary_lines) + "\n"
 
 out = root / "summary_comparison.md"
 out.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +274,7 @@ PY
 
 echo "== FastVGGT-aligned evaluation =="
 echo "   output: ${OUTPUT_DIR}"
+echo "   skip_depth_eval (ScanNet depth vs GT): ${SKIP_DEPTH_EVAL}"
 echo "   scannet_models: ${SCANNET_MODELS}"
 echo "   models_7andn: ${MODELS_7ANDN}"
 echo "   run_scannet: ${RUN_SCANNET}"
@@ -266,6 +308,6 @@ else
 fi
 
 echo "== Done =="
-echo "   ScanNet outputs:  ${OUTPUT_DIR}/scannet/<model>"
+echo "   ScanNet outputs:  ${OUTPUT_DIR}/scans_test50/<model>"
 echo "   7N outputs:       ${OUTPUT_DIR}/7andn/<model>"
 

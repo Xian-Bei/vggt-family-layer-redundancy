@@ -24,9 +24,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 from vggt.models.vggt import VGGT
-from vggt.utils.eval_utils import (
+from analysis.eval.eval_utils import (
     build_frame_selection,
-    evaluate_scene_and_save,
     get_all_scenes,
     get_sorted_image_paths,
     get_vgg_input_imgs,
@@ -34,19 +33,27 @@ from vggt.utils.eval_utils import (
     load_images_rgb,
     load_poses,
 )
+from analysis.eval import evaluate_scene_and_save
 from .collect import collect_batch
 from .cache_layout import (
     load_scene_metadata,
     load_scene_pred,
     load_scene_replay_layer,
 )
-from .prediction_eval import (
+from analysis.eval.prediction_eval import (
+    _depth_or_conf_to_shw,
     build_fastvggt_scene_eval_context,
     build_scannet_eval_row_from_payload_with_context,
     write_eval_scannet_json,
 )
 from .prediction_save import build_scene_prediction_payload
-from .scannet_eval import aggregate_metric_dict, discover_scannet_scenes, load_scene_images, select_scene_image_paths_fastvggt
+from .scannet_eval import (
+    SceneData,
+    aggregate_metric_dict,
+    discover_scannet_scenes,
+    load_scene_images,
+    select_scene_image_paths_fastvggt,
+)
 
 
 @dataclass(frozen=True)
@@ -619,27 +626,36 @@ def _write_curves(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
         plt.savefig(out_dir / "train_curves.png", dpi=150)
         plt.close()
 
-        # Component plots: each weighted loss term gets its own figure.
-        component_dir = out_dir / "train_loss_components"
-        component_dir.mkdir(parents=True, exist_ok=True)
-        component_cols = [
-            str(k)
-            for k in sorted({k for r in epoch_rows for k in r.keys()})
-            if k.startswith("mean_loss_")
+        # Single figure: only terms with independent weights.
+        weighted_cols = [
+            # Alignment weighted parts
+            ("mean_loss_align_mse_term", "align_mse"),
+            ("mean_loss_align_cos_term", "align_cos"),
+            # Prediction weighted parts (outer w_pred already applied in *_contrib)
+            ("mean_loss_pred_camera_term_contrib", "pred_camera"),
+            ("mean_loss_pred_depth_reg_term_contrib", "pred_depth_reg"),
+            ("mean_loss_pred_depth_conf_term_contrib", "pred_depth_conf"),
+            ("mean_loss_pred_depth_grad_term_contrib", "pred_depth_grad"),
+            ("mean_loss_pred_point_reg_term_contrib", "pred_point_reg"),
+            ("mean_loss_pred_point_conf_term_contrib", "pred_point_conf"),
+            ("mean_loss_pred_point_grad_term_contrib", "pred_point_grad"),
         ]
-        for col in component_cols:
+        plt.figure(figsize=(11, 6))
+        any_plotted = False
+        for col, label in weighted_cols:
             ys = [float(r.get(col, float("nan"))) for r in epoch_rows]
             if not any(np.isfinite(y) for y in ys):
                 continue
-            plt.figure(figsize=(9, 5))
-            plt.plot(epochs, ys, label=col)
+            plt.plot(epochs, ys, label=label)
+            any_plotted = True
+        if any_plotted:
             plt.xlabel("epoch")
-            plt.ylabel("loss")
-            plt.title(col.replace("mean_", ""))
+            plt.ylabel("weighted_loss_component")
+            plt.title("Weighted loss components")
             plt.legend()
             plt.tight_layout()
-            plt.savefig(component_dir / f"{col}.png", dpi=150)
-            plt.close()
+            plt.savefig(out_dir / "train_loss_weighted_components.png", dpi=150)
+        plt.close()
     except Exception:
         pass
 
@@ -674,7 +690,7 @@ def _evaluate_dev_stage1_style(
     model.eval()
     t_eval0 = time.perf_counter()
     try:
-        for scene in scenes:
+        for scene in tqdm(scenes, desc="eval dev", leave=False):
             scene_eff = select_scene_image_paths_fastvggt(scene, max_frames)
             if not scene_eff.image_paths:
                 continue
@@ -749,7 +765,7 @@ def _evaluate_test_run_eval_style(
     was_training = bool(model.training)
     model.eval()
     try:
-        for scene in scene_names:
+        for scene in tqdm(scene_names, desc="eval test", leave=False):
             scene_dir = data_dir / f"{scene}"
             images_dir = scene_dir / "color"
             pose_path = scene_dir / "pose"
@@ -770,14 +786,40 @@ def _evaluate_test_run_eval_style(
             vgg_input, patch_width, patch_height = get_vgg_input_imgs(images_array)
             if hasattr(model, "update_patch_dimensions"):
                 model.update_patch_dimensions(patch_width, patch_height)
-            # Reuse run_eval/eval_scannet.py reconstruction path.
-            _, _, all_world_points, _, all_cam_to_world_mat, inference_time_ms = infer_vggt_and_reconstruct(
-                model,
-                vgg_input,
-                eval_amp_dtype,
-                depth_conf_thresh,
-                selected_image_paths,
+            # Reuse run_eval/eval_scannet.py reconstruction + dense-depth GT path (for parity with average_metrics.json).
+            _, _, all_world_points, _, all_cam_to_world_mat, inference_time_ms, depth_raw_np = (
+                infer_vggt_and_reconstruct(
+                    model,
+                    vgg_input,
+                    eval_amp_dtype,
+                    depth_conf_thresh,
+                    selected_image_paths,
+                )
             )
+            gt_depth = None
+            pred_depth_for_metrics = None
+            try:
+                pred_depth_for_metrics = _depth_or_conf_to_shw(depth_raw_np, "depth")
+            except Exception as e:
+                print(f"[warn] pred depth layout normalize failed for {scene}: {e}")
+                pred_depth_for_metrics = np.asarray(depth_raw_np, dtype=np.float32)
+            try:
+                scene_data = SceneData(
+                    scene_id=scene,
+                    scene_dir=scene_dir,
+                    image_paths=list(selected_image_paths),
+                )
+                ctx = build_fastvggt_scene_eval_context(
+                    scene_data,
+                    data_dir,
+                    gt_ply_dir,
+                    image_hw=(int(vgg_input.shape[2]), int(vgg_input.shape[3])),
+                )
+                gt_depth = ctx.gt_depth
+            except Exception as e:
+                print(
+                    f"[warn] depth GT load skipped for {scene} (align with eval_scannet when data is complete): {e}"
+                )
             with tempfile.TemporaryDirectory(prefix="lora_eval_scannet_") as tmpd:
                 metrics = evaluate_scene_and_save(
                     scene,
@@ -791,12 +833,24 @@ def _evaluate_test_run_eval_style(
                     chamfer_max_dist,
                     inference_time_ms,
                     False,
+                    pred_depth=pred_depth_for_metrics,
+                    gt_depth=gt_depth,
                 )
             if metrics is not None:
                 all_scenes_metrics[scene] = {
                     key: float(value)
                     for key, value in metrics.items()
-                    if key in ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "inference_time_ms")
+                    if key
+                    in (
+                        "chamfer_distance",
+                        "ate",
+                        "are",
+                        "rpe_rot",
+                        "rpe_trans",
+                        "inference_time_ms",
+                        "depth_abs_rel",
+                        "depth_delta1",
+                    )
                 }
     finally:
         if was_training:
@@ -851,7 +905,7 @@ def _run_test_upper_sanity_check(
     ref_payload = json.loads(ref_average_metrics_path.read_text(encoding="utf-8"))
     ref = _float_metrics_from_aggregate(ref_payload)
     # Keep sanity focused on quality metrics; inference latency is environment-sensitive.
-    keys = ("ate", "are", "rpe_rot", "rpe_trans", "chamfer_distance")
+    keys = ("ate", "are", "rpe_rot", "rpe_trans", "chamfer_distance", "depth_abs_rel", "depth_delta1")
     missing = [k for k in keys if k not in test_upper_metrics or k not in ref]
     if missing:
         raise SystemExit(f"Test sanity check failed: missing metrics {missing}")
@@ -878,9 +932,40 @@ def _append_eval_history(
         history_rows.append({"epoch": int(epoch), "split": str(split), "tag": str(tag), "metric": str(k), "value": float(v)})
 
 
+def _eval_epochs_metrics_payload(history_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """One nested summary for periodic eval: epoch → dev/test metric dicts (for eval_epochs_metrics.json)."""
+    ep_dev: Dict[int, Dict[str, float]] = {}
+    ep_test: Dict[int, Dict[str, float]] = {}
+    for r in history_rows:
+        if str(r.get("tag", "")) != "train":
+            continue
+        split = str(r.get("split", ""))
+        ep = int(r["epoch"])
+        key = str(r["metric"])
+        val = float(r["value"])
+        if split == "dev":
+            ep_dev.setdefault(ep, {})[key] = val
+        elif split == "test":
+            ep_test.setdefault(ep, {})[key] = val
+    epochs_sorted = sorted(set(ep_dev.keys()) | set(ep_test.keys()))
+    epochs_out: List[Dict[str, Any]] = []
+    for ep in epochs_sorted:
+        row: Dict[str, Any] = {"epoch": ep}
+        if ep in ep_dev:
+            row["dev"] = {k: ep_dev[ep][k] for k in sorted(ep_dev[ep].keys())}
+        if ep in ep_test:
+            row["test"] = {k: ep_test[ep][k] for k in sorted(ep_test[ep].keys())}
+        epochs_out.append(row)
+    return {"epochs": epochs_out}
+
+
 def _write_eval_artifacts(out_dir: Path, bounds: Dict[str, Dict[str, float]], history_rows: List[Dict[str, Any]]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "eval_bounds.json").write_text(json.dumps(bounds, indent=2), encoding="utf-8")
+    (out_dir / "eval_epochs_metrics.json").write_text(
+        json.dumps(_eval_epochs_metrics_payload(history_rows), indent=2),
+        encoding="utf-8",
+    )
     with (out_dir / "eval_metrics_history.csv").open("w", encoding="utf-8", newline="") as f:
         fields = ["epoch", "split", "tag", "metric", "value"]
         w = csv.DictWriter(f, fieldnames=fields)
@@ -890,30 +975,102 @@ def _write_eval_artifacts(out_dir: Path, bounds: Dict[str, Dict[str, float]], hi
     try:
         import matplotlib.pyplot as plt  # type: ignore
 
-        metrics = sorted({str(r["metric"]) for r in history_rows if str(r.get("tag", "")) == "train"})
-        for split in ("dev", "test"):
-            split_rows = [r for r in history_rows if str(r.get("split", "")) == split and str(r.get("tag", "")) == "train"]
-            for metric in metrics:
-                rows_m = [r for r in split_rows if str(r.get("metric", "")) == metric]
-                if not rows_m:
-                    continue
-                xs = [int(r["epoch"]) for r in rows_m]
-                ys = [float(r["value"]) for r in rows_m]
-                plt.figure(figsize=(9, 5))
-                plt.plot(xs, ys, marker="o", label=f"{split}_{metric}")
-                ub = bounds.get(split, {}).get("upper", {}).get(metric)
-                lb = bounds.get(split, {}).get("lower", {}).get(metric)
-                if ub is not None:
-                    plt.axhline(float(ub), linestyle="--", label="upper")
-                if lb is not None:
-                    plt.axhline(float(lb), linestyle="--", label="lower")
-                plt.xlabel("epoch")
-                plt.ylabel(metric)
-                plt.title(f"{split} {metric}")
-                plt.legend()
-                plt.tight_layout()
-                plt.savefig(out_dir / f"eval_plot_{split}_{metric}.png", dpi=150)
-                plt.close()
+        train_rows = [r for r in history_rows if str(r.get("tag", "")) == "train"]
+        metrics_with_dev = {str(r["metric"]) for r in train_rows if str(r.get("split", "")) == "dev"}
+        metrics_with_test = {str(r["metric"]) for r in train_rows if str(r.get("split", "")) == "test"}
+        # Only metrics that appear in periodic eval for both splits.
+        candidate_metrics = sorted(metrics_with_dev & metrics_with_test)
+
+        dev_color = "#c62828"  # red
+        test_color = "#1565c0"  # blue
+
+        for metric in candidate_metrics:
+            dev_rows = [r for r in train_rows if str(r.get("split", "")) == "dev" and str(r.get("metric", "")) == metric]
+            test_rows = [r for r in train_rows if str(r.get("split", "")) == "test" and str(r.get("metric", "")) == metric]
+            dev_ub = bounds.get("dev", {}).get("upper", {}).get(metric)
+            dev_lb = bounds.get("dev", {}).get("lower", {}).get(metric)
+            test_ub = bounds.get("test", {}).get("upper", {}).get(metric)
+            test_lb = bounds.get("test", {}).get("lower", {}).get(metric)
+            # One figure = dev upper/lower/plot + test upper/lower/plot (six series); skip otherwise.
+            if not dev_rows or not test_rows:
+                continue
+            if dev_ub is None or dev_lb is None or test_ub is None or test_lb is None:
+                continue
+
+            plt.figure(figsize=(10, 6))
+            z_band = 1
+            z_curve = 3
+
+            plt.axhline(
+                float(dev_ub),
+                linestyle="-.",
+                color=dev_color,
+                linewidth=1.6,
+                label="dev_upper",
+                zorder=z_band,
+                alpha=0.95,
+            )
+            plt.axhline(
+                float(dev_lb),
+                linestyle=":",
+                color=dev_color,
+                linewidth=1.6,
+                label="dev_lower",
+                zorder=z_band,
+                alpha=0.95,
+            )
+            plt.axhline(
+                float(test_ub),
+                linestyle="-.",
+                color=test_color,
+                linewidth=1.6,
+                label="test_upper",
+                zorder=z_band,
+                alpha=0.95,
+            )
+            plt.axhline(
+                float(test_lb),
+                linestyle=":",
+                color=test_color,
+                linewidth=1.6,
+                label="test_lower",
+                zorder=z_band,
+                alpha=0.95,
+            )
+
+            dev_xs = [int(r["epoch"]) for r in dev_rows]
+            dev_ys = [float(r["value"]) for r in dev_rows]
+            test_xs = [int(r["epoch"]) for r in test_rows]
+            test_ys = [float(r["value"]) for r in test_rows]
+            plt.plot(
+                dev_xs,
+                dev_ys,
+                marker="o",
+                linestyle="-",
+                color=dev_color,
+                linewidth=2.0,
+                label="dev",
+                zorder=z_curve,
+            )
+            plt.plot(
+                test_xs,
+                test_ys,
+                marker="s",
+                linestyle="--",
+                color=test_color,
+                linewidth=2.0,
+                label="test",
+                zorder=z_curve,
+            )
+
+            plt.xlabel("epoch")
+            plt.ylabel(metric)
+            plt.title(f"{metric} (dev red vs test blue; upper/lower/plot per split)")
+            plt.legend(loc="best", fontsize=9)
+            plt.grid(True, alpha=0.25)
+            plt.tight_layout()
+            plt.savefig(out_dir / f"eval_plot_{metric}.png", dpi=150)
+            plt.close()
     except Exception:
         pass
 
@@ -1017,7 +1174,7 @@ def main() -> None:
     test_sanity_avg_path = (
         Path(args.test_sanity_average_metrics_file)
         if args.test_sanity_average_metrics_file is not None
-        else Path("analysis_outputs/evaluation/scannet/baseline") / f"input_frame_{int(args.eval_input_frame)}" / "average_metrics.json"
+        else Path("analysis_outputs/evaluation/scans_test50/baseline") / f"input_frame_{int(args.eval_input_frame)}" / "average_metrics.json"
     )
 
     rules = _load_interval_rules(args.interval_config_file)
@@ -1489,12 +1646,13 @@ def main() -> None:
             dev_metrics = _evaluate_dev_stage1_style(
                 model=model,
                 data_root=args.dev_data_root,
-                out_dir=out_dir / f"eval_epoch_{epoch+1:04d}_dev",
+                out_dir=out_dir,
                 max_scenes=int(args.eval_max_scenes),
                 max_frames=int(args.eval_input_frame),
                 depth_conf_thresh=1.0,
                 chamfer_max_dist=0.5,
                 eval_amp_dtype=amp_dtype,
+                write_json=False,
             )
             _log(f"[eval][epoch={epoch+1}][scans_dev50] elapsed={time.perf_counter() - t_eval_dev0:.2f}s")
             t_eval_test0 = time.perf_counter()
@@ -1502,7 +1660,7 @@ def main() -> None:
                 model=model,
                 data_dir=args.test_data_dir,
                 gt_ply_dir=args.test_gt_ply_dir,
-                out_dir=out_dir / f"eval_epoch_{epoch+1:04d}_test",
+                out_dir=out_dir,
                 input_frame=int(args.eval_input_frame),
                 num_scenes=int(args.eval_max_scenes),
                 depth_conf_thresh=1.0,

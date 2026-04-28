@@ -90,7 +90,7 @@ def build_frame_selection(
     input_frame: int,
 ) -> Tuple[List[int], List[Path], List[int]]:
     """
-    Same logic as FastVGGT ``vggt/utils/eval_utils.build_frame_selection``:
+    Same logic as FastVGGT ``analysis.eval.eval_utils.build_frame_selection``:
     intersect image stems with valid pose frame ids, then subsample (first frame kept,
     then approximately uniform step on the rest) when more than ``input_frame`` frames.
     """
@@ -137,7 +137,7 @@ def select_scene_image_paths_fastvggt(scene: SceneData, max_frames: int) -> Scen
             f"Scene {scene.scene_id} is missing required pose directory: {pose_path}"
         )
 
-    from .fastvggt_scannet_eval import load_poses
+    from analysis.eval.eval_utils import load_poses
 
     _, _, available = load_poses(pose_path)
     _ids, selected_paths, _ = build_frame_selection(scene.image_paths, available, max_frames)

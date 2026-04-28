@@ -12,7 +12,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from vggt.models.vggt import VGGT
-from vggt.utils.eval_utils import (
+from analysis.eval.eval_utils import (
     load_poses,
     get_vgg_input_imgs,
     get_sorted_image_paths,
@@ -20,9 +20,8 @@ from vggt.utils.eval_utils import (
     build_frame_selection,
     load_images_rgb,
     infer_vggt_and_reconstruct,
-    evaluate_scene_and_save,
-    compute_average_metrics_and_save,
 )
+from analysis.eval import compute_average_metrics_and_save, evaluate_scene_and_save
 
 
 if __name__ == "__main__":
@@ -84,6 +83,12 @@ if __name__ == "__main__":
         type=float,
         default=0.9,
         help="Token merge ratio (0.0-1.0)",
+    )
+    parser.add_argument(
+        "--skip_depth_eval",
+        action="store_true",
+        help="Disable dense depth vs ScanNet GT (depth_abs_rel, depth_delta1); same protocol as "
+        "redundancy cache_scannet Stage1 when left unset.",
     )
     args = parser.parse_args()
     torch.manual_seed(33)
@@ -178,6 +183,7 @@ if __name__ == "__main__":
                 all_point_colors,
                 all_cam_to_world_mat,
                 inference_time_ms,
+                depth_raw_np,
             ) = infer_vggt_and_reconstruct(
                 model, vgg_input, dtype, args.depth_conf_thresh, image_paths
             )
@@ -191,6 +197,44 @@ if __name__ == "__main__":
                 continue
 
             # Evaluate and save
+            gt_depth = None
+            pred_depth_for_metrics = None
+            if not args.skip_depth_eval:
+                from analysis.eval.prediction_eval import (
+                    build_fastvggt_scene_eval_context,
+                    _depth_or_conf_to_shw,
+                )
+                from analysis.redundancy.scannet_eval import SceneData
+
+                try:
+                    pred_depth_for_metrics = _depth_or_conf_to_shw(
+                        depth_raw_np, "depth"
+                    )
+                except Exception as e:
+                    print(f"[warn] pred depth layout normalize failed for {scene}: {e}")
+                    pred_depth_for_metrics = np.asarray(
+                        depth_raw_np, dtype=np.float32
+                    )
+                try:
+                    scene_data = SceneData(
+                        scene_id=scene,
+                        scene_dir=scene_dir,
+                        image_paths=list(image_paths),
+                    )
+                    # Pixel (H, W) of vgg_input — same contract as cache_scannet / train_lora_skip_baseline.
+                    # Do not pass patch grid counts (patch_height, patch_width); that breaks GT depth
+                    # preprocessing and pred/gt shape alignment, so depth metrics are silently skipped.
+                    ctx = build_fastvggt_scene_eval_context(
+                        scene_data,
+                        args.data_dir,
+                        args.gt_ply_dir,
+                        image_hw=(int(vgg_input.shape[2]), int(vgg_input.shape[3])),
+                    )
+                    gt_depth = ctx.gt_depth
+                except Exception as e:
+                    print(
+                        f"[warn] depth GT load skipped for {scene} (align with Stage1 when data is complete): {e}"
+                    )
             metrics = evaluate_scene_and_save(
                 scene,
                 c2ws,
@@ -203,20 +247,24 @@ if __name__ == "__main__":
                 args.chamfer_max_dist,
                 inference_time_ms,
                 args.plot,
+                pred_depth=pred_depth_for_metrics,
+                gt_depth=gt_depth,
             )
             if metrics is not None:
+                summary_keys = [
+                    "chamfer_distance",
+                    "ate",
+                    "are",
+                    "rpe_rot",
+                    "rpe_trans",
+                    "inference_time_ms",
+                    "depth_abs_rel",
+                    "depth_delta1",
+                ]
                 all_scenes_metrics["scenes"][scene] = {
                     key: float(value)
                     for key, value in metrics.items()
-                    if key
-                    in [
-                        "chamfer_distance",
-                        "ate",
-                        "are",
-                        "rpe_rot",
-                        "rpe_trans",
-                        "inference_time_ms",
-                    ]
+                    if key in summary_keys
                 }
                 print("Complete metrics", all_scenes_metrics["scenes"][scene])
 

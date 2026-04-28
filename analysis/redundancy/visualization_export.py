@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from .prediction_eval import _depth_or_conf_to_shw, _squeeze_batch_to_ndim
+from analysis.eval.prediction_eval import _depth_or_conf_to_shw, _squeeze_batch_to_ndim
 
 
 def _safe_scene_id(scene_id: str) -> str:

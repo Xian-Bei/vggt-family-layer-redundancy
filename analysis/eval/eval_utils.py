@@ -1,9 +1,15 @@
+"""VGGT-aligned evaluation helpers (dataset IO, trajectory metrics, reconstruction).
+
+Lives under ``analysis/eval`` so evaluation code stays outside the ``vggt`` package.
+"""
+
 from collections import deque
 from PIL import Image
 import cv2
 import io
 import random
 import time
+import inspect
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from copy import deepcopy
@@ -157,6 +163,8 @@ def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0):
 def load_gt_pointcloud(scene_id, gt_ply_dir):
     scene_dir = gt_ply_dir / scene_id
     ply_path = scene_dir / (scene_id + "_vh_clean_2.ply")
+    if not ply_path.is_file():
+        return None, None
     pcd = o3d.io.read_point_cloud(str(ply_path))
 
     # Convert to numpy arrays
@@ -171,7 +179,7 @@ def load_gt_pointcloud(scene_id, gt_ply_dir):
     return points, colors
 
 
-def eval_trajectory(poses_est, poses_gt, frame_ids, align=False):
+def eval_trajectory(poses_est, poses_gt, frame_ids, align=False, plot_trajectory: bool = True):
     # Build reference trajectory object
     traj_ref = PoseTrajectory3D(
         positions_xyz=poses_gt[:, :3, 3],  # Extract translation part
@@ -300,53 +308,52 @@ def eval_trajectory(poses_est, poses_gt, frame_ids, align=False):
     )
     rpe_trans = rpe_transs_result.stats["rmse"]
 
-    # Plot trajectory graph
-    plot_mode = plot.PlotMode.xz  # Use correct PlotMode reference
-    fig = plt.figure()
-    ax = plot.prepare_axis(fig, plot_mode)
-    ax.set_title(f"ATE: {round(ate, 3)}, ARE: {round(are, 3)}")
+    stats = {"ate": ate, "are": are, "rpe_rot": rpe_rot, "rpe_trans": rpe_trans}
+    pillow_image = None
+    if plot_trajectory:
+        # Plot trajectory graph
+        plot_mode = plot.PlotMode.xz  # Use correct PlotMode reference
+        fig = plt.figure()
+        ax = plot.prepare_axis(fig, plot_mode)
+        ax.set_title(f"ATE: {round(ate, 3)}, ARE: {round(are, 3)}")
 
-    # Use reference trajectory (GT) for plotting
-    plot.traj(ax, plot_mode, traj_ref, "--", "gray", "gt")
+        # Use reference trajectory (GT) for plotting
+        plot.traj(ax, plot_mode, traj_ref, "--", "gray", "gt")
 
-    # Use aligned trajectory for visualization
-    if align:
-        traj_est_aligned = ate_result.trajectories["traj"]
-        plot.traj_colormap(
-            ax,
-            traj_est_aligned,
-            ate_result.np_arrays["error_array"],
-            plot_mode,
-            min_map=ate_result.stats["min"],
-            max_map=ate_result.stats["max"],
-        )
-    else:
-        plot.traj_colormap(
-            ax,
-            traj_est,
-            ate_result.np_arrays["error_array"],
-            plot_mode,
-            min_map=ate_result.stats["min"],
-            max_map=ate_result.stats["max"],
-        )
+        # Use aligned trajectory for visualization
+        if align:
+            traj_est_aligned = ate_result.trajectories["traj"]
+            plot.traj_colormap(
+                ax,
+                traj_est_aligned,
+                ate_result.np_arrays["error_array"],
+                plot_mode,
+                min_map=ate_result.stats["min"],
+                max_map=ate_result.stats["max"],
+            )
+        else:
+            plot.traj_colormap(
+                ax,
+                traj_est,
+                ate_result.np_arrays["error_array"],
+                plot_mode,
+                min_map=ate_result.stats["min"],
+                max_map=ate_result.stats["max"],
+            )
 
-    ax.legend()
+        ax.legend()
 
-    # Save image to memory buffer
-    buffer = io.BytesIO()
-    plt.savefig(buffer, format="png", dpi=90)
-    buffer.seek(0)
+        # Save image to memory buffer
+        buffer = io.BytesIO()
+        plt.savefig(buffer, format="png", dpi=90)
+        buffer.seek(0)
 
-    pillow_image = Image.open(buffer)
-    pillow_image.load()
-    buffer.close()
-    plt.close(fig)
+        pillow_image = Image.open(buffer)
+        pillow_image.load()
+        buffer.close()
+        plt.close(fig)
 
-    return (
-        {"ate": ate, "are": are, "rpe_rot": rpe_rot, "rpe_trans": rpe_trans},
-        pillow_image,
-        transform,
-    )
+    return (stats, pillow_image, transform)
 
 
 def load_poses(path):
@@ -637,6 +644,15 @@ def compute_original_coords(
     return original_coords
 
 
+def _aggregator_supports_return_layers(aggregator) -> bool:
+    """FastVGGT vendor :class:`Aggregator` has no ``return_layers`` kwarg; main-repo VGGT does."""
+    try:
+        sig = inspect.signature(aggregator.forward)
+    except (TypeError, ValueError):
+        return False
+    return "return_layers" in sig.parameters
+
+
 def _required_prediction_layers_for_sparse_heads(model, num_layers):
     required = set()
     if getattr(model, "camera_head", None) is not None and num_layers > 0:
@@ -674,6 +690,7 @@ def infer_vggt_and_reconstruct(
     List[np.ndarray],
     List[np.ndarray],
     float,
+    np.ndarray,
 ]:
     torch.cuda.synchronize()
     start = time.time()
@@ -685,7 +702,16 @@ def infer_vggt_and_reconstruct(
             images_batched = vgg_input_cuda
         else:
             raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_input_cuda.shape)}")
-        predictions = _forward_vggt_sparse_heads(model, images_batched)
+        if hasattr(model, "forward_from_aggregated_tokens") and _aggregator_supports_return_layers(
+            model.aggregator
+        ):
+            predictions = _forward_vggt_sparse_heads(model, images_batched)
+        else:
+            # FastVGGT / vendor: full aggregator forward (no partial-layer API).
+            try:
+                predictions = model(images_batched, image_paths=image_paths)
+            except TypeError:
+                predictions = model(images_batched)
     torch.cuda.synchronize()
     end = time.time()
     inference_time_ms = (end - start) * 1000.0
@@ -698,7 +724,8 @@ def infer_vggt_and_reconstruct(
     depth_conf = predictions["depth_conf"]
     depth_conf_np = depth_conf[0].detach().float().cpu().numpy()
     depth_mask = depth_conf_np >= depth_conf_thresh
-    depth_filtered = depth_tensor[0].detach().float().cpu().numpy()
+    depth_raw_np = depth_tensor[0].detach().float().cpu().numpy()
+    depth_filtered = depth_raw_np.copy()
     depth_filtered[~depth_mask] = np.nan
     depth_np = depth_filtered
 
@@ -740,111 +767,16 @@ def infer_vggt_and_reconstruct(
         all_colors,
         all_cam_to_world_mat,
         inference_time_ms,
+        depth_raw_np,
     )
 
 
-def evaluate_scene_and_save(
-    scene: str,
-    c2ws: np.ndarray,
-    first_gt_pose: np.ndarray,
-    frame_ids: List[int],
-    all_cam_to_world_mat: List[np.ndarray],
-    all_world_points: List[np.ndarray],
-    output_scene_dir: Path,
-    gt_ply_dir: Path,
-    chamfer_max_dist: float,
-    inference_time_ms: float,
-    plot_flag: bool,
-) -> Optional[Dict[str, float]]:
-    if not all_cam_to_world_mat or not all_world_points:
-        print(f"Skipping {scene}: failed to obtain valid camera poses or point clouds")
-        return None
-
-    output_scene_dir.mkdir(parents=True, exist_ok=True)
-
-    poses_gt = c2ws
-    w2cs = np.linalg.inv(poses_gt)
-    traj_est_poses = np.array(all_cam_to_world_mat)
-    n = min(len(traj_est_poses), len(w2cs))
-    timestamps = frame_ids[:n]
-    stats_aligned, traj_plot, _ = eval_trajectory(
-        traj_est_poses[:n], w2cs[:n], timestamps, align=True
-    )
-
+def dependencies_available() -> bool:
+    """Whether optional ScanNet metric deps (evo, open3d) are installed."""
     try:
-        merged_point_cloud = np.vstack(all_world_points)
-        gt_point_cloud, _ = load_gt_pointcloud(scene, gt_ply_dir)
-        if gt_point_cloud is not None:
-            homogeneous_points = np.hstack(
-                [merged_point_cloud, np.ones((merged_point_cloud.shape[0], 1))]
-            )
-            world_points_raw = np.dot(homogeneous_points, first_gt_pose.T)[:, :3]
+        import evo.main_ape as _  # noqa: F401
+        import open3d as _  # noqa: F401
 
-            world_points_scaled, scale_factor = align_point_clouds_scale(
-                world_points_raw, gt_point_cloud
-            )
-
-            cd_value = compute_chamfer_distance(
-                world_points_scaled, gt_point_cloud, max_dist=chamfer_max_dist
-            )
-            stats_aligned["chamfer_distance"] = float(cd_value)
-            stats_aligned["scale_factor"] = float(scale_factor)
-    except Exception as e:
-        print(f"Error computing Chamfer Distance for {scene}: {e}")
-
-    all_metrics: Dict[str, float] = deepcopy(stats_aligned)
-    for metric_name, metric_value in list(stats_aligned.items()):
-        all_metrics[f"aligned_{metric_name}"] = metric_value
-    all_metrics["inference_time_ms"] = float(inference_time_ms)
-
-    with open(output_scene_dir / "metrics.json", "w") as f:
-        import json
-
-        json.dump(all_metrics, f, indent=4)
-    if plot_flag:
-        try:
-            traj_plot.save(output_scene_dir / "plot.png")
-        except Exception:
-            pass
-
-    return all_metrics
-
-
-def compute_average_metrics_and_save(
-    all_scenes_metrics: Dict[str, Dict[str, Dict[str, float]]],
-    output_path: Path,
-    input_frame: int,
-) -> Dict[str, float]:
-    metric_names = [
-        "chamfer_distance",
-        "ate",
-        "are",
-        "rpe_rot",
-        "rpe_trans",
-        "inference_time_ms",
-    ]
-    average_metrics_list: Dict[str, List[float]] = {
-        metric: [] for metric in metric_names
-    }
-    for _, metrics in all_scenes_metrics["scenes"].items():
-        for metric_name, metric_value in metrics.items():
-            if metric_name in average_metrics_list:
-                average_metrics_list[metric_name].append(float(metric_value))
-
-    average_metrics: Dict[str, float] = {}
-    for metric_name, values in average_metrics_list.items():
-        average_metrics[metric_name] = float(np.mean(values)) if values else 0.0
-
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    input_frame_dir = output_path / f"input_frame_{input_frame}"
-    input_frame_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(input_frame_dir / "average_metrics.json", "w") as f:
-        import json
-
-        json.dump(average_metrics, f, indent=4)
-
-    
-
-    return average_metrics
+        return True
+    except ImportError:
+        return False
