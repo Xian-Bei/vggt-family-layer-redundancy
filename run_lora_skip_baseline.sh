@@ -69,8 +69,6 @@ TEST_GT_PLY_DIR="${TEST_GT_PLY_DIR:-data/scans_test50}"
 TEST_SANITY_AVG_FILE="${TEST_SANITY_AVG_FILE:-}"
 EVAL_MAX_SCENES="${EVAL_MAX_SCENES:-0}"
 EVAL_INPUT_FRAME="${EVAL_INPUT_FRAME:-30}"
-STAGE1_SANITY_ATOL="${STAGE1_SANITY_ATOL:-1e-6}"
-STAGE1_SANITY_RTOL="${STAGE1_SANITY_RTOL:-1e-6}"
 TEST_SANITY_ATOL="${TEST_SANITY_ATOL:-5e-3}"
 TEST_SANITY_RTOL="${TEST_SANITY_RTOL:-1e-2}"
 BOUNDS_CACHE_FILE="${BOUNDS_CACHE_FILE:-${OUT_DIR}/bounds_summary.json}"
@@ -169,8 +167,6 @@ run_one_trial() {
     $( [[ -n "${TEST_SANITY_AVG_FILE}" ]] && printf '%s %s' --test-sanity-average-metrics-file "${TEST_SANITY_AVG_FILE}" ) \
     --eval-max-scenes "${EVAL_MAX_SCENES}" \
     --eval-input-frame "${EVAL_INPUT_FRAME}" \
-    --stage1-sanity-atol "${STAGE1_SANITY_ATOL}" \
-    --stage1-sanity-rtol "${STAGE1_SANITY_RTOL}" \
     --test-sanity-atol "${TEST_SANITY_ATOL}" \
     --test-sanity-rtol "${TEST_SANITY_RTOL}" \
     $( [[ -n "${RESUME_FROM}" ]] && printf '%s %s' --resume-from "${RESUME_FROM}" ) \

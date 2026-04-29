@@ -1229,8 +1229,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--eval-max-scenes", type=int, default=0, help="0 means full split.")
     p.add_argument("--eval-input-frame", type=int, default=30)
-    p.add_argument("--stage1-sanity-atol", type=float, default=1e-6)
-    p.add_argument("--stage1-sanity-rtol", type=float, default=1e-6)
     p.add_argument(
         "--test-sanity-atol",
         type=float,

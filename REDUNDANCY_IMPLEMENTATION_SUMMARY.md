@@ -87,7 +87,7 @@ skip-range 分析当前是我们讨论后的实现：
 
 1. 直接复用 `0..i-1` 层缓存好的 `concat(frame, global)`；
 2. 从第 `i` 层缓存里切出 `frame_i`；
-3. 在 `[i..j]` 内把 global block 视作 identity；
+3. 在 `[i..j]` 内把 global block 视作 `skip_global`（恒等透传）；
 4. frame block 继续正常传播；
 5. 从 `j+1` 起恢复正常的 frame/global 执行；
 6. 最终重新构造完整 `aggregated_tokens_list`，再正常走 heads 与 GT eval。
@@ -96,24 +96,24 @@ skip-range 分析当前是我们讨论后的实现：
 
 此外，Stage2 replay 现在支持一个仅影响 skip 层的实验开关列表：
 
-- `SKIPPED_GLOBAL_MODES=identity`：
-  默认值，与当前主线完全一致；被 skip 的 global 层直接视作 identity。
-- `SKIPPED_GLOBAL_MODES=special_only`：
+- `MODES=skip_global`：
+  默认值之一，与当前主线 identity 行为一致；被 skip 的 global 层直接做恒等透传。
+- `MODES=special_only`：
   在被 skip 的 global 层中，仅对 camera/register token 保留非对称 global attention；
   patch token 不做 patch-patch global attention，并原样透传到后续 frame block。
 
-- `SKIPPED_GLOBAL_MODES=patch_special`：
+- `MODES=patch_special`：
   在被 skip 的 global 层中，special token 仍然对全部 token 做全局 attention；
   patch token 也会对 special token 做全局 attention，并继续经过正常的 residual 与 `norm2/mlp`；
   但 patch token 之间仍然不做 global attention。
 
-- `SKIPPED_GLOBAL_MODES=special_only_nomlp`：
+- `MODES=special_only_nomlp`：
   与 `special_only` 相同的 attention 路径，但 special token 不再经过后续 `norm2/mlp` 分支。
 
-- `SKIPPED_GLOBAL_MODES=patch_special_nomlp`：
+- `MODES=patch_special_nomlp`：
   与 `patch_special` 相同的 attention 路径，但 special 与 patch 两个分支都不再经过后续 `norm2/mlp` 分支。
 
-- `SKIPPED_GLOBAL_MODES=special_only,identity`：
+- `MODES=special_only,skip_global`：
   Stage2 会按列表中的 mode 依次各跑一次 skip-range；
   多模式时 heatmap / summary / visualization 会附加 mode 后缀，方便横向对比。
 
@@ -144,7 +144,7 @@ skip-range 分析当前是我们讨论后的实现：
 | `MAX_CONCAT_TOKENS` | `0` | Stage2 相似性前不二次下采样。 |
 | `PAIR_MAX_SPAN` | `1` | 默认启用主逻辑 `sim(frame_i, global_i)`。 |
 | `SKIP_RANGE_MAX_SPAN` | `6` | 最多连续跳过 6 个 global block。 |
-| `SKIPPED_GLOBAL_MODES` | `special_only,identity` | Stage2 skip 层近似方式列表；支持 `identity`、`special_only`、`special_only_nomlp`、`patch_special`、`patch_special_nomlp`（兼容别名 `patch_special_bipartite`）。单值保持旧单模式行为，多值会按 mode 分别运行并给输出加后缀。 |
+| `MODES` | `special_only,skip_global` | Stage2 skip 层近似方式列表；支持 `skip_global`、`skip_both`、`special_only`、`special_only_nomlp`、`patch_special`、`patch_special_nomlp`（兼容别名 `patch_special_bipartite`）。单值保持旧单模式行为，多值会按 mode 分别运行并给输出加后缀。 |
 | `EXPORT_VIS_STAGE1` | `0` | Stage1 可视化默认关闭。 |
 | `EXPORT_VIS_STAGE2` | `0` | Stage2 可视化默认关闭。 |
 | `SAVE_PER_SCENE_STAGE2` | `0` | Stage2 per-scene 报告默认关闭。 |

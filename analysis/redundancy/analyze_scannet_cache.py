@@ -369,10 +369,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fusion-modes",
         nargs="+",
-        default=("identity", "special_only", "special_only_nomlp", "patch_special", "patch_special_nomlp"),
+        default=("skip_global", "special_only", "special_only_nomlp", "patch_special", "patch_special_nomlp"),
         choices=(
-            "identity",
-            "both",
+            "skip_global",
+            "skip_both",
             "special_only",
             "special_only_nomlp",
             "patch_special",
@@ -1591,7 +1591,7 @@ def _apply_skipped_global_mode(
     tokens_per_frame: int,
     pos_global: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    if skipped_global_mode in ("identity", "both"):
+    if skipped_global_mode in ("skip_global", "skip_both"):
         return global_in
     if skipped_global_mode == "special_only":
         return _special_only_global_block_forward(
@@ -1720,7 +1720,7 @@ def _forward_with_suffix_replay(
         if layer_idx + 1 >= num_layers:
             break
         skip_next_frame_block = (
-            skipped_global_mode == "both"
+            skipped_global_mode == "skip_both"
             and skip_start is not None
             and skip_end is not None
             and skip_start <= (layer_idx + 1) <= skip_end
@@ -1799,7 +1799,7 @@ def _replay_global_output_at_layer(
         if layer_idx == target_layer:
             return global_view
         skip_next_frame_block = (
-            skipped_global_mode == "both" and skip_start <= (layer_idx + 1) <= skip_end
+            skipped_global_mode == "skip_both" and skip_start <= (layer_idx + 1) <= skip_end
         )
         if skip_next_frame_block:
             continue
