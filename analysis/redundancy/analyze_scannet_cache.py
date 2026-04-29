@@ -433,21 +433,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--depth-conf-thresh", type=float, default=1.0)
     p.add_argument("--chamfer-max-dist", type=float, default=0.5)
     p.add_argument(
-        "--disable-stage1-sanity-check",
+        "--disable-cache-sanity-check",
         action="store_true",
-        help="Disable Stage2 sanity check that verifies Stage1 and Stage2 use identical frame selection per scene.",
+        help="Disable cache sanity check that verifies cache replay uses identical frame selection per scene.",
     )
     p.add_argument(
-        "--stage1-sanity-atol",
+        "--cache-sanity-atol",
         type=float,
         default=1e-6,
-        help="Absolute tolerance for Stage1 no-op sanity check metric comparison.",
+        help="Absolute tolerance for cache no-op sanity check metric comparison.",
     )
     p.add_argument(
-        "--stage1-sanity-rtol",
+        "--cache-sanity-rtol",
         type=float,
         default=1e-6,
-        help="Relative tolerance for Stage1 no-op sanity check metric comparison.",
+        help="Relative tolerance for cache no-op sanity check metric comparison.",
     )
     p.add_argument(
         "--export-visualization",
@@ -1830,9 +1830,9 @@ def _collect_skip_range_loss(
     stage2_vis_root: Optional[Path],
     skipped_global_mode: str,
     vis_pair_suffix: str,
-    stage1_sanity_check: bool,
-    stage1_sanity_atol: float,
-    stage1_sanity_rtol: float,
+    cache_sanity_check: bool,
+    cache_sanity_atol: float,
+    cache_sanity_rtol: float,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     if not hf_model.strip():
         raise SystemExit("--hf-model must be non-empty when skip-range loss is enabled.")
@@ -1890,7 +1890,7 @@ def _collect_skip_range_loss(
                 f"Stage2 skip-loss requires complete data, but scene {scene.scene_id} has no valid frames "
                 "after FastVGGT selection."
             )
-        if stage1_sanity_check:
+        if cache_sanity_check:
             _check_stage1_selection_match(scene.scene_id, _item, scene_eff)
         images = load_scene_images(scene_eff, mode="crop").to(device)
         if images.dim() == 4:
@@ -1907,7 +1907,7 @@ def _collect_skip_range_loss(
         hw = (int(images.shape[-2]), int(images.shape[-1]))
         replay_concat_layers = _load_scene_replay_cache(cache_dir, _item, num_layers)
         pos_frame, pos_global = _build_aggregator_positions(model, images)
-        if stage1_sanity_check:
+        if cache_sanity_check:
             with torch.no_grad(), torch.autocast(
                 device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp
             ):
@@ -1937,14 +1937,14 @@ def _collect_skip_range_loss(
                 scene.scene_id,
                 stage1_gt,
                 noop_gt,
-                atol=stage1_sanity_atol,
-                rtol=stage1_sanity_rtol,
+                atol=cache_sanity_atol,
+                rtol=cache_sanity_rtol,
             )
             del noop_pred, noop_pred_cpu
             if timing:
                 print(
-                    f"[timing] stage1 sanity check passed for {scene.scene_id} "
-                    f"(mode={skipped_global_mode}, atol={stage1_sanity_atol}, rtol={stage1_sanity_rtol})",
+                    f"[timing] cache sanity check passed for {scene.scene_id} "
+                    f"(mode={skipped_global_mode}, atol={cache_sanity_atol}, rtol={cache_sanity_rtol})",
                     flush=True,
                 )
 
@@ -2103,9 +2103,9 @@ def _collect_skip_range_loss(
             "skip_max_span": int(skip_max_span),
             "skipped_global_mode": skipped_global_mode,
             "num_scenes_used": len(selected),
-            "stage1_sanity_check": bool(stage1_sanity_check),
-            "stage1_sanity_atol": float(stage1_sanity_atol),
-            "stage1_sanity_rtol": float(stage1_sanity_rtol),
+            "cache_sanity_check": bool(cache_sanity_check),
+            "cache_sanity_atol": float(cache_sanity_atol),
+            "cache_sanity_rtol": float(cache_sanity_rtol),
             "skip_range_loss_upper_by_metric": mean_upper_by_metric,
             "timing_breakdown_total_seconds": global_breakdown_totals if global_breakdown_pairs > 0 else {},
             "timing_breakdown_pairs": int(global_breakdown_pairs),
@@ -2302,7 +2302,7 @@ def main() -> None:
                     f"Fusion analysis requires complete data, but scene {scene.scene_id} has no valid frames "
                     "after FastVGGT selection."
                 )
-            if not bool(args.disable_stage1_sanity_check):
+            if not bool(args.disable_cache_sanity_check):
                 _check_stage1_selection_match(scene.scene_id, item, scene_eff)
 
             images = load_scene_images(scene_eff, mode="crop").to(skip_loss_device)
@@ -2319,7 +2319,7 @@ def main() -> None:
 
         pos_frame, pos_global = _build_aggregator_positions(model, images)
 
-        if not skip_gt_eval and not bool(args.disable_stage1_sanity_check):
+        if not skip_gt_eval and not bool(args.disable_cache_sanity_check):
             with torch.no_grad(), torch.autocast(
                 device_type=autocast_device_type, dtype=skip_loss_dtype, enabled=use_amp
             ):
@@ -2349,8 +2349,8 @@ def main() -> None:
                 scene.scene_id,
                 stage1_gt,
                 noop_gt,
-                atol=float(args.stage1_sanity_atol),
-                rtol=float(args.stage1_sanity_rtol),
+                atol=float(args.cache_sanity_atol),
+                rtol=float(args.cache_sanity_rtol),
             )
             del noop_pred, noop_pred_cpu
 

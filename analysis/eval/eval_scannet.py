@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import os
 import sys
+import json
 
 # Ensure project root is in sys.path for absolute imports like `vggt.*`
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -281,6 +282,12 @@ if __name__ == "__main__":
         args.output_path,
         input_frame=None,  # external dir already encodes input_frame; save directly under output_path
     )
+    average_metrics["num_scenes"] = int(len(all_scenes_metrics.get("scenes") or {}))
+    with open(args.output_path / "average_metrics.json", "w") as f:
+        json.dump(average_metrics, f, indent=4)
     print("\nAverage metrics:")
     for metric_name, value in average_metrics.items():
-        print(f"{metric_name}: {value:.6f}")
+        if isinstance(value, (int, np.integer)):
+            print(f"{metric_name}: {int(value)}")
+        else:
+            print(f"{metric_name}: {float(value):.6f}")

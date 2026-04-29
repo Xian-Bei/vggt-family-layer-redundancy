@@ -8,7 +8,7 @@ export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 # FastVGGT-aligned CLI knobs
-DATA_DIR="${DATA_DIR:-data/scans_test50}"
+DATA_DIR="${DATA_DIR:-data/scans_test50,data/scans_dev50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
 OUTPUT_DIR="${OUTPUT_DIR:-analysis_outputs/evaluation}"
@@ -29,7 +29,7 @@ SKIP_DEPTH_EVAL="${SKIP_DEPTH_EVAL:-0}"
 BASELINE_BACKEND="${BASELINE_BACKEND:-vggt}"
 FAST_BACKEND="${FAST_BACKEND:-fastvggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
-SCANNET_MODELS="${SCANNET_MODELS:-Baseline(vggt),Ours(fastvggt)}"
+SCANNET_MODELS="${SCANNET_MODELS:-Baseline(vggt),Baseline(fastvggt),Ours(vggt),Ours(fastvggt)}"
 MODELS_7ANDN="${MODELS_7ANDN:-Baseline(fastvggt)}"
 # Tag used for ScanNet-style output directories. Defaults to basename of DATA_DIR
 # (e.g. scans_dev50 / scans_test50), but you can override explicitly.
@@ -39,7 +39,6 @@ OURS_TRAIN_DIR="${OURS_TRAIN_DIR:-}"
 OURS_EPOCH="${OURS_EPOCH:-}"
 RUN_SCANNET="${RUN_SCANNET:-1}"
 RUN_7ANDN="${RUN_7ANDN:-0}"
-RUN_SUMMARY="${RUN_SUMMARY:-1}"
 
 trim_spaces() {
   local s="$1"
@@ -184,7 +183,6 @@ echo "   scannet_models: ${SCANNET_MODELS}"
 echo "   models_7andn: ${MODELS_7ANDN}"
 echo "   run_scannet: ${RUN_SCANNET}"
 echo "   run_7andn: ${RUN_7ANDN}"
-echo "   run_summary: ${RUN_SUMMARY}"
 
 if [[ "${RUN_SCANNET}" == "1" || "${RUN_SCANNET}" == "true" ]]; then
   IFS=',' read -r -a DATA_DIR_ARR <<< "${DATA_DIR}"
@@ -213,11 +211,7 @@ else
   echo "   [skip] 7scenes + NRGBD evaluation disabled"
 fi
 
-if [[ "${RUN_SUMMARY}" == "1" || "${RUN_SUMMARY}" == "true" ]]; then
-  python -m analysis.eval.summary --output-dir "${OUTPUT_DIR}"
-else
-  echo "   [skip] summary generation disabled"
-fi
+python -m analysis.eval.summary --output-dir "${OUTPUT_DIR}"
 
 echo "== Done =="
 echo "   ScanNet outputs:  ${OUTPUT_DIR}/<scannet_tag>_input_frame_${INPUT_FRAME}/<model>_<backend>[_ckpt]"
