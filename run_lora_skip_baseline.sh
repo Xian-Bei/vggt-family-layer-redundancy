@@ -18,7 +18,7 @@ HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
 OUT_DIR="${OUT_DIR:-analysis_outputs/lora_skip_baseline}"
 # Hyperparam search config (enable one at a time, in recommended order):
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/01_lr.json}"
-SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/02_rank_alpha_tuple.json}"
+SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/01_align_pred_tuple.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/03_lora_dropout.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/04_weight_decay.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/05_align_pred_tuple.json}"
