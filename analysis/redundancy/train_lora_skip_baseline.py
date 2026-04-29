@@ -595,6 +595,7 @@ def _prediction_official_camera_depth(
     student_pred: Dict[str, torch.Tensor],
     target_batch: Dict[str, torch.Tensor],
     *,
+    w_pred: float,
     w_camera: float,
     w_depth: float,
     w_depth_grad: float,
@@ -605,6 +606,7 @@ def _prediction_official_camera_depth(
     device = next(iter(student_pred.values())).device
     total = torch.zeros((), device=device)
     logs: Dict[str, float] = {}
+    wp = float(w_pred)
 
     if "pose_enc_list" in student_pred:
         camera_loss_dict = compute_camera_loss(
@@ -614,11 +616,7 @@ def _prediction_official_camera_depth(
         )
         l_camera = camera_loss_dict["loss_camera"]
         total = total + float(w_camera) * l_camera
-        logs["loss_camera"] = float(l_camera.detach().item())
-        logs["loss_T"] = float(camera_loss_dict["loss_T"].detach().item())
-        logs["loss_R"] = float(camera_loss_dict["loss_R"].detach().item())
-        logs["loss_FL"] = float(camera_loss_dict["loss_FL"].detach().item())
-        logs["loss_camera_term"] = float((float(w_camera) * l_camera).detach().item())
+        logs["loss_camera"] = float((wp * float(w_camera) * l_camera).detach().item())
 
     if "depth" in student_pred and "depth_conf" in student_pred:
         depth_loss_dict = compute_depth_loss(
@@ -632,15 +630,12 @@ def _prediction_official_camera_depth(
         l_grad = depth_loss_dict["loss_grad_depth"]
         l_depth = l_conf + l_reg + float(w_depth_grad) * l_grad
         total = total + float(w_depth) * l_depth
-        logs["loss_conf_depth"] = float(l_conf.detach().item())
-        logs["loss_reg_depth"] = float(l_reg.detach().item())
-        logs["loss_grad_depth"] = float(l_grad.detach().item())
-        logs["loss_depth_term"] = float((float(w_depth) * l_depth).detach().item())
-        logs["loss_depth_conf_term"] = float((float(w_depth) * l_conf).detach().item())
-        logs["loss_depth_reg_term"] = float((float(w_depth) * l_reg).detach().item())
-        logs["loss_depth_grad_term"] = float(
-            (float(w_depth) * float(w_depth_grad) * l_grad).detach().item()
-        )
+        wd = float(w_depth)
+        wdg = float(w_depth_grad)
+        logs["loss_depth"] = float((wp * wd * l_depth).detach().item())
+        logs["loss_depth_conf"] = float((wp * wd * l_conf).detach().item())
+        logs["loss_depth_reg"] = float((wp * wd * l_reg).detach().item())
+        logs["loss_depth_grad"] = float((wp * wd * wdg * l_grad).detach().item())
 
     return total, logs
 
@@ -791,16 +786,13 @@ def _write_curves(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
         plt.savefig(out_dir / "train_curves.png", dpi=150)
         plt.close()
 
-        # Single figure: only terms with independent weights.
+        # Single figure: only terms with independent weights (values are contributions to total loss).
+        # mean_loss_depth is w_pred * w_depth * (conf + reg + w_depth_grad * grad), see _prediction_official_camera_depth.
         weighted_cols = [
-            # Alignment weighted parts
-            ("mean_loss_align_mse_term", "align_mse"),
-            ("mean_loss_align_cos_term", "align_cos"),
-            # Prediction weighted parts (outer w_pred already applied in *_contrib)
-            ("mean_loss_camera_term_contrib", "pred_camera"),
-            ("mean_loss_depth_reg_term_contrib", "pred_depth_reg"),
-            ("mean_loss_depth_conf_term_contrib", "pred_depth_conf"),
-            ("mean_loss_depth_grad_term_contrib", "pred_depth_grad"),
+            ("mean_loss_align_mse", "align_mse"),
+            ("mean_loss_align_cos", "align_cos"),
+            ("mean_loss_camera", "pred_camera"),
+            ("mean_loss_depth", "pred_depth"),
         ]
         plt.figure(figsize=(11, 6))
         any_plotted = False
@@ -1147,8 +1139,14 @@ def _write_eval_artifacts(out_dir: Path, bounds: Dict[str, Dict[str, float]], hi
         test_color = "#1565c0"  # blue
 
         for metric in candidate_metrics:
-            dev_rows = [r for r in train_rows if str(r.get("split", "")) == "dev" and str(r.get("metric", "")) == metric]
-            test_rows = [r for r in train_rows if str(r.get("split", "")) == "test" and str(r.get("metric", "")) == metric]
+            dev_rows = sorted(
+                (r for r in train_rows if str(r.get("split", "")) == "dev" and str(r.get("metric", "")) == metric),
+                key=lambda r: int(r["epoch"]),
+            )
+            test_rows = sorted(
+                (r for r in train_rows if str(r.get("split", "")) == "test" and str(r.get("metric", "")) == metric),
+                key=lambda r: int(r["epoch"]),
+            )
             dev_ub = bounds.get("dev", {}).get("upper", {}).get(metric)
             dev_lb = bounds.get("dev", {}).get("lower", {}).get(metric)
             test_ub = bounds.get("test", {}).get("upper", {}).get(metric)
@@ -1675,9 +1673,28 @@ def main() -> None:
         bounds_lower_path.write_text(json.dumps(_extract_bound_payload(bounds, "lower"), indent=2), encoding="utf-8")
         _log(f"[eval] wrote lower bound cache to {bounds_lower_path}")
 
+    # Lower bound = pruned model metrics before any LoRA training; log as epoch 0 for eval CSV/plots.
+    if bounds["dev"]["lower"] and bounds["test"]["lower"]:
+        _append_eval_history(
+            eval_history_rows,
+            epoch=0,
+            split="dev",
+            tag="train",
+            metrics=dict(bounds["dev"]["lower"]),
+        )
+        _append_eval_history(
+            eval_history_rows,
+            epoch=0,
+            split="test",
+            tag="train",
+            metrics=dict(bounds["test"]["lower"]),
+        )
+
     if need_upper or need_lower:
         bounds_path.parent.mkdir(parents=True, exist_ok=True)
         bounds_path.write_text(json.dumps(bounds, indent=2), encoding="utf-8")
+
+    if eval_history_rows:
         _write_eval_artifacts(out_dir, bounds, eval_history_rows)
 
     model, trainable, pre_prune_total_params, removed_params = _build_model_variant(prune=True, inject_lora=True)
@@ -1825,9 +1842,6 @@ def main() -> None:
                     align_mse = align_mse / n_terms
                     align_cos = align_cos / n_terms
                 t_align = time.perf_counter() - t_align0
-                loss_align_mse_term = float(args.w_align) * float(args.w_align_mse) * align_mse
-                loss_align_cos_term = float(args.w_align) * float(args.w_align_cos) * align_cos
-
                 t_pred0 = time.perf_counter()
                 if str(args.target_source) == "teacher":
                     target_batch = _build_target_batch_from_teacher(
@@ -1849,6 +1863,7 @@ def main() -> None:
                 loss_pred, pred_logs = _prediction_official_camera_depth(
                     replay.pred,
                     target_batch,
+                    w_pred=float(args.w_pred),
                     w_camera=float(args.w_camera),
                     w_depth=float(args.w_depth),
                     w_depth_grad=float(args.w_depth_grad),
@@ -1893,21 +1908,22 @@ def main() -> None:
 
             global_step += 1
             step_s = time.perf_counter() - t_step0
+            wa = float(args.w_align)
+            wam = float(args.w_align_mse)
+            wac = float(args.w_align_cos)
+            wp = float(args.w_pred)
+            wr = float(args.w_reg)
             log_row: Dict[str, Any] = {
                 "epoch": epoch,
                 "scene_idx": si,
                 "scene_id": sid,
                 "global_step": global_step,
                 "loss_total": float(loss_total.detach().item()),
-                "loss_align": float(loss_align.detach().item()),
-                "loss_align_mse": float(align_mse.detach().item()),
-                "loss_align_cos": float(align_cos.detach().item()),
-                "loss_align_mse_term": float(loss_align_mse_term.detach().item()),
-                "loss_align_cos_term": float(loss_align_cos_term.detach().item()),
-                "loss_pred": float(loss_pred.detach().item()),
-                "loss_pred_term": float((float(args.w_pred) * loss_pred).detach().item()),
-                "loss_reg": float(loss_reg.detach().item()),
-                "loss_reg_term": float((float(args.w_reg) * loss_reg).detach().item()),
+                "loss_align": float((wa * loss_align).detach().item()),
+                "loss_align_mse": float((wa * wam * align_mse).detach().item()),
+                "loss_align_cos": float((wa * wac * align_cos).detach().item()),
+                "loss_pred": float((wp * loss_pred).detach().item()),
+                "loss_reg": float((wr * loss_reg).detach().item()),
                 "step_seconds": step_s,
                 "time_load_s": t_load,
                 "time_replay_s": t_replay,
@@ -1919,9 +1935,6 @@ def main() -> None:
                 "grad_norm": float(grad_norm.detach().item()) if torch.is_tensor(grad_norm) else float(grad_norm),
             }
             log_row.update(pred_logs)
-            for k, v in pred_logs.items():
-                if k.endswith("_term"):
-                    log_row[f"{k}_contrib"] = float(args.w_pred) * float(v)
             rows.append(log_row)
             pbar.update(1)
             pbar.set_postfix(
