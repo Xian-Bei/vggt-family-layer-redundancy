@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from vggt.models.vggt import VGGT
 
 from .cache_layout import build_scene_row_compat
-from .scannet_eval import SceneData, discover_scannet_scenes, load_scene_images
+from analysis.eval.scannet_eval import SceneData, discover_scannet_scenes, load_scene_images
 
 
 def _build_parser() -> argparse.ArgumentParser:

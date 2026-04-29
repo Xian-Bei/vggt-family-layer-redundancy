@@ -64,7 +64,12 @@ from analysis.eval.prediction_eval import (
     metrics_float_dict,
     read_eval_scannet_rows_by_scene,
 )
-from .scannet_eval import SceneData, discover_scannet_scenes, load_scene_images, select_scene_image_paths_fastvggt
+from analysis.eval.scannet_eval import (
+    SceneData,
+    discover_scannet_scenes,
+    load_scene_images,
+    select_scene_image_paths_fastvggt,
+)
 from .prediction_save import build_scene_prediction_payload
 from .visualization_export import export_scene_visualization_assets
 from .cache_layout import build_scene_row_compat, load_scene_metadata, load_scene_replay_layers

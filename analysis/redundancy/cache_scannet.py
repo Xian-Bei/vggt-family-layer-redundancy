@@ -40,7 +40,11 @@ from analysis.eval.prediction_eval import (
     write_eval_scannet_json,
 )
 from .prediction_save import build_scene_prediction_payload
-from .scannet_eval import discover_scannet_scenes, load_scene_images, select_scene_image_paths_fastvggt
+from analysis.eval.scannet_eval import (
+    discover_scannet_scenes,
+    load_scene_images,
+    select_scene_image_paths_fastvggt,
+)
 from .visualization_export import export_scene_visualization_assets
 
 

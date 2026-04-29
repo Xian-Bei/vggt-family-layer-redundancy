@@ -14,7 +14,7 @@ Depth GT handling follows the current redundancy pipeline protocol:
 Scene aggregates are plain per-scene means (FastVGGT-style), not valid-pixel-weighted means.
 
 This module lives under ``analysis.eval``; :class:`SceneData` and aggregation helpers come from
-``analysis.redundancy.scannet_eval`` (dataset layout / scene discovery).
+``analysis.eval.scannet_eval`` (dataset layout / scene discovery).
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from PIL import Image
 
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 
-from analysis.redundancy.scannet_eval import SceneData, aggregate_metric_dict
+from analysis.eval.scannet_eval import SceneData, aggregate_metric_dict
 
 from .scannet_scene_metrics import (
     STREAMVGGT_DEPTH_MAX,

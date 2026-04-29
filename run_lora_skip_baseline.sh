@@ -16,22 +16,24 @@ export MPLBACKEND="${MPLBACKEND:-Agg}"
 CACHE_DIR="${CACHE_DIR:-analysis_outputs/scannet_cache}"
 HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
 OUT_DIR="${OUT_DIR:-analysis_outputs/lora_skip_baseline}"
+# Backend switching (match run_eval.sh semantics)
+BACKEND="${BACKEND:-vggt}"
+FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
 # Hyperparam search config (enable one at a time, in recommended order):
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/01_lr.json}"
-SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/01_align_pred_tuple.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/03_lora_dropout.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/04_weight_decay.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/05_align_pred_tuple.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/06_align_mse_cos_tuple.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/07_depth_grad_tuple.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/redundancy/hp_search/01_lr.json}"
+# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_lr.json}"
+SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/01_loss_weight.json}"
+# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/03_lora_dropout.json}"
+# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/02_rank_alpha_tuple.json}"
+# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_align_mse_cos_tuple.json}"
+# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_depth_point_grad_tuple.json}"
+# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_lr.json}"
 INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/redundancy/interval_config.template.json}"
 VARIANT="${VARIANT:-multi_interval_config}"
 DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bfloat16}"               # float32 | bfloat16 | float16 (default follows official training)
 CONDA_ENV="${CONDA_ENV:-vggt}"
 SEED="${SEED:-0}"
-EPOCHS="${EPOCHS:-100}"
+EPOCHS="${EPOCHS:-50}"
 MAX_SCENES="${MAX_SCENES:-0}"
 MAX_STEPS="${MAX_STEPS:-0}"
 LR="${LR:-5e-5}"
@@ -48,10 +50,10 @@ LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
 W_ALIGN="${W_ALIGN:-1.0}"
 W_ALIGN_MSE="${W_ALIGN_MSE:-1.0}"
 W_ALIGN_COS="${W_ALIGN_COS:-1.0}"
-W_PRED="${W_PRED:-1.0}"
+W_ALIGN_CKA="${W_ALIGN_CKA:-1.0}"
+W_PRED="${W_PRED:-4.0}"
 W_CAMERA="${W_CAMERA:-5.0}"
 W_DEPTH="${W_DEPTH:-1.0}"
-W_DEPTH_GRAD="${W_DEPTH_GRAD:-1.0}"
 DEPTH_VALID_RANGE="${DEPTH_VALID_RANGE:-0.98}"
 DEPTH_GRADIENT_LOSS_FN="${DEPTH_GRADIENT_LOSS_FN:-grad}"
 CAMERA_LOSS_TYPE="${CAMERA_LOSS_TYPE:-l1}"
@@ -82,15 +84,50 @@ echo "  EPOCHS=${EPOCHS} MAX_SCENES=${MAX_SCENES} MAX_STEPS=${MAX_STEPS}"
 echo "  EVAL_EPOCH=${EVAL_EPOCH} EVAL_MAX_SCENES=${EVAL_MAX_SCENES} EVAL_INPUT_FRAME=${EVAL_INPUT_FRAME}"
 echo "  SEARCH_CONFIG_FILE=${SEARCH_CONFIG_FILE:-<none>}"
 echo "  CONDA_ENV=${CONDA_ENV}"
+echo "  BACKEND=${BACKEND}"
 
 # Avoid buffered/captured output so progress logs stream in real time.
 export PYTHONUNBUFFERED=1
+
+set_backend_pythonpath() {
+  local backend="$1"
+  if [[ "${backend}" == "fastvggt" ]]; then
+    export PYTHONPATH="${FASTVGGT_VENDOR_PATH}:${REPO_ROOT}:${PYTHONPATH:-}"
+  else
+    export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+  fi
+}
+
+ensure_bounds_cache() {
+  local trial_out_dir="$1"
+  local eval_root="${EVAL_ROOT:-analysis_outputs/evaluation}"
+  local dev_set
+  dev_set="$(basename "${DEV_DATA_ROOT}")"
+  local test_set
+  test_set="$(basename "${TEST_DATA_DIR}")"
+
+  echo "== Bounds cache =="
+  echo "  eval_root=${eval_root}"
+  echo "  dev_set=${dev_set} test_set=${test_set} input_frame=${EVAL_INPUT_FRAME} backend=${BACKEND}"
+  local p_upper_dev="${eval_root}/${dev_set}_input_frame_${EVAL_INPUT_FRAME}/Baseline_${BACKEND}/average_metrics.json"
+  local p_lower_dev="${eval_root}/${dev_set}_input_frame_${EVAL_INPUT_FRAME}/Ours_${BACKEND}/average_metrics.json"
+  local p_upper_test="${eval_root}/${test_set}_input_frame_${EVAL_INPUT_FRAME}/Baseline_${BACKEND}/average_metrics.json"
+  local p_lower_test="${eval_root}/${test_set}_input_frame_${EVAL_INPUT_FRAME}/Ours_${BACKEND}/average_metrics.json"
+  for p in "${p_upper_dev}" "${p_lower_dev}" "${p_upper_test}" "${p_lower_test}"; do
+    if [[ ! -f "${p}" ]]; then
+      echo "[error] Missing bounds file: ${p}" >&2
+      exit 1
+    fi
+  done
+}
 
 run_one_trial() {
   local trial_out_dir="$1"
   echo "== Trial =="
   echo "  OUT_DIR=${trial_out_dir}"
-  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.redundancy.train_lora_skip_baseline \
+  ensure_bounds_cache "${trial_out_dir}"
+  set_backend_pythonpath "${BACKEND}"
+  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.train.train_lora_skip_baseline \
     --cache-dir "${CACHE_DIR}" \
     --hf-model "${HF_MODEL}" \
     --output-dir "${trial_out_dir}" \
@@ -114,10 +151,10 @@ run_one_trial() {
     --w-align "${W_ALIGN}" \
     --w-align-mse "${W_ALIGN_MSE}" \
     --w-align-cos "${W_ALIGN_COS}" \
+    --w-align-cka "${W_ALIGN_CKA}" \
     --w-pred "${W_PRED}" \
     --w-camera "${W_CAMERA}" \
     --w-depth "${W_DEPTH}" \
-    --w-depth-grad "${W_DEPTH_GRAD}" \
     --depth-valid-range "${DEPTH_VALID_RANGE}" \
     --depth-gradient-loss-fn "${DEPTH_GRADIENT_LOSS_FN}" \
     --camera-loss-type "${CAMERA_LOSS_TYPE}" \

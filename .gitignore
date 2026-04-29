@@ -149,8 +149,8 @@ skyseg.onnx
 *.egg-info
 
 
-data/
-analysis_outputs/
+data
+analysis_outputs
 .gradio/
 examples/
 nouse/

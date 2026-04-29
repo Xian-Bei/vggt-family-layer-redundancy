@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import os
 import sys
-import yaml
 
 # Ensure project root is in sys.path for absolute imports like `vggt.*`
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -12,6 +11,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from vggt.models.vggt import VGGT
+from analysis.train.model import build_model, load_interval_rules
 from analysis.eval.eval_utils import (
     load_poses,
     get_vgg_input_imgs,
@@ -29,12 +29,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_dir", type=Path, default="/data/sy/scannetv2/process_scannet"
     )
-    parser.add_argument(
-        "--gt_ply_dir",
-        type=Path,
-        default="/data/sy/scannetv2/OpenDataLab___ScanNet_v2/raw/scans",
-    )
     parser.add_argument("--output_path", type=Path, default="./eval_results")
+    parser.add_argument("--model-name", type=str, default="Baseline", choices=("Baseline", "Ours"))
+    parser.add_argument("--backend", type=str, default="vggt", choices=("vggt", "fastvggt"))
+    parser.add_argument(
+        "--interval-config-file",
+        type=Path,
+        default=None,
+        help="Required for Ours(lowerbound) when no checkpoint is provided.",
+    )
+    parser.add_argument("--train-dir", type=Path, default=None, help="Training output dir for Ours checkpoint resolve.")
+    parser.add_argument("--epoch", type=int, default=None, help="Epoch index for Ours checkpoint resolve.")
     parser.add_argument("--merging", type=int, default=None)
     parser.add_argument("--plot", type=bool, default=True)
     parser.add_argument(
@@ -58,13 +63,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_scenes",
         type=int,
-        default=None,
-        help="Maximum number of scenes to evaluate",
+        default=0,
+        help="If >0, evaluate at most N scenes. If 0, evaluate all scenes under --data_dir.",
     )
     parser.add_argument(
         "--ckpt_path",
         type=str,
-        default="/home/sy/code/vggt_0625/ckpt/model_tracker_fixed_e20.pt",
+        default="",
         help="Path to the model checkpoint file",
     )
     parser.add_argument(
@@ -94,44 +99,40 @@ if __name__ == "__main__":
     torch.manual_seed(33)
 
     # Scene sampling
-    if args.num_scenes is not None:
-        scannet_scenes = get_all_scenes(args.data_dir, args.num_scenes)
-        print(f"Evaluate {len(scannet_scenes)} scenes")
+    if int(args.num_scenes) > 0:
+        scannet_scenes = get_all_scenes(args.data_dir, int(args.num_scenes))
+        print(f"Evaluate {len(scannet_scenes)} scenes (sampled, --num_scenes={int(args.num_scenes)})")
     else:
-        yaml_path = Path(__file__).parent / "scannet_50.yaml"
-        with open(yaml_path, "r") as f:
-            scannet_scenes = [line.strip() for line in f if line.strip()]
-        print(f"Evaluate {len(scannet_scenes)} scenes from {yaml_path}")
+        scannet_scenes = sorted([d.name for d in Path(args.data_dir).iterdir() if d.is_dir()])
+        print(f"Evaluate {len(scannet_scenes)} scenes (all under {args.data_dir})")
 
     all_scenes_metrics = {"scenes": {}, "average": {}}
     # Use fp16 by default for compatibility with baseline VGGT implementations.
     dtype = torch.float16
-    # Load VGGT model
-    try:
-        model = VGGT(
-            merging=args.merging,
-            merge_ratio=args.merge_ratio,
-            vis_attn_map=args.vis_attn_map,
-        )
-    except TypeError:
-        # Compatibility fallback for baseline VGGT implementations that do not
-        # expose FastVGGT's merging-related constructor arguments.
-        print(
-            "[warn] Current VGGT class does not support merging args; "
-            "falling back to baseline constructor."
-        )
-        model = VGGT()
-    if args.hf_model:
-        model = VGGT.from_pretrained(args.hf_model)
-    else:
-        ckpt = torch.load(args.ckpt_path, map_location="cpu")
-        incompat = model.load_state_dict(ckpt, strict=False)
+    interval_rules = None
+    if str(args.model_name) == "Ours" and (not args.ckpt_path) and (args.train_dir is None):
+        if args.interval_config_file is None:
+            raise SystemExit("--interval-config-file is required for Ours without checkpoint (lowerbound).")
+        interval_rules = load_interval_rules(args.interval_config_file)
+
+    ckpt_path = args.ckpt_path if str(args.ckpt_path).strip() else None
+    model = build_model(
+        model_name=str(args.model_name),  # type: ignore[arg-type]
+        backend=str(args.backend),  # type: ignore[arg-type]
+        hf_model=str(args.hf_model),
+        device="cpu",
+        interval_rules=interval_rules,
+        ckpt_path=ckpt_path,
+        train_dir=args.train_dir,
+        epoch=args.epoch,
+        eval_mode=True,
+    )
     model = model.cuda().eval()
 
     # Process each scene
     for scene in scannet_scenes:
         scene_dir = args.data_dir / f"{scene}"
-        output_scene_dir = args.output_path / f"input_frame_{args.input_frame}" / scene
+        output_scene_dir = args.output_path / scene
 
         # Load scene data
         images_dir = scene_dir / "color"
@@ -204,7 +205,7 @@ if __name__ == "__main__":
                     build_fastvggt_scene_eval_context,
                     _depth_or_conf_to_shw,
                 )
-                from analysis.redundancy.scannet_eval import SceneData
+                from analysis.eval.scannet_eval import SceneData
 
                 try:
                     pred_depth_for_metrics = _depth_or_conf_to_shw(
@@ -227,7 +228,7 @@ if __name__ == "__main__":
                     ctx = build_fastvggt_scene_eval_context(
                         scene_data,
                         args.data_dir,
-                        args.gt_ply_dir,
+                        args.data_dir,
                         image_hw=(int(vgg_input.shape[2]), int(vgg_input.shape[3])),
                     )
                     gt_depth = ctx.gt_depth
@@ -243,7 +244,7 @@ if __name__ == "__main__":
                 all_cam_to_world_mat,
                 all_world_points,
                 output_scene_dir,
-                args.gt_ply_dir,
+                args.data_dir,
                 args.chamfer_max_dist,
                 inference_time_ms,
                 args.plot,
@@ -278,7 +279,7 @@ if __name__ == "__main__":
     average_metrics = compute_average_metrics_and_save(
         all_scenes_metrics,
         args.output_path,
-        args.input_frame,
+        input_frame=None,  # external dir already encodes input_frame; save directly under output_path
     )
     print("\nAverage metrics:")
     for metric_name, value in average_metrics.items():

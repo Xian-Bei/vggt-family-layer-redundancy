@@ -35,7 +35,7 @@ except ImportError as exc:  # pragma: no cover - import guard for optional demo 
 from vggt.models.vggt import VGGT
 
 from .redundancy.metrics import upper_triangle_unpack_for_heatmap
-from .redundancy.scannet_eval import SceneData, discover_scannet_scenes, load_scene_images
+from analysis.eval.scannet_eval import SceneData, discover_scannet_scenes, load_scene_images
 from .redundancy.visualize_pair_attention import (
     _build_global_positions,
     _load_cache_row,

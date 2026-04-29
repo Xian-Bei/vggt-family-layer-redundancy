@@ -194,7 +194,7 @@ def evaluate_scene_and_save(
 def compute_average_metrics_and_save(
     all_scenes_metrics: Dict[str, Dict[str, Dict[str, float]]],
     output_path: Path,
-    input_frame: int,
+    input_frame: Optional[int],
 ) -> Dict[str, float]:
     metric_names = [
         "chamfer_distance",
@@ -224,10 +224,10 @@ def compute_average_metrics_and_save(
 
     output_path.mkdir(parents=True, exist_ok=True)
 
-    input_frame_dir = output_path / f"input_frame_{input_frame}"
-    input_frame_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = output_path if input_frame is None else (output_path / f"input_frame_{int(input_frame)}")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(input_frame_dir / "average_metrics.json", "w") as f:
+    with open(out_dir / "average_metrics.json", "w") as f:
         import json
 
         json.dump(average_metrics, f, indent=4)

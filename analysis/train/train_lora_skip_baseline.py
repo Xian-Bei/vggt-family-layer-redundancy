@@ -40,8 +40,16 @@ from analysis.eval.eval_utils import (
     load_poses,
 )
 from analysis.eval import evaluate_scene_and_save
-from .collect import collect_batch
-from .cache_layout import (
+from analysis.train.model import (
+    IntervalRule,
+    build_skipped_layer_indices,
+    count_unique_params,
+    inject_lora_attn,
+    lora_injection_plan_from_rules,
+    replace_skipped_layers_with_identity,
+)
+from analysis.redundancy.collect import collect_batch
+from analysis.redundancy.cache_layout import (
     load_scene_metadata,
     load_scene_pred,
     load_scene_replay_layer,
@@ -53,8 +61,8 @@ from analysis.eval.prediction_eval import (
     build_scannet_eval_row_from_payload_with_context,
     write_eval_scannet_json,
 )
-from .prediction_save import build_scene_prediction_payload
-from .scannet_eval import (
+from analysis.redundancy.prediction_save import build_scene_prediction_payload
+from analysis.eval.scannet_eval import (
     SceneData,
     aggregate_metric_dict,
     discover_scannet_scenes,
@@ -63,23 +71,6 @@ from .scannet_eval import (
 )
 from training.loss import compute_camera_loss, compute_depth_loss
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-
-
-@dataclass(frozen=True)
-class IntervalRule:
-    l: int
-    r: int
-    skip_frame_in_interval: bool
-    inject_prev: Literal["global", "frame_global"]
-    inject_frame_inside_interval: bool
-
-    @property
-    def prev_layer(self) -> int:
-        return int(self.l) - 1
-
-    @property
-    def has_frame_lora(self) -> bool:
-        return bool(self.inject_prev == "frame_global" or self.inject_frame_inside_interval)
 
 
 def _load_interval_rules(path: Path) -> List[IntervalRule]:
@@ -140,21 +131,6 @@ def _frame_skip_intervals_from_rules(rules: Sequence[IntervalRule]) -> List[Tupl
     return [(int(x.l), int(x.r)) for x in rules if bool(x.skip_frame_in_interval)]
 
 
-def _lora_injection_plan_from_rules(
-    rules: Sequence[IntervalRule],
-) -> Tuple[List[int], List[int]]:
-    frame_idxs: set[int] = set()
-    global_idxs: set[int] = set()
-    for rule in rules:
-        pidx = int(rule.prev_layer)
-        global_idxs.add(pidx)
-        if rule.inject_prev == "frame_global":
-            frame_idxs.add(pidx)
-        if (not rule.skip_frame_in_interval) and bool(rule.inject_frame_inside_interval):
-            frame_idxs.update(range(int(rule.l), int(rule.r) + 1))
-    return sorted(frame_idxs), sorted(global_idxs)
-
-
 def _load_manifest(cache_dir: Path) -> List[Dict[str, Any]]:
     p = cache_dir / "manifest.json"
     if not p.exists():
@@ -183,79 +159,11 @@ def _split_concat(layer_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return layer_t[..., :c], layer_t[..., c:]
 
 
-class LoRALinear(nn.Module):
-    def __init__(self, base: nn.Linear, rank: int, alpha: float, dropout: float = 0.0) -> None:
-        super().__init__()
-        self.base = base
-        for p in self.base.parameters():
-            p.requires_grad_(False)
-        self.rank = int(rank)
-        self.alpha = float(alpha)
-        self.scaling = self.alpha / max(self.rank, 1)
-        self.dropout = nn.Dropout(float(dropout)) if float(dropout) > 0 else nn.Identity()
-
-        in_f = int(base.in_features)
-        out_f = int(base.out_features)
-        self.lora_A = nn.Linear(in_f, self.rank, bias=False)
-        self.lora_B = nn.Linear(self.rank, out_f, bias=False)
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-        # Keep LoRA params on the same device/dtype as wrapped base layer.
-        self.lora_A.to(device=base.weight.device, dtype=base.weight.dtype)
-        self.lora_B.to(device=base.weight.device, dtype=base.weight.dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
-
-
-class SkipIdentityBlock(nn.Module):
-    """
-    Identity block that is API-compatible with transformer blocks (accepts pos kwarg).
-    Used to physically replace skipped layers while keeping module list indices unchanged.
-    """
-
-    def forward(self, x: torch.Tensor, pos: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return x
-
-
-def _inject_lora_attn(block: nn.Module, rank: int, alpha: float, dropout: float) -> List[nn.Parameter]:
-    trainable: List[nn.Parameter] = []
-    attn = getattr(block, "attn", None)
-    if attn is None:
-        return trainable
-    for name in ("qkv", "proj"):
-        mod = getattr(attn, name, None)
-        if isinstance(mod, nn.Linear):
-            lora_mod = LoRALinear(mod, rank=rank, alpha=alpha, dropout=dropout)
-            setattr(attn, name, lora_mod)
-            trainable.extend([p for p in lora_mod.parameters() if p.requires_grad])
-    return trainable
-
-
 def _is_skipped(layer_idx: int, intervals: Sequence[Tuple[int, int]]) -> bool:
     for l, r in intervals:
         if l <= layer_idx <= r:
             return True
     return False
-
-
-def _replace_skipped_layers_with_identity(
-    model: VGGT,
-    *,
-    frame_intervals: Sequence[Tuple[int, int]],
-    global_intervals: Sequence[Tuple[int, int]],
-) -> None:
-    depth = len(model.aggregator.frame_blocks)
-    for l, r in frame_intervals:
-        for idx in range(int(l), int(r) + 1):
-            if idx < 0 or idx >= depth:
-                raise SystemExit(f"Skip layer index {idx} out of range for model depth {depth}.")
-            model.aggregator.frame_blocks[idx] = SkipIdentityBlock()
-    for l, r in global_intervals:
-        for idx in range(int(l), int(r) + 1):
-            if idx < 0 or idx >= depth:
-                raise SystemExit(f"Skip layer index {idx} out of range for model depth {depth}.")
-            model.aggregator.global_blocks[idx] = SkipIdentityBlock()
 
 
 def _build_pos(model: VGGT, images: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -300,11 +208,24 @@ def _run_block_with_checkpoint(
 
 
 def _required_head_layers(model: VGGT, num_layers: int) -> List[int]:
+    # FastVGGT returns a compact list of 4 aggregated token tensors (for DPT),
+    # whose indices [0,1,2,3] correspond to flat block indices [4,11,17,23].
+    # Our replay/cache layout uses flat layer indices, so we must map the fast
+    # head's compact indexing back to flat indices when determining required layers.
+    FAST_DPT_FLAT_LAYERS = (4, 11, 17, 23)
+
+    def _is_fast_backend(m: VGGT) -> bool:
+        idx = list(getattr(getattr(m, "depth_head", None), "intermediate_layer_idx", []) or [])
+        return idx == [0, 1, 2, 3]
+
     keep: set[int] = set()
     if model.camera_head is not None and num_layers > 0:
         keep.add(num_layers - 1)
     if model.depth_head is not None:
-        keep.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
+        if _is_fast_backend(model):
+            keep.update(int(i) for i in FAST_DPT_FLAT_LAYERS)
+        else:
+            keep.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
     return sorted(i for i in keep if 0 <= i < num_layers)
 
 
@@ -326,6 +247,12 @@ def _replay_student_cache_first(
     device: torch.device,
     dummy_images: torch.Tensor,
 ) -> ReplayResult:
+    FAST_DPT_FLAT_LAYERS = (4, 11, 17, 23)
+
+    def _is_fast_backend(m: VGGT) -> bool:
+        idx = list(getattr(getattr(m, "depth_head", None), "intermediate_layer_idx", []) or [])
+        return idx == [0, 1, 2, 3]
+
     _get_layer_cpu = get_layer_cpu
     if num_layers <= 0:
         raise ValueError("Replay cache is empty.")
@@ -392,25 +319,52 @@ def _replay_student_cache_first(
             if idx not in concat_out:
                 raise RuntimeError(f"Missing replay output at required layer {idx}")
             selected[idx] = concat_out[idx]
-    agg_list: List[torch.Tensor] = [None] * num_layers  # type: ignore[list-item]
-    for idx, t in selected.items():
-        agg_list[idx] = t
-    pred = model.forward_from_aggregated_tokens(
-        agg_list,
-        int(model.aggregator.patch_start_idx),
-        dummy_images,
-    )
+    if _is_fast_backend(model):
+        # Adapter: replay/cache uses flat indices, but fast heads index a compact 4-list.
+        # Ensure we feed the four DPT layers in the expected compact order.
+        compact = [selected[int(i)] for i in FAST_DPT_FLAT_LAYERS]
+        pred = model.forward_from_aggregated_tokens(
+            compact,
+            int(model.aggregator.patch_start_idx),
+            dummy_images,
+        )
+    else:
+        agg_list: List[torch.Tensor] = [None] * num_layers  # type: ignore[list-item]
+        for idx, t in selected.items():
+            agg_list[idx] = t
+        pred = model.forward_from_aggregated_tokens(
+            agg_list,
+            int(model.aggregator.patch_start_idx),
+            dummy_images,
+        )
     return ReplayResult(concat_by_layer=concat_out, pred=pred)
 
 
-def _loss_mse_cos(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor]:
-    mse = F.mse_loss(a, b)
+def _loss_mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return F.mse_loss(a, b)
+
+
+def _loss_cos(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     af = a.reshape(-1, a.shape[-1]).float()
     bf = b.reshape(-1, b.shape[-1]).float()
     af = af / (af.norm(dim=-1, keepdim=True) + eps)
     bf = bf / (bf.norm(dim=-1, keepdim=True) + eps)
-    cos = 1.0 - (af * bf).sum(dim=-1).mean()
-    return mse, cos
+    return 1.0 - (af * bf).sum(dim=-1).mean()
+
+
+def _loss_cka(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    af = a.reshape(-1, a.shape[-1]).float()
+    bf = b.reshape(-1, b.shape[-1]).float()
+    if af.shape != bf.shape:
+        raise AssertionError(f"CKA expects identical flattened shapes, got {tuple(af.shape)} vs {tuple(bf.shape)}")
+    af = af - af.mean(dim=0, keepdim=True)
+    bf = bf - bf.mean(dim=0, keepdim=True)
+    atb = af.t() @ bf
+    ata = af.t() @ af
+    btb = bf.t() @ bf
+    num = (atb * atb).sum()
+    den = torch.sqrt((ata * ata).sum() * (btb * btb).sum()).clamp_min(eps)
+    return 1.0 - (num / den)
 
 
 def _spatial_grad_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -598,7 +552,6 @@ def _prediction_official_camera_depth(
     w_pred: float,
     w_camera: float,
     w_depth: float,
-    w_depth_grad: float,
     camera_loss_type: str,
     depth_valid_range: float,
     depth_gradient_loss_fn: str,
@@ -628,14 +581,13 @@ def _prediction_official_camera_depth(
         l_conf = depth_loss_dict["loss_conf_depth"]
         l_reg = depth_loss_dict["loss_reg_depth"]
         l_grad = depth_loss_dict["loss_grad_depth"]
-        l_depth = l_conf + l_reg + float(w_depth_grad) * l_grad
+        l_depth = l_conf + l_reg + l_grad
         total = total + float(w_depth) * l_depth
         wd = float(w_depth)
-        wdg = float(w_depth_grad)
         logs["loss_depth"] = float((wp * wd * l_depth).detach().item())
         logs["loss_depth_conf"] = float((wp * wd * l_conf).detach().item())
         logs["loss_depth_reg"] = float((wp * wd * l_reg).detach().item())
-        logs["loss_depth_grad"] = float((wp * wd * wdg * l_grad).detach().item())
+        logs["loss_depth_grad"] = float((wp * wd * l_grad).detach().item())
 
     return total, logs
 
@@ -666,26 +618,6 @@ def _compute_total_steps(num_scenes: int, epochs: int, max_steps: int) -> int:
     if max_steps > 0:
         return min(natural, int(max_steps))
     return natural
-
-
-def _build_skipped_layer_indices(intervals: Sequence[Tuple[int, int]]) -> List[int]:
-    out: List[int] = []
-    for l, r in intervals:
-        out.extend(range(int(l), int(r) + 1))
-    return sorted(set(out))
-
-
-def _count_unique_params(modules: Sequence[nn.Module]) -> int:
-    seen: set[int] = set()
-    total = 0
-    for m in modules:
-        for p in m.parameters(recurse=True):
-            pid = id(p)
-            if pid in seen:
-                continue
-            seen.add(pid)
-            total += int(p.numel())
-    return total
 
 
 def _format_param_count(n: int) -> str:
@@ -787,10 +719,11 @@ def _write_curves(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
         plt.close()
 
         # Single figure: only terms with independent weights (values are contributions to total loss).
-        # mean_loss_depth is w_pred * w_depth * (conf + reg + w_depth_grad * grad), see _prediction_official_camera_depth.
+        # mean_loss_depth is w_pred * w_depth * (conf + reg + grad), see _prediction_official_camera_depth.
         weighted_cols = [
             ("mean_loss_align_mse", "align_mse"),
             ("mean_loss_align_cos", "align_cos"),
+            ("mean_loss_align_cka", "align_cka"),
             ("mean_loss_camera", "pred_camera"),
             ("mean_loss_depth", "pred_depth"),
         ]
@@ -910,11 +843,11 @@ def _evaluate_test_run_eval_style(
     chamfer_max_dist: float,
     eval_amp_dtype: torch.dtype,
 ) -> Dict[str, float]:
-    scene_names = get_all_scenes(data_dir, num_scenes) if num_scenes > 0 else [
-        line.strip()
-        for line in (Path(__file__).resolve().parents[1] / "eval" / "scannet_50.yaml").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    scene_names = (
+        get_all_scenes(data_dir, num_scenes)
+        if num_scenes > 0
+        else sorted([d.name for d in Path(data_dir).iterdir() if d.is_dir()])
+    )
     all_scenes_metrics: Dict[str, Dict[str, float]] = {}
     was_training = bool(model.training)
     model.eval()
@@ -1243,39 +1176,10 @@ def _fmt_metric_brief(metrics: Dict[str, float], keys: Sequence[str]) -> str:
     return " ".join(parts)
 
 
-def _resolve_bounds_cache_paths(bounds_cache_file: Optional[Path], out_dir: Path) -> Tuple[Path, Path, Path]:
-    combined_path = Path(bounds_cache_file) if bounds_cache_file is not None else (out_dir / "bounds_summary.json")
-    suffix = combined_path.suffix if combined_path.suffix else ".json"
-    upper_path = combined_path.with_name(f"{combined_path.stem}_upper{suffix}")
-    lower_path = combined_path.with_name(f"{combined_path.stem}_lower{suffix}")
-    return combined_path, upper_path, lower_path
-
-
 def _extract_bound_payload(bounds: Dict[str, Dict[str, Dict[str, float]]], tag: Literal["upper", "lower"]) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for split in ("dev", "test"):
         out[split] = dict(bounds.get(split, {}).get(tag, {}))
-    return out
-
-
-def _load_bound_payload(path: Path) -> Dict[str, Dict[str, float]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise SystemExit(f"Invalid bounds payload (expect object): {path}")
-    out: Dict[str, Dict[str, float]] = {}
-    for split in ("dev", "test"):
-        split_payload = payload.get(split, {})
-        if split_payload is None:
-            split_payload = {}
-        if not isinstance(split_payload, dict):
-            raise SystemExit(f"Invalid bounds payload split '{split}' (expect object): {path}")
-        casted: Dict[str, float] = {}
-        for k, v in split_payload.items():
-            try:
-                casted[str(k)] = float(v)
-            except Exception:
-                continue
-        out[split] = casted
     return out
 
 
@@ -1309,9 +1213,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Base cache JSON path. Script now reads/writes split files "
-            "('<stem>_upper.json' and '<stem>_lower.json'); "
-            "legacy combined file is still used as fallback."
+            "Deprecated: bounds are always read directly from analysis_outputs/evaluation/<scans_set>_input_frame_<N>/"
+            "<Baseline|Ours>_<backend>/average_metrics.json via EVAL_ROOT/BACKEND env vars."
         ),
     )
     p.add_argument("--eval-epoch", type=int, default=0, help="Run dev/test eval every N epochs. 0 disables periodic eval.")
@@ -1346,6 +1249,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--w-align", type=float, default=1.0)
     p.add_argument("--w-align-mse", type=float, default=1.0)
     p.add_argument("--w-align-cos", type=float, default=1.0)
+    p.add_argument("--w-align-cka", type=float, default=0.0)
     p.add_argument("--w-pred", type=float, default=1.0)
     p.add_argument("--w-camera", type=float, default=1.0)
     p.add_argument("--w-depth", type=float, default=1.0)
@@ -1450,11 +1354,11 @@ def main() -> None:
         log_file.write(msg + "\n")
         log_file.flush()
 
-    skipped_global_idxs = _build_skipped_layer_indices(global_skip_intervals)
-    skipped_frame_idxs = _build_skipped_layer_indices(frame_skip_intervals)
+    skipped_global_idxs = build_skipped_layer_indices(global_skip_intervals)
+    skipped_frame_idxs = build_skipped_layer_indices(frame_skip_intervals)
     skipped_idxs = sorted(set(skipped_global_idxs).union(skipped_frame_idxs))
     eval_dir = out_dir
-    bounds_path, bounds_upper_path, bounds_lower_path = _resolve_bounds_cache_paths(args.bounds_cache_file, out_dir)
+    # Bounds are always read directly from analysis_outputs/evaluation/*average_metrics.json.
     eval_history_rows: List[Dict[str, Any]] = []
     bounds: Dict[str, Dict[str, Dict[str, float]]] = {"dev": {"upper": {}, "lower": {}}, "test": {"upper": {}, "lower": {}}}
 
@@ -1474,19 +1378,19 @@ def main() -> None:
                 raise SystemExit(f"Invalid skipped global index {idx} for model depth {len(m.aggregator.global_blocks)}")
             skipped_modules_before.append(m.aggregator.global_blocks[idx])
         pre_total = sum(p.numel() for p in m.parameters())
-        removed = _count_unique_params(skipped_modules_before) if prune else 0
+        removed = count_unique_params(skipped_modules_before) if prune else 0
         if prune:
-            _replace_skipped_layers_with_identity(
+            replace_skipped_layers_with_identity(
                 m,
                 frame_intervals=frame_skip_intervals,
                 global_intervals=global_skip_intervals,
             )
         trainable_local: List[nn.Parameter] = []
         if inject_lora:
-            frame_lora_idxs, global_lora_idxs = _lora_injection_plan_from_rules(rules)
+            frame_lora_idxs, global_lora_idxs = lora_injection_plan_from_rules(rules)
             for pidx in frame_lora_idxs:
                 trainable_local.extend(
-                    _inject_lora_attn(
+                    inject_lora_attn(
                         m.aggregator.frame_blocks[pidx],
                         rank=int(args.lora_rank),
                         alpha=float(args.lora_alpha),
@@ -1495,7 +1399,7 @@ def main() -> None:
                 )
             for pidx in global_lora_idxs:
                 trainable_local.extend(
-                    _inject_lora_attn(
+                    inject_lora_attn(
                         m.aggregator.global_blocks[pidx],
                         rank=int(args.lora_rank),
                         alpha=float(args.lora_alpha),
@@ -1504,174 +1408,29 @@ def main() -> None:
                 )
         return m, trainable_local, pre_total, removed
 
-    has_upper = False
-    has_lower = False
-    if bounds_upper_path.exists():
-        upper_payload = _load_bound_payload(bounds_upper_path)
-        bounds["dev"]["upper"] = upper_payload.get("dev", {})
-        bounds["test"]["upper"] = upper_payload.get("test", {})
-        has_upper = True
-        _log(f"[eval] reuse existing upper bound from {bounds_upper_path}")
-    if bounds_lower_path.exists():
-        lower_payload = _load_bound_payload(bounds_lower_path)
-        bounds["dev"]["lower"] = lower_payload.get("dev", {})
-        bounds["test"]["lower"] = lower_payload.get("test", {})
-        has_lower = True
-        _log(f"[eval] reuse existing lower bound from {bounds_lower_path}")
-    if bounds_path.exists():
-        legacy_bounds = json.loads(bounds_path.read_text(encoding="utf-8"))
-        for split in ("dev", "test"):
-            split_payload = legacy_bounds.get(split, {}) if isinstance(legacy_bounds, dict) else {}
-            if not isinstance(split_payload, dict):
-                continue
-            if not has_upper and isinstance(split_payload.get("upper"), dict):
-                bounds["dev" if split == "dev" else "test"]["upper"] = {
-                    str(k): float(v) for k, v in split_payload["upper"].items()
-                }
-            if not has_lower and isinstance(split_payload.get("lower"), dict):
-                bounds["dev" if split == "dev" else "test"]["lower"] = {
-                    str(k): float(v) for k, v in split_payload["lower"].items()
-                }
-        if not has_upper and bounds["dev"]["upper"] and bounds["test"]["upper"]:
-            has_upper = True
-            bounds_upper_path.parent.mkdir(parents=True, exist_ok=True)
-            bounds_upper_path.write_text(json.dumps(_extract_bound_payload(bounds, "upper"), indent=2), encoding="utf-8")
-            _log(f"[eval] hydrated upper bound cache from legacy file -> {bounds_upper_path}")
-        if not has_lower and bounds["dev"]["lower"] and bounds["test"]["lower"]:
-            has_lower = True
-            bounds_lower_path.parent.mkdir(parents=True, exist_ok=True)
-            bounds_lower_path.write_text(json.dumps(_extract_bound_payload(bounds, "lower"), indent=2), encoding="utf-8")
-            _log(f"[eval] hydrated lower bound cache from legacy file -> {bounds_lower_path}")
+    backend = str(os.environ.get("BACKEND", "vggt")).strip() or "vggt"
+    eval_root = Path(os.environ.get("EVAL_ROOT", "analysis_outputs/evaluation"))
+    dev_set = Path(args.dev_data_root).name
+    test_set = Path(args.test_data_dir).name
+    input_frame = int(args.eval_input_frame)
 
-    # Baseline bounds: upper=original model, lower=pruned model without LoRA.
-    need_upper = not has_upper
-    need_lower = not has_lower
-    if need_upper or need_lower:
-        missing = []
-        if need_upper:
-            missing.append("upper")
-        if need_lower:
-            missing.append("lower")
-        _log(f"[eval] computing missing bounds on dev/test: {','.join(missing)}")
-    else:
-        _log(f"[eval] reuse existing split bounds from {bounds_upper_path} and {bounds_lower_path}")
+    def _read_avg(scans_set: str, model_name: str) -> Dict[str, float]:
+        p = eval_root / f"{scans_set}_input_frame_{input_frame}" / f"{model_name}_{backend}" / "average_metrics.json"
+        if not p.exists():
+            raise SystemExit(f"Missing bounds file: {p}")
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise SystemExit(f"Invalid bounds payload (expect object): {p}")
+        return {str(k): float(v) for k, v in payload.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
-    if need_upper:
-        upper_model, _, _, _ = _build_model_variant(prune=False, inject_lora=False)
-        try:
-            t_upper_dev0 = time.perf_counter()
-            upper_dev = _evaluate_dev_stage1_style(
-                model=upper_model,
-                data_root=args.dev_data_root,
-                out_dir=eval_dir / "eval_upper_bound_dev",
-                max_scenes=int(args.eval_max_scenes),
-                max_frames=int(args.eval_input_frame),
-                depth_conf_thresh=1.0,
-                chamfer_max_dist=0.5,
-                eval_amp_dtype=amp_dtype,
-                write_json=False,
-            )
-            _log(f"[eval][upper][scans_dev50] elapsed={time.perf_counter() - t_upper_dev0:.2f}s")
-            _log(
-                "[eval][upper][scans_dev50] "
-                + _fmt_metric_brief(
-                    upper_dev,
-                    ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "depth_abs_rel", "depth_delta1"),
-                )
-            )
-            _run_stage1_upper_sanity_check(
-                dev_upper_metrics=upper_dev,
-                cache_dir=args.cache_dir,
-                rtol=float(args.stage1_sanity_rtol),
-                atol=float(args.stage1_sanity_atol),
-            )
-            _log("[eval][upper][scans_dev50] stage1 sanity check: PASSED")
-            t_upper_test0 = time.perf_counter()
-            upper_test = _evaluate_test_run_eval_style(
-                model=upper_model,
-                data_dir=args.test_data_dir,
-                gt_ply_dir=args.test_gt_ply_dir,
-                out_dir=eval_dir / "eval_upper_bound_test",
-                input_frame=int(args.eval_input_frame),
-                num_scenes=int(args.eval_max_scenes),
-                depth_conf_thresh=1.0,
-                chamfer_max_dist=0.5,
-                eval_amp_dtype=amp_dtype,
-            )
-            _log(f"[eval][upper][scans_test50] elapsed={time.perf_counter() - t_upper_test0:.2f}s")
-            _run_test_upper_sanity_check(
-                test_upper_metrics=upper_test,
-                ref_average_metrics_path=test_sanity_avg_path,
-                rtol=float(args.test_sanity_rtol),
-                atol=float(args.test_sanity_atol),
-            )
-            _log(
-                f"[eval][upper][scans_test50] run_eval sanity check: PASSED "
-                f"(ref={test_sanity_avg_path})"
-            )
-            _log(
-                "[eval][upper][scans_test50] "
-                + _fmt_metric_brief(upper_test, ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "inference_time_ms"))
-            )
-        finally:
-            del upper_model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-        bounds["dev"]["upper"] = upper_dev
-        bounds["test"]["upper"] = upper_test
-        bounds_upper_path.parent.mkdir(parents=True, exist_ok=True)
-        bounds_upper_path.write_text(json.dumps(_extract_bound_payload(bounds, "upper"), indent=2), encoding="utf-8")
-        _log(f"[eval] wrote upper bound cache to {bounds_upper_path}")
-
-    if need_lower:
-        lower_model, _, _, _ = _build_model_variant(prune=True, inject_lora=False)
-        try:
-            t_lower_dev0 = time.perf_counter()
-            lower_dev = _evaluate_dev_stage1_style(
-                model=lower_model,
-                data_root=args.dev_data_root,
-                out_dir=eval_dir / "eval_lower_bound_dev",
-                max_scenes=int(args.eval_max_scenes),
-                max_frames=int(args.eval_input_frame),
-                depth_conf_thresh=1.0,
-                chamfer_max_dist=0.5,
-                eval_amp_dtype=amp_dtype,
-                write_json=False,
-            )
-            _log(f"[eval][lower][scans_dev50] elapsed={time.perf_counter() - t_lower_dev0:.2f}s")
-            _log(
-                "[eval][lower][scans_dev50] "
-                + _fmt_metric_brief(
-                    lower_dev,
-                    ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "depth_abs_rel", "depth_delta1"),
-                )
-            )
-            t_lower_test0 = time.perf_counter()
-            lower_test = _evaluate_test_run_eval_style(
-                model=lower_model,
-                data_dir=args.test_data_dir,
-                gt_ply_dir=args.test_gt_ply_dir,
-                out_dir=eval_dir / "eval_lower_bound_test",
-                input_frame=int(args.eval_input_frame),
-                num_scenes=int(args.eval_max_scenes),
-                depth_conf_thresh=1.0,
-                chamfer_max_dist=0.5,
-                eval_amp_dtype=amp_dtype,
-            )
-            _log(f"[eval][lower][scans_test50] elapsed={time.perf_counter() - t_lower_test0:.2f}s")
-            _log(
-                "[eval][lower][scans_test50] "
-                + _fmt_metric_brief(lower_test, ("chamfer_distance", "ate", "are", "rpe_rot", "rpe_trans", "inference_time_ms"))
-            )
-        finally:
-            del lower_model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-        bounds["dev"]["lower"] = lower_dev
-        bounds["test"]["lower"] = lower_test
-        bounds_lower_path.parent.mkdir(parents=True, exist_ok=True)
-        bounds_lower_path.write_text(json.dumps(_extract_bound_payload(bounds, "lower"), indent=2), encoding="utf-8")
-        _log(f"[eval] wrote lower bound cache to {bounds_lower_path}")
+    bounds["dev"]["upper"] = _read_avg(dev_set, "Baseline")
+    bounds["dev"]["lower"] = _read_avg(dev_set, "Ours")
+    bounds["test"]["upper"] = _read_avg(test_set, "Baseline")
+    bounds["test"]["lower"] = _read_avg(test_set, "Ours")
+    _log(
+        f"[eval] loaded bounds from {eval_root} "
+        f"(dev={dev_set} test={test_set} input_frame={input_frame} backend={backend})"
+    )
 
     # Lower bound = pruned model metrics before any LoRA training; log as epoch 0 for eval CSV/plots.
     if bounds["dev"]["lower"] and bounds["test"]["lower"]:
@@ -1689,10 +1448,6 @@ def main() -> None:
             tag="train",
             metrics=dict(bounds["test"]["lower"]),
         )
-
-    if need_upper or need_lower:
-        bounds_path.parent.mkdir(parents=True, exist_ok=True)
-        bounds_path.write_text(json.dumps(bounds, indent=2), encoding="utf-8")
 
     if eval_history_rows:
         _write_eval_artifacts(out_dir, bounds, eval_history_rows)
@@ -1818,6 +1573,10 @@ def main() -> None:
                 loss_align = torch.zeros((), device=device)
                 align_mse = torch.zeros((), device=device)
                 align_cos = torch.zeros((), device=device)
+                align_cka = torch.zeros((), device=device)
+                wam = float(args.w_align_mse)
+                wac = float(args.w_align_cos)
+                wak = float(args.w_align_cka)
                 n_terms = 0
                 t_align0 = time.perf_counter()
                 for rule in rules:
@@ -1826,21 +1585,32 @@ def main() -> None:
                     t_concat = _get_layer_cpu(int(rule.r)).to(device=device, non_blocking=(device.type == "cuda"))
                     sf, sg = _split_concat(s_concat)
                     tf, tg = _split_concat(t_concat)
-                    mg, cg = _loss_mse_cos(sg, tg)
-                    mse_i = mg
-                    cos_i = cg
+                    mse_i = torch.zeros((), device=device)
+                    cos_i = torch.zeros((), device=device)
+                    cka_i = torch.zeros((), device=device)
+                    if wam != 0.0:
+                        mse_i = mse_i + _loss_mse(sg, tg)
+                    if wac != 0.0:
+                        cos_i = cos_i + _loss_cos(sg, tg)
+                    if wak != 0.0:
+                        cka_i = cka_i + _loss_cka(sg, tg)
                     if bool(rule.has_frame_lora):
-                        mf, cf = _loss_mse_cos(sf, tf)
-                        mse_i = mse_i + mf
-                        cos_i = cos_i + cf
-                    loss_align = loss_align + float(args.w_align_mse) * mse_i + float(args.w_align_cos) * cos_i
+                        if wam != 0.0:
+                            mse_i = mse_i + _loss_mse(sf, tf)
+                        if wac != 0.0:
+                            cos_i = cos_i + _loss_cos(sf, tf)
+                        if wak != 0.0:
+                            cka_i = cka_i + _loss_cka(sf, tf)
+                    loss_align = loss_align + wam * mse_i + wac * cos_i + wak * cka_i
                     align_mse = align_mse + mse_i
                     align_cos = align_cos + cos_i
+                    align_cka = align_cka + cka_i
                     n_terms += 1
                 if n_terms > 0:
                     loss_align = loss_align / n_terms
                     align_mse = align_mse / n_terms
                     align_cos = align_cos / n_terms
+                    align_cka = align_cka / n_terms
                 t_align = time.perf_counter() - t_align0
                 t_pred0 = time.perf_counter()
                 if str(args.target_source) == "teacher":
@@ -1866,7 +1636,6 @@ def main() -> None:
                     w_pred=float(args.w_pred),
                     w_camera=float(args.w_camera),
                     w_depth=float(args.w_depth),
-                    w_depth_grad=float(args.w_depth_grad),
                     camera_loss_type=str(args.camera_loss_type),
                     depth_valid_range=float(args.depth_valid_range),
                     depth_gradient_loss_fn=str(args.depth_gradient_loss_fn),
@@ -1911,6 +1680,7 @@ def main() -> None:
             wa = float(args.w_align)
             wam = float(args.w_align_mse)
             wac = float(args.w_align_cos)
+            wak = float(args.w_align_cka)
             wp = float(args.w_pred)
             wr = float(args.w_reg)
             log_row: Dict[str, Any] = {
@@ -1922,6 +1692,7 @@ def main() -> None:
                 "loss_align": float((wa * loss_align).detach().item()),
                 "loss_align_mse": float((wa * wam * align_mse).detach().item()),
                 "loss_align_cos": float((wa * wac * align_cos).detach().item()),
+                "loss_align_cka": float((wa * wak * align_cka).detach().item()),
                 "loss_pred": float((wp * loss_pred).detach().item()),
                 "loss_reg": float((wr * loss_reg).detach().item()),
                 "step_seconds": step_s,

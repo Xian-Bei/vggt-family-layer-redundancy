@@ -17,6 +17,10 @@ from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
 from collections import defaultdict
 import torchvision.transforms as transforms
+from analysis.train.model import (
+    build_model,
+    load_interval_rules,
+)
 
 
 def get_args_parser():
@@ -24,11 +28,20 @@ def get_args_parser():
     parser.add_argument(
         "--ckpt_path",
         type=str,
-        default="/home/sy/code/FastVGGT/ckpt/model_tracker_fixed_e20.pt",
+        default="",
         help="ckpt name",
     )
     parser.add_argument("--device", type=str, default="cuda:0", help="device")
-    parser.add_argument("--model_name", type=str, default="VGGT")
+    parser.add_argument("--model-name", type=str, default="Baseline", choices=("Baseline", "Ours"))
+    parser.add_argument("--backend", type=str, default="vggt", choices=("vggt", "fastvggt"))
+    parser.add_argument(
+        "--interval-config-file",
+        type=str,
+        default="",
+        help="Required for Ours(lowerbound) when no checkpoint is provided.",
+    )
+    parser.add_argument("--train-dir", type=str, default="", help="Training output dir for Ours checkpoint resolve.")
+    parser.add_argument("--epoch", type=int, default=None, help="Epoch index for Ours checkpoint resolve.")
     parser.add_argument(
         "--conf_thresh", type=float, default=0.0, help="confidence threshold"
     )
@@ -117,38 +130,34 @@ def main(args):
     }
 
     device = args.device
-    model_name = args.model_name
 
-    from vggt.models.vggt import VGGT
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     from vggt.utils.geometry import unproject_depth_map_to_point_map
     from criterion import Regr3D_t_ScaleShiftInv, L21
 
     dtype = torch.float16
-    # Load VGGT model
-    try:
-        model = VGGT(merging=args.merging, merge_ratio=args.merge_ratio, enable_point=True)
-    except TypeError:
-        print(
-            "[warn] Current VGGT class does not support merging args; "
-            "falling back to baseline constructor."
-        )
-        try:
-            model = VGGT(enable_point=True)
-        except TypeError:
-            model = VGGT()
-    if args.hf_model:
-        model = VGGT.from_pretrained(args.hf_model)
-    else:
-        ckpt = torch.load(args.ckpt_path, map_location="cpu")
-        model.load_state_dict(
-            ckpt, strict=False
-        )  # Use strict=False due to enable_point=True difference
+    interval_rules = None
+    if str(args.model_name) == "Ours" and (not str(args.ckpt_path).strip()) and (not str(args.train_dir).strip()):
+        if not str(args.interval_config_file).strip():
+            raise SystemExit("--interval-config-file is required for Ours without checkpoint (lowerbound).")
+        interval_rules = load_interval_rules(str(args.interval_config_file))
+
+    ckpt_path = str(args.ckpt_path).strip() or None
+    train_dir = str(args.train_dir).strip() or None
+    model = build_model(
+        model_name=str(args.model_name),  # type: ignore[arg-type]
+        backend=str(args.backend),  # type: ignore[arg-type]
+        hf_model=str(args.hf_model),
+        device="cpu",
+        interval_rules=interval_rules,
+        ckpt_path=ckpt_path,
+        train_dir=train_dir,
+        epoch=args.epoch,
+        eval_mode=True,
+    )
 
     model = model.cuda().eval()
 
-    if not args.hf_model:
-        del ckpt
     os.makedirs(osp.join(args.output_dir, f"{args.kf}"), exist_ok=True)
 
     criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode=False, gt_scale=True)
