@@ -37,8 +37,8 @@ SCANNET_TAG="${SCANNET_TAG:-$(basename "${DATA_DIR}")}"
 # Ours checkpoint resolution (used when model spec is Ours(<backend>))
 OURS_TRAIN_DIR="${OURS_TRAIN_DIR:-}"
 OURS_EPOCH="${OURS_EPOCH:-}"
-RUN_SCANNET="${RUN_SCANNET:-0}"
-RUN_7ANDN="${RUN_7ANDN:-1}"
+RUN_SCANNET="${RUN_SCANNET:-1}"
+RUN_7ANDN="${RUN_7ANDN:-0}"
 
 trim_spaces() {
   local s="$1"

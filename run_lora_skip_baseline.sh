@@ -21,7 +21,7 @@ BACKEND="${BACKEND:-vggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
 # Hyperparam search config (enable one at a time, in recommended order):
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_lr.json}"
-SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/01_loss_weight.json}"
+SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/02_rank_alpha_tuple.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/03_lora_dropout.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/02_rank_alpha_tuple.json}"
 # SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_align_mse_cos_tuple.json}"
