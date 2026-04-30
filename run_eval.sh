@@ -8,7 +8,7 @@ export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 # FastVGGT-aligned CLI knobs
-DATA_DIR="${DATA_DIR:-data/scans_test50,data/scans_dev50}"
+DATA_DIR="${DATA_DIR:-data/scans_test50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
 OUTPUT_DIR="${OUTPUT_DIR:-analysis_outputs/evaluation}"
@@ -29,7 +29,7 @@ SKIP_DEPTH_EVAL="${SKIP_DEPTH_EVAL:-0}"
 BASELINE_BACKEND="${BASELINE_BACKEND:-vggt}"
 FAST_BACKEND="${FAST_BACKEND:-fastvggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
-SCANNET_MODELS="${SCANNET_MODELS:-Baseline(vggt),Baseline(fastvggt),Ours(vggt),Ours(fastvggt)}"
+SCANNET_MODELS="${SCANNET_MODELS:-Ours(vggt)}"
 MODELS_7ANDN="${MODELS_7ANDN:-Baseline(fastvggt)}"
 # Tag used for ScanNet-style output directories. Defaults to basename of DATA_DIR
 # (e.g. scans_dev50 / scans_test50), but you can override explicitly.

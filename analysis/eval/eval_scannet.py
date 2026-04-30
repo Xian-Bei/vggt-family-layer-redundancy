@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 import numpy as np
 import torch
+import random
 import os
 import sys
 import json
@@ -97,7 +98,13 @@ if __name__ == "__main__":
         "redundancy cache_scannet Stage1 when left unset.",
     )
     args = parser.parse_args()
-    torch.manual_seed(33)
+    # Reproducibility (does NOT force CUDA/SDPA deterministic kernels).
+    SEED = 33
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
     # Scene sampling
     if int(args.num_scenes) > 0:

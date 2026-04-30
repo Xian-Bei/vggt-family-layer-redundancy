@@ -1,5 +1,6 @@
 import os
 import sys
+import random
 
 # Ensure project root is on sys.path for absolute imports like `vggt.*`
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -102,6 +103,15 @@ def main(args):
     from data import SevenScenes, NRGBD
     from utils import accuracy, completion
 
+    # Reproducibility (does NOT force CUDA/SDPA deterministic kernels).
+    SEED = 33
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+    rng_np = np.random.default_rng(SEED)
+
     if args.size == 512:
         resolution = (512, 384)
     elif args.size == 224:
@@ -118,6 +128,7 @@ def main(args):
             num_seq=1,
             full_video=True,
             kf_every=args.kf,
+            seed=SEED,
         ),  # 20),
         "NRGBD": NRGBD(
             split="test",
@@ -126,6 +137,7 @@ def main(args):
             num_seq=1,
             full_video=True,
             kf_every=args.kf,
+            seed=SEED,
         ),
     }
 
@@ -370,7 +382,7 @@ def main(args):
 
                 # If number of points exceeds threshold, sample by points
                 if pts_all_masked.shape[0] > 999999:
-                    sample_indices = np.random.choice(
+                    sample_indices = rng_np.choice(
                         pts_all_masked.shape[0], 999999, replace=False
                     )
                     pts_all_masked = pts_all_masked[sample_indices]
@@ -378,7 +390,7 @@ def main(args):
 
                 # Apply the same sampling to GT point cloud
                 if pts_gt_all_masked.shape[0] > 999999:
-                    sample_indices_gt = np.random.choice(
+                    sample_indices_gt = rng_np.choice(
                         pts_gt_all_masked.shape[0], 999999, replace=False
                     )
                     pts_gt_all_masked = pts_gt_all_masked[sample_indices_gt]
