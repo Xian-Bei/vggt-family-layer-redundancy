@@ -113,34 +113,48 @@ def evaluate_scene_metrics(
     traj_est_poses = np.array(all_cam_to_world_mat)
     n = min(len(traj_est_poses), len(w2cs_rel))
     timestamps = frame_ids[:n]
-    # Plot + pose stats in relative coordinates (visual convenience).
-    stats_aligned, traj_plot, _sim3_rel = eval_trajectory(
-        traj_est_poses[:n], w2cs_rel[:n], timestamps, align=True, plot_trajectory=plot_trajectory
-    )
-    # Sim(3) in original ScanNet world for point cloud alignment against GT mesh.
-    c2ws_world = np.asarray(first_gt_pose, dtype=np.float64) @ c2ws_rel
-    w2cs_world = np.linalg.inv(c2ws_world)
-    _, _, sim3_T = eval_trajectory(
-        traj_est_poses[:n], w2cs_world[:n], timestamps, align=True, plot_trajectory=False
-    )
-
-    merged_point_cloud = np.vstack(all_world_points)
-    if gt_point_cloud is None:
-        gt_point_cloud, _ = load_gt_pointcloud(scene, gt_ply_dir)
-    if gt_point_cloud is None:
-        raise RuntimeError(
-            f"{scene}: Chamfer / alignment require GT mesh under gt_ply_dir={gt_ply_dir!s}"
+    traj_plot: Optional[Image.Image] = None
+    try:
+        # Plot + pose stats in relative coordinates (visual convenience).
+        stats_aligned, traj_plot, _sim3_rel = eval_trajectory(
+            traj_est_poses[:n], w2cs_rel[:n], timestamps, align=True, plot_trajectory=plot_trajectory
         )
-    # Align predicted point cloud into GT mesh world using the same Sim(3) as trajectory alignment.
-    P = np.asarray(merged_point_cloud, dtype=np.float64)
-    R = np.asarray(sim3_T[:3, :3], dtype=np.float64)
-    t = np.asarray(sim3_T[:3, 3], dtype=np.float64)
-    world_points_scaled = (P @ R.T) + t[None, :]
+        # Sim(3) in original ScanNet world for point cloud alignment against GT mesh.
+        c2ws_world = np.asarray(first_gt_pose, dtype=np.float64) @ c2ws_rel
+        w2cs_world = np.linalg.inv(c2ws_world)
+        _, _, sim3_T = eval_trajectory(
+            traj_est_poses[:n], w2cs_world[:n], timestamps, align=True, plot_trajectory=False
+        )
 
-    cd_value = compute_chamfer_distance(
-        world_points_scaled, gt_point_cloud, max_dist=chamfer_max_dist
-    )
-    stats_aligned["chamfer_distance"] = float(cd_value)
+        merged_point_cloud = np.vstack(all_world_points)
+        if gt_point_cloud is None:
+            gt_point_cloud, _ = load_gt_pointcloud(scene, gt_ply_dir)
+        if gt_point_cloud is None:
+            raise RuntimeError(
+                f"{scene}: Chamfer / alignment require GT mesh under gt_ply_dir={gt_ply_dir!s}"
+            )
+        # Align predicted point cloud into GT mesh world using the same Sim(3) as trajectory alignment.
+        P = np.asarray(merged_point_cloud, dtype=np.float64)
+        R = np.asarray(sim3_T[:3, :3], dtype=np.float64)
+        t = np.asarray(sim3_T[:3, 3], dtype=np.float64)
+        world_points_scaled = (P @ R.T) + t[None, :]
+
+        cd_value = compute_chamfer_distance(
+            world_points_scaled, gt_point_cloud, max_dist=chamfer_max_dist
+        )
+        stats_aligned["chamfer_distance"] = float(cd_value)
+    except Exception as e:
+        msg = str(e)
+        if "Degenerate covariance rank" not in msg and "Umeyama alignment" not in msg:
+            raise
+        print(f"[warn] {scene}: trajectory alignment failed ({msg}); writing NaN pose/chamfer metrics.")
+        stats_aligned = {
+            "ate": float("nan"),
+            "are": float("nan"),
+            "rpe_rot": float("nan"),
+            "rpe_trans": float("nan"),
+            "chamfer_distance": float("nan"),
+        }
 
     all_metrics: Dict[str, float] = deepcopy(stats_aligned)
     all_metrics["inference_time_ms"] = float(inference_time_ms)
@@ -229,7 +243,8 @@ def compute_average_metrics_and_save(
 
     average_metrics: Dict[str, float] = {}
     for metric_name, values in average_metrics_list.items():
-        average_metrics[metric_name] = float(np.mean(values)) if values else 0.0
+        finite_vals = [float(v) for v in values if np.isfinite(float(v))]
+        average_metrics[metric_name] = float(np.mean(finite_vals)) if finite_vals else float("nan")
 
     output_path.mkdir(parents=True, exist_ok=True)
 

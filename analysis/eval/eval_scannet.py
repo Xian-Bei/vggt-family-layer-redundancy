@@ -127,7 +127,7 @@ if __name__ == "__main__":
 
     all_scenes_metrics = {"scenes": {}, "average": {}}
     # Use fp16 by default for compatibility with baseline VGGT implementations.
-    dtype = torch.float16
+    dtype = torch.bfloat16
     interval_rules = None
     if str(args.model_name) == "Ours" and (not args.ckpt_path) and (args.train_dir is None):
         if args.interval_config_file is None:

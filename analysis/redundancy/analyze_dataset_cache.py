@@ -446,6 +446,13 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("bfloat16", "float16", "float32"),
     )
     p.add_argument(
+        "--cache-load-dtype",
+        type=str,
+        default="auto",
+        choices=("auto", "bfloat16", "float16", "float32"),
+        help="Dtype used when moving replay cache tensors to device (default: preserve cache dtype).",
+    )
+    p.add_argument(
         "--layer-gt-eval",
         action="store_true",
         help="Run skip-layer GT evaluation and produce GT delta outputs.",
@@ -1007,7 +1014,13 @@ def _write_fusion_full_reports_from_per_scene_json(
         {"scene_id": sid, **{k: scene_scores_map.get(sid, {}).get(k, "") for k in score_keys}} for sid in scene_ids
     ]
     for k in score_keys:
-        vals = [float(r[k]) for r in per_scene_rows_final if r.get(k) not in ("", None) and str(r[k]).strip() != ""]
+        vals = [
+            float(r[k])
+            for r in per_scene_rows_final
+            if r.get(k) not in ("", None)
+            and str(r[k]).strip() != ""
+            and not math.isnan(float(r[k]))
+        ]
         if vals:
             mean_v = sum(vals) / len(vals)
             similarity_summary_rows.append({"metric": f"scene_avg_{k}", "value": mean_v})
@@ -1750,6 +1763,7 @@ def _forward_with_suffix_replay(
     skipped_global_mode: str,
     pos_frame: Optional[torch.Tensor],
     pos_global: Optional[torch.Tensor],
+    cache_load_dtype: Optional[torch.dtype] = None,
     capture_global_layer: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     num_layers = len(replay_concat_layers)
@@ -1780,9 +1794,15 @@ def _forward_with_suffix_replay(
             return cached
         t = replay_concat_layers[idx]
         if images.device.type == "cuda":
-            t = t.to(device=images.device, non_blocking=True)
+            if cache_load_dtype is None:
+                t = t.to(device=images.device, non_blocking=True)
+            else:
+                t = t.to(device=images.device, dtype=cache_load_dtype, non_blocking=True)
         else:
-            t = t.to(device=images.device)
+            if cache_load_dtype is None:
+                t = t.to(device=images.device)
+            else:
+                t = t.to(device=images.device, dtype=cache_load_dtype)
         layer_cache[idx] = t
         return t
 
@@ -1800,7 +1820,14 @@ def _forward_with_suffix_replay(
         if start_layer == 0:
             if initial_tokens is None:
                 raise ValueError("initial_tokens are required to replay frame-skipping modes from layer 0.")
-            token_view = initial_tokens.to(device=images.device, non_blocking=(images.device.type == "cuda"))
+            if cache_load_dtype is None:
+                token_view = initial_tokens.to(device=images.device, non_blocking=(images.device.type == "cuda"))
+            else:
+                token_view = initial_tokens.to(
+                    device=images.device,
+                    dtype=cache_load_dtype,
+                    non_blocking=(images.device.type == "cuda"),
+                )
             if token_view.shape[:3] != (bsz, seq_len, p):
                 raise RuntimeError(
                     f"Initial token shape {tuple(token_view.shape)} does not match replay cache "
@@ -1902,6 +1929,7 @@ def _replay_global_output_at_layer(
     skipped_global_mode: str,
     pos_frame: Optional[torch.Tensor],
     pos_global: Optional[torch.Tensor],
+    cache_load_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     num_layers = len(replay_concat_layers)
     if not (0 <= start_layer < num_layers):
@@ -1911,7 +1939,14 @@ def _replay_global_output_at_layer(
             f"Invalid target_layer={target_layer}; expected {start_layer} <= target_layer < {num_layers}"
         )
 
-    start_tokens = replay_concat_layers[start_layer].to(device=device, non_blocking=(device.type == "cuda"))
+    if cache_load_dtype is None:
+        start_tokens = replay_concat_layers[start_layer].to(device=device, non_blocking=(device.type == "cuda"))
+    else:
+        start_tokens = replay_concat_layers[start_layer].to(
+            device=device,
+            dtype=cache_load_dtype,
+            non_blocking=(device.type == "cuda"),
+        )
     bsz, seq_len, p, two_c = start_tokens.shape
     if two_c % 2 != 0:
         raise ValueError(f"Expected even channel count in replay cache, got {two_c}")
@@ -1921,16 +1956,30 @@ def _replay_global_output_at_layer(
         if start_layer == 0:
             if initial_tokens is None:
                 raise ValueError("initial_tokens are required to replay frame-skipping modes from layer 0.")
-            token_view = initial_tokens.to(device=device, non_blocking=(device.type == "cuda"))
+            if cache_load_dtype is None:
+                token_view = initial_tokens.to(device=device, non_blocking=(device.type == "cuda"))
+            else:
+                token_view = initial_tokens.to(
+                    device=device,
+                    dtype=cache_load_dtype,
+                    non_blocking=(device.type == "cuda"),
+                )
             if token_view.shape[:3] != (bsz, seq_len, p):
                 raise RuntimeError(
                     f"Initial token shape {tuple(token_view.shape)} does not match replay cache "
                     f"prefix {(bsz, seq_len, p)}."
                 )
         else:
-            prev_tokens = replay_concat_layers[start_layer - 1].to(
-                device=device, non_blocking=(device.type == "cuda")
-            )
+            if cache_load_dtype is None:
+                prev_tokens = replay_concat_layers[start_layer - 1].to(
+                    device=device, non_blocking=(device.type == "cuda")
+                )
+            else:
+                prev_tokens = replay_concat_layers[start_layer - 1].to(
+                    device=device,
+                    dtype=cache_load_dtype,
+                    non_blocking=(device.type == "cuda"),
+                )
             token_view = prev_tokens[..., c:]
 
         for layer_idx in range(start_layer, target_layer + 1):
@@ -2406,6 +2455,13 @@ def main() -> None:
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     skip_loss_dtype = dtype_map[args.skip_loss_dtype]
+    cache_load_dtype_map: Dict[str, Optional[torch.dtype]] = {
+        "auto": None,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    cache_load_dtype = cache_load_dtype_map[args.cache_load_dtype]
     skip_loss_device = torch.device(
         args.skip_loss_device if torch.cuda.is_available() or args.skip_loss_device == "cpu" else "cpu"
     )
@@ -2512,6 +2568,7 @@ def main() -> None:
                     skipped_global_mode=fusion_modes[0],
                     pos_frame=pos_frame,
                     pos_global=pos_global,
+                    cache_load_dtype=cache_load_dtype,
                 )
             noop_pred_cpu = predictions_to_cpu_float(noop_pred)
             noop_payload = build_scene_prediction_payload(noop_pred_cpu, hw)
@@ -2539,10 +2596,17 @@ def main() -> None:
             cached = original_global_cache.get(layer_idx)
             if cached is not None:
                 return cached
-            concat = replay_concat_layers[layer_idx].to(
-                device=skip_loss_device,
-                non_blocking=(skip_loss_device.type == "cuda"),
-            )
+            if cache_load_dtype is None:
+                concat = replay_concat_layers[layer_idx].to(
+                    device=skip_loss_device,
+                    non_blocking=(skip_loss_device.type == "cuda"),
+                )
+            else:
+                concat = replay_concat_layers[layer_idx].to(
+                    device=skip_loss_device,
+                    dtype=cache_load_dtype,
+                    non_blocking=(skip_loss_device.type == "cuda"),
+                )
             c_local = concat.shape[-1] // 2
             g = concat[..., c_local:]
             original_global_cache[layer_idx] = g
@@ -2592,6 +2656,7 @@ def main() -> None:
                                 skipped_global_mode=mode,
                                 pos_frame=pos_frame,
                                 pos_global=pos_global,
+                                cache_load_dtype=cache_load_dtype,
                                 capture_global_layer=j,
                             )
                             captured_global = pred.get("_captured_global")
@@ -2611,6 +2676,7 @@ def main() -> None:
                                 skipped_global_mode=mode,
                                 pos_frame=pos_frame,
                                 pos_global=pos_global,
+                                cache_load_dtype=cache_load_dtype,
                             )
                         elif layer_gt_eval:
                             pred = _forward_with_suffix_replay(
@@ -2624,6 +2690,7 @@ def main() -> None:
                                 skipped_global_mode=mode,
                                 pos_frame=pos_frame,
                                 pos_global=pos_global,
+                                cache_load_dtype=cache_load_dtype,
                             )
                     t_forward = time.perf_counter() - t0_fwd
 

@@ -8,19 +8,20 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 SCANNET_ROOT="${SCANNET_ROOT:-data/scans_dev50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
-RUN_SCANNET="${RUN_SCANNET:-0}"
-RUN_7SCENES="${RUN_7SCENES:-1}"
+RUN_SCANNET="${RUN_SCANNET:-1}"
+RUN_7SCENES="${RUN_7SCENES:-0}"
 RUN_NRGBD="${RUN_NRGBD:-0}"
 
 # Shared knobs
 HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
 DEVICE="${DEVICE:-cuda}"
-DTYPE="${DTYPE:-bfloat16}"
+# Replay cache load dtype only (Stage2 autocast is fixed via --skip-loss-dtype bfloat16).
+DTYPE="${DTYPE:-float32}"
 GT_PLY_DIR="${GT_PLY_DIR:-}"
 CHAMFER_MAX_DIST="${CHAMFER_MAX_DIST:-0.5}"
 DEPTH_CONF_THRESH="${DEPTH_CONF_THRESH:-1.0}"
 MAX_SPAN="${MAX_SPAN:-24}"
-MODES="${MODES:-skip_both,skip_global,skip_frame}"
+MODES="${MODES:-skip_global}"
 SIMILARITY_METRICS="${SIMILARITY_METRICS:-cka,cosine,neg_mse}"
 TIMING="${TIMING:-1}"
 HEATMAP_FILL="${HEATMAP_FILL:-nan}"
@@ -30,8 +31,8 @@ SAVE_HEATMAP_PNG="${SAVE_HEATMAP_PNG:-0}"
 NUM_PROCS="${NUM_PROCS:-1}"
 MAX_SCENES="${MAX_SCENES:-0}"
 EXPORT_VIS="${EXPORT_VIS:-0}"
-ENABLE_SIMILARITY="${ENABLE_SIMILARITY:-1}"
-LAYER_GT_EVAL="${LAYER_GT_EVAL:-0}"
+ENABLE_SIMILARITY="${ENABLE_SIMILARITY:-0}"
+LAYER_GT_EVAL="${LAYER_GT_EVAL:-1}"
 CACHE_SANITY_CHECK="${CACHE_SANITY_CHECK:-1}"
 CACHE_SANITY_ATOL="${CACHE_SANITY_ATOL:-1e-6}"
 CACHE_SANITY_RTOL="${CACHE_SANITY_RTOL:-1e-6}"
@@ -57,6 +58,7 @@ run_one_dataset() {
   if [[ "${LAYER_GT_EVAL}" == "1" || "${LAYER_GT_EVAL}" == "true" ]]; then
     extra_args+=(--layer-gt-eval)
   fi
+  extra_args+=(--cache-load-dtype "${DTYPE}")
   if [[ "${ENABLE_SIMILARITY}" != "1" && "${ENABLE_SIMILARITY}" != "true" ]]; then
     extra_args+=(--no-fusion-compute-similarity)
   fi
@@ -139,7 +141,7 @@ PY
     --hf-model "${HF_MODEL}" \
     --device "${ANALYSIS_DEVICE}" \
     --skip-loss-device "${DEVICE}" \
-    --skip-loss-dtype "${DTYPE}" \
+    --skip-loss-dtype "bfloat16" \
     --heatmap-fill "${HEATMAP_FILL}" \
     --chamfer-max-dist "${CHAMFER_MAX_DIST}" \
     --depth-conf-thresh "${DEPTH_CONF_THRESH}" \

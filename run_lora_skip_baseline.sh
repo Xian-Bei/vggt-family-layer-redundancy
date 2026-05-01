@@ -30,7 +30,6 @@ SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/01_loss_weigh
 INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/redundancy/interval_config.template.json}"
 VARIANT="${VARIANT:-multi_interval_config}"
 DEVICE="${DEVICE:-cuda}"
-DTYPE="${DTYPE:-bfloat16}"               # float32 | bfloat16 | float16 (default follows official training)
 CONDA_ENV="${CONDA_ENV:-vggt}"
 SEED="${SEED:-0}"
 EPOCHS="${EPOCHS:-50}"
@@ -43,15 +42,15 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 GRAD_CLIP_MAX_NORM="${GRAD_CLIP_MAX_NORM:-1.0}"
 SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-10}"
 RESUME_FROM="${RESUME_FROM:-}"
-LORA_RANK="${LORA_RANK:-8}"
-LORA_ALPHA="${LORA_ALPHA:-16.0}"
+LORA_RANK="${LORA_RANK:-128}"
+LORA_ALPHA="${LORA_ALPHA:-256}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
 
 W_ALIGN="${W_ALIGN:-1.0}"
-W_ALIGN_MSE="${W_ALIGN_MSE:-1.0}"
-W_ALIGN_COS="${W_ALIGN_COS:-1.0}"
 W_ALIGN_CKA="${W_ALIGN_CKA:-1.0}"
-W_PRED="${W_PRED:-4.0}"
+W_ALIGN_MSE="${W_ALIGN_MSE:-0.0}"
+W_ALIGN_COS="${W_ALIGN_COS:-0.0}"
+W_PRED="${W_PRED:-1.0}"
 W_CAMERA="${W_CAMERA:-5.0}"
 W_DEPTH="${W_DEPTH:-1.0}"
 DEPTH_VALID_RANGE="${DEPTH_VALID_RANGE:-0.98}"
@@ -132,7 +131,6 @@ run_one_trial() {
     --interval-config-file "${INTERVAL_CONFIG_FILE}" \
     --variant "${VARIANT}" \
     --device "${DEVICE}" \
-    --dtype "${DTYPE}" \
     --seed "${SEED}" \
     --epochs "${EPOCHS}" \
     --max-scenes "${MAX_SCENES}" \

@@ -207,7 +207,7 @@ def main(args):
         world = torch.where(valid.unsqueeze(-1), world, torch.full_like(world, float("nan")))
         return world
 
-    dtype = torch.float16
+    dtype = torch.bfloat16
     interval_rules = None
     if str(args.model_name) == "Ours" and (not str(args.ckpt_path).strip()) and (not str(args.train_dir).strip()):
         if not str(args.interval_config_file).strip():
@@ -288,7 +288,7 @@ def main(args):
                 conf_all = []
                 in_camera1 = None
 
-                dtype = torch.float16
+                dtype = torch.bfloat16
                 with torch.cuda.amp.autocast(dtype=dtype):
                     if isinstance(batch, dict) and "img" in batch:
                         batch["img"] = (batch["img"] + 1.0) / 2.0

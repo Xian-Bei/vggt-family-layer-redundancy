@@ -62,7 +62,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path, default=Path("analysis_outputs/cache/scannet"))
     p.add_argument("--hf-model", type=str, default="facebook/VGGT-1B")
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--dtype", type=str, default="bfloat16", choices=("bfloat16", "float16", "float32"))
+    p.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16",
+        choices=("bfloat16", "float16", "float32"),
+        help="On-disk dtype for replay cache layers (autocast remains bfloat16 on CUDA).",
+    )
     p.add_argument("--max-scenes", type=int, default=0, help="0 = all scenes.")
     p.add_argument("--max-frames", type=int, default=30)
     p.add_argument("--max-tokens-per-layer", type=int, default=0)
@@ -222,7 +228,9 @@ def main() -> None:
     dataset = str(args.dataset).strip().lower()
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-    amp_dtype = dtype_map[args.dtype]
+    layer_storage_dtype = dtype_map[args.dtype]
+    # Keep Stage1 compute path stable: always use bf16 autocast on CUDA.
+    amp_dtype = torch.bfloat16
     use_amp = device.type == "cuda"
 
     if not args.skip_gt_eval and not dependencies_available():
@@ -314,8 +322,7 @@ def main() -> None:
         layers_dir = scene_dir / "layers"
         metadata_path = scene_dir / "metadata.json"
         pred_path = scene_dir / "pred.pt"
-        # Match --dtype (e.g. run_cache.sh DTYPE): on-disk replay layers use this dtype; pred stays float32.
-        layer_storage_dtype = amp_dtype
+        # --dtype controls only on-disk replay cache precision; pred stays float32.
 
         payload = {
             "scene_id": scene_id,
