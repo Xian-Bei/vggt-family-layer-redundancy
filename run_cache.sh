@@ -10,8 +10,8 @@ SCANNET_ROOT="${SCANNET_ROOT:-data/scans_dev50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
 RUN_SCANNET="${RUN_SCANNET:-0}"
-RUN_7SCENES="${RUN_7SCENES:-0}"
-RUN_NRGBD="${RUN_NRGBD:-1}"
+RUN_7SCENES="${RUN_7SCENES:-1}"
+RUN_NRGBD="${RUN_NRGBD:-0}"
 
 # Shared knobs (kept identical across datasets)
 HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
