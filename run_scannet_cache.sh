@@ -30,8 +30,6 @@ CACHE_DIR="${CACHE_DIR:-analysis_outputs/scannet_cache}"
 MAX_SCENES="${MAX_SCENES:-50}"
 MAX_FRAMES="${MAX_FRAMES:-30}"
 MAX_TOKENS_PER_LAYER="${MAX_TOKENS_PER_LAYER:-0}"
-EXPORT_VIS="${EXPORT_VIS:-1}"
-VIS_DIR="${VIS_DIR:-${CACHE_DIR}/visualization}"
 
 echo "== caching global-block activations + direct GT eval =="
 echo "    DATA_ROOT=${DATA_ROOT}"
@@ -42,9 +40,6 @@ if [[ -n "${GT_PLY_DIR}" ]]; then
   CACHE_EVAL_ARGS+=(--gt-ply-dir "${GT_PLY_DIR}")
 fi
 CACHE_EVAL_ARGS+=(--chamfer-max-dist "${CHAMFER_MAX_DIST}" --depth-conf-thresh "${DEPTH_CONF_THRESH}")
-if [[ "${EXPORT_VIS}" == "1" || "${EXPORT_VIS}" == "true" ]]; then
-  CACHE_EVAL_ARGS+=(--export-visualization --visualization-dir "${VIS_DIR}")
-fi
 
 python -m analysis.redundancy.cache_scannet \
   --data-root "${DATA_ROOT}" \

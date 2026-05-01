@@ -8,7 +8,7 @@ export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 # FastVGGT-aligned CLI knobs
-DATA_DIR="${DATA_DIR:-data/scans_test50}"
+DATA_DIR="${DATA_DIR:-data/scans_test50,data/scans_dev50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
 OUTPUT_DIR="${OUTPUT_DIR:-analysis_outputs/evaluation}"
@@ -26,10 +26,13 @@ DEPTH_CONF_THRESH="${DEPTH_CONF_THRESH:-1.0}"
 CHAMFER_MAX_DIST="${CHAMFER_MAX_DIST:-0.5}"
 # Set to 1 to pass --skip_depth_eval (no depth_abs_rel / depth_delta1 vs ScanNet GT).
 SKIP_DEPTH_EVAL="${SKIP_DEPTH_EVAL:-0}"
+# Export per-scene visualization assets for the Gradio+Viser panel.
+EXPORT_VIS="${EXPORT_VIS:-1}"
+VIS_MAX_POINTS="${VIS_MAX_POINTS:-0}"
 BASELINE_BACKEND="${BASELINE_BACKEND:-vggt}"
 FAST_BACKEND="${FAST_BACKEND:-fastvggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
-SCANNET_MODELS="${SCANNET_MODELS:-Ours(vggt)}"
+SCANNET_MODELS="${SCANNET_MODELS:-Baseline(fastvggt),Ours(vggt),Ours(fastvggt)}"
 MODELS_7ANDN="${MODELS_7ANDN:-Baseline(fastvggt)}"
 # Tag used for ScanNet-style output directories. Defaults to basename of DATA_DIR
 # (e.g. scans_dev50 / scans_test50), but you can override explicitly.
@@ -120,6 +123,9 @@ run_scannet() {
   if [[ "${SKIP_DEPTH_EVAL}" == "1" || "${SKIP_DEPTH_EVAL}" == "true" ]]; then
     args+=(--skip_depth_eval)
   fi
+  if [[ "${EXPORT_VIS}" == "1" || "${EXPORT_VIS}" == "true" ]]; then
+    args+=(--export-visualization --vis-max-points "${VIS_MAX_POINTS}")
+  fi
 
   set_backend_pythonpath "${backend}"
   rm -rf "${out_dir}"
@@ -168,6 +174,9 @@ run_7andn() {
   fi
   if [[ "${backend}" == "fastvggt" ]]; then
     args+=(--merging "${MERGING}" --merge_ratio "${MERGE_RATIO}")
+  fi
+  if [[ "${EXPORT_VIS}" == "1" || "${EXPORT_VIS}" == "true" ]]; then
+    args+=(--export-visualization --vis-max-points "${VIS_MAX_POINTS}")
   fi
 
   set_backend_pythonpath "${backend}"

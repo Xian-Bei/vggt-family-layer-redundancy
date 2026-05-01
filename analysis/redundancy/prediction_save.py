@@ -24,7 +24,8 @@ def build_scene_prediction_payload(pred_cpu: Dict[str, torch.Tensor], image_hw: 
         payload["pose_enc"] = pe.half()
         payload["extrinsic"] = extri.float().cpu()
         payload["intrinsic"] = intri.float().cpu() if intri is not None else None
-    for key in ("depth", "depth_conf", "world_points", "world_points_conf"):
+    # Exclude point-head outputs (world_points / world_points_conf) across the project.
+    for key in ("depth", "depth_conf"):
         if key in pred_cpu and pred_cpu[key].numel() > 0:
             payload[key] = pred_cpu[key].half()
     return payload

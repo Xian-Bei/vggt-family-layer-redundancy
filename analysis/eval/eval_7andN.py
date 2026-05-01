@@ -96,6 +96,17 @@ def get_args_parser():
         default="",
         help="Optional HuggingFace model id. If set, load via from_pretrained.",
     )
+    parser.add_argument(
+        "--export-visualization",
+        action="store_true",
+        help="Export per-scene visualization assets under <output_dir>/<kf>/<dataset>/<scene_id>/vis/ for the Gradio+Viser panel.",
+    )
+    parser.add_argument(
+        "--vis-max-points",
+        type=int,
+        default=200000,
+        help="Max points saved into viser_points(.npz) per scene (0 = keep all).",
+    )
     return parser
 
 
@@ -144,8 +155,57 @@ def main(args):
     device = args.device
 
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-    from vggt.utils.geometry import unproject_depth_map_to_point_map
     from criterion import Regr3D_t_ScaleShiftInv, L21
+
+    def _depth_to_world_points_torch(
+        depth_bshw: torch.Tensor,
+        extrinsics_bsx34: torch.Tensor,
+        intrinsics_bsx33: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """Unproject depth to world points (OpenCV extrinsic: cam_from_world)."""
+        if depth_bshw.dim() != 4:
+            raise ValueError(f"Expected depth [B,S,H,W], got {tuple(depth_bshw.shape)}")
+        if extrinsics_bsx34.shape[-2:] != (3, 4):
+            raise ValueError(f"Expected extrinsics [B,S,3,4], got {tuple(extrinsics_bsx34.shape)}")
+        if intrinsics_bsx33.shape[-2:] != (3, 3):
+            raise ValueError(f"Expected intrinsics [B,S,3,3], got {tuple(intrinsics_bsx33.shape)}")
+
+        B, S, H, W = depth_bshw.shape
+        device = depth_bshw.device
+
+        depth = depth_bshw.float()
+        fx = intrinsics_bsx33[..., 0, 0].float().unsqueeze(-1).unsqueeze(-1)  # [B,S,1,1]
+        fy = intrinsics_bsx33[..., 1, 1].float().unsqueeze(-1).unsqueeze(-1)
+        cx = intrinsics_bsx33[..., 0, 2].float().unsqueeze(-1).unsqueeze(-1)
+        cy = intrinsics_bsx33[..., 1, 2].float().unsqueeze(-1).unsqueeze(-1)
+
+        # Pixel grid [H,W]
+        u = torch.arange(W, device=device, dtype=torch.float32).view(1, 1, 1, W).expand(B, S, H, W)
+        v = torch.arange(H, device=device, dtype=torch.float32).view(1, 1, H, 1).expand(B, S, H, W)
+
+        valid = torch.isfinite(depth) & (depth > eps)
+        x_cam = (u - cx) * depth / fx
+        y_cam = (v - cy) * depth / fy
+        z_cam = depth
+
+        # [B,S,H,W,3]
+        cam_points = torch.stack([x_cam, y_cam, z_cam], dim=-1)
+
+        # Invert OpenCV extrinsic (cam_from_world): world_from_cam.
+        R_cw = extrinsics_bsx34[..., :3].float()  # [B,S,3,3]
+        t_cw = extrinsics_bsx34[..., 3].float()   # [B,S,3]
+        R_wc = R_cw.transpose(-1, -2)
+        t_wc = -(R_wc @ t_cw.unsqueeze(-1)).squeeze(-1)  # [B,S,3]
+
+        # world = R_wc @ cam + t_wc
+        world = (
+            torch.matmul(R_wc[:, :, None, None, :, :], cam_points.unsqueeze(-1)).squeeze(-1)
+            + t_wc[:, :, None, None, :]
+        )
+
+        world = torch.where(valid.unsqueeze(-1), world, torch.full_like(world, float("nan")))
+        return world
 
     dtype = torch.float16
     interval_rules = None
@@ -262,13 +322,34 @@ def main(args):
                             "predictions is missing a key to infer sequence length"
                         )
 
+                    # Switch point cloud source: use depth unprojection (like eval_scannet.py),
+                    # instead of point-head `world_points` output.
+                    img_hw = (int(imgs_tensor.shape[2]), int(imgs_tensor.shape[3]))
+                    extrinsics, intrinsics = pose_encoding_to_extri_intri(
+                        predictions["pose_enc"], img_hw
+                    )  # [B,S,3,4], [B,S,3,3]
+                    depth = predictions["depth"]  # [B,S,H,W]
+                    depth_conf = predictions.get("depth_conf", None)
+                    if depth_conf is None:
+                        raise KeyError("predictions missing required key `depth_conf` for depth->points.")
+                    depth_f = depth.float()
+                    depth_f = torch.where(
+                        depth_conf.float() >= float(args.conf_thresh),
+                        depth_f,
+                        torch.full_like(depth_f, float("nan")),
+                    )
+                    world_points_from_depth = _depth_to_world_points_torch(
+                        depth_f, extrinsics, intrinsics
+                    )  # [B,S,H,W,3]
+
                     ress = []
                     for s in range(S):
                         res = {
-                            "pts3d_in_other_view": predictions["world_points"][:, s],
-                            "conf": predictions["world_points_conf"][:, s],
+                            "pts3d_in_other_view": world_points_from_depth[:, s],
+                            # Use depth confidence as point confidence (closest analogue to world_points_conf).
+                            "conf": depth_conf[:, s],
                             "depth": predictions["depth"][:, s],
-                            "depth_conf": predictions["depth_conf"][:, s],
+                            "depth_conf": depth_conf[:, s],
                             "camera_pose": predictions["pose_enc"][:, s, :],
                         }
                         if (
@@ -349,6 +430,7 @@ def main(args):
                 pts_all = np.concatenate(pts_all, axis=0)
                 pts_gt_all = np.concatenate(pts_gt_all, axis=0)
                 masks_all = np.concatenate(masks_all, axis=0)
+                conf_all = np.concatenate(conf_all, axis=0) if len(conf_all) > 0 else None
 
                 scene_id = view["label"][0].rsplit("/", 1)[0]
                 # Record average inference time per scene
@@ -367,9 +449,12 @@ def main(args):
                 pts_all_masked = pts_all[masks_all > 0]
                 pts_gt_all_masked = pts_gt_all[masks_all > 0]
                 images_all_masked = images_all[masks_all > 0]
+                conf_all_masked = conf_all[masks_all > 0] if conf_all is not None else None
 
                 mask = np.isfinite(pts_all_masked)
                 pts_all_masked = pts_all_masked[mask]
+                if conf_all_masked is not None:
+                    conf_all_masked = conf_all_masked[mask]
 
                 mask_gt = np.isfinite(pts_gt_all_masked)
                 pts_gt_all_masked = pts_gt_all_masked[mask_gt]
@@ -379,6 +464,8 @@ def main(args):
                 pts_all_masked = pts_all_masked.reshape(-1, 3)
                 pts_gt_all_masked = pts_gt_all_masked.reshape(-1, 3)
                 images_all_masked = images_all_masked.reshape(-1, 3)
+                if conf_all_masked is not None:
+                    conf_all_masked = conf_all_masked.reshape(-1)
 
                 # If number of points exceeds threshold, sample by points
                 if pts_all_masked.shape[0] > 999999:
@@ -387,6 +474,8 @@ def main(args):
                     )
                     pts_all_masked = pts_all_masked[sample_indices]
                     images_all_masked = images_all_masked[sample_indices]
+                    if conf_all_masked is not None:
+                        conf_all_masked = conf_all_masked[sample_indices]
 
                 # Apply the same sampling to GT point cloud
                 if pts_gt_all_masked.shape[0] > 999999:
@@ -394,6 +483,64 @@ def main(args):
                         pts_gt_all_masked.shape[0], 999999, replace=False
                     )
                     pts_gt_all_masked = pts_gt_all_masked[sample_indices_gt]
+
+                if args.export_visualization:
+                    try:
+                        from pathlib import Path
+
+                        from analysis.vis.vis_assets import write_cameras_json, write_viser_points_npz
+
+                        scene_out = Path(save_path) / str(scene_id)
+                        vis_pred_dir = scene_out / "vis" / "pred"
+                        vis_gt_dir = scene_out / "vis" / "gt"
+                        vis_pred_dir.mkdir(parents=True, exist_ok=True)
+                        vis_gt_dir.mkdir(parents=True, exist_ok=True)
+
+                        cols_u8 = (np.asarray(images_all_masked, dtype=np.float32) * 255.0).clip(0, 255).astype(np.uint8)
+                        write_viser_points_npz(
+                            vis_pred_dir / "viser_points.npz",
+                            points=np.asarray(pts_all_masked, dtype=np.float32),
+                            colors_uint8=cols_u8,
+                            confidence=None if conf_all_masked is None else np.asarray(conf_all_masked, dtype=np.float32),
+                            frame_indices=None,
+                            max_points=int(args.vis_max_points),
+                        )
+                        write_viser_points_npz(
+                            vis_gt_dir / "viser_points_gt.npz",
+                            points=np.asarray(pts_gt_all_masked, dtype=np.float32),
+                            colors_uint8=np.tile(
+                                np.array([[160, 160, 160]], dtype=np.uint8),
+                                (int(pts_gt_all_masked.shape[0]), 1),
+                            ),
+                            confidence=None,
+                            frame_indices=None,
+                            max_points=int(args.vis_max_points),
+                        )
+
+                        # Best-effort camera export: pred extrinsics from pose_enc are available above as `extrinsics` (B,S,3,4).
+                        # Here B=1; export cameras.json if shapes look valid.
+                        try:
+                            extr = extrinsics.detach().float().cpu().numpy()
+                            intr = intrinsics.detach().float().cpu().numpy()
+                            if extr.ndim == 4:
+                                extr = extr[0]
+                            if intr.ndim == 4:
+                                intr = intr[0]
+                            image_paths = []
+                            if isinstance(batch, list) and len(batch) > 0 and "path" in batch[0]:
+                                image_paths = [Path(v["path"][0]) for v in batch]
+                            write_cameras_json(
+                                vis_pred_dir / "cameras.json",
+                                scene_id=str(scene_id),
+                                image_paths=image_paths,
+                                extrinsic_cw=extr,
+                                intrinsic=intr,
+                                image_hw=None,
+                            )
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[warn] 7andN visualization export failed for {scene_id}: {e}")
 
                 if args.use_proj:
 

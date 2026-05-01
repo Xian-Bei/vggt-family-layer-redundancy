@@ -180,21 +180,34 @@ def load_gt_pointcloud(scene_id, gt_ply_dir):
 
 
 def eval_trajectory(poses_est, poses_gt, frame_ids, align=False, plot_trajectory: bool = True):
+    # NOTE: `poses_est`/`poses_gt` are expected to be camera-from-world (w2c) SE(3) matrices.
+    # For physical consistency with point clouds in world coordinates, build trajectories from camera centers:
+    #   C_world = -R^T t   where x_cam = R x_world + t.
+    def _camera_centers_and_orientations_wxyz(w2c: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        E = np.asarray(w2c, dtype=np.float64)
+        if E.ndim != 3 or E.shape[1:] != (4, 4):
+            raise ValueError(f"Expected w2c poses [N,4,4], got {E.shape}")
+        R_cw = E[:, :3, :3]
+        t_cw = E[:, :3, 3]
+        R_wc = np.transpose(R_cw, (0, 2, 1))
+        centers = -np.einsum("nij,nj->ni", R_wc, t_cw)
+        quat_wxyz = Rotation.from_matrix(R_wc).as_quat(scalar_first=True)
+        return centers, quat_wxyz
+
+    ref_centers, ref_quat_wxyz = _camera_centers_and_orientations_wxyz(poses_gt)
+    est_centers, est_quat_wxyz = _camera_centers_and_orientations_wxyz(poses_est)
+
     # Build reference trajectory object
     traj_ref = PoseTrajectory3D(
-        positions_xyz=poses_gt[:, :3, 3],  # Extract translation part
-        orientations_quat_wxyz=Rotation.from_matrix(poses_gt[:, :3, :3]).as_quat(
-            scalar_first=True
-        ),  # Convert rotation matrix to quaternion
+        positions_xyz=ref_centers,
+        orientations_quat_wxyz=ref_quat_wxyz,
         timestamps=frame_ids,
     )
 
     # Build estimated trajectory object
     traj_est = PoseTrajectory3D(
-        positions_xyz=poses_est[:, :3, 3],
-        orientations_quat_wxyz=Rotation.from_matrix(poses_est[:, :3, :3]).as_quat(
-            scalar_first=True
-        ),
+        positions_xyz=est_centers,
+        orientations_quat_wxyz=est_quat_wxyz,
         timestamps=frame_ids,
     )
 
@@ -691,6 +704,7 @@ def infer_vggt_and_reconstruct(
     List[np.ndarray],
     float,
     np.ndarray,
+    np.ndarray,
 ]:
     torch.cuda.synchronize()
     start = time.time()
@@ -768,6 +782,7 @@ def infer_vggt_and_reconstruct(
         all_cam_to_world_mat,
         inference_time_ms,
         depth_raw_np,
+        depth_conf_np,
     )
 
 

@@ -874,7 +874,7 @@ def _evaluate_test_run_eval_style(
             if hasattr(model, "update_patch_dimensions"):
                 model.update_patch_dimensions(patch_width, patch_height)
             # Reuse run_eval/eval_scannet.py reconstruction + dense-depth GT path (for parity with average_metrics.json).
-            _, _, all_world_points, _, all_cam_to_world_mat, inference_time_ms, depth_raw_np = (
+            _, _, all_world_points, _, all_cam_to_world_mat, inference_time_ms, depth_raw_np, _depth_conf_np = (
                 infer_vggt_and_reconstruct(
                     model,
                     vgg_input,

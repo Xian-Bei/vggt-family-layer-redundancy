@@ -45,13 +45,14 @@ from analysis.eval.scannet_eval import (
     load_scene_images,
     select_scene_image_paths_fastvggt,
 )
-from .visualization_export import export_scene_visualization_assets
 
 
 def _normalize_scene_pred_for_cache(predictions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Keep a compact per-scene prediction subset in cache payload."""
     out: Dict[str, torch.Tensor] = {}
-    for key in ("pose_enc", "depth", "depth_conf", "world_points", "world_points_conf"):
+    # NOTE: This cache intentionally excludes point-head outputs (world_points / world_points_conf).
+    # The redundancy pipeline and visualization rely on depth-based unprojection instead.
+    for key in ("pose_enc", "depth", "depth_conf"):
         value = predictions.get(key)
         if value is None or not isinstance(value, torch.Tensor):
             continue
@@ -98,17 +99,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--chamfer-max-dist", type=float, default=0.5)
     p.add_argument("--depth-conf-thresh", type=float, default=1.0)
-    p.add_argument(
-        "--export-visualization",
-        action="store_true",
-        help="Export per-scene visualization assets under <output-dir>/visualization/<scene_id>/.",
-    )
-    p.add_argument(
-        "--visualization-dir",
-        type=Path,
-        default=None,
-        help="Visualization root. Default: <output-dir>/visualization",
-    )
     return p
 
 
@@ -134,7 +124,7 @@ def main() -> None:
 
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    vis_root = args.visualization_dir if args.visualization_dir is not None else (out_dir / "visualization")
+    # Visualization export is no longer performed during caching (Stage1).
 
     manifest: List[Dict[str, Any]] = []
     eval_rows: List[Dict[str, Any]] = []
@@ -192,17 +182,6 @@ def main() -> None:
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         torch.save(payload["pred"], pred_path)
         pred_payload = build_scene_prediction_payload(batch.predictions, (int(images.shape[-2]), int(images.shape[-1])))
-        if args.export_visualization:
-            vis_dir = export_scene_visualization_assets(
-                output_root=vis_root,
-                scene_id=scene.scene_id,
-                image_paths=scene_eff.image_paths,
-                images_tensor=images,
-                prediction_payload=pred_payload,
-                depth_conf_thresh=args.depth_conf_thresh,
-            )
-            if vis_dir is not None:
-                print(f"    [vis] exported {vis_dir}")
         manifest.append(
             {
                 "scene_id": scene.scene_id,

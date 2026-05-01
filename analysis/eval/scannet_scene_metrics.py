@@ -13,7 +13,6 @@ import numpy as np
 from PIL import Image
 
 from .eval_utils import (
-    align_point_clouds_scale,
     compute_chamfer_distance,
     eval_trajectory,
     load_gt_pointcloud,
@@ -105,13 +104,24 @@ def evaluate_scene_metrics(
             f"{scene}: cannot evaluate metrics — empty camera poses or point clouds"
         )
 
-    poses_gt = c2ws
-    w2cs = np.linalg.inv(poses_gt)
+    # `c2ws` returned by load_poses() is normalized to the first-frame coordinate system.
+    # For 2D plot output (plot.png), we keep this relative coordinate system because it yields
+    # a stable, room-local top-down view. For Chamfer vs GT mesh, we must operate in the
+    # original ScanNet world coordinate system (mesh ply coordinates).
+    c2ws_rel = np.asarray(c2ws, dtype=np.float64)
+    w2cs_rel = np.linalg.inv(c2ws_rel)
     traj_est_poses = np.array(all_cam_to_world_mat)
-    n = min(len(traj_est_poses), len(w2cs))
+    n = min(len(traj_est_poses), len(w2cs_rel))
     timestamps = frame_ids[:n]
-    stats_aligned, traj_plot, _ = eval_trajectory(
-        traj_est_poses[:n], w2cs[:n], timestamps, align=True, plot_trajectory=plot_trajectory
+    # Plot + pose stats in relative coordinates (visual convenience).
+    stats_aligned, traj_plot, _sim3_rel = eval_trajectory(
+        traj_est_poses[:n], w2cs_rel[:n], timestamps, align=True, plot_trajectory=plot_trajectory
+    )
+    # Sim(3) in original ScanNet world for point cloud alignment against GT mesh.
+    c2ws_world = np.asarray(first_gt_pose, dtype=np.float64) @ c2ws_rel
+    w2cs_world = np.linalg.inv(c2ws_world)
+    _, _, sim3_T = eval_trajectory(
+        traj_est_poses[:n], w2cs_world[:n], timestamps, align=True, plot_trajectory=False
     )
 
     merged_point_cloud = np.vstack(all_world_points)
@@ -121,12 +131,11 @@ def evaluate_scene_metrics(
         raise RuntimeError(
             f"{scene}: Chamfer / alignment require GT mesh under gt_ply_dir={gt_ply_dir!s}"
         )
-    homogeneous_points = np.hstack(
-        [merged_point_cloud, np.ones((merged_point_cloud.shape[0], 1))]
-    )
-    world_points_raw = np.dot(homogeneous_points, first_gt_pose.T)[:, :3]
-
-    world_points_scaled, _ = align_point_clouds_scale(world_points_raw, gt_point_cloud)
+    # Align predicted point cloud into GT mesh world using the same Sim(3) as trajectory alignment.
+    P = np.asarray(merged_point_cloud, dtype=np.float64)
+    R = np.asarray(sim3_T[:3, :3], dtype=np.float64)
+    t = np.asarray(sim3_T[:3, 3], dtype=np.float64)
+    world_points_scaled = (P @ R.T) + t[None, :]
 
     cd_value = compute_chamfer_distance(
         world_points_scaled, gt_point_cloud, max_dist=chamfer_max_dist

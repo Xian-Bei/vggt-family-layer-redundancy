@@ -67,8 +67,6 @@ def _required_prediction_layers(model: VGGT, num_layers: int) -> List[int]:
         required.add(num_layers - 1)
     if model.depth_head is not None:
         required.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
-    if model.point_head is not None:
-        required.update(int(i) for i in getattr(model.point_head, "intermediate_layer_idx", []))
     return sorted(i for i in required if 0 <= i < num_layers)
 
 
@@ -201,8 +199,6 @@ def collect_batch(
     scene_scores: Dict[str, float] = {}
     if "depth_conf" in preds:
         scene_scores["depth_conf_mean"] = float(preds["depth_conf"].mean().item())
-    if "world_points_conf" in preds:
-        scene_scores["point_conf_mean"] = float(preds["world_points_conf"].mean().item())
     if "pose_enc" in preds:
         scene_scores["pose_norm"] = float(preds["pose_enc"].norm(dim=-1).mean().item())
 

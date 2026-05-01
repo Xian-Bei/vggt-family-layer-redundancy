@@ -10,9 +10,9 @@
     {
       "l": 17,
       "r": 23,
-      "skip_frame_in_interval": true,
+      "skip_frame_in_interval": false,
       "inject_prev": "global",
-      "inject_frame_inside_interval": false
+      "inject_frame_inside_interval": true
     }
   ]
 }

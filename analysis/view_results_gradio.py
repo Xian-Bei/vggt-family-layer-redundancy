@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import threading
 
 try:
     import gradio as gr
@@ -66,6 +67,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--server-name", type=str, default="127.0.0.1")
     p.add_argument("--server-port", type=int, default=7861)
+    p.add_argument(
+        "--eval-root",
+        type=Path,
+        default=Path("analysis_outputs/evaluation/scans_test50_input_frame_30/Baseline_vggt"),
+        help="Optional evaluation output root containing per-scene folders with metrics.json and vis/ assets.",
+    )
+    p.add_argument("--viser-host", type=str, default="127.0.0.1", help="Host for embedded Viser server.")
+    p.add_argument("--viser-port", type=int, default=8090, help="Port for embedded Viser server.")
     return p
 
 
@@ -129,9 +138,10 @@ class PairAttentionController:
         self.device = torch.device(device_arg if torch.cuda.is_available() or device_arg == "cpu" else "cpu")
 
         manifest_path = cache_dir / "manifest.json"
-        if not manifest_path.exists():
-            raise SystemExit(f"Missing {manifest_path}; run Stage1 first.")
-        self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.cache_available = manifest_path.exists()
+        self.manifest: Dict[str, Any] = {}
+        if self.cache_available:
+            self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.scene_items: Dict[str, Dict[str, Any]] = {}
         for item in self.manifest.get("scenes", []):
             scene_id = str(item.get("scene_id", "")).strip()
@@ -139,13 +149,11 @@ class PairAttentionController:
             has_file = str(item.get("file", "")).strip() != ""
             if scene_id and (has_dir or has_file):
                 self.scene_items[scene_id] = item
-        if not self.scene_items:
-            raise SystemExit(f"No cached scenes found in {cache_dir}.")
 
         self.discovered = {s.scene_id: s for s in discover_scannet_scenes(data_root)}
         self.hf_model = hf_model.strip() or str(self.manifest.get("hf_model", "")).strip()
-        if not self.hf_model:
-            raise SystemExit("No HF model provided and manifest.json lacks 'hf_model'.")
+        # Model is required only for Pair Attention reconstruction; Stage2/LoRA/Eval tabs can work without it.
+        self.pair_available = self.cache_available and bool(self.scene_items) and bool(self.hf_model)
 
         self.model: Optional[VGGT] = None
         self.scene_cache: Dict[str, SceneCache] = {}
@@ -156,6 +164,10 @@ class PairAttentionController:
         self.stage2_render_cache: Dict[Tuple[str, str, int], Tuple[Dict[str, List[np.ndarray]], str]] = {}
 
     def _get_model(self) -> VGGT:
+        if not self.hf_model:
+            raise SystemExit(
+                "Pair Attention unavailable: no HF model provided and cache manifest lacks 'hf_model'."
+            )
         if self.model is None:
             self.model = VGGT.from_pretrained(self.hf_model).to(self.device).eval()
         return self.model
@@ -392,6 +404,221 @@ class PairAttentionController:
                     return n
 
         return 0
+
+
+class EvalViserController:
+    """Serve per-scene pointcloud/trajectory assets via a single Viser server."""
+
+    def __init__(self, *, eval_root: Path, host: str, port: int) -> None:
+        self.eval_root = Path(eval_root)
+        self.host = str(host)
+        self.port = int(port)
+        self._server = None
+        self._server_lock = threading.Lock()
+        self._apply_lock = threading.Lock()
+        self._loaded_scene: str | None = None
+        self._callbacks_bound = False
+        self._request_lock = threading.Lock()
+        self._latest_request_id = 0
+        self._latest_scene_id: str | None = None
+        self._default_point_size = 0.003
+
+        # Mutable scene state read by GUI callbacks.
+        self._pred_pts = np.zeros((0, 3), dtype=np.float32)
+        self._pred_cols = np.zeros((0, 3), dtype=np.uint8)
+        self._pred_order = np.zeros((0,), dtype=np.int64)
+
+    def _ensure_server(self):
+        if self._server is not None:
+            return self._server
+        with self._server_lock:
+            if self._server is not None:
+                return self._server
+            import viser
+
+            server = viser.ViserServer(host=self.host, port=self.port)
+            server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
+            self._server = server
+            return server
+
+    def _next_request_id(self, scene_id: str) -> int:
+        with self._request_lock:
+            self._latest_request_id += 1
+            self._latest_scene_id = str(scene_id)
+            return int(self._latest_request_id)
+
+    def _is_request_current(self, request_id: int) -> bool:
+        with self._request_lock:
+            return int(request_id) == int(self._latest_request_id)
+
+    def _load_npz(self, path: Path) -> Dict[str, np.ndarray]:
+        data = np.load(path)
+        return {k: np.asarray(data[k]) for k in data.files}
+
+    def _add_or_update_point_cloud(self, server, name: str, points: np.ndarray, colors_u8: np.ndarray):
+        # Viser point cloud handle supports in-place update of points/colors.
+        handle = getattr(self, f"_pc_{name}", None)
+        if handle is None:
+            handle = server.scene.add_point_cloud(
+                name=name,
+                points=np.asarray(points, dtype=np.float32),
+                colors=np.asarray(colors_u8, dtype=np.uint8),
+                point_size=float(getattr(self, "_gui_point_size", None).value if hasattr(self, "_gui_point_size") else self._default_point_size),
+                point_shape="circle",
+            )
+            setattr(self, f"_pc_{name}", handle)
+        else:
+            handle.points = np.asarray(points, dtype=np.float32)
+            handle.colors = np.asarray(colors_u8, dtype=np.uint8)
+
+    def _add_or_update_traj(self, server, name: str, centers: np.ndarray, color_rgb=(1.0, 0.4, 0.1)):
+        handle = getattr(self, f"_traj_{name}", None)
+        pts = np.asarray(centers, dtype=np.float32).reshape(-1, 3)
+        if pts.shape[0] < 2:
+            if handle is not None:
+                handle.remove()
+                setattr(self, f"_traj_{name}", None)
+            return
+        # viser==0.2.23 add_line_segments expects points shaped (N,2,3).
+        seg_points = np.stack([pts[:-1], pts[1:]], axis=1)  # [N,2,3]
+        rgb = np.asarray(color_rgb, dtype=np.float32).reshape(-1)[:3]
+        rgb_u8 = (np.clip(rgb, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+        seg_colors = np.tile(rgb_u8.reshape(1, 1, 3), (int(seg_points.shape[0]), 2, 1))  # [N,2,3] uint8
+        if handle is None:
+            handle = server.scene.add_line_segments(
+                name=name,
+                points=seg_points,
+                colors=seg_colors,
+                line_width=2.0,
+            )
+            setattr(self, f"_traj_{name}", handle)
+        else:
+            handle.points = seg_points
+            handle.colors = seg_colors
+
+    def _bind_gui_callbacks_once(self, server) -> None:
+        if self._callbacks_bound:
+            return
+        self._gui_point_size = server.gui.add_slider(
+            "Point Size", min=0.0005, max=0.02, step=0.0005, initial_value=float(self._default_point_size)
+        )
+        self._gui_conf = server.gui.add_slider("Confidence Percent", min=0, max=100, step=0.1, initial_value=50.0)
+        self._gui_show_gt = server.gui.add_checkbox("Show GT", initial_value=False)
+        self._gui_show_pred = server.gui.add_checkbox("Show Pred", initial_value=True)
+
+        @self._gui_point_size.on_update
+        def _(_evt):
+            size = float(self._gui_point_size.value)
+            for name in ("_pc_pred_points", "_pc_gt_points"):
+                pc = getattr(self, name, None)
+                if pc is not None:
+                    pc.point_size = size
+
+        @self._gui_conf.on_update
+        def _(_evt):
+            with self._apply_lock:
+                self._apply_conf_locked(server)
+
+        @self._gui_show_pred.on_update
+        def _(_evt):
+            pc = getattr(self, "_pc_pred_points", None)
+            if pc is not None:
+                pc.visible = bool(self._gui_show_pred.value)
+
+        @self._gui_show_gt.on_update
+        def _(_evt):
+            pc = getattr(self, "_pc_gt_points", None)
+            if pc is not None:
+                pc.visible = bool(self._gui_show_gt.value)
+            traj = getattr(self, "_traj_gt_traj", None)
+            if traj is not None:
+                traj.visible = bool(self._gui_show_gt.value)
+
+        self._callbacks_bound = True
+
+    def _apply_conf_locked(self, server) -> None:
+        # Keep top (100-pct)% points: pct=0 -> keep all; pct=100 -> keep none.
+        pct = float(self._gui_conf.value)
+        n = int(self._pred_pts.shape[0])
+        if n <= 0:
+            return
+        k = int(round(n * (pct / 100.0)))
+        keep = self._pred_order[k:]
+        if keep.size == 0:
+            keep = self._pred_order[:1]
+        self._add_or_update_point_cloud(server, "pred_points", self._pred_pts[keep], self._pred_cols[keep])
+        pc = getattr(self, "_pc_pred_points", None)
+        if pc is not None:
+            pc.visible = bool(self._gui_show_pred.value)
+
+    def load_scene(self, scene_id: str, *, show_gt: bool) -> str:
+        """Load one scene assets and return a status string.
+
+        Latest-request-wins: if a newer scene request arrives while this one is loading,
+        this request exits early and does not overwrite scene state.
+        """
+        request_id = self._next_request_id(str(scene_id))
+        scene_dir = self.eval_root / str(scene_id)
+        pred_dir = scene_dir / "vis" / "pred"
+        gt_dir = scene_dir / "vis" / "gt"
+        pred_npz = pred_dir / "viser_points.npz"
+        pred_cam = pred_dir / "cameras.json"
+        gt_npz = gt_dir / "viser_points_gt.npz"
+        gt_cam = gt_dir / "cameras_gt.json"
+
+        if not pred_npz.exists():
+            return f"Missing {pred_npz}"
+
+        # Load files outside apply lock so UI callbacks can continue.
+        pred = self._load_npz(pred_npz)
+        pts = pred["points"]
+        cols = pred["colors"]
+        conf = pred.get("confidence", np.ones((pts.shape[0],), dtype=np.float32))
+        order = np.argsort(conf.astype(np.float32), kind="mergesort")
+        pred_centers = None
+        if pred_cam.exists():
+            payload = json.loads(pred_cam.read_text(encoding="utf-8"))
+            pred_centers = np.asarray([f["camera_center_world"] for f in payload.get("frames", [])], dtype=np.float32)
+        gt = None
+        gt_centers = None
+        if show_gt and gt_npz.exists():
+            gt = self._load_npz(gt_npz)
+        if show_gt and gt_cam.exists():
+            payload = json.loads(gt_cam.read_text(encoding="utf-8"))
+            gt_centers = np.asarray(payload.get("camera_centers_world", []), dtype=np.float32)
+
+        if not self._is_request_current(request_id):
+            return f"Skipped stale request for scene={scene_id}"
+
+        server = self._ensure_server()
+        with self._apply_lock:
+            if not self._is_request_current(request_id):
+                return f"Skipped stale request for scene={scene_id}"
+
+            self._bind_gui_callbacks_once(server)
+            self._pred_pts = pts.astype(np.float32)
+            self._pred_cols = cols.astype(np.uint8)
+            self._pred_order = order.astype(np.int64)
+            self._apply_conf_locked(server)
+
+            # Pred cameras / trajectory
+            if pred_centers is not None:
+                self._add_or_update_traj(server, "pred_traj", pred_centers, color_rgb=(1.0, 0.4, 0.1))
+
+            # GT optional
+            if show_gt and gt is not None:
+                self._add_or_update_point_cloud(server, "gt_points", gt["points"], gt["colors"])
+                pc = getattr(self, "_pc_gt_points", None)
+                if pc is not None:
+                    pc.visible = bool(self._gui_show_gt.value)
+            if show_gt and gt_centers is not None:
+                self._add_or_update_traj(server, "gt_traj", gt_centers, color_rgb=(0.2, 0.8, 0.2))
+                traj = getattr(self, "_traj_gt_traj", None)
+                if traj is not None:
+                    traj.visible = bool(self._gui_show_gt.value)
+
+            self._loaded_scene = str(scene_id)
+            return f"Loaded scene={scene_id} | pred_points={int(pts.shape[0])} | gt={'on' if show_gt else 'off'}"
 
 
 def _gallery_update(items: List[np.ndarray]):
@@ -1087,12 +1314,18 @@ def _prepare_stage2_render(
 
 def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     scene_ids = controller.scene_ids()
-    initial_scene = scene_ids[0]
-    num_layers, num_frames, frame_labels = controller.scene_metadata(initial_scene)
+    pair_enabled = bool(scene_ids)
+    initial_scene = scene_ids[0] if scene_ids else None
+    if pair_enabled and initial_scene is not None:
+        num_layers, num_frames, frame_labels = controller.scene_metadata(initial_scene)
+        num_heads = controller.num_heads()
+    else:
+        num_layers, num_frames, frame_labels = 0, 0, []
+        num_heads = 1
     initial_frame_a = 0
     initial_frame_b = min(1, len(frame_labels) - 1) if frame_labels else 0
-    num_heads = controller.num_heads()
     stage2_skip_modes = _discover_skip_modes(controller.skip_reports)
+    stage1_baseline_available = bool(controller.stage1_eval_by_scene)
     lora_root = getattr(controller, "lora_root", Path("analysis_outputs/lora_skip_baseline"))
     lora_exps = _discover_lora_experiments(Path(lora_root))
     initial_lora_exp = lora_exps[0] if lora_exps else None
@@ -1315,7 +1548,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         }
         """,
     ) as demo:
-        with gr.Tab("LoRA results"):
+        with gr.Tab("LoRA results") as tab_lora:
             gr.Markdown("## LoRA results")
             gr.Markdown(
                 "Each subfolder under `--lora-dir` is treated as one experiment run. "
@@ -1385,68 +1618,76 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 lora_info,
             ]
             lora_exp_dd.change(_refresh_lora, inputs=[lora_exp_dd], outputs=lora_outputs)
-            demo.load(_refresh_lora, inputs=[lora_exp_dd], outputs=lora_outputs)
+            tab_lora.select(_refresh_lora, inputs=[lora_exp_dd], outputs=lora_outputs)
 
-        with gr.Tab("Pair Attention"):
+        with gr.Tab("Pair Attention") as tab_pair:
             gr.Markdown("## Pair Attention Panel")
             gr.Markdown(
                 "Choose a Stage1-cached scene, global layer, two frames, score space, and head view. "
                 "The panel refreshes automatically and shows overlay summaries for both directions: `i -> j` and `j -> i`."
             )
-            with gr.Row():
-                with gr.Column(scale=1):
-                    scene_dd = gr.Dropdown(label="Scene", choices=scene_ids, value=initial_scene)
-                    scene_info = gr.Textbox(
-                        label="Scene metadata",
-                        value=f"layers: {num_layers}, frames: {num_frames}",
-                        interactive=False,
-                    )
-                    layer_slider = gr.Slider(label="Global layer", minimum=0, maximum=max(0, num_layers - 1), value=0, step=1)
-                    frame_a_slider = gr.Slider(label="Frame A", minimum=0, maximum=max(0, num_frames - 1), value=initial_frame_a, step=1)
-                    frame_a_info = gr.Textbox(
-                        label="Frame A selection",
-                        value=frame_labels[initial_frame_a] if frame_labels else "",
-                        interactive=False,
-                    )
-                    frame_b_slider = gr.Slider(label="Frame B", minimum=0, maximum=max(0, num_frames - 1), value=initial_frame_b, step=1)
-                    frame_b_info = gr.Textbox(
-                        label="Frame B selection",
-                        value=frame_labels[initial_frame_b] if frame_labels else "",
-                        interactive=False,
-                    )
-                    score_space = gr.Radio(
-                        label="Score space",
-                        choices=["before_softmax", "after_softmax"],
-                        value="before_softmax",
-                    )
-                    head_mode = gr.Radio(label="Head view", choices=["mean", "single"], value="mean")
-                    head_index = gr.Slider(label="Head index", minimum=0, maximum=max(0, num_heads - 1), value=0, step=1)
-                    summary = gr.Textbox(label="Selection", interactive=False)
-                with gr.Column(scale=5):
-                    panel = gr.Image(label="Bidirectional pair attention panel", type="numpy", elem_classes=["results-media"])
+            if not pair_enabled:
+                gr.Markdown(
+                    "Pair Attention unavailable. "
+                    f"Expected cache manifest at `{controller.cache_dir / 'manifest.json'}` with usable scene entries "
+                    "and a valid HF model id."
+                )
+            else:
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        scene_dd = gr.Dropdown(label="Scene", choices=scene_ids, value=initial_scene)
+                        scene_info = gr.Textbox(
+                            label="Scene metadata",
+                            value=f"layers: {num_layers}, frames: {num_frames}",
+                            interactive=False,
+                        )
+                        layer_slider = gr.Slider(label="Global layer", minimum=0, maximum=max(0, num_layers - 1), value=0, step=1)
+                        frame_a_slider = gr.Slider(
+                            label="Frame A", minimum=0, maximum=max(0, num_frames - 1), value=initial_frame_a, step=1
+                        )
+                        frame_a_info = gr.Textbox(
+                            label="Frame A selection",
+                            value=frame_labels[initial_frame_a] if frame_labels else "",
+                            interactive=False,
+                        )
+                        frame_b_slider = gr.Slider(
+                            label="Frame B", minimum=0, maximum=max(0, num_frames - 1), value=initial_frame_b, step=1
+                        )
+                        frame_b_info = gr.Textbox(
+                            label="Frame B selection",
+                            value=frame_labels[initial_frame_b] if frame_labels else "",
+                            interactive=False,
+                        )
+                        score_space = gr.Radio(
+                            label="Score space",
+                            choices=["before_softmax", "after_softmax"],
+                            value="before_softmax",
+                        )
+                        head_mode = gr.Radio(label="Head view", choices=["mean", "single"], value="mean")
+                        head_index = gr.Slider(label="Head index", minimum=0, maximum=max(0, num_heads - 1), value=0, step=1)
+                        summary = gr.Textbox(label="Selection", interactive=False)
+                    with gr.Column(scale=5):
+                        panel = gr.Image(
+                            label="Bidirectional pair attention panel", type="numpy", elem_classes=["results-media"]
+                        )
 
-            refresh_inputs = [scene_dd, layer_slider, frame_a_slider, frame_b_slider, score_space, head_mode, head_index]
-            refresh_outputs = [panel, summary, frame_a_info, frame_b_info]
+                refresh_inputs = [scene_dd, layer_slider, frame_a_slider, frame_b_slider, score_space, head_mode, head_index]
+                refresh_outputs = [panel, summary, frame_a_info, frame_b_info]
 
-            scene_dd.change(
-                _scene_changed,
-                inputs=[scene_dd, score_space, head_mode, head_index],
-                outputs=[layer_slider, frame_a_slider, frame_b_slider, scene_info, panel, summary, frame_a_info, frame_b_info],
-            )
-            layer_slider.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
-            frame_a_slider.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
-            frame_b_slider.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
-            score_space.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
-            head_mode.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
-            head_index.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
+                scene_dd.change(
+                    _scene_changed,
+                    inputs=[scene_dd, score_space, head_mode, head_index],
+                    outputs=[layer_slider, frame_a_slider, frame_b_slider, scene_info, panel, summary, frame_a_info, frame_b_info],
+                )
+                layer_slider.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
+                frame_a_slider.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
+                frame_b_slider.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
+                score_space.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
+                head_mode.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
+                head_index.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
+                tab_pair.select(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
 
-            demo.load(
-                _refresh_outputs,
-                inputs=refresh_inputs,
-                outputs=refresh_outputs,
-            )
-
-        with gr.Tab("Stage2 Heatmaps"):
+        with gr.Tab("Stage2 Heatmaps") as tab_stage2:
             gr.Markdown("## Stage2 Heatmaps")
             gr.Markdown(
                 "Choose `mean` or a scene. Per skip mode: pose → special sim → depth → patch sim. "
@@ -1458,7 +1699,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     stage2_scene_dd = gr.Dropdown(label="Scene", choices=stage2_scene_ids, value=initial_stage2_scene)
                     stage2_value_mode = gr.Radio(
                         label="Skip heatmap value",
-                        choices=["absolute", "pct"],
+                        choices=["absolute", "pct"] if stage1_baseline_available else ["absolute"],
                         value="absolute",
                     )
                     stage2_pct_clip_slider = gr.Slider(
@@ -1525,12 +1766,89 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 stage2_mode_filter.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
                 stage2_metric_rows_filter.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
                 stage2_token_rows_filter.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
-                demo.load(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
+                tab_stage2.select(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
             else:
                 stage2_info.value = (
                     f"No Stage2/Stage3 reports found under "
                     f"sim={controller.analysis_similarity_dir} and skip={controller.analysis_skip_dir}"
                 )
+
+        with gr.Tab("Eval Visualization") as tab_eval:
+            gr.Markdown("## Eval visualization (2D + 3D)")
+            gr.Markdown("2D: per-scene `plot.png` (if present). 3D: Viser pointcloud + trajectory (requires exported vis assets).")
+
+            eval_root = getattr(controller, "eval_root", None)
+            viser_host = getattr(controller, "viser_host", "127.0.0.1")
+            viser_port = getattr(controller, "viser_port", 8090)
+            eval_ctrl = None
+            if eval_root:
+                try:
+                    eval_ctrl = EvalViserController(eval_root=Path(eval_root), host=str(viser_host), port=int(viser_port))
+                except Exception:
+                    eval_ctrl = None
+
+            def _discover_eval_scenes(root: str | None) -> List[str]:
+                if not root:
+                    return []
+                p = Path(root)
+                if not p.exists():
+                    return []
+                out = []
+                for d in sorted(p.iterdir()):
+                    if d.is_dir() and (d / "metrics.json").exists():
+                        out.append(d.name)
+                return out
+
+            eval_scenes = _discover_eval_scenes(str(eval_root) if eval_root else None)
+            iframe_html = f'<iframe src="http://{viser_host}:{int(viser_port)}" style="width:100%; height:650px; border:0;"></iframe>'
+            with gr.Row():
+                with gr.Column(scale=1):
+                    eval_scene_dd = gr.Dropdown(label="Scene", choices=eval_scenes, value=eval_scenes[0] if eval_scenes else None)
+                    eval_view_mode = gr.Radio(label="View mode", choices=["2D", "3D"], value="2D")
+                    eval_status = gr.Textbox(label="Status", interactive=False)
+                with gr.Column(scale=5):
+                    eval_plot_img = gr.Image(label="plot.png", type="numpy", elem_classes=["results-media"])
+                    eval_3d_html = gr.HTML(value=iframe_html, visible=False)
+
+            def _load_plot(scene_id: str | None):
+                if not eval_root or not scene_id:
+                    return None, "Eval root not set."
+                path = Path(eval_root) / str(scene_id) / "plot.png"
+                if not path.exists():
+                    return None, f"Missing {path}"
+                arr = _load_image_if_exists(path)
+                return arr, f"Loaded {path}"
+
+            def _refresh_eval_view(scene_id: str | None, view_mode: str):
+                if view_mode == "2D":
+                    img, status = _load_plot(scene_id)
+                    return gr.update(visible=True, value=img), gr.update(visible=False), status
+                # 3D mode
+                if eval_ctrl is None:
+                    return gr.update(visible=False, value=None), gr.update(visible=True), "Eval visualization not configured (missing --eval-root)."
+                if not scene_id:
+                    return gr.update(visible=False, value=None), gr.update(visible=True), "No scene selected."
+                status = eval_ctrl.load_scene(str(scene_id), show_gt=True)
+                return gr.update(visible=False, value=None), gr.update(visible=True), status
+
+            eval_scene_dd.change(
+                _refresh_eval_view,
+                inputs=[eval_scene_dd, eval_view_mode],
+                outputs=[eval_plot_img, eval_3d_html, eval_status],
+                queue=False,
+            )
+            eval_view_mode.change(
+                _refresh_eval_view,
+                inputs=[eval_scene_dd, eval_view_mode],
+                outputs=[eval_plot_img, eval_3d_html, eval_status],
+                queue=False,
+            )
+            tab_eval.select(
+                _refresh_eval_view,
+                inputs=[eval_scene_dd, eval_view_mode],
+                outputs=[eval_plot_img, eval_3d_html, eval_status],
+                queue=False,
+            )
 
     return demo
 
@@ -1552,6 +1870,10 @@ def main() -> None:
         device_arg=args.device,
     )
     setattr(controller, "lora_root", args.lora_dir)
+    # Optional eval visualization config.
+    setattr(controller, "eval_root", getattr(args, "eval_root", None))
+    setattr(controller, "viser_host", getattr(args, "viser_host", "127.0.0.1"))
+    setattr(controller, "viser_port", getattr(args, "viser_port", 8090))
     demo = _build_ui(controller)
     demo.queue().launch(server_name=args.server_name, server_port=args.server_port, show_error=True, share=True)
 

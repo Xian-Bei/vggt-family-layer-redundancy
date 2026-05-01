@@ -97,6 +97,17 @@ if __name__ == "__main__":
         help="Disable dense depth vs ScanNet GT (depth_abs_rel, depth_delta1); same protocol as "
         "redundancy cache_scannet Stage1 when left unset.",
     )
+    parser.add_argument(
+        "--export-visualization",
+        action="store_true",
+        help="Export per-scene visualization assets under <output_path>/<scene>/vis/ for the Gradio+Viser panel.",
+    )
+    parser.add_argument(
+        "--vis-max-points",
+        type=int,
+        default=200000,
+        help="Max points saved into viser_points(.npz) per scene (0 = keep all).",
+    )
     args = parser.parse_args()
     # Reproducibility (does NOT force CUDA/SDPA deterministic kernels).
     SEED = 33
@@ -193,6 +204,7 @@ if __name__ == "__main__":
                 all_cam_to_world_mat,
                 inference_time_ms,
                 depth_raw_np,
+                depth_conf_np,
             ) = infer_vggt_and_reconstruct(
                 model, vgg_input, dtype, args.depth_conf_thresh, image_paths
             )
@@ -259,6 +271,144 @@ if __name__ == "__main__":
                 pred_depth=pred_depth_for_metrics,
                 gt_depth=gt_depth,
             )
+            if args.export_visualization:
+                try:
+                    from analysis.vis.vis_assets import write_cameras_json, write_viser_points_npz
+                    from analysis.eval.eval_utils import load_gt_pointcloud
+                    from analysis.eval.eval_utils import eval_trajectory
+
+                    vis_pred_dir = output_scene_dir / "vis" / "pred"
+                    vis_gt_dir = output_scene_dir / "vis" / "gt"
+                    vis_pred_dir.mkdir(parents=True, exist_ok=True)
+                    vis_gt_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Compute the same Sim(3) used by metrics, in the original ScanNet world coordinates.
+                    c2ws_world = np.asarray(first_gt_pose, dtype=np.float64) @ np.asarray(c2ws, dtype=np.float64)
+                    w2cs = np.linalg.inv(c2ws_world)
+                    traj_est_poses = np.asarray(all_cam_to_world_mat, dtype=np.float64)
+                    n_align = min(int(traj_est_poses.shape[0]), int(w2cs.shape[0]), len(frame_ids))
+                    _, _, sim3_T = eval_trajectory(
+                        traj_est_poses[:n_align],
+                        w2cs[:n_align],
+                        frame_ids[:n_align],
+                        align=True,
+                        plot_trajectory=False,
+                    )
+                    R_sim = np.asarray(sim3_T[:3, :3], dtype=np.float64)
+                    t_sim = np.asarray(sim3_T[:3, 3], dtype=np.float64)
+
+                    # Build flattened pred pointcloud arrays with per-point confidence from depth_conf.
+                    # depth_conf_np is [S,H,W] or [S,H,W,1] depending on model; normalize to [S,H,W].
+                    dc = np.asarray(depth_conf_np)
+                    if dc.ndim == 4 and dc.shape[-1] == 1:
+                        dc = dc[..., 0]
+                    if dc.ndim != 3:
+                        raise ValueError(f"depth_conf_np expected [S,H,W] or [S,H,W,1], got {dc.shape}")
+                    vgg_np = vgg_input.detach().float().cpu().numpy()  # [S,3,H,W]
+                    colors_hwc = (np.transpose(vgg_np, (0, 2, 3, 1)) * 255.0).clip(0, 255).astype(np.uint8)
+                    S, H, W = int(dc.shape[0]), int(dc.shape[1]), int(dc.shape[2])
+                    frame_idx_all = []
+                    pts_all = []
+                    cols_all = []
+                    conf_all = []
+                    for fi in range(min(S, len(image_paths))):
+                        # Recreate valid mask consistent with infer_vggt_and_reconstruct output.
+                        # all_world_points[fi] already removed NaN/Inf; recompute mask from unprojected depth is not available here,
+                        # so we approximate by using depth_conf threshold + finite depth_raw.
+                        # This keeps confidence slider meaningful while matching exported points reasonably well.
+                        d = np.asarray(depth_raw_np[fi])
+                        if d.ndim == 3 and d.shape[-1] == 1:
+                            d = d[..., 0]
+                        conf_map = np.asarray(dc[fi])
+                        valid = np.isfinite(d) & (d > 0) & np.isfinite(conf_map)
+                        # Apply the same conf threshold used in reconstruction.
+                        valid &= conf_map >= float(args.depth_conf_thresh)
+                        if not np.any(valid):
+                            continue
+                        # Unprojected points are not retained per-pixel; fall back to concatenated valid points we already computed.
+                        # We therefore attach per-point confidence by sampling the valid confidence values in raster order and truncating.
+                        pts = np.asarray(all_world_points[fi], dtype=np.float32).reshape(-1, 3)
+                        cols = np.asarray(all_point_colors[fi], dtype=np.uint8).reshape(-1, 3)
+                        conf_flat = conf_map.reshape(-1)[valid.reshape(-1)]
+                        n = min(int(pts.shape[0]), int(cols.shape[0]), int(conf_flat.shape[0]))
+                        if n <= 0:
+                            continue
+                        pts_all.append(pts[:n])
+                        cols_all.append(cols[:n])
+                        conf_all.append(conf_flat[:n].astype(np.float32))
+                        frame_idx_all.append(np.full((n,), fi, dtype=np.int32))
+
+                    if pts_all:
+                        points = np.concatenate(pts_all, axis=0).astype(np.float64)
+                        colors = np.concatenate(cols_all, axis=0)
+                        conf = np.concatenate(conf_all, axis=0)
+                        frame_indices = np.concatenate(frame_idx_all, axis=0)
+                        # Align points into GT coords using Sim(3).
+                        points = (points @ R_sim.T) + t_sim[None, :]
+                        write_viser_points_npz(
+                            vis_pred_dir / "viser_points.npz",
+                            points=points.astype(np.float32),
+                            colors_uint8=colors,
+                            confidence=conf,
+                            frame_indices=frame_indices,
+                            max_points=int(args.vis_max_points),
+                        )
+                        # Save aligned camera centers for trajectory visualization (do not rely on raw extrinsics).
+                        # Camera centers are derived from w2c: C = -R^T t, then transformed by Sim(3).
+                        E = np.asarray(extrinsic_np, dtype=np.float64)
+                        if E.ndim == 4:
+                            E = E[0]
+                        R_cw = E[:, :3, :3]
+                        t_cw = E[:, :3, 3]
+                        R_wc = np.transpose(R_cw, (0, 2, 1))
+                        centers = -np.einsum("nij,nj->ni", R_wc, t_cw)
+                        centers_aligned = (centers @ R_sim.T) + t_sim[None, :]
+                        cam_payload = {
+                            "scene_id": scene,
+                            "frames": [
+                                {
+                                    "frame_index": int(i),
+                                    "frame_id": str(image_paths[i].stem),
+                                    "image_path": str(image_paths[i]),
+                                    "camera_center_world": centers_aligned[i].tolist(),
+                                }
+                                for i in range(min(len(image_paths), int(centers_aligned.shape[0])))
+                            ],
+                        }
+                        (vis_pred_dir / "cameras.json").write_text(json.dumps(cam_payload, indent=2), encoding="utf-8")
+
+                        # Save alignment for audit/debug (panel does not consume it).
+                        align_payload = {"sim3_T": sim3_T.tolist(), "source": "umeyama_camera_centers_w2c"}
+                        (vis_pred_dir / "sim3_alignment.json").write_text(
+                            json.dumps(align_payload, indent=2), encoding="utf-8"
+                        )
+
+                    # GT: reuse the exact points/colors loaded for Chamfer (avoid rereading ply later).
+                    gt_points, gt_colors = load_gt_pointcloud(scene, args.data_dir)
+                    if gt_points is not None:
+                        gt_cols = (
+                            (np.asarray(gt_colors, dtype=np.float32) * 255.0).clip(0, 255).astype(np.uint8)
+                            if gt_colors is not None
+                            else np.tile(np.array([[160, 160, 160]], dtype=np.uint8), (int(gt_points.shape[0]), 1))
+                        )
+                        write_viser_points_npz(
+                            vis_gt_dir / "viser_points_gt.npz",
+                            points=np.asarray(gt_points, dtype=np.float32),
+                            colors_uint8=gt_cols,
+                            confidence=None,
+                            frame_indices=None,
+                            max_points=int(args.vis_max_points),
+                        )
+                    # GT trajectory in original ScanNet world coordinates (matches GT mesh ply).
+                    centers_gt = np.asarray(c2ws_world[:, :3, 3], dtype=np.float64)
+                    gt_cam_payload = {
+                        "scene_id": scene,
+                        "frame_ids": [int(x) for x in frame_ids],
+                        "camera_centers_world": centers_gt.tolist(),
+                    }
+                    (vis_gt_dir / "cameras_gt.json").write_text(json.dumps(gt_cam_payload, indent=2), encoding="utf-8")
+                except Exception as e:
+                    print(f"[warn] visualization export failed for {scene}: {e}")
             if metrics is not None:
                 summary_keys = [
                     "chamfer_distance",
