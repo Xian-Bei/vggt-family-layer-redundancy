@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -54,6 +55,7 @@ class RedundancyBatchResult:
     frame_tokens: List[torch.Tensor]
     global_tokens: List[torch.Tensor]
     aggregated_concat_tokens: List[torch.Tensor]
+    initial_tokens: Optional[torch.Tensor]
     global_patch_tokens: List[torch.Tensor]
     global_special_tokens: List[torch.Tensor]
     patch_start_idx: int
@@ -79,6 +81,35 @@ def _sparse_layer_list(num_layers: int, selected: Dict[int, torch.Tensor], *, re
     if require_last and out[-1] is None:
         raise RuntimeError("Sparse layer list is missing final layer needed by CameraHead.")
     return out
+
+
+def _slice_expand_and_flatten(token_tensor: torch.Tensor, bsz: int, seq_len: int) -> torch.Tensor:
+    query = token_tensor[:, 0:1, ...].expand(bsz, 1, *token_tensor.shape[2:])
+    if seq_len <= 1:
+        return query.reshape(bsz * seq_len, *token_tensor.shape[2:])
+    others = token_tensor[:, 1:, ...].expand(bsz, seq_len - 1, *token_tensor.shape[2:])
+    return torch.cat([query, others], dim=1).reshape(bsz * seq_len, *token_tensor.shape[2:])
+
+
+def _aggregator_initial_tokens(model: VGGT, images: torch.Tensor) -> torch.Tensor:
+    agg = model.aggregator
+    if images.dim() == 4:
+        images = images.unsqueeze(0)
+    if images.dim() != 5:
+        raise ValueError(f"Expected images with shape [S,3,H,W] or [B,S,3,H,W], got {tuple(images.shape)}")
+    bsz, seq_len, channels, height, width = images.shape
+    if channels != 3:
+        raise ValueError(f"Expected 3 image channels, got {channels}.")
+
+    norm_images = (images - agg._resnet_mean) / agg._resnet_std
+    patch_tokens = agg.patch_embed(norm_images.view(bsz * seq_len, channels, height, width))
+    if isinstance(patch_tokens, dict):
+        patch_tokens = patch_tokens["x_norm_patchtokens"]
+
+    camera_token = _slice_expand_and_flatten(agg.camera_token, bsz, seq_len)
+    register_token = _slice_expand_and_flatten(agg.register_token, bsz, seq_len)
+    tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+    return tokens.view(bsz, seq_len, tokens.shape[1], tokens.shape[2])
 
 
 def _attention_weight_stats(attn_module: torch.nn.Module) -> Dict[str, float]:
@@ -124,17 +155,27 @@ def predictions_to_cpu_float(preds: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     return out
 
 
+def _sync_cuda_if_needed(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def collect_batch(
     model: VGGT,
     images: torch.Tensor,
     *,
     keep_activations_on_gpu: bool = False,
     collect_full_cache: bool = True,
+    timing_ms: Optional[Dict[str, float]] = None,
 ) -> RedundancyBatchResult:
     if images.dim() == 4:
         images = images.unsqueeze(0)
     elif images.dim() != 5:
         raise ValueError(f"Expected images with shape [S,3,H,W] or [B,S,3,H,W], got {tuple(images.shape)}")
+
+    dev = next(model.parameters()).device
+    if timing_ms is not None:
+        timing_ms.clear()
 
     num_layers = len(model.aggregator.global_blocks)
     required_layers = _required_prediction_layers(model, num_layers)
@@ -154,11 +195,25 @@ def collect_batch(
             selected_layer_tensors[layer_idx] = t
 
     with torch.no_grad():
+        if timing_ms is not None:
+            _sync_cuda_if_needed(dev)
+            t0 = time.perf_counter()
+        initial_tokens_cpu = (
+            _aggregator_initial_tokens(model, images).detach().cpu().contiguous() if collect_full_cache else None
+        )
+        if timing_ms is not None:
+            _sync_cuda_if_needed(dev)
+            timing_ms["patch_embed_cache_ms"] = (time.perf_counter() - t0) * 1000.0
+            t1 = time.perf_counter()
         selected_outputs, patch_start_idx = model.aggregator(
             images,
             return_layers=selected_layer_set,
             layer_callback=_layer_callback if collect_full_cache else None,
         )
+        if timing_ms is not None:
+            _sync_cuda_if_needed(dev)
+            timing_ms["aggregator_ms"] = (time.perf_counter() - t1) * 1000.0
+            t2 = time.perf_counter()
         if len(selected_outputs) != len(required_layers):
             raise RuntimeError(
                 f"Aggregator returned {len(selected_outputs)} selected layers, expected {len(required_layers)}."
@@ -171,6 +226,9 @@ def collect_batch(
             patch_start_idx,
             images,
         )
+        if timing_ms is not None:
+            _sync_cuda_if_needed(dev)
+            timing_ms["heads_ms"] = (time.perf_counter() - t2) * 1000.0
 
     frame_tokens: List[torch.Tensor] = []
     global_tokens: List[torch.Tensor] = []
@@ -208,6 +266,7 @@ def collect_batch(
         frame_tokens=frame_tokens,
         global_tokens=global_tokens,
         aggregated_concat_tokens=aggregated_concat_tokens,
+        initial_tokens=initial_tokens_cpu,
         global_patch_tokens=global_patch_tokens,
         global_special_tokens=global_special_tokens,
         patch_start_idx=patch_start_idx,

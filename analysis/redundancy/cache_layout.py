@@ -34,6 +34,14 @@ def scene_cache_dir(cache_dir: Path, item: Dict[str, Any]) -> Optional[Path]:
     return cache_dir / name
 
 
+def _replay_layer_files(layers_dir: Path) -> List[Path]:
+    return sorted(
+        p
+        for p in layers_dir.glob("layer_*.pt")
+        if p.stem != "layer_-1"
+    )
+
+
 def load_scene_metadata(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, Any]:
     scene_dir = scene_cache_dir(cache_dir, item)
     if scene_dir is not None:
@@ -83,7 +91,7 @@ def load_scene_replay_layers(
     if scene_dir is not None:
         layers_dir = scene_dir / "layers"
         if layers_dir.exists():
-            layer_files = sorted(layers_dir.glob("layer_*.pt"))
+            layer_files = _replay_layer_files(layers_dir)
             if expected_num_layers is not None and len(layer_files) != int(expected_num_layers):
                 raise SystemExit(
                     f"Expected {expected_num_layers} replay layers under {layers_dir}, found {len(layer_files)}."
@@ -113,6 +121,26 @@ def load_scene_replay_layers(
     return out
 
 
+def load_scene_initial_tokens(cache_dir: Path, item: Dict[str, Any]) -> torch.Tensor:
+    scene_dir = scene_cache_dir(cache_dir, item)
+    if scene_dir is not None:
+        initial_path = scene_dir / "layers" / "layer_-1.pt"
+        if initial_path.exists():
+            t = _torch_load_cpu(initial_path)
+            if not isinstance(t, torch.Tensor) or t.dim() != 4:
+                raise SystemExit(f"Invalid initial token tensor in {initial_path}: expected 4D torch.Tensor.")
+            return t.contiguous()
+
+    row = load_scene_metadata(cache_dir, item)
+    t = row.get("initial_tokens")
+    if not isinstance(t, torch.Tensor) or t.dim() != 4:
+        raise SystemExit(
+            "Cache row lacks initial_tokens/layers/layer_-1.pt. Please rerun Stage1 cache_scannet "
+            "with the updated cache format."
+        )
+    return t.contiguous()
+
+
 def load_scene_replay_layer(
     cache_dir: Path,
     item: Dict[str, Any],
@@ -133,7 +161,7 @@ def load_scene_replay_layer(
     if scene_dir is not None:
         layers_dir = scene_dir / "layers"
         if layers_dir.exists():
-            layer_files = sorted(layers_dir.glob("layer_*.pt"))
+            layer_files = _replay_layer_files(layers_dir)
             if not layer_files:
                 raise SystemExit(f"No layer_*.pt files found under {layers_dir}")
             if expected_num_layers is not None and len(layer_files) != int(expected_num_layers):

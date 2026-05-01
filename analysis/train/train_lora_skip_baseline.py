@@ -49,6 +49,10 @@ from analysis.train.model import (
     replace_skipped_layers_with_identity,
 )
 from analysis.redundancy.collect import collect_batch
+from analysis.redundancy.metrics import (
+    linear_cka_value_tensor,
+    sample_cosine_similarity_tensor,
+)
 from analysis.redundancy.cache_layout import (
     load_scene_metadata,
     load_scene_pred,
@@ -341,30 +345,18 @@ def _replay_student_cache_first(
 
 
 def _loss_mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # Keep elementwise :func:`torch.nn.functional.mse_loss` on raw tensors for AMP parity with
+    # bf16/fp16 activations. Redundancy ``neg_mse`` uses :func:`token_mean_squared_error_tensor`
+    # (flatten + float32) in ``analysis.redundancy.metrics``.
     return F.mse_loss(a, b)
 
 
 def _loss_cos(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    af = a.reshape(-1, a.shape[-1]).float()
-    bf = b.reshape(-1, b.shape[-1]).float()
-    af = af / (af.norm(dim=-1, keepdim=True) + eps)
-    bf = bf / (bf.norm(dim=-1, keepdim=True) + eps)
-    return 1.0 - (af * bf).sum(dim=-1).mean()
+    return 1.0 - sample_cosine_similarity_tensor(a, b, eps=eps)
 
 
 def _loss_cka(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    af = a.reshape(-1, a.shape[-1]).float()
-    bf = b.reshape(-1, b.shape[-1]).float()
-    if af.shape != bf.shape:
-        raise AssertionError(f"CKA expects identical flattened shapes, got {tuple(af.shape)} vs {tuple(bf.shape)}")
-    af = af - af.mean(dim=0, keepdim=True)
-    bf = bf - bf.mean(dim=0, keepdim=True)
-    atb = af.t() @ bf
-    ata = af.t() @ af
-    btb = bf.t() @ bf
-    num = (atb * atb).sum()
-    den = torch.sqrt((ata * ata).sum() * (btb * btb).sum()).clamp_min(eps)
-    return 1.0 - (num / den)
+    return 1.0 - linear_cka_value_tensor(a, b, eps=eps)
 
 
 def _spatial_grad_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

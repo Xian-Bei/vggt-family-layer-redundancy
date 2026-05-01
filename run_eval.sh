@@ -41,7 +41,7 @@ SCANNET_TAG="${SCANNET_TAG:-$(basename "${DATA_DIR}")}"
 OURS_TRAIN_DIR="${OURS_TRAIN_DIR:-}"
 OURS_EPOCH="${OURS_EPOCH:-}"
 RUN_SCANNET="${RUN_SCANNET:-1}"
-RUN_7ANDN="${RUN_7ANDN:-0}"
+RUN_7ANDN="${RUN_7ANDN:-1}"
 
 trim_spaces() {
   local s="$1"

@@ -89,14 +89,25 @@ def _flatten_tokens_pair(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor
     return x, y
 
 
-def sample_cosine_similarity(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
+def sample_cosine_similarity_tensor(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Mean row-wise cosine similarity after flattening to ``[N,C]`` (differentiable)."""
     x, y = _flatten_tokens_pair(x, y)
     x = x / (x.norm(dim=-1, keepdim=True) + eps)
     y = y / (y.norm(dim=-1, keepdim=True) + eps)
-    return float((x * y).sum(dim=-1).mean().item())
+    return (x * y).sum(dim=-1).mean()
 
 
-def linear_cka(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
+def sample_cosine_similarity(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
+    return float(sample_cosine_similarity_tensor(x, y, eps=eps).item())
+
+
+def linear_cka_value_tensor(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Linear CKA similarity in ``(0,1]`` (differentiable).
+
+    Denominator uses ``sqrt(||X^T X||_F^2 * ||Y^T Y||_F^2).clamp_min(eps)``, matching the
+    historical training loss in ``train_lora_skip_baseline`` (``1 - CKA`` form).
+    """
     x, y = _flatten_tokens_pair(x, y)
 
     x = x - x.mean(dim=0, keepdim=True)
@@ -106,8 +117,18 @@ def linear_cka(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
     xtx = x.t() @ x
     yty = y.t() @ y
     num = (xty * xty).sum()
-    den = torch.sqrt((xtx * xtx).sum() * (yty * yty).sum()) + eps
-    return float((num / den).item())
+    den = torch.sqrt((xtx * xtx).sum() * (yty * yty).sum()).clamp_min(eps)
+    return num / den
+
+
+def linear_cka(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
+    return float(linear_cka_value_tensor(x, y, eps=eps).item())
+
+
+def token_mean_squared_error_tensor(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Scalar MSE after token flatten to ``[N,C]`` (same reduction as :func:`neg_mean_squared_error`)."""
+    x, y = _flatten_tokens_pair(x, y)
+    return F.mse_loss(x, y)
 
 
 def _cca_singular_values(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -136,9 +157,7 @@ def neg_mean_squared_error(x: torch.Tensor, y: torch.Tensor) -> float:
 
     Closer activations → smaller MSE → **larger** (less negative) ``-MSE`` → higher redundancy.
     """
-    x, y = _flatten_tokens_pair(x, y)
-    mse = F.mse_loss(x, y)
-    return float((-mse).item())
+    return float((-token_mean_squared_error_tensor(x, y)).item())
 
 
 def pwcca_similarity(x: torch.Tensor, y: torch.Tensor, keep_components: int = 64) -> float:

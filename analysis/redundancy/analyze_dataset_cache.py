@@ -4,14 +4,18 @@ Step 2: unified redundancy analysis.
 Part A (from cached activations):
 - default/mainline similarity mode: within-layer ``sim(frame_i, global_i)`` to measure how much
   each global block changes its own input (stored in the same upper-triangle format, so only the
-  diagonal is populated and off-diagonal entries are ``NaN``);
+  diagonal is populated and off-diagonal entries are ``NaN``). Similarity is reported for patch
+  tokens, special tokens, and all tokens together (``global_*_similarity_upper_by_metric``).
 - legacy mode (when ``pair_max_span > 1``): inter-layer similarity between Stage1 cached global
   outputs. This mixes frame/global effects because adjacent global outputs are separated by a frame
   block, so it should not be interpreted as "global-only" redundancy.
 
 Part B (skip-range loss): for each layer range [i..j] with span ``j-i+1 <= max_span``,
 reuse Stage1 cached prefix activations and replay only the affected suffix.
-Compare to Stage1 GT metrics loaded from Stage1 ``eval_scannet.json``:
+Fusion ``--fusion-modes`` include ``skip_global`` (identity global in range), ``skip_frame``
+(identity frame in range, real global in range), ``skip_both`` (identity frame and global in range),
+and structured global variants (``special_only``, ``patch_special``, …).
+Compare to Stage1 GT metrics loaded from Stage1 ``eval.json``:
 for ``ate``, ``are``, ``rpe_rot``, ``rpe_trans``, ``chamfer_distance``, and ``depth_abs_rel``,
 score_k(i,j) = stage1_metric_k - pruned_metric_k; for ``depth_delta1`` the delta is negated,
 i.e. score_k = pruned_metric_k - stage1_metric_k. Values are reported per GT metric key.
@@ -72,13 +76,13 @@ from analysis.eval.scannet_eval import (
 )
 from .prediction_save import build_scene_prediction_payload
 from .visualization_export import export_scene_visualization_assets
-from .cache_layout import build_scene_row_compat, load_scene_metadata, load_scene_replay_layers
+from .cache_layout import build_scene_row_compat, load_scene_initial_tokens, load_scene_metadata, load_scene_replay_layers
 
 
 def _read_manifest(cache_dir: Path) -> List[Dict[str, Any]]:
     manifest_path = cache_dir / "manifest.json"
     if not manifest_path.exists():
-        raise SystemExit(f"Missing {manifest_path}; run cache_scannet first.")
+        raise SystemExit(f"Missing {manifest_path}; run cache_dataset first.")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     scenes = manifest.get("scenes", [])
     if not scenes:
@@ -119,6 +123,8 @@ def _split_concat_branch_tuples(
         elif branch == "special":
             frame_t = frame_t[:, :, :patch_start_idx, :]
             global_t = global_t[:, :, :patch_start_idx, :]
+        elif branch == "all":
+            pass
         else:
             raise ValueError(f"Unknown branch: {branch}")
 
@@ -133,7 +139,7 @@ def _split_concat_branch_tuples(
             expected_n = int(frame_flat.shape[0])
         elif int(frame_flat.shape[0]) != expected_n:
             raise SystemExit(
-                f"Inconsistent flattened token count across replay layers for branch {branch}: "
+                f"Inconsistent flattened token count across replay layers for branch {branch!r}: "
                 f"expected {expected_n}, got {tuple(frame_flat.shape)} at layer {li}."
             )
         frame_layers.append(frame_flat)
@@ -243,6 +249,7 @@ def _write_redundancy_heatmaps(
     similarity_mode: str,
     title_suffix: str,
     fname_prefix: str,
+    all_upper: Optional[Dict[str, List[float]]] = None,
 ) -> None:
     n = num_layers
     vm_default: tuple[Optional[float], Optional[float]] = (0.0, 1.0)
@@ -257,9 +264,11 @@ def _write_redundancy_heatmaps(
     if similarity_mode == "intra_layer_frame_vs_global":
         patch_label = "Global patch intra-layer (frame_i vs global_i)"
         special_label = "Global special intra-layer (frame_i vs global_i)"
+        all_label = "Global all tokens intra-layer (frame_i vs global_i)"
     else:
         patch_label = "Legacy global patch inter-layer"
         special_label = "Legacy global special inter-layer"
+        all_label = "Legacy global all tokens inter-layer"
 
     _h(patch_upper["cka"], f"{pfx}heatmap_global_patch_cka.png", f"{patch_label} CKA{ts}", vm_default)
     _h(patch_upper["cosine"], f"{pfx}heatmap_global_patch_cosine.png", f"{patch_label} cosine{ts}", vm_default)
@@ -272,6 +281,13 @@ def _write_redundancy_heatmaps(
     if enable_pwcca:
         _h(special_upper["pwcca"], f"{pfx}heatmap_global_special_pwcca.png", f"{special_label} PWCCA{ts}", vm_default)
     _h(special_upper["neg_mse"], f"{pfx}heatmap_global_special_neg_mse.png", f"{special_label} -MSE{ts}", vm_mse)
+
+    if all_upper:
+        _h(all_upper["cka"], f"{pfx}heatmap_global_all_cka.png", f"{all_label} CKA{ts}", vm_default)
+        _h(all_upper["cosine"], f"{pfx}heatmap_global_all_cosine.png", f"{all_label} cosine{ts}", vm_default)
+        if enable_pwcca:
+            _h(all_upper["pwcca"], f"{pfx}heatmap_global_all_pwcca.png", f"{all_label} PWCCA{ts}", vm_default)
+        _h(all_upper["neg_mse"], f"{pfx}heatmap_global_all_neg_mse.png", f"{all_label} -MSE{ts}", vm_mse)
 
 
 def _write_skip_loss_heatmap(
@@ -298,19 +314,20 @@ def _write_skip_loss_heatmap(
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Fusion redundancy analysis from Stage1 cache + replay + GT.")
-    p.add_argument("--cache-dir", type=Path, default=Path("analysis_outputs/scannet_cache"))
-    p.add_argument("--output-dir", type=Path, default=Path("analysis_outputs/scannet_redundancy_fusion"))
+    p.add_argument("--dataset", type=str, default="scannet")
+    p.add_argument("--cache-dir", type=Path, default=Path("analysis_outputs/cache/scannet"))
+    p.add_argument("--output-dir", type=Path, default=Path("analysis_outputs/redundancy_fusion/scannet"))
     p.add_argument(
         "--similarity-output-dir",
         type=Path,
         default=None,
-        help="Output directory for similarity reports. Default: analysis_outputs/scannet_redundancy_similarity.",
+        help="Output directory for similarity reports. Default: analysis_outputs/similarity/<dataset>.",
     )
     p.add_argument(
         "--skip-output-dir",
         type=Path,
         default=None,
-        help="Output directory for skip GT reports. Default: analysis_outputs/scannet_redundancy_skip.",
+        help="Output directory for skip GT reports. Default: analysis_outputs/skip/<dataset>.",
     )
     p.add_argument(
         "--per-scene-report-suffix",
@@ -372,6 +389,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=("skip_global", "special_only", "special_only_nomlp", "patch_special", "patch_special_nomlp"),
         choices=(
             "skip_global",
+            "skip_frame",
             "skip_both",
             "special_only",
             "special_only_nomlp",
@@ -420,7 +438,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--data-root", type=Path, default=Path("data"))
     p.add_argument("--hf-model", type=str, default="facebook/VGGT-1B")
-    p.add_argument("--max-frames", type=int, default=32)
     p.add_argument("--skip-loss-device", type=str, default="cuda")
     p.add_argument(
         "--skip-loss-dtype",
@@ -428,7 +445,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default="bfloat16",
         choices=("bfloat16", "float16", "float32"),
     )
-    p.add_argument("--skip-gt-eval", action="store_true")
+    p.add_argument(
+        "--layer-gt-eval",
+        action="store_true",
+        help="Run skip-layer GT evaluation and produce GT delta outputs.",
+    )
     p.add_argument("--gt-ply-dir", type=Path, default=None)
     p.add_argument("--depth-conf-thresh", type=float, default=1.0)
     p.add_argument("--chamfer-max-dist", type=float, default=0.5)
@@ -639,13 +660,18 @@ def _merge_similarity_fusion_by_mode(old_fb: Any, new_fb: Any) -> Dict[str, Any]
         pn = nm.get("global_patch_similarity_upper_by_metric", {})
         so = om.get("global_special_similarity_upper_by_metric", {})
         sn = nm.get("global_special_similarity_upper_by_metric", {})
+        ao = om.get("global_all_similarity_upper_by_metric", {})
+        an = nm.get("global_all_similarity_upper_by_metric", {})
         merged_patch = _merge_packed_metric_dict(po, pn)
         merged_spec = _merge_packed_metric_dict(so, sn)
+        merged_all = _merge_packed_metric_dict(ao, an)
         payload: Dict[str, Any] = {}
         if merged_patch:
             payload["global_patch_similarity_upper_by_metric"] = merged_patch
         if merged_spec:
             payload["global_special_similarity_upper_by_metric"] = merged_spec
+        if merged_all:
+            payload["global_all_similarity_upper_by_metric"] = merged_all
         if payload:
             out[mode] = payload
     return out
@@ -736,7 +762,11 @@ def _discover_similarity_metric_keys_from_rows(
             mm = fb.get(mode, {})
             if not isinstance(mm, dict):
                 continue
-            for sub in ("global_patch_similarity_upper_by_metric", "global_special_similarity_upper_by_metric"):
+            for sub in (
+                "global_patch_similarity_upper_by_metric",
+                "global_special_similarity_upper_by_metric",
+                "global_all_similarity_upper_by_metric",
+            ):
                 d = mm.get(sub, {})
                 if isinstance(d, dict):
                     for k, v in d.items():
@@ -834,11 +864,13 @@ def _write_fusion_full_reports_from_per_scene_json(
     for mode in mode_list:
         mode_sim_patch: Dict[str, List[float]] = {}
         mode_sim_special: Dict[str, List[float]] = {}
+        mode_sim_all: Dict[str, List[float]] = {}
         mode_skip_gt: Dict[str, List[float]] = {}
 
         for mk in sim_metrics_effective:
             patch_rows: List[List[float]] = []
             special_rows: List[List[float]] = []
+            all_rows: List[List[float]] = []
             for sid in scene_ids:
                 row = sim_rows_by_scene.get(sid, {})
                 by_mode = row.get("fusion_by_mode", {}) if isinstance(row, dict) else {}
@@ -847,14 +879,19 @@ def _write_fusion_full_reports_from_per_scene_json(
                     continue
                 patch = mode_map.get("global_patch_similarity_upper_by_metric", {})
                 special = mode_map.get("global_special_similarity_upper_by_metric", {})
+                all_m = mode_map.get("global_all_similarity_upper_by_metric", {})
                 if isinstance(patch, dict) and isinstance(patch.get(mk), list):
                     patch_rows.append([float(v) for v in patch[mk]])
                 if isinstance(special, dict) and isinstance(special.get(mk), list):
                     special_rows.append([float(v) for v in special[mk]])
+                if isinstance(all_m, dict) and isinstance(all_m.get(mk), list):
+                    all_rows.append([float(v) for v in all_m[mk]])
             if patch_rows:
                 mode_sim_patch[mk] = _finite_mean_packed(patch_rows)
             if special_rows:
                 mode_sim_special[mk] = _finite_mean_packed(special_rows)
+            if all_rows:
+                mode_sim_all[mk] = _finite_mean_packed(all_rows)
 
         for gk in GT_KEYS_FOR_SKIP:
             gt_rows: List[List[float]] = []
@@ -874,6 +911,7 @@ def _write_fusion_full_reports_from_per_scene_json(
             "num_scenes_used": len(scene_ids),
             "global_patch_similarity_upper_by_metric": mode_sim_patch,
             "global_special_similarity_upper_by_metric": mode_sim_special,
+            "global_all_similarity_upper_by_metric": mode_sim_all,
         }
         skip_fusion_by_mode[mode] = {
             "num_scenes_used": len(scene_ids),
@@ -931,6 +969,13 @@ def _write_fusion_full_reports_from_per_scene_json(
                     {
                         "metric": f"fusion_global_special_{mk}_{mode}_mean_finite",
                         "value": _nanmean_finite(mode_sim["global_special_similarity_upper_by_metric"][mk]),
+                    }
+                )
+            if mk in mode_sim.get("global_all_similarity_upper_by_metric", {}):
+                similarity_summary_rows.append(
+                    {
+                        "metric": f"fusion_global_all_{mk}_{mode}_mean_finite",
+                        "value": _nanmean_finite(mode_sim["global_all_similarity_upper_by_metric"][mk]),
                     }
                 )
         for gk in GT_KEYS_FOR_SKIP:
@@ -1009,6 +1054,7 @@ def _write_fusion_full_reports_from_per_scene_json(
                     similarity_mode="intra_layer_frame_vs_global",
                     title_suffix=f" (mean, {mode})",
                     fname_prefix=f"{mode}_",
+                    all_upper=mode_sim.get("global_all_similarity_upper_by_metric") or None,
                 )
             if save_skip_output:
                 for gk in GT_KEYS_FOR_SKIP:
@@ -1195,22 +1241,31 @@ def _aligned_change_per_key(stage1_gt: Dict[str, float], pruned_gt: Dict[str, fl
     return out
 
 
-def _manifest_frame_ids(item: Dict[str, Any]) -> Optional[List[int]]:
+def _manifest_frame_ids(item: Dict[str, Any]) -> Optional[List[str]]:
     vals = item.get("frame_ids")
     if not isinstance(vals, list):
         return None
-    out: List[int] = []
+    out: List[str] = []
     for v in vals:
-        try:
-            out.append(int(v))
-        except Exception:
-            return None
+        out.append(str(v))
     return out
 
 
 def _check_stage1_selection_match(scene_id: str, item: Dict[str, Any], scene_eff: SceneData) -> None:
     expected = _manifest_frame_ids(item)
-    actual = [int(p.stem) for p in scene_eff.image_paths]
+    expected_paths_raw = item.get("image_paths")
+    if isinstance(expected_paths_raw, list) and expected_paths_raw:
+        expected_paths = [str(p) for p in expected_paths_raw]
+        actual_paths = [str(p) for p in scene_eff.image_paths]
+        if expected_paths != actual_paths:
+            raise SystemExit(
+                f"Stage1 sanity check failed for {scene_id}: image path selection mismatch.\n"
+                f"Stage1 image_paths={expected_paths}\n"
+                f"Stage2 image_paths={actual_paths}"
+            )
+        actual = [str(Path(p).stem) for p in actual_paths]
+    else:
+        actual = [str(p.stem) for p in scene_eff.image_paths]
     if expected is None:
         raise SystemExit(
             f"Stage1 sanity check failed for {scene_id}: manifest.json lacks frame_ids. "
@@ -1228,6 +1283,28 @@ def _check_stage1_selection_match(scene_id: str, item: Dict[str, Any], scene_eff
             f"Stage1 sanity check failed for {scene_id}: num_frames mismatch "
             f"(manifest={expected_num_frames}, current={len(actual)})."
         )
+
+
+def _scene_data_from_manifest(item: Dict[str, Any], *, data_root: Path) -> SceneData:
+    scene_id = str(item.get("scene_id", "")).strip()
+    paths_raw = item.get("image_paths")
+    if not scene_id:
+        raise SystemExit(f"Invalid manifest scene entry without scene_id: {item}")
+    if not isinstance(paths_raw, list) or not paths_raw:
+        raise SystemExit(
+            f"Manifest entry for {scene_id!r} is missing image_paths. "
+            "Please rerun Stage1 cache generation."
+        )
+    image_paths = [Path(str(p)) for p in paths_raw]
+    scene_dir = data_root
+    if image_paths:
+        image_parent = image_paths[0].parent
+        # For ScanNet-like layout ".../<scene>/color/<frame>.jpg", scene root should be ".../<scene>".
+        if image_parent.name.lower() in ("color", "rgb", "images", "image"):
+            scene_dir = image_parent.parent
+        else:
+            scene_dir = image_parent
+    return SceneData(scene_id=scene_id, scene_dir=scene_dir, image_paths=image_paths)
 
 
 def _check_stage1_noop_metrics_match(
@@ -1314,20 +1391,23 @@ def _infer_num_layers_from_manifest(cache_dir: Path, scenes_meta: Sequence[Dict[
     )
 
 
-def _build_aggregator_positions(model: VGGT, images: torch.Tensor) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+def _build_aggregator_positions(
+    model: VGGT,
+    *,
+    bsz: int,
+    seq_len: int,
+    image_hw: Tuple[int, int],
+    device: torch.device,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     agg = model.aggregator
     if agg.rope is None:
         return None, None
-    if images.dim() == 4:
-        images = images.unsqueeze(0)
-    if images.dim() != 5:
-        raise ValueError(f"Expected images with 4 or 5 dims, got shape {tuple(images.shape)}")
-    bsz, seq_len, _, height, width = images.shape
+    height, width = int(image_hw[0]), int(image_hw[1])
     pos_frame = agg.position_getter(
         bsz * seq_len,
         height // agg.patch_size,
         width // agg.patch_size,
-        device=images.device,
+        device=device,
     )
     if agg.patch_start_idx > 0:
         pos_frame = pos_frame + 1
@@ -1335,7 +1415,7 @@ def _build_aggregator_positions(model: VGGT, images: torch.Tensor) -> tuple[Opti
             bsz * seq_len,
             agg.patch_start_idx,
             2,
-            device=images.device,
+            device=device,
             dtype=pos_frame.dtype,
         )
         pos_frame = torch.cat([pos_special, pos_frame], dim=1)
@@ -1593,6 +1673,8 @@ def _apply_skipped_global_mode(
 ) -> torch.Tensor:
     if skipped_global_mode in ("skip_global", "skip_both"):
         return global_in
+    if skipped_global_mode == "skip_frame":
+        return model.aggregator.global_blocks[layer_idx](global_in, pos=pos_global)
     if skipped_global_mode == "special_only":
         return _special_only_global_block_forward(
             model.aggregator.global_blocks[layer_idx],
@@ -1640,11 +1722,28 @@ def _apply_skipped_global_mode(
     raise ValueError(f"Unknown skipped_global_mode: {skipped_global_mode}")
 
 
+def _mode_replays_from_previous_global(skipped_global_mode: str) -> bool:
+    return skipped_global_mode in ("skip_both", "skip_frame")
+
+
+def _skip_frame_block_at_layer(
+    skipped_global_mode: str,
+    layer_idx: int,
+    skip_start: Optional[int],
+    skip_end: Optional[int],
+) -> bool:
+    """Return True to replace ``frame_blocks[layer_idx]`` with identity."""
+    if skip_start is None or skip_end is None:
+        return False
+    return skipped_global_mode in ("skip_both", "skip_frame") and skip_start <= layer_idx <= skip_end
+
+
 def _forward_with_suffix_replay(
     model: VGGT,
     images: torch.Tensor,
     replay_concat_layers: Sequence[torch.Tensor],
     *,
+    initial_tokens: Optional[torch.Tensor],
     start_layer: int,
     skip_start: Optional[int],
     skip_end: Optional[int],
@@ -1687,7 +1786,8 @@ def _forward_with_suffix_replay(
         layer_cache[idx] = t
         return t
 
-    bsz, seq_len, p, two_c = _get_layer(start_layer).shape
+    start_tokens = _get_layer(start_layer)
+    bsz, seq_len, p, two_c = start_tokens.shape
     if two_c % 2 != 0:
         raise ValueError(f"Expected even channel count in replay cache, got {two_c}")
     c = two_c // 2
@@ -1695,43 +1795,80 @@ def _forward_with_suffix_replay(
     for idx in required_layers:
         if idx < start_layer:
             selected_layers[idx] = _get_layer(idx)
-    frame_view = _get_layer(start_layer)[..., :c]
-    for layer_idx in range(start_layer, num_layers):
-        global_in = frame_view.view(bsz, seq_len * p, c)
-        if skip_start is not None and skip_end is not None and skip_start <= layer_idx <= skip_end:
-            global_out = _apply_skipped_global_mode(
-                model,
-                global_in,
-                layer_idx=layer_idx,
-                skipped_global_mode=skipped_global_mode,
-                bsz=bsz,
-                seq_len=seq_len,
-                tokens_per_frame=p,
-                pos_global=pos_global,
-            )
+
+    if skip_start is not None and _mode_replays_from_previous_global(skipped_global_mode):
+        if start_layer == 0:
+            if initial_tokens is None:
+                raise ValueError("initial_tokens are required to replay frame-skipping modes from layer 0.")
+            token_view = initial_tokens.to(device=images.device, non_blocking=(images.device.type == "cuda"))
+            if token_view.shape[:3] != (bsz, seq_len, p):
+                raise RuntimeError(
+                    f"Initial token shape {tuple(token_view.shape)} does not match replay cache "
+                    f"prefix {(bsz, seq_len, p)}."
+                )
         else:
-            global_out = model.aggregator.global_blocks[layer_idx](global_in, pos=pos_global)
-        global_view = global_out.view(bsz, seq_len, p, c)
-        if capture_global_layer is not None and layer_idx == capture_global_layer:
-            captured_global = global_view
-        concat_tokens = torch.cat([frame_view, global_view], dim=-1)
-        if layer_idx in required_set:
-            selected_layers[layer_idx] = concat_tokens
-        if layer_idx + 1 >= num_layers:
-            break
-        skip_next_frame_block = (
-            skipped_global_mode == "skip_both"
-            and skip_start is not None
-            and skip_end is not None
-            and skip_start <= (layer_idx + 1) <= skip_end
-        )
-        if skip_next_frame_block:
-            del global_in, global_out, global_view, concat_tokens
-            continue
-        frame_in = global_out.view(bsz * seq_len, p, c)
-        frame_out = model.aggregator.frame_blocks[layer_idx + 1](frame_in, pos=pos_frame)
-        frame_view = frame_out.view(bsz, seq_len, p, c)
-        del global_in, global_out, global_view, concat_tokens, frame_in, frame_out
+            prev_tokens = _get_layer(start_layer - 1)
+            token_view = prev_tokens[..., c:]
+
+        for layer_idx in range(start_layer, num_layers):
+            frame_in = token_view.view(bsz * seq_len, p, c)
+            if _skip_frame_block_at_layer(skipped_global_mode, layer_idx, skip_start, skip_end):
+                frame_out = frame_in
+            else:
+                frame_out = model.aggregator.frame_blocks[layer_idx](frame_in, pos=pos_frame)
+            frame_view = frame_out.view(bsz, seq_len, p, c)
+
+            global_in = frame_view.view(bsz, seq_len * p, c)
+            if skip_start <= layer_idx <= skip_end:
+                global_out = _apply_skipped_global_mode(
+                    model,
+                    global_in,
+                    layer_idx=layer_idx,
+                    skipped_global_mode=skipped_global_mode,
+                    bsz=bsz,
+                    seq_len=seq_len,
+                    tokens_per_frame=p,
+                    pos_global=pos_global,
+                )
+            else:
+                global_out = model.aggregator.global_blocks[layer_idx](global_in, pos=pos_global)
+            global_view = global_out.view(bsz, seq_len, p, c)
+            if capture_global_layer is not None and layer_idx == capture_global_layer:
+                captured_global = global_view
+            concat_tokens = torch.cat([frame_view, global_view], dim=-1)
+            if layer_idx in required_set:
+                selected_layers[layer_idx] = concat_tokens
+            token_view = global_view
+            del frame_in, frame_out, global_in, global_out, concat_tokens
+    else:
+        frame_view = start_tokens[..., :c]
+        for layer_idx in range(start_layer, num_layers):
+            global_in = frame_view.view(bsz, seq_len * p, c)
+            if skip_start is not None and skip_end is not None and skip_start <= layer_idx <= skip_end:
+                global_out = _apply_skipped_global_mode(
+                    model,
+                    global_in,
+                    layer_idx=layer_idx,
+                    skipped_global_mode=skipped_global_mode,
+                    bsz=bsz,
+                    seq_len=seq_len,
+                    tokens_per_frame=p,
+                    pos_global=pos_global,
+                )
+            else:
+                global_out = model.aggregator.global_blocks[layer_idx](global_in, pos=pos_global)
+            global_view = global_out.view(bsz, seq_len, p, c)
+            if capture_global_layer is not None and layer_idx == capture_global_layer:
+                captured_global = global_view
+            concat_tokens = torch.cat([frame_view, global_view], dim=-1)
+            if layer_idx in required_set:
+                selected_layers[layer_idx] = concat_tokens
+            if layer_idx + 1 >= num_layers:
+                break
+            frame_in = global_out.view(bsz * seq_len, p, c)
+            frame_out = model.aggregator.frame_blocks[layer_idx + 1](frame_in, pos=pos_frame)
+            frame_view = frame_out.view(bsz, seq_len, p, c)
+            del global_in, global_out, global_view, concat_tokens, frame_in, frame_out
     if model.camera_head is not None and (num_layers - 1) not in selected_layers:
         raise RuntimeError("Replay sparse layers missing final layer required by camera head.")
     aggregated_tokens_list: List[torch.Tensor] = [None] * num_layers  # type: ignore[list-item]
@@ -1757,6 +1894,7 @@ def _replay_global_output_at_layer(
     replay_concat_layers: Sequence[torch.Tensor],
     *,
     device: torch.device,
+    initial_tokens: Optional[torch.Tensor],
     start_layer: int,
     target_layer: int,
     skip_start: int,
@@ -1778,34 +1916,71 @@ def _replay_global_output_at_layer(
     if two_c % 2 != 0:
         raise ValueError(f"Expected even channel count in replay cache, got {two_c}")
     c = two_c // 2
-    frame_view = start_tokens[..., :c]
 
-    for layer_idx in range(start_layer, target_layer + 1):
-        global_in = frame_view.view(bsz, seq_len * p, c)
-        if skip_start <= layer_idx <= skip_end:
-            global_out = _apply_skipped_global_mode(
-                model,
-                global_in,
-                layer_idx=layer_idx,
-                skipped_global_mode=skipped_global_mode,
-                bsz=bsz,
-                seq_len=seq_len,
-                tokens_per_frame=p,
-                pos_global=pos_global,
-            )
+    if _mode_replays_from_previous_global(skipped_global_mode):
+        if start_layer == 0:
+            if initial_tokens is None:
+                raise ValueError("initial_tokens are required to replay frame-skipping modes from layer 0.")
+            token_view = initial_tokens.to(device=device, non_blocking=(device.type == "cuda"))
+            if token_view.shape[:3] != (bsz, seq_len, p):
+                raise RuntimeError(
+                    f"Initial token shape {tuple(token_view.shape)} does not match replay cache "
+                    f"prefix {(bsz, seq_len, p)}."
+                )
         else:
-            global_out = model.aggregator.global_blocks[layer_idx](global_in, pos=pos_global)
-        global_view = global_out.view(bsz, seq_len, p, c)
-        if layer_idx == target_layer:
-            return global_view
-        skip_next_frame_block = (
-            skipped_global_mode == "skip_both" and skip_start <= (layer_idx + 1) <= skip_end
-        )
-        if skip_next_frame_block:
-            continue
-        frame_in = global_out.view(bsz * seq_len, p, c)
-        frame_out = model.aggregator.frame_blocks[layer_idx + 1](frame_in, pos=pos_frame)
-        frame_view = frame_out.view(bsz, seq_len, p, c)
+            prev_tokens = replay_concat_layers[start_layer - 1].to(
+                device=device, non_blocking=(device.type == "cuda")
+            )
+            token_view = prev_tokens[..., c:]
+
+        for layer_idx in range(start_layer, target_layer + 1):
+            frame_in = token_view.view(bsz * seq_len, p, c)
+            if _skip_frame_block_at_layer(skipped_global_mode, layer_idx, skip_start, skip_end):
+                frame_out = frame_in
+            else:
+                frame_out = model.aggregator.frame_blocks[layer_idx](frame_in, pos=pos_frame)
+            frame_view = frame_out.view(bsz, seq_len, p, c)
+            global_in = frame_view.view(bsz, seq_len * p, c)
+            if skip_start <= layer_idx <= skip_end:
+                global_out = _apply_skipped_global_mode(
+                    model,
+                    global_in,
+                    layer_idx=layer_idx,
+                    skipped_global_mode=skipped_global_mode,
+                    bsz=bsz,
+                    seq_len=seq_len,
+                    tokens_per_frame=p,
+                    pos_global=pos_global,
+                )
+            else:
+                global_out = model.aggregator.global_blocks[layer_idx](global_in, pos=pos_global)
+            global_view = global_out.view(bsz, seq_len, p, c)
+            if layer_idx == target_layer:
+                return global_view
+            token_view = global_view
+    else:
+        frame_view = start_tokens[..., :c]
+        for layer_idx in range(start_layer, target_layer + 1):
+            global_in = frame_view.view(bsz, seq_len * p, c)
+            if skip_start <= layer_idx <= skip_end:
+                global_out = _apply_skipped_global_mode(
+                    model,
+                    global_in,
+                    layer_idx=layer_idx,
+                    skipped_global_mode=skipped_global_mode,
+                    bsz=bsz,
+                    seq_len=seq_len,
+                    tokens_per_frame=p,
+                    pos_global=pos_global,
+                )
+            else:
+                global_out = model.aggregator.global_blocks[layer_idx](global_in, pos=pos_global)
+            global_view = global_out.view(bsz, seq_len, p, c)
+            if layer_idx == target_layer:
+                return global_view
+            frame_in = global_out.view(bsz * seq_len, p, c)
+            frame_out = model.aggregator.frame_blocks[layer_idx + 1](frame_in, pos=pos_frame)
+            frame_view = frame_out.view(bsz, seq_len, p, c)
 
     raise RuntimeError("Unexpected replay flow when capturing target global output.")
 
@@ -1839,7 +2014,7 @@ def _collect_skip_range_loss(
 
     discovered = discover_scannet_scenes(data_root)
     scene_map: Dict[str, SceneData] = {s.scene_id: s for s in discovered}
-    eval_path = cache_dir / "eval_scannet.json"
+    eval_path = cache_dir / "eval.json"
     if not eval_path.exists():
         raise SystemExit(
             f"Missing {eval_path}; Stage2 skip-range GT comparison now requires Stage1 eval results."
@@ -1858,7 +2033,7 @@ def _collect_skip_range_loss(
         if sid not in stage1_eval_map:
             raise SystemExit(
                 f"Stage2 skip-loss requires complete Stage1 eval rows, but {sid} is missing in "
-                f"{cache_dir / 'eval_scannet.json'}."
+                f"{cache_dir / 'eval.json'}."
             )
         selected.append((item, scene_map[sid], stage1_eval_map[sid]))
 
@@ -1906,6 +2081,11 @@ def _collect_skip_range_loss(
         stage1_gt = metrics_float_dict(stage1_eval_row)
         hw = (int(images.shape[-2]), int(images.shape[-1]))
         replay_concat_layers = _load_scene_replay_cache(cache_dir, _item, num_layers)
+        initial_tokens = (
+            load_scene_initial_tokens(cache_dir, _item)
+            if _mode_replays_from_previous_global(skipped_global_mode)
+            else None
+        )
         pos_frame, pos_global = _build_aggregator_positions(model, images)
         if cache_sanity_check:
             with torch.no_grad(), torch.autocast(
@@ -1915,6 +2095,7 @@ def _collect_skip_range_loss(
                     model,
                     images,
                     replay_concat_layers,
+                    initial_tokens=initial_tokens,
                     start_layer=0,
                     skip_start=None,
                     skip_end=None,
@@ -1980,6 +2161,7 @@ def _collect_skip_range_loss(
                         model,
                         images,
                         replay_concat_layers,
+                        initial_tokens=initial_tokens,
                         start_layer=i,
                         skip_start=i,
                         skip_end=j,
@@ -2128,12 +2310,17 @@ def main() -> None:
         )
     if not skip_per_scene_suffix.endswith(".json"):
         raise SystemExit(f"skip_per_scene_report_suffix must end with .json, got: {skip_per_scene_suffix}")
+    dataset_tag = str(args.dataset).strip().lower() or "scannet"
     similarity_out_dir = (
         args.similarity_output_dir
         if args.similarity_output_dir is not None
-        else Path("analysis_outputs/scannet_redundancy_similarity")
+        else Path(f"analysis_outputs/similarity/{dataset_tag}")
     )
-    skip_out_dir = args.skip_output_dir if args.skip_output_dir is not None else Path("analysis_outputs/scannet_redundancy_skip")
+    skip_out_dir = (
+        args.skip_output_dir
+        if args.skip_output_dir is not None
+        else Path(f"analysis_outputs/skip/{dataset_tag}")
+    )
     similarity_report_path = similarity_out_dir / similarity_report_name
     skip_report_path = skip_out_dir / skip_report_name
     fill_value = _parse_heatmap_fill(args.heatmap_fill)
@@ -2142,6 +2329,7 @@ def main() -> None:
     fusion_max_span = max(1, int(args.fusion_max_span))
     fusion_num_procs = max(1, int(args.fusion_num_procs))
     vis_root_stage2 = args.visualization_dir if args.visualization_dir is not None else (similarity_out_dir / "visualization")
+    frame_skip_modes_need_initial_tokens = any(_mode_replays_from_previous_global(mode) for mode in fusion_modes)
 
     compute_similarity = bool(args.fusion_compute_similarity)
     sim_metrics: List[str] = []
@@ -2157,9 +2345,9 @@ def main() -> None:
             raise SystemExit("fusion_similarity_metrics is empty after normalization.")
     compute_pwcca = compute_similarity and ("pwcca" in sim_metrics)
     write_aggregate = bool(args.fusion_write_aggregate)
-    skip_gt_eval = bool(args.skip_gt_eval)
+    layer_gt_eval = bool(args.layer_gt_eval)
     save_similarity_output = bool(compute_similarity)
-    save_skip_output = not bool(skip_gt_eval)
+    save_skip_output = bool(layer_gt_eval)
     if not save_similarity_output and not save_skip_output:
         raise SystemExit("Both similarity and skip outputs are disabled; nothing to save.")
 
@@ -2178,7 +2366,7 @@ def main() -> None:
             compute_pwcca=compute_pwcca,
             fusion_num_procs=fusion_num_procs,
             analysis_device=analysis_device,
-            skip_gt_eval=skip_gt_eval,
+            skip_gt_eval=not layer_gt_eval,
         )
         paths: List[str] = []
         if save_similarity_output:
@@ -2224,18 +2412,15 @@ def main() -> None:
     use_amp = skip_loss_device.type == "cuda"
     autocast_device_type = "cuda" if skip_loss_device.type == "cuda" else "cpu"
 
-    scene_map: Dict[str, SceneData] = {}
     stage1_eval_map: Dict[str, Dict[str, Any]] = {}
     selected: List[Tuple[Dict[str, Any], Optional[SceneData], Optional[Dict[str, Any]]]] = []
 
-    if skip_gt_eval:
+    if not layer_gt_eval:
         selected = [(item, None, None) for item in scenes_meta]
         if not selected:
             raise SystemExit("No scenes were selected from manifest for fusion analysis.")
     else:
-        discovered = discover_scannet_scenes(args.data_root)
-        scene_map = {s.scene_id: s for s in discovered}
-        eval_path = args.cache_dir / "eval_scannet.json"
+        eval_path = args.cache_dir / "eval.json"
         if not eval_path.exists():
             raise SystemExit(
                 f"Missing {eval_path}; fusion analysis requires Stage1 eval results for GT delta computation."
@@ -2247,16 +2432,12 @@ def main() -> None:
 
         for item in scenes_meta:
             sid = str(item["scene_id"])
-            if sid not in scene_map:
-                raise SystemExit(
-                    f"Fusion analysis requires complete data, but scene_id {sid} was not found under {args.data_root}."
-                )
             if sid not in stage1_eval_map:
                 raise SystemExit(
                     f"Fusion analysis requires complete Stage1 eval rows, but {sid} is missing in "
-                    f"{args.cache_dir / 'eval_scannet.json'}."
+                    f"{args.cache_dir / 'eval.json'}."
                 )
-            selected.append((item, scene_map[sid], stage1_eval_map[sid]))
+            selected.append((item, _scene_data_from_manifest(item, data_root=args.data_root), stage1_eval_map[sid]))
         if not selected:
             raise SystemExit("No valid scene with Stage1 predictions was found for fusion analysis.")
 
@@ -2270,56 +2451,53 @@ def main() -> None:
         scene_scores = dict(scene_scores_raw) if isinstance(scene_scores_raw, dict) else {}
 
         replay_concat_layers = _load_scene_replay_cache(args.cache_dir, item, num_layers)
+        initial_tokens = (
+            load_scene_initial_tokens(args.cache_dir, item) if frame_skip_modes_need_initial_tokens else None
+        )
         patch_start_idx = int(item.get("patch_start_idx", model.aggregator.patch_start_idx))
 
+        scene_eff = _scene_data_from_manifest(item, data_root=args.data_root)
         eval_ctx = None
-        scene_eff: Optional[SceneData] = None
         stage1_gt: Dict[str, float] = {}
-        if skip_gt_eval:
-            cache_row = _load_scene_cache_row(args.cache_dir, item)
-            h, w = _infer_image_hw_for_replay(
-                cache_row,
-                replay_concat_layers,
-                patch_start_idx=patch_start_idx,
-                patch_size=int(model.aggregator.patch_size),
-            )
-            seq_len_cache = int(cache_row.get("num_frames", replay_concat_layers[0].shape[1]))
-            if seq_len_cache <= 0:
-                seq_len_cache = int(replay_concat_layers[0].shape[1])
-            images = torch.zeros(
-                (1, seq_len_cache, 3, h, w),
-                device=skip_loss_device,
-                dtype=torch.float32,
-            )
-            hw = (h, w)
-        else:
-            assert scene is not None
+        cache_row = _load_scene_cache_row(args.cache_dir, item)
+        h, w = _infer_image_hw_for_replay(
+            cache_row,
+            replay_concat_layers,
+            patch_start_idx=patch_start_idx,
+            patch_size=int(model.aggregator.patch_size),
+        )
+        seq_len_cache = int(cache_row.get("num_frames", replay_concat_layers[0].shape[1]))
+        if seq_len_cache <= 0:
+            seq_len_cache = int(replay_concat_layers[0].shape[1])
+        images = torch.zeros(
+            (1, seq_len_cache, 3, h, w),
+            device=skip_loss_device,
+            dtype=torch.float32,
+        )
+        hw = (h, w)
+
+        if not bool(args.disable_cache_sanity_check):
+            _check_stage1_selection_match(scene_eff.scene_id, item, scene_eff)
+
+        if layer_gt_eval:
             assert stage1_eval_row is not None
-
-            scene_eff = select_scene_image_paths_fastvggt(scene, args.max_frames)
-            if not scene_eff.image_paths:
-                raise SystemExit(
-                    f"Fusion analysis requires complete data, but scene {scene.scene_id} has no valid frames "
-                    "after FastVGGT selection."
-                )
-            if not bool(args.disable_cache_sanity_check):
-                _check_stage1_selection_match(scene.scene_id, item, scene_eff)
-
-            images = load_scene_images(scene_eff, mode="crop").to(skip_loss_device)
-            if images.dim() == 4:
-                images = images.unsqueeze(0)
             eval_ctx = build_fastvggt_scene_eval_context(
                 scene_eff,
                 args.data_root,
                 args.gt_ply_dir,
-                image_hw=(int(images.shape[-2]), int(images.shape[-1])),
+                image_hw=hw,
             )
             stage1_gt = metrics_float_dict(stage1_eval_row)
-            hw = (int(images.shape[-2]), int(images.shape[-1]))
 
-        pos_frame, pos_global = _build_aggregator_positions(model, images)
+        pos_frame, pos_global = _build_aggregator_positions(
+            model,
+            bsz=1,
+            seq_len=seq_len_cache,
+            image_hw=hw,
+            device=skip_loss_device,
+        )
 
-        if not skip_gt_eval and not bool(args.disable_cache_sanity_check):
+        if layer_gt_eval and not bool(args.disable_cache_sanity_check):
             with torch.no_grad(), torch.autocast(
                 device_type=autocast_device_type, dtype=skip_loss_dtype, enabled=use_amp
             ):
@@ -2327,6 +2505,7 @@ def main() -> None:
                     model,
                     images,
                     replay_concat_layers,
+                    initial_tokens=initial_tokens,
                     start_layer=0,
                     skip_start=None,
                     skip_end=None,
@@ -2378,6 +2557,7 @@ def main() -> None:
                 )
             scene_patch_upper_by_metric = {m: [] for m in sim_metrics}
             scene_special_upper_by_metric = {m: [] for m in sim_metrics}
+            scene_all_upper_by_metric = {m: [] for m in sim_metrics}
             scene_gt_upper_by_metric = {k: [] for k in GT_KEYS_FOR_SKIP}
 
             for i in range(num_layers):
@@ -2386,6 +2566,7 @@ def main() -> None:
                         for m in sim_metrics:
                             scene_patch_upper_by_metric[m].append(float("nan"))
                             scene_special_upper_by_metric[m].append(float("nan"))
+                            scene_all_upper_by_metric[m].append(float("nan"))
                         for k in GT_KEYS_FOR_SKIP:
                             scene_gt_upper_by_metric[k].append(float("nan"))
                         continue
@@ -2393,16 +2574,18 @@ def main() -> None:
                     t_pair0 = time.perf_counter()
                     pred: Optional[Dict[str, torch.Tensor]] = None
                     new_global: Optional[torch.Tensor] = None
+                    t0_fwd = time.perf_counter()
                     with torch.no_grad(), torch.autocast(
                         device_type=autocast_device_type,
                         dtype=skip_loss_dtype,
                         enabled=use_amp,
                     ):
-                        if compute_similarity and not skip_gt_eval:
+                        if compute_similarity and layer_gt_eval:
                             pred = _forward_with_suffix_replay(
                                 model,
                                 images,
                                 replay_concat_layers,
+                                initial_tokens=initial_tokens,
                                 start_layer=i,
                                 skip_start=i,
                                 skip_end=j,
@@ -2420,6 +2603,7 @@ def main() -> None:
                                 model,
                                 replay_concat_layers,
                                 device=skip_loss_device,
+                                initial_tokens=initial_tokens,
                                 start_layer=i,
                                 target_layer=j,
                                 skip_start=i,
@@ -2428,11 +2612,12 @@ def main() -> None:
                                 pos_frame=pos_frame,
                                 pos_global=pos_global,
                             )
-                        elif not skip_gt_eval:
+                        elif layer_gt_eval:
                             pred = _forward_with_suffix_replay(
                                 model,
                                 images,
                                 replay_concat_layers,
+                                initial_tokens=initial_tokens,
                                 start_layer=i,
                                 skip_start=i,
                                 skip_end=j,
@@ -2440,8 +2625,11 @@ def main() -> None:
                                 pos_frame=pos_frame,
                                 pos_global=pos_global,
                             )
+                    t_forward = time.perf_counter() - t0_fwd
 
+                    t_similarity = 0.0
                     if compute_similarity:
+                        t0_sim = time.perf_counter()
                         assert new_global is not None
                         orig_global = _orig_global(j)
                         c = int(orig_global.shape[-1])
@@ -2449,6 +2637,8 @@ def main() -> None:
                         new_patch = new_global[:, :, patch_start_idx:, :].reshape(-1, c).float()
                         orig_special = orig_global[:, :, :patch_start_idx, :].reshape(-1, c).float()
                         new_special = new_global[:, :, :patch_start_idx, :].reshape(-1, c).float()
+                        orig_all = orig_global.reshape(-1, c).float()
+                        new_all = new_global.reshape(-1, c).float()
 
                         patch_sim = paired_layer_similarity_matrices(
                             (orig_patch,),
@@ -2462,25 +2652,42 @@ def main() -> None:
                             compute_pwcca=compute_pwcca,
                             device=analysis_device,
                         )
+                        all_sim = paired_layer_similarity_matrices(
+                            (orig_all,),
+                            (new_all,),
+                            compute_pwcca=compute_pwcca,
+                            device=analysis_device,
+                        )
                         for m in sim_metrics:
                             pv = patch_sim.get(m)
                             sv = special_sim.get(m)
+                            av = all_sim.get(m)
                             scene_patch_upper_by_metric[m].append(
                                 float(pv[0, 0].item()) if pv is not None else float("nan")
                             )
                             scene_special_upper_by_metric[m].append(
                                 float(sv[0, 0].item()) if sv is not None else float("nan")
                             )
+                            scene_all_upper_by_metric[m].append(
+                                float(av[0, 0].item()) if av is not None else float("nan")
+                            )
+                        t_similarity = time.perf_counter() - t0_sim
 
-                    if skip_gt_eval:
+                    t_payload = 0.0
+                    t_gt_eval = 0.0
+                    t_post = 0.0
+                    if not layer_gt_eval:
                         for k in GT_KEYS_FOR_SKIP:
                             scene_gt_upper_by_metric[k].append(float("nan"))
                     else:
                         assert pred is not None
                         assert eval_ctx is not None
                         assert scene_eff is not None
+                        t0_pl = time.perf_counter()
                         pred_cpu = predictions_to_cpu_float(pred)
                         payload = build_scene_prediction_payload(pred_cpu, hw)
+                        t_payload = time.perf_counter() - t0_pl
+                        t0_ev = time.perf_counter()
                         pruned_eval_row = build_scannet_eval_row_from_payload_with_context(
                             payload,
                             scene_eff,
@@ -2489,21 +2696,28 @@ def main() -> None:
                             chamfer_max_dist=args.chamfer_max_dist,
                             inference_time_ms=0.0,
                         )
+                        t_gt_eval = time.perf_counter() - t0_ev
+                        t0_po = time.perf_counter()
                         pruned_gt = metrics_float_dict(pruned_eval_row)
                         gt_delta = _aligned_change_per_key(stage1_gt, pruned_gt)
                         for k in GT_KEYS_FOR_SKIP:
                             scene_gt_upper_by_metric[k].append(float(gt_delta[k]) if k in gt_delta else float("nan"))
+                        t_post = time.perf_counter() - t0_po
 
+                    pair_total = time.perf_counter() - t_pair0
                     if args.timing:
                         print(
                             f"[timing] fusion scene {si + 1}/{len(selected)} {sid} | mode={mode} | "
-                            f"(i={i},j={j},span={j - i + 1}) total={time.perf_counter() - t_pair0:.2f}s",
+                            f"(i={i},j={j},span={j - i + 1}) total={pair_total:.2f}s "
+                            f"[forward={t_forward:.2f}s, sim={t_similarity:.2f}s, payload={t_payload:.2f}s, "
+                            f"gt_eval={t_gt_eval:.2f}s, post={t_post:.2f}s]",
                             flush=True,
                         )
 
             scene_fusion_by_mode[mode] = {
                 "global_patch_similarity_upper_by_metric": scene_patch_upper_by_metric,
                 "global_special_similarity_upper_by_metric": scene_special_upper_by_metric,
+                "global_all_similarity_upper_by_metric": scene_all_upper_by_metric,
                 "gt_delta_upper_by_metric": scene_gt_upper_by_metric,
             }
 
@@ -2532,6 +2746,9 @@ def main() -> None:
                     mode: {
                         "global_patch_similarity_upper_by_metric": mode_map["global_patch_similarity_upper_by_metric"],
                         "global_special_similarity_upper_by_metric": mode_map["global_special_similarity_upper_by_metric"],
+                        "global_all_similarity_upper_by_metric": mode_map.get(
+                            "global_all_similarity_upper_by_metric", {}
+                        ),
                     }
                     for mode, mode_map in scene_modes.items()
                     if isinstance(mode_map, dict)
@@ -2580,6 +2797,7 @@ def main() -> None:
                             similarity_mode="intra_layer_frame_vs_global",
                             title_suffix=f" ({sid}, {mode})",
                             fname_prefix=f"{safe_id}_{mode}_",
+                            all_upper=mode_map.get("global_all_similarity_upper_by_metric") or None,
                         )
                     if save_skip_output:
                         assert per_scene_skip_dir is not None
@@ -2629,7 +2847,7 @@ def main() -> None:
         compute_pwcca=compute_pwcca,
         fusion_num_procs=fusion_num_procs,
         analysis_device=analysis_device,
-        skip_gt_eval=skip_gt_eval,
+        skip_gt_eval=not layer_gt_eval,
         fusion_save_per_scene=save_per_scene,
         timing_main=None,
     )

@@ -36,7 +36,7 @@ except ImportError as exc:  # pragma: no cover - import guard for optional demo 
 from vggt.models.vggt import VGGT
 
 from .redundancy.metrics import upper_triangle_unpack_for_heatmap
-from analysis.eval.scannet_eval import SceneData, discover_scannet_scenes, load_scene_images
+from analysis.eval.scannet_eval import SceneData, load_scene_images
 from .redundancy.visualize_pair_attention import (
     _build_global_positions,
     _load_cache_row,
@@ -47,7 +47,8 @@ from .redundancy.visualize_pair_attention import (
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Interactive browser panel for pair attention.")
-    p.add_argument("--cache-dir", type=Path, default=Path("analysis_outputs/scannet_cache"))
+    p.add_argument("--dataset", type=str, default="scannet", choices=["scannet", "7scenes", "nrgbd"])
+    p.add_argument("--cache-dir", type=Path, default=Path("analysis_outputs/cache"))
     p.add_argument(
         "--lora-dir",
         type=Path,
@@ -60,9 +61,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Legacy single analysis dir. If set, used for both similarity and skip reports.",
     )
-    p.add_argument("--analysis-sim-dir", type=Path, default=Path("analysis_outputs/scannet_redundancy_similarity"))
-    p.add_argument("--analysis-skip-dir", type=Path, default=Path("analysis_outputs/scannet_redundancy_skip"))
+    p.add_argument("--analysis-sim-dir", type=Path, default=Path("analysis_outputs/similarity"))
+    p.add_argument("--analysis-skip-dir", type=Path, default=Path("analysis_outputs/skip"))
     p.add_argument("--data-root", type=Path, default=Path("data/scans_dev50/"))
+    p.add_argument("--scannet-root", type=Path, default=Path("data/scans_dev50/"))
+    p.add_argument("--root-7scenes", type=Path, default=Path("data/7scenes"))
+    p.add_argument("--root-nrgbd", type=Path, default=Path("data/neural_rgbd_data"))
     p.add_argument("--hf-model", type=str, default="", help="Optional HF model override; default reads manifest.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--server-name", type=str, default="127.0.0.1")
@@ -84,7 +88,7 @@ class SceneCache:
     row: Dict[str, Any]
     scene_eff: SceneData
     images: torch.Tensor
-    frame_ids: List[int]
+    frame_ids: List[str]
     image_hw: Tuple[int, int]
     patch_start_idx: int
     replay_layers: List[torch.Tensor]
@@ -128,16 +132,25 @@ class PairAttentionController:
         analysis_sim_dir: Path,
         analysis_skip_dir: Path,
         data_root: Path,
+        dataset: str,
+        data_roots_by_dataset: Dict[str, Path],
         hf_model: str,
         device_arg: str,
     ) -> None:
-        self.cache_dir = cache_dir
-        self.analysis_similarity_dir = analysis_sim_dir
-        self.analysis_skip_dir = analysis_skip_dir
+        self.cache_root = cache_dir
+        self.analysis_similarity_root = analysis_sim_dir
+        self.analysis_skip_root = analysis_skip_dir
         self.data_root = data_root
+        self.data_roots_by_dataset = dict(data_roots_by_dataset)
         self.device = torch.device(device_arg if torch.cuda.is_available() or device_arg == "cpu" else "cpu")
+        self.dataset = str(dataset).strip().lower()
 
-        manifest_path = cache_dir / "manifest.json"
+        self.cache_dir = self._resolve_dataset_dir(self.cache_root, self.dataset)
+        self.analysis_similarity_dir = self._resolve_dataset_dir(self.analysis_similarity_root, self.dataset)
+        self.analysis_skip_dir = self._resolve_dataset_dir(self.analysis_skip_root, self.dataset)
+        self.data_root = self.data_roots_by_dataset.get(self.dataset, self.data_root)
+
+        manifest_path = self.cache_dir / "manifest.json"
         self.cache_available = manifest_path.exists()
         self.manifest: Dict[str, Any] = {}
         if self.cache_available:
@@ -150,7 +163,6 @@ class PairAttentionController:
             if scene_id and (has_dir or has_file):
                 self.scene_items[scene_id] = item
 
-        self.discovered = {s.scene_id: s for s in discover_scannet_scenes(data_root)}
         self.hf_model = hf_model.strip() or str(self.manifest.get("hf_model", "")).strip()
         # Model is required only for Pair Attention reconstruction; Stage2/LoRA/Eval tabs can work without it.
         self.pair_available = self.cache_available and bool(self.scene_items) and bool(self.hf_model)
@@ -162,6 +174,44 @@ class PairAttentionController:
         self.similarity_reports = self._discover_similarity_reports()
         self.skip_reports = self._discover_skip_reports()
         self.stage2_render_cache: Dict[Tuple[str, str, int], Tuple[Dict[str, List[np.ndarray]], str]] = {}
+
+    def _resolve_dataset_dir(self, root: Path, dataset: str) -> Path:
+        p = Path(root)
+        cand = p / dataset
+        if (cand / "manifest.json").exists() or (cand / "per_scene").exists() or cand.exists():
+            return cand
+        return p
+
+    def switch_dataset(self, dataset: str) -> None:
+        new_ds = str(dataset).strip().lower()
+        self.dataset = new_ds
+        self.cache_dir = self._resolve_dataset_dir(self.cache_root, self.dataset)
+        self.analysis_similarity_dir = self._resolve_dataset_dir(self.analysis_similarity_root, self.dataset)
+        self.analysis_skip_dir = self._resolve_dataset_dir(self.analysis_skip_root, self.dataset)
+        self.data_root = self.data_roots_by_dataset.get(self.dataset, self.data_root)
+
+        manifest_path = self.cache_dir / "manifest.json"
+        self.cache_available = manifest_path.exists()
+        self.manifest = {}
+        if self.cache_available:
+            self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.scene_items = {}
+        for item in self.manifest.get("scenes", []):
+            scene_id = str(item.get("scene_id", "")).strip()
+            has_dir = str(item.get("dir", "")).strip() != ""
+            has_file = str(item.get("file", "")).strip() != ""
+            if scene_id and (has_dir or has_file):
+                self.scene_items[scene_id] = item
+
+        self.hf_model = str(self.manifest.get("hf_model", "")).strip() or self.hf_model
+        self.pair_available = self.cache_available and bool(self.scene_items) and bool(self.hf_model)
+        self.scene_cache = {}
+        self.qk_cache = {}
+        self.stage2_render_cache = {}
+        self.stage1_eval_by_scene = self._load_stage1_eval_by_scene()
+        self.similarity_reports = self._discover_similarity_reports()
+        self.skip_reports = self._discover_skip_reports()
 
     def _get_model(self) -> VGGT:
         if not self.hf_model:
@@ -187,22 +237,15 @@ class PairAttentionController:
         model = self._get_model()
         return int(model.aggregator.global_blocks[0].attn.num_heads)
 
-    def _resolve_scene_eff(self, scene_id: str, frame_ids: List[int]) -> SceneData:
-        if scene_id not in self.discovered:
-            raise SystemExit(f"Scene {scene_id!r} not found under {self.data_root}.")
-        scene = self.discovered[scene_id]
-        frame_to_path = {int(p.stem): p for p in scene.image_paths}
-        selected_paths: List[Path] = []
-        missing: List[int] = []
-        for fid in frame_ids:
-            path = frame_to_path.get(int(fid))
-            if path is None:
-                missing.append(int(fid))
-            else:
-                selected_paths.append(path)
-        if missing:
-            raise SystemExit(f"Scene {scene_id!r} is missing frame files for ids: {missing}")
-        return SceneData(scene_id=scene.scene_id, scene_dir=scene.scene_dir, image_paths=selected_paths)
+    def _resolve_scene_eff(self, scene_id: str, item: Dict[str, Any]) -> SceneData:
+        image_paths_raw = item.get("image_paths")
+        if not isinstance(image_paths_raw, list) or not image_paths_raw:
+            raise SystemExit(
+                f"Scene {scene_id!r} manifest entry lacks image_paths; please rerun cache with cache_dataset."
+            )
+        image_paths = [Path(str(p)) for p in image_paths_raw]
+        scene_dir = image_paths[0].parent if image_paths else self.data_root
+        return SceneData(scene_id=scene_id, scene_dir=scene_dir, image_paths=image_paths)
 
     def get_scene_cache(self, scene_id: str) -> SceneCache:
         cached = self.scene_cache.get(scene_id)
@@ -210,7 +253,7 @@ class PairAttentionController:
             return cached
 
         item = self.scene_items[scene_id]
-        frame_ids = [int(x) for x in item.get("frame_ids", [])]
+        frame_ids = [str(x) for x in item.get("frame_ids", [])]
         if not frame_ids:
             raise SystemExit(f"Manifest entry for {scene_id!r} lacks frame_ids.")
         row = _load_cache_row(self.cache_dir, item)
@@ -218,7 +261,7 @@ class PairAttentionController:
         if not isinstance(replay_layers, list) or not replay_layers:
             raise SystemExit(f"Scene {scene_id!r} cache lacks aggregated_concat_per_layer. Please rerun Stage1.")
 
-        scene_eff = self._resolve_scene_eff(scene_id, frame_ids)
+        scene_eff = self._resolve_scene_eff(scene_id, item)
         images = load_scene_images(scene_eff, mode="crop")
         image_hw = tuple(int(x) for x in row["image_hw"])
         patch_start_idx = int(row["patch_start_idx"])
@@ -315,7 +358,7 @@ class PairAttentionController:
         return data if isinstance(data, dict) else {}
 
     def _load_stage1_eval_by_scene(self) -> Dict[str, Dict[str, float]]:
-        eval_path = self.cache_dir / "eval_scannet.json"
+        eval_path = self.cache_dir / "eval.json"
         payload = self._load_json_if_exists(eval_path)
         out: Dict[str, Dict[str, float]] = {}
         for row in payload.get("scenes", []):
@@ -629,6 +672,7 @@ STAGE2_METRIC_ROW_POSE = "pose"
 STAGE2_METRIC_ROW_POINT = "point"
 STAGE2_TOKEN_ROW_SPECIAL = "special"
 STAGE2_TOKEN_ROW_PATCH = "patch"
+STAGE2_TOKEN_ROW_ALL = "all"
 
 
 def _discover_lora_experiments(root: Path) -> List[str]:
@@ -702,6 +746,7 @@ def _stage2_row_visibility_flags(
         out.append(on and STAGE2_TOKEN_ROW_SPECIAL in tokens)
         out.append(on and STAGE2_METRIC_ROW_POINT in metrics)
         out.append(on and STAGE2_TOKEN_ROW_PATCH in tokens)
+        out.append(on and STAGE2_TOKEN_ROW_ALL in tokens)
     return out
 
 
@@ -814,6 +859,7 @@ def _extract_similarity_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str,
                 continue
             patch_map = mode_payload.get("global_patch_similarity_upper_by_metric")
             special_map = mode_payload.get("global_special_similarity_upper_by_metric")
+            all_map = mode_payload.get("global_all_similarity_upper_by_metric")
             patch_clean = (
                 {
                     str(k): packed
@@ -832,8 +878,17 @@ def _extract_similarity_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str,
                 if isinstance(special_map, dict)
                 else {}
             )
-            if patch_clean or special_clean:
-                out[str(mode)] = {"patch": patch_clean, "special": special_clean}
+            all_clean = (
+                {
+                    str(k): packed
+                    for k, packed in ((k, _coerce_packed(v)) for k, v in all_map.items())
+                    if packed is not None
+                }
+                if isinstance(all_map, dict)
+                else {}
+            )
+            if patch_clean or special_clean or all_clean:
+                out[str(mode)] = {"patch": patch_clean, "special": special_clean, "all": all_clean}
 
     # Legacy fallback: single-mode top-level similarity maps.
     legacy_patch = report.get("global_patch_similarity_upper")
@@ -858,7 +913,7 @@ def _extract_similarity_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str,
             else {}
         )
         if patch_clean or special_clean:
-            out.setdefault("default", {"patch": patch_clean, "special": special_clean})
+            out.setdefault("default", {"patch": patch_clean, "special": special_clean, "all": {}})
 
     return out
 
@@ -886,6 +941,40 @@ def _discover_skip_modes(skip_reports: Dict[str, Stage2SceneReport]) -> List[str
         for mode in _extract_skip_metric_maps_by_mode(scene_report.report).keys():
             _add(mode)
     return ordered
+
+
+def _discover_similarity_modes(similarity_reports: Dict[str, Stage2SceneReport]) -> List[str]:
+    ordered: List[str] = []
+
+    def _add(mode: str) -> None:
+        key = str(mode).strip()
+        if key and key not in ordered:
+            ordered.append(key)
+
+    report_items = [("mean", similarity_reports.get("mean"))]
+    report_items.extend((sid, rep) for sid, rep in similarity_reports.items() if sid != "mean")
+    for _sid, scene_report in report_items:
+        if scene_report is None:
+            continue
+        by_mode = _extract_similarity_metric_maps_by_mode(scene_report.report)
+        for mode in by_mode.keys():
+            _add(mode)
+    return ordered
+
+
+def _discover_stage2_modes(
+    similarity_reports: Dict[str, Stage2SceneReport],
+    skip_reports: Dict[str, Stage2SceneReport],
+) -> List[str]:
+    """Union of skip/similarity modes, preserving stable discovery order."""
+    out: List[str] = []
+    for mode in _discover_skip_modes(skip_reports):
+        if mode not in out:
+            out.append(mode)
+    for mode in _discover_similarity_modes(similarity_reports):
+        if mode not in out:
+            out.append(mode)
+    return out
 
 
 def _mean_stage1_baseline_for_metric(
@@ -922,7 +1011,7 @@ def _similarity_maps_for_skip_mode(
         return similarity_by_mode[skip_mode]
     if "default" in similarity_by_mode:
         return similarity_by_mode["default"]
-    return {"patch": {}, "special": {}}
+    return {"patch": {}, "special": {}, "all": {}}
 
 
 def _packed_delta_to_pct(
@@ -1022,7 +1111,7 @@ def _render_similarity_gallery(
     *,
     role_short: str,
 ) -> List[np.ndarray]:
-    """role_short: one-letter tag, e.g. S (special) / P (patch)."""
+    """role_short: one-letter tag, e.g. S (special) / P (patch) / A (all tokens)."""
     images: List[np.ndarray] = []
     tag = (role_short or "?").strip()[:1].upper()
     for metric_key, metric_label in SIMILARITY_METRICS:
@@ -1138,8 +1227,8 @@ def _render_panel_array(
     layer_idx: int,
     frame_a_index: int,
     frame_b_index: int,
-    frame_a_id: int,
-    frame_b_id: int,
+    frame_a_id: str,
+    frame_b_id: str,
     image_a: torch.Tensor,
     image_b: torch.Tensor,
     maps_ab: Dict[str, np.ndarray],
@@ -1225,7 +1314,7 @@ def _build_stage2_skip_maps(
         if not pct_by_mode:
             raise gr.Error(
                 "Mean pct view: no skip heatmaps built. "
-                f"Check {controller.cache_dir / 'eval_scannet.json'} has Stage1 metrics for "
+                f"Check {controller.cache_dir / 'eval.json'} has Stage1 metrics for "
                 f"scene_ids in full_report_skip.json."
             )
         detail = f"{n_fused} scenes" if n_fused > 0 else "full_report"
@@ -1233,7 +1322,7 @@ def _build_stage2_skip_maps(
 
     baseline_row = controller.stage1_eval_by_scene.get(scene_id)
     if baseline_row is None:
-        raise gr.Error(f"Missing Stage1 baseline metrics for {scene_id!r} in {controller.cache_dir / 'eval_scannet.json'}.")
+        raise gr.Error(f"Missing Stage1 baseline metrics for {scene_id!r} in {controller.cache_dir / 'eval.json'}.")
 
     pct_by_mode: Dict[str, Dict[str, List[float]]] = {}
     for mode, metric_map in skip_by_mode.items():
@@ -1301,10 +1390,15 @@ def _prepare_stage2_render(
             num_layers,
             role_short="P",
         )
+        galleries[f"sim_{mode}_all"] = _render_similarity_gallery(
+            sim_entry.get("all", {}),
+            num_layers,
+            role_short="A",
+        )
 
     mode_summaries = " | ".join(
         f"{mode}: skip {len(galleries[f'skip_{mode}_main'])+len(galleries[f'skip_{mode}_depth'])}, "
-        f"sim {len(galleries[f'sim_{mode}_special'])+len(galleries[f'sim_{mode}_patch'])}"
+        f"sim {len(galleries[f'sim_{mode}_special'])+len(galleries[f'sim_{mode}_patch'])+len(galleries[f'sim_{mode}_all'])}"
         for mode in mode_order
     )
     info = f"scene={scene_id} | view={value_mode} | {mode_summaries} | {skip_source} | pct_clip={clip_key}%"
@@ -1313,6 +1407,7 @@ def _prepare_stage2_render(
 
 
 def _build_ui(controller: PairAttentionController) -> gr.Blocks:
+    dataset_choices = ["scannet", "7scenes", "nrgbd"]
     scene_ids = controller.scene_ids()
     pair_enabled = bool(scene_ids)
     initial_scene = scene_ids[0] if scene_ids else None
@@ -1324,7 +1419,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         num_heads = 1
     initial_frame_a = 0
     initial_frame_b = min(1, len(frame_labels) - 1) if frame_labels else 0
-    stage2_skip_modes = _discover_skip_modes(controller.skip_reports)
+    stage2_modes = _discover_stage2_modes(controller.similarity_reports, controller.skip_reports)
     stage1_baseline_available = bool(controller.stage1_eval_by_scene)
     lora_root = getattr(controller, "lora_root", Path("analysis_outputs/lora_skip_baseline"))
     lora_exps = _discover_lora_experiments(Path(lora_root))
@@ -1422,6 +1517,52 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             frame_b_info,
         )
 
+    def _dataset_changed(dataset: str):
+        controller.switch_dataset(dataset)
+        scene_ids_new = controller.scene_ids()
+        stage2_scene_ids_new = controller.stage2_scene_ids()
+        initial_scene_new = scene_ids_new[0] if scene_ids_new else None
+        initial_stage2_scene_new = stage2_scene_ids_new[0] if stage2_scene_ids_new else None
+
+        if initial_scene_new is None:
+            return (
+                gr.update(value=controller.dataset),
+                gr.update(value=controller.dataset),
+                gr.update(choices=scene_ids_new, value=None),
+                "layers: 0, frames: 0",
+                gr.update(maximum=0, value=0),
+                gr.update(maximum=0, value=0),
+                gr.update(maximum=0, value=0),
+                None,
+                f"No scenes found under {controller.cache_dir}",
+                "",
+                "",
+                gr.update(choices=stage2_scene_ids_new, value=initial_stage2_scene_new),
+                f"dataset={controller.dataset} | sim={controller.analysis_similarity_dir} | skip={controller.analysis_skip_dir}",
+            )
+
+        max_layer_u, fa_u, fb_u, info_u, panel_u, summary_u, fa_info_u, fb_info_u = _scene_changed(
+            initial_scene_new,
+            score_space="before_softmax",
+            head_mode="mean",
+            head_index=0,
+        )
+        return (
+            gr.update(value=controller.dataset),
+            gr.update(value=controller.dataset),
+            gr.update(choices=scene_ids_new, value=initial_scene_new),
+            info_u,
+            max_layer_u,
+            fa_u,
+            fb_u,
+            panel_u,
+            summary_u,
+            fa_info_u,
+            fb_info_u,
+            gr.update(choices=stage2_scene_ids_new, value=initial_stage2_scene_new),
+            f"dataset={controller.dataset} | sim={controller.analysis_similarity_dir} | skip={controller.analysis_skip_dir}",
+        )
+
     def _refresh_stage2_full(
         scene_id: str,
         value_mode: str,
@@ -1430,15 +1571,16 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         filter_metric_rows: List[str] | None,
         filter_token_rows: List[str] | None,
     ):
-        galleries, details = _prepare_stage2_render(controller, scene_id, value_mode, pct_clip_percent, stage2_skip_modes)
+        galleries, details = _prepare_stage2_render(controller, scene_id, value_mode, pct_clip_percent, stage2_modes)
         block_updates: List[Any] = []
-        for mode in stage2_skip_modes:
+        for mode in stage2_modes:
             block_updates.append(_gallery_update(galleries[f"skip_{mode}_main"]))
             block_updates.append(_gallery_update(galleries[f"sim_{mode}_special"]))
             block_updates.append(_gallery_update(galleries[f"skip_{mode}_depth"]))
             block_updates.append(_gallery_update(galleries[f"sim_{mode}_patch"]))
+            block_updates.append(_gallery_update(galleries[f"sim_{mode}_all"]))
         vis_flags = _stage2_row_visibility_flags(
-            stage2_skip_modes,
+            stage2_modes,
             list(filter_modes or []),
             list(filter_metric_rows or []),
             list(filter_token_rows or []),
@@ -1635,6 +1777,12 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             else:
                 with gr.Row():
                     with gr.Column(scale=1):
+                        dataset_dd = gr.Dropdown(
+                            label="Dataset",
+                            choices=dataset_choices,
+                            value=controller.dataset,
+                            info="Select cache/similarity/skip subdirectory under analysis_outputs/*/<dataset>/",
+                        )
                         scene_dd = gr.Dropdown(label="Scene", choices=scene_ids, value=initial_scene)
                         scene_info = gr.Textbox(
                             label="Scene metadata",
@@ -1687,15 +1835,21 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 head_index.change(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
                 tab_pair.select(_refresh_outputs, inputs=refresh_inputs, outputs=refresh_outputs)
 
-        with gr.Tab("Stage2 Heatmaps") as tab_stage2:
-            gr.Markdown("## Stage2 Heatmaps")
+        with gr.Tab("Heatmaps") as tab_stage2:
+            gr.Markdown("## Heatmaps")
             gr.Markdown(
-                "Choose `mean` or a scene. Per skip mode: pose → special sim → depth → patch sim. "
+                "Choose `mean` or a scene. Per skip mode: pose → special sim → depth → patch sim → all-token sim. "
                 "Use the **left filters** to show or hide fusion modes and row groups. "
                 "`pct` applies to skip rows only (mean uses full_report Δ then pct+clip vs mean Stage1)."
             )
             with gr.Row():
                 with gr.Column(scale=1):
+                    stage2_dataset_dd = gr.Dropdown(
+                        label="Dataset",
+                        choices=dataset_choices,
+                        value=controller.dataset,
+                        info="Switch Stage2 report roots to <sim/skip>/<dataset>/",
+                    )
                     stage2_scene_dd = gr.Dropdown(label="Scene", choices=stage2_scene_ids, value=initial_stage2_scene)
                     stage2_value_mode = gr.Radio(
                         label="Skip heatmap value",
@@ -1711,8 +1865,8 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     )
                     stage2_mode_filter = gr.CheckboxGroup(
                         label="Fusion / skip modes",
-                        choices=list(stage2_skip_modes),
-                        value=list(stage2_skip_modes),
+                        choices=list(stage2_modes),
+                        value=list(stage2_modes),
                     )
                     stage2_metric_rows_filter = gr.CheckboxGroup(
                         label="Skip Δ rows",
@@ -1722,20 +1876,21 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     )
                     stage2_token_rows_filter = gr.CheckboxGroup(
                         label="Token similarity rows",
-                        choices=[STAGE2_TOKEN_ROW_SPECIAL, STAGE2_TOKEN_ROW_PATCH],
-                        value=[STAGE2_TOKEN_ROW_SPECIAL, STAGE2_TOKEN_ROW_PATCH],
-                        info="special- vs patch-token heatmaps.",
+                        choices=[STAGE2_TOKEN_ROW_SPECIAL, STAGE2_TOKEN_ROW_PATCH, STAGE2_TOKEN_ROW_ALL],
+                        value=[STAGE2_TOKEN_ROW_SPECIAL, STAGE2_TOKEN_ROW_PATCH, STAGE2_TOKEN_ROW_ALL],
+                        info="special-, patch-, and all-token heatmaps.",
                     )
                     stage2_info = gr.Textbox(label="Displayed counts", interactive=False)
                 with gr.Column(scale=5, elem_classes=["stage2-right"]):
                     stage2_mode_galleries: List[gr.Gallery] = []
                     stage2_row_body_cols: List[gr.Column] = []
-                    for mode in stage2_skip_modes:
+                    for mode in stage2_modes:
                         for label, n_columns in (
                             (f"{mode}: pose", 4),
                             (f"{mode}: sim · special", 4),
                             (f"{mode}: depth", 3),
                             (f"{mode}: sim · patch", 4),
+                            (f"{mode}: sim · all tokens", 4),
                         ):
                             with gr.Row(elem_classes=["stage2-gallery-row"], equal_height=False):
                                 with gr.Column(scale=1, min_width=280) as row_body:
@@ -1767,11 +1922,47 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 stage2_metric_rows_filter.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
                 stage2_token_rows_filter.change(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
                 tab_stage2.select(_refresh_stage2_full, inputs=stage2_inputs, outputs=stage2_outputs)
+                stage2_dataset_dd.change(
+                    _dataset_changed,
+                    inputs=[stage2_dataset_dd],
+                    outputs=[
+                        dataset_dd,
+                        stage2_dataset_dd,
+                        scene_dd,
+                        scene_info,
+                        layer_slider,
+                        frame_a_slider,
+                        frame_b_slider,
+                        panel,
+                        summary,
+                        frame_a_info,
+                        frame_b_info,
+                        stage2_scene_dd,
+                        stage2_info,
+                    ],
+                )
             else:
                 stage2_info.value = (
                     f"No Stage2/Stage3 reports found under "
                     f"sim={controller.analysis_similarity_dir} and skip={controller.analysis_skip_dir}"
                 )
+            dataset_switch_outputs = [
+                dataset_dd,
+                stage2_dataset_dd,
+                scene_dd,
+                scene_info,
+                layer_slider,
+                frame_a_slider,
+                frame_b_slider,
+                panel,
+                summary,
+                frame_a_info,
+                frame_b_info,
+                stage2_scene_dd,
+                stage2_info,
+            ]
+            dataset_dd.change(_dataset_changed, inputs=[dataset_dd], outputs=dataset_switch_outputs)
+            stage2_dataset_dd.change(_dataset_changed, inputs=[stage2_dataset_dd], outputs=dataset_switch_outputs)
 
         with gr.Tab("Eval Visualization") as tab_eval:
             gr.Markdown("## Eval visualization (2D + 3D)")
@@ -1866,6 +2057,12 @@ def main() -> None:
         analysis_sim_dir=analysis_sim_dir,
         analysis_skip_dir=analysis_skip_dir,
         data_root=args.data_root,
+        dataset=args.dataset,
+        data_roots_by_dataset={
+            "scannet": args.scannet_root,
+            "7scenes": args.root_7scenes,
+            "nrgbd": args.root_nrgbd,
+        },
         hf_model=args.hf_model,
         device_arg=args.device,
     )
