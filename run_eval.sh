@@ -8,20 +8,18 @@ export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 # FastVGGT-aligned CLI knobs
-DATA_DIR="${DATA_DIR:-data/scans_test50,data/scans_dev50}"
+ROOT_SCANNET="${ROOT_SCANNET:-data/scans_test50,data/scans_dev50}"
+SCANNET_INPUT_FRAME="${SCANNET_INPUT_FRAME:-50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
 OUTPUT_DIR="${OUTPUT_DIR:-analysis_outputs/evaluation}"
 CKPT_PATH="${CKPT_PATH:-}"
 HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
-INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/redundancy/interval_config_90.json}"
+INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/train/interval_config_90.json}"
 DEVICE="${DEVICE:-cuda:0}"
-INPUT_FRAME="${INPUT_FRAME:-50}"
 NUM_SCENES="${NUM_SCENES:-0}"
 KF="${KF:-10}"
 SIZE="${SIZE:-518}"
-MERGING="${MERGING:-0}"
-MERGE_RATIO="${MERGE_RATIO:-0.9}"
 DEPTH_CONF_THRESH="${DEPTH_CONF_THRESH:-1.0}"
 CHAMFER_MAX_DIST="${CHAMFER_MAX_DIST:-0.5}"
 # Set to 1 to pass --skip_depth_eval (no depth_abs_rel / depth_delta1 vs ScanNet GT).
@@ -33,10 +31,10 @@ BASELINE_BACKEND="${BASELINE_BACKEND:-vggt}"
 FAST_BACKEND="${FAST_BACKEND:-fastvggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
 SCANNET_MODELS="${SCANNET_MODELS:-Baseline(vggt),Baseline(fastvggt),Ours(vggt),Ours(fastvggt)}"
-MODELS_7ANDN="${MODELS_7ANDN:-Baseline(fastvggt)}"
-# Tag used for ScanNet-style output directories. Defaults to basename of DATA_DIR
+MODELS_7ANDN="${MODELS_7ANDN:-Baseline(vggt),Baseline(fastvggt),Ours(vggt),Ours(fastvggt)}"
+# Tag used for ScanNet-style output directories. Defaults to basename of ROOT_SCANNET
 # (e.g. scans_dev50 / scans_test50), but you can override explicitly.
-SCANNET_TAG="${SCANNET_TAG:-$(basename "${DATA_DIR}")}"
+SCANNET_TAG="${SCANNET_TAG:-$(basename "${ROOT_SCANNET}")}"
 # Ours checkpoint resolution (used when model spec is Ours(<backend>))
 OURS_TRAIN_DIR="${OURS_TRAIN_DIR:-}"
 OURS_EPOCH="${OURS_EPOCH:-}"
@@ -81,16 +79,17 @@ run_scannet() {
   local model_name="$1"
   local backend="$2"
   local ckpt_flag="${3:-}" # "" or "ckpt"
+  local scannet_data_dir="${DATA_DIR:-${ROOT_SCANNET}}"
   local model_dir="${model_name}_${backend}"
   if [[ "${ckpt_flag}" == "ckpt" ]]; then
     model_dir="${model_dir}_ckpt"
   fi
-  local out_dir="${OUTPUT_DIR}/${SCANNET_TAG}_input_frame_${INPUT_FRAME}/${model_dir}"
+  local out_dir="${OUTPUT_DIR}/${SCANNET_TAG}_input_frame_${SCANNET_INPUT_FRAME}/${model_dir}"
   local num_scenes_arg="${NUM_SCENES}"
-  local input_frame_arg="${INPUT_FRAME}"
+  local input_frame_arg="${SCANNET_INPUT_FRAME}"
 
   args=(
-    --data_dir "${DATA_DIR}"
+    --data_dir "${scannet_data_dir}"
     --output_path "${out_dir}"
     --input_frame "${input_frame_arg}"
     --depth_conf_thresh "${DEPTH_CONF_THRESH}"
@@ -117,9 +116,6 @@ run_scannet() {
   else
     args+=(--hf_model "${HF_MODEL}")
   fi
-  if [[ "${backend}" == "fastvggt" ]]; then
-    args+=(--merging "${MERGING}" --merge_ratio "${MERGE_RATIO}")
-  fi
   if [[ "${SKIP_DEPTH_EVAL}" == "1" || "${SKIP_DEPTH_EVAL}" == "true" ]]; then
     args+=(--skip_depth_eval)
   fi
@@ -144,14 +140,12 @@ run_7andn() {
   local out_dir="${OUTPUT_DIR}/7andn/${model_dir}"
   local max_scenes=0
   local max_samples=0
-  local size_arg="${SIZE}"
-  local kf_arg="${KF}"
 
   args=(
     --device "${DEVICE}"
     --output_dir "${out_dir}"
-    --size "${size_arg}"
-    --kf "${kf_arg}"
+    --kf "${KF}"
+    --size "${SIZE}"
     --root_7scenes "${ROOT_7SCENES}"
     --root_nrgbd "${ROOT_NRGBD}"
     --max_scenes_per_dataset "${max_scenes}"
@@ -172,9 +166,6 @@ run_7andn() {
   else
     args+=(--hf_model "${HF_MODEL}")
   fi
-  if [[ "${backend}" == "fastvggt" ]]; then
-    args+=(--merging "${MERGING}" --merge_ratio "${MERGE_RATIO}")
-  fi
   if [[ "${EXPORT_VIS}" == "1" || "${EXPORT_VIS}" == "true" ]]; then
     args+=(--export-visualization --vis-max-points "${VIS_MAX_POINTS}")
   fi
@@ -194,7 +185,7 @@ echo "   run_scannet: ${RUN_SCANNET}"
 echo "   run_7andn: ${RUN_7ANDN}"
 
 if [[ "${RUN_SCANNET}" == "1" || "${RUN_SCANNET}" == "true" ]]; then
-  IFS=',' read -r -a DATA_DIR_ARR <<< "${DATA_DIR}"
+  IFS=',' read -r -a DATA_DIR_ARR <<< "${ROOT_SCANNET}"
   IFS=',' read -r -a SCANNET_MODEL_ARR <<< "${SCANNET_MODELS}"
   for dd in "${DATA_DIR_ARR[@]}"; do
     dd="$(trim_spaces "${dd}")"
@@ -223,6 +214,6 @@ fi
 python -m analysis.eval.summary --output-dir "${OUTPUT_DIR}"
 
 echo "== Done =="
-echo "   ScanNet outputs:  ${OUTPUT_DIR}/<scannet_tag>_input_frame_${INPUT_FRAME}/<model>_<backend>[_ckpt]"
+echo "   ScanNet outputs:  ${OUTPUT_DIR}/<scannet_tag>_input_frame_${SCANNET_INPUT_FRAME}/<model>_<backend>[_ckpt]"
 echo "   7N outputs:       ${OUTPUT_DIR}/7andn/<model>_<backend>[_ckpt]"
 

@@ -14,23 +14,16 @@ RUN_NRGBD="${RUN_NRGBD:-0}"
 
 # Shared knobs
 HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
-DEVICE="${DEVICE:-cuda}"
 # Replay cache load dtype only (Stage2 autocast is fixed via --skip-loss-dtype bfloat16).
 DTYPE="${DTYPE:-float32}"
-GT_PLY_DIR="${GT_PLY_DIR:-}"
-CHAMFER_MAX_DIST="${CHAMFER_MAX_DIST:-0.5}"
-DEPTH_CONF_THRESH="${DEPTH_CONF_THRESH:-1.0}"
 MAX_SPAN="${MAX_SPAN:-24}"
 MODES="${MODES:-skip_global}"
 SIMILARITY_METRICS="${SIMILARITY_METRICS:-cka,cosine,neg_mse}"
 TIMING="${TIMING:-1}"
 HEATMAP_FILL="${HEATMAP_FILL:-nan}"
-ANALYSIS_DEVICE="${ANALYSIS_DEVICE:-${DEVICE}}"
 SAVE_PER_SCENE="${SAVE_PER_SCENE:-1}"
-SAVE_HEATMAP_PNG="${SAVE_HEATMAP_PNG:-0}"
 NUM_PROCS="${NUM_PROCS:-1}"
 MAX_SCENES="${MAX_SCENES:-0}"
-EXPORT_VIS="${EXPORT_VIS:-0}"
 ENABLE_SIMILARITY="${ENABLE_SIMILARITY:-0}"
 LAYER_GT_EVAL="${LAYER_GT_EVAL:-1}"
 CACHE_SANITY_CHECK="${CACHE_SANITY_CHECK:-1}"
@@ -52,21 +45,12 @@ run_one_dataset() {
   echo "   max_scenes=${MAX_SCENES}"
 
   extra_args=()
-  if [[ -n "${GT_PLY_DIR}" ]]; then
-    extra_args+=(--gt-ply-dir "${GT_PLY_DIR}")
-  fi
   if [[ "${LAYER_GT_EVAL}" == "1" || "${LAYER_GT_EVAL}" == "true" ]]; then
     extra_args+=(--layer-gt-eval)
   fi
   extra_args+=(--cache-load-dtype "${DTYPE}")
   if [[ "${ENABLE_SIMILARITY}" != "1" && "${ENABLE_SIMILARITY}" != "true" ]]; then
     extra_args+=(--no-fusion-compute-similarity)
-  fi
-  if [[ "${EXPORT_VIS}" == "1" || "${EXPORT_VIS}" == "true" ]]; then
-    extra_args+=(--export-visualization --visualization-dir "${vis_dir}")
-  fi
-  if [[ "${SAVE_HEATMAP_PNG}" == "1" || "${SAVE_HEATMAP_PNG}" == "true" ]]; then
-    extra_args+=(--save-heatmap-png)
   fi
   if [[ "${CACHE_SANITY_CHECK}" != "1" && "${CACHE_SANITY_CHECK}" != "true" ]]; then
     extra_args+=(--disable-cache-sanity-check)
@@ -139,12 +123,7 @@ PY
     --skip-output-dir "${skip_dir}" \
     --data-root "${data_root}" \
     --hf-model "${HF_MODEL}" \
-    --device "${ANALYSIS_DEVICE}" \
-    --skip-loss-device "${DEVICE}" \
-    --skip-loss-dtype "bfloat16" \
     --heatmap-fill "${HEATMAP_FILL}" \
-    --chamfer-max-dist "${CHAMFER_MAX_DIST}" \
-    --depth-conf-thresh "${DEPTH_CONF_THRESH}" \
     --fusion-max-span "${MAX_SPAN}" \
     --fusion-num-procs "${NUM_PROCS}" \
     --fusion-modes "${mode_args[@]}" \

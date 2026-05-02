@@ -15,42 +15,26 @@ export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 CACHE_DIR="${CACHE_DIR:-analysis_outputs/scannet_cache}"
 HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
-OUT_DIR="${OUT_DIR:-analysis_outputs/lora_skip_baseline}"
+OUT_DIR="${OUT_DIR:-analysis_outputs/lora_skip}"
 # Backend switching (match run_eval.sh semantics)
 BACKEND="${BACKEND:-vggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
 # Hyperparam search config (enable one at a time, in recommended order):
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_lr.json}"
-SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/01_loss_weight.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/03_lora_dropout.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/02_rank_alpha_tuple.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_align_mse_cos_tuple.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_depth_point_grad_tuple.json}"
-# SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/hp_search/10_lr.json}"
-INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/redundancy/interval_config.template.json}"
+SEARCH_CONFIG_FILE="${SEARCH_CONFIG_FILE:-analysis/train/ablation.json}"
+INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/trian/interval_config_90.json}"
 VARIANT="${VARIANT:-multi_interval_config}"
 DEVICE="${DEVICE:-cuda}"
-CONDA_ENV="${CONDA_ENV:-vggt}"
-SEED="${SEED:-0}"
 EPOCHS="${EPOCHS:-50}"
 MAX_SCENES="${MAX_SCENES:-0}"
 MAX_STEPS="${MAX_STEPS:-0}"
+SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-100}"
 LR="${LR:-5e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
 MIN_LR="${MIN_LR:-1e-8}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 GRAD_CLIP_MAX_NORM="${GRAD_CLIP_MAX_NORM:-1.0}"
-SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-10}"
-RESUME_FROM="${RESUME_FROM:-}"
-LORA_RANK="${LORA_RANK:-128}"
-LORA_ALPHA="${LORA_ALPHA:-256}"
-LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
 
-W_ALIGN="${W_ALIGN:-1.0}"
-W_ALIGN_CKA="${W_ALIGN_CKA:-1.0}"
-W_ALIGN_MSE="${W_ALIGN_MSE:-0.0}"
-W_ALIGN_COS="${W_ALIGN_COS:-0.0}"
-W_PRED="${W_PRED:-1.0}"
+
 W_CAMERA="${W_CAMERA:-5.0}"
 W_DEPTH="${W_DEPTH:-1.0}"
 DEPTH_VALID_RANGE="${DEPTH_VALID_RANGE:-0.98}"
@@ -60,8 +44,18 @@ TARGET_SOURCE="${TARGET_SOURCE:-teacher}"   # teacher | dataset
 GT_DATA_ROOT="${GT_DATA_ROOT:-data/scans_dev50}"
 W_REG="${W_REG:-0.0}"
 USE_CHECKPOINT="${USE_CHECKPOINT:-1}"
+RESUME_FROM="${RESUME_FROM:-}"
 PRINT_STEP_TIMING="${PRINT_STEP_TIMING:-0}"
 EVAL_EPOCH="${EVAL_EPOCH:-5}"
+
+LORA_RANK="${LORA_RANK:-128}"
+LORA_ALPHA="${LORA_ALPHA:-256}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
+W_ALIGN="${W_ALIGN:-1.0}"
+W_ALIGN_CKA="${W_ALIGN_CKA:-1.0}"
+W_ALIGN_MSE="${W_ALIGN_MSE:-0.0}"
+W_ALIGN_COS="${W_ALIGN_COS:-1.0}"
+W_PRED="${W_PRED:-1.0}"
 DEV_DATA_ROOT="${DEV_DATA_ROOT:-data/scans_dev50}"
 TEST_DATA_DIR="${TEST_DATA_DIR:-data/scans_test50}"
 TEST_GT_PLY_DIR="${TEST_GT_PLY_DIR:-data/scans_test50}"
@@ -69,8 +63,7 @@ TEST_SANITY_AVG_FILE="${TEST_SANITY_AVG_FILE:-}"
 EVAL_MAX_SCENES="${EVAL_MAX_SCENES:-0}"
 EVAL_INPUT_FRAME="${EVAL_INPUT_FRAME:-30}"
 TEST_SANITY_ATOL="${TEST_SANITY_ATOL:-5e-3}"
-TEST_SANITY_RTOL="${TEST_SANITY_RTOL:-1e-2}"
-BOUNDS_CACHE_FILE="${BOUNDS_CACHE_FILE:-${OUT_DIR}/bounds_summary.json}"
+TEST_SANITY_RTOL="${TEST_SANITY_RTOL:-5e-3}"
 
 echo "== Train LoRA Skip Baseline =="
 echo "  CACHE_DIR=${CACHE_DIR}"
@@ -80,7 +73,6 @@ echo "  VARIANT=${VARIANT}"
 echo "  EPOCHS=${EPOCHS} MAX_SCENES=${MAX_SCENES} MAX_STEPS=${MAX_STEPS}"
 echo "  EVAL_EPOCH=${EVAL_EPOCH} EVAL_MAX_SCENES=${EVAL_MAX_SCENES} EVAL_INPUT_FRAME=${EVAL_INPUT_FRAME}"
 echo "  SEARCH_CONFIG_FILE=${SEARCH_CONFIG_FILE:-<none>}"
-echo "  CONDA_ENV=${CONDA_ENV}"
 echo "  BACKEND=${BACKEND}"
 
 # Avoid buffered/captured output so progress logs stream in real time.
@@ -124,14 +116,13 @@ run_one_trial() {
   echo "  OUT_DIR=${trial_out_dir}"
   ensure_bounds_cache "${trial_out_dir}"
   set_backend_pythonpath "${BACKEND}"
-  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.train.train_lora_skip_baseline \
+  conda run --no-capture-output -n python -m analysis.train.train_lora_skip_baseline \
     --cache-dir "${CACHE_DIR}" \
     --hf-model "${HF_MODEL}" \
     --output-dir "${trial_out_dir}" \
     --interval-config-file "${INTERVAL_CONFIG_FILE}" \
     --variant "${VARIANT}" \
     --device "${DEVICE}" \
-    --seed "${SEED}" \
     --epochs "${EPOCHS}" \
     --max-scenes "${MAX_SCENES}" \
     --max-steps "${MAX_STEPS}" \
@@ -161,7 +152,6 @@ run_one_trial() {
     --dev-data-root "${DEV_DATA_ROOT}" \
     --test-data-dir "${TEST_DATA_DIR}" \
     --test-gt-ply-dir "${TEST_GT_PLY_DIR}" \
-    --bounds-cache-file "${BOUNDS_CACHE_FILE}" \
     $( [[ -n "${TEST_SANITY_AVG_FILE}" ]] && printf '%s %s' --test-sanity-average-metrics-file "${TEST_SANITY_AVG_FILE}" ) \
     --eval-max-scenes "${EVAL_MAX_SCENES}" \
     --eval-input-frame "${EVAL_INPUT_FRAME}" \

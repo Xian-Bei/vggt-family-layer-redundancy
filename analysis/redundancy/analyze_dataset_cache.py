@@ -458,8 +458,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run skip-layer GT evaluation and produce GT delta outputs.",
     )
     p.add_argument("--gt-ply-dir", type=Path, default=None)
-    p.add_argument("--depth-conf-thresh", type=float, default=1.0)
-    p.add_argument("--chamfer-max-dist", type=float, default=0.5)
     p.add_argument(
         "--disable-cache-sanity-check",
         action="store_true",

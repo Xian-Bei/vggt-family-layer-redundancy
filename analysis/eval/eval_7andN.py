@@ -24,6 +24,27 @@ from analysis.train.model import (
 )
 
 
+def _depth_to_bshw(depth: torch.Tensor) -> torch.Tensor:
+    """
+    VGGT depth head (exp activation) returns [B, S, H, W, 1]. Confidence is [B, S, H, W].
+    Squeeze the trailing channel before torch.where / unprojection: a 5D depth and 4D conf
+    broadcast incorrectly from the right (..., 518, 1) vs (..., 392, 518), causing
+    RuntimeError on dim 3. FastVGGT eval_7andN uses world_points and does not hit this path.
+    """
+    if depth.ndim == 5 and depth.size(-1) == 1:
+        return depth.squeeze(-1)
+    return depth
+
+
+def _conf_to_bshw(conf: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize confidence layout to [B,S,H,W] to keep shape-consistent masking/cropping.
+    """
+    if conf.ndim == 5 and conf.size(-1) == 1:
+        return conf.squeeze(-1)
+    return conf
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser("3D Reconstruction evaluation", add_help=False)
     parser.add_argument(
@@ -44,7 +65,7 @@ def get_args_parser():
     parser.add_argument("--train-dir", type=str, default="", help="Training output dir for Ours checkpoint resolve.")
     parser.add_argument("--epoch", type=int, default=None, help="Epoch index for Ours checkpoint resolve.")
     parser.add_argument(
-        "--conf_thresh", type=float, default=0.0, help="confidence threshold"
+        "--conf_thresh", type=float, default=1.0, help="confidence threshold (evaluation uses >=1.0)"
     )
     parser.add_argument(
         "--output_dir",
@@ -153,6 +174,8 @@ def main(args):
     }
 
     device = args.device
+    # Evaluation-time confidence floor: keep only pred pixels/points with conf >= 1.0.
+    eval_conf_thresh = max(1.0, float(args.conf_thresh))
 
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     from criterion import Regr3D_t_ScaleShiftInv, L21
@@ -289,142 +312,150 @@ def main(args):
                 in_camera1 = None
 
                 dtype = torch.bfloat16
-                with torch.cuda.amp.autocast(dtype=dtype):
-                    if isinstance(batch, dict) and "img" in batch:
-                        batch["img"] = (batch["img"] + 1.0) / 2.0
-                    elif isinstance(batch, list) and all(
-                        isinstance(v, dict) and "img" in v for v in batch
-                    ):
-                        for view in batch:
-                            view["img"] = (view["img"] + 1.0) / 2.0
-                        # Gather all `img` tensors into a single tensor of shape [N, C, H, W]
-                        imgs_tensor = torch.cat([v["img"] for v in batch], dim=0)
+                if isinstance(batch, dict) and "img" in batch:
+                    batch["img"] = (batch["img"] + 1.0) / 2.0
+                elif isinstance(batch, list) and all(
+                    isinstance(v, dict) and "img" in v for v in batch
+                ):
+                    for view in batch:
+                        view["img"] = (view["img"] + 1.0) / 2.0
+                    # Gather all `img` tensors into a single tensor of shape [N, C, H, W]
+                    imgs_tensor = torch.cat([v["img"] for v in batch], dim=0)
 
-                with torch.cuda.amp.autocast(dtype=dtype):
-                    with torch.no_grad():
-                        torch.cuda.synchronize()
-                        start = time.time()
+                with torch.no_grad():
+                    torch.cuda.synchronize()
+                    start = time.time()
+                    # Keep input and post-processing out of autocast; only model forward is autocast.
+                    with torch.cuda.amp.autocast(dtype=dtype):
                         preds = model(imgs_tensor)
-                        torch.cuda.synchronize()
-                        end = time.time()
-                        inference_time_ms = (end - start) * 1000
-                        print(f"Inference time: {inference_time_ms:.2f}ms")
+                    torch.cuda.synchronize()
+                    end = time.time()
+                    inference_time_ms = (end - start) * 1000
+                    print(f"Inference time: {inference_time_ms:.2f}ms")
 
-                    # Wrap model outputs per-view to align with batch later
-                    predictions = preds
-                    views = batch  # list[dict]
-                    if "pose_enc" in predictions:
-                        B, S = predictions["pose_enc"].shape[:2]
-                    elif "world_points" in predictions:
-                        B, S = predictions["world_points"].shape[:2]
-                    else:
-                        raise KeyError(
-                            "predictions is missing a key to infer sequence length"
+                # Wrap model outputs per-view to align with batch later
+                predictions = preds
+                views = batch  # list[dict]
+                if "pose_enc" in predictions:
+                    B, S = predictions["pose_enc"].shape[:2]
+                elif "world_points" in predictions:
+                    B, S = predictions["world_points"].shape[:2]
+                else:
+                    raise KeyError(
+                        "predictions is missing a key to infer sequence length"
+                    )
+
+                # Switch point cloud source: use depth unprojection (like eval_scannet.py),
+                # instead of point-head `world_points` output.
+                img_hw = (int(imgs_tensor.shape[2]), int(imgs_tensor.shape[3]))
+                extrinsics, intrinsics = pose_encoding_to_extri_intri(
+                    predictions["pose_enc"], img_hw
+                )  # [B,S,3,4], [B,S,3,3]
+                depth = _depth_to_bshw(predictions["depth"])  # [B,S,H,W]
+                depth_conf = predictions.get("depth_conf", None)
+                if depth_conf is None:
+                    raise KeyError("predictions missing required key `depth_conf` for depth->points.")
+                depth_conf = _conf_to_bshw(depth_conf)
+                depth_f = depth.float()
+                if depth_f.shape != depth_conf.shape:
+                    raise ValueError(
+                        f"Depth/conf shape mismatch after layout normalize: depth={tuple(depth_f.shape)} conf={tuple(depth_conf.shape)}"
+                    )
+                depth_f = torch.where(
+                    depth_conf.float() >= eval_conf_thresh,
+                    depth_f,
+                    torch.full_like(depth_f, float("nan")),
+                )
+                world_points_from_depth = _depth_to_world_points_torch(
+                    depth_f, extrinsics, intrinsics
+                )  # [B,S,H,W,3]
+
+                ress = []
+                for s in range(S):
+                    res = {
+                        "pts3d_in_other_view": world_points_from_depth[:, s],
+                        # Use depth confidence as point confidence (closest analogue to world_points_conf).
+                        "conf": depth_conf[:, s],
+                        "depth": depth[:, s],
+                        "depth_conf": depth_conf[:, s],
+                        "camera_pose": predictions["pose_enc"][:, s, :],
+                    }
+                    if (
+                        isinstance(views, list)
+                        and s < len(views)
+                        and "valid_mask" in views[s]
+                    ):
+                        res["valid_mask"] = views[s]["valid_mask"]
+                    if "track" in predictions:
+                        res.update(
+                            {
+                                "track": predictions["track"][:, s],
+                                "vis": (
+                                    predictions.get("vis", None)[:, s]
+                                    if "vis" in predictions
+                                    else None
+                                ),
+                                "track_conf": (
+                                    predictions.get("conf", None)[:, s]
+                                    if "conf" in predictions
+                                    else None
+                                ),
+                            }
                         )
+                    ress.append(res)
 
-                    # Switch point cloud source: use depth unprojection (like eval_scannet.py),
-                    # instead of point-head `world_points` output.
-                    img_hw = (int(imgs_tensor.shape[2]), int(imgs_tensor.shape[3]))
-                    extrinsics, intrinsics = pose_encoding_to_extri_intri(
-                        predictions["pose_enc"], img_hw
-                    )  # [B,S,3,4], [B,S,3,3]
-                    depth = predictions["depth"]  # [B,S,H,W]
-                    depth_conf = predictions.get("depth_conf", None)
-                    if depth_conf is None:
-                        raise KeyError("predictions missing required key `depth_conf` for depth->points.")
-                    depth_f = depth.float()
-                    depth_f = torch.where(
-                        depth_conf.float() >= float(args.conf_thresh),
-                        depth_f,
-                        torch.full_like(depth_f, float("nan")),
-                    )
-                    world_points_from_depth = _depth_to_world_points_torch(
-                        depth_f, extrinsics, intrinsics
-                    )  # [B,S,H,W,3]
+                preds = ress
 
-                    ress = []
-                    for s in range(S):
-                        res = {
-                            "pts3d_in_other_view": world_points_from_depth[:, s],
-                            # Use depth confidence as point confidence (closest analogue to world_points_conf).
-                            "conf": depth_conf[:, s],
-                            "depth": predictions["depth"][:, s],
-                            "depth_conf": depth_conf[:, s],
-                            "camera_pose": predictions["pose_enc"][:, s, :],
-                        }
-                        if (
-                            isinstance(views, list)
-                            and s < len(views)
-                            and "valid_mask" in views[s]
-                        ):
-                            res["valid_mask"] = views[s]["valid_mask"]
-                        if "track" in predictions:
-                            res.update(
-                                {
-                                    "track": predictions["track"][:, s],
-                                    "vis": (
-                                        predictions.get("vis", None)[:, s]
-                                        if "vis" in predictions
-                                        else None
-                                    ),
-                                    "track_conf": (
-                                        predictions.get("conf", None)[:, s]
-                                        if "conf" in predictions
-                                        else None
-                                    ),
-                                }
-                            )
-                        ress.append(res)
+                valid_length = len(preds) // args.revisit
+                if args.revisit > 1:
+                    preds = preds[-valid_length:]
+                    batch = batch[-valid_length:]
 
-                    preds = ress
+                # Evaluation
+                print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
+                gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = (
+                    criterion.get_all_pts3d_t(batch, preds)
+                )
 
-                    valid_length = len(preds) // args.revisit
-                    if args.revisit > 1:
-                        preds = preds[-valid_length:]
-                        batch = batch[-valid_length:]
+                in_camera1 = None
+                pts_all = []
+                pts_gt_all = []
+                images_all = []
+                masks_all = []
+                conf_all = []
 
-                    # Evaluation
-                    print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
-                    gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = (
-                        criterion.get_all_pts3d_t(batch, preds)
-                    )
+                for j, view in enumerate(batch):
+                    if in_camera1 is None:
+                        in_camera1 = view["camera_pose"][0].cpu()
 
-                    in_camera1 = None
-                    pts_all = []
-                    pts_gt_all = []
-                    images_all = []
-                    masks_all = []
-                    conf_all = []
+                    image = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]
+                    mask = view["valid_mask"].cpu().numpy()[0]
 
-                    for j, view in enumerate(batch):
-                        if in_camera1 is None:
-                            in_camera1 = view["camera_pose"][0].cpu()
+                    pts = pred_pts[j].cpu().numpy()[0]
+                    conf = preds[j]["conf"].cpu().data.numpy()[0]
 
-                        image = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]
-                        mask = view["valid_mask"].cpu().numpy()[0]
+                    # mask = mask & (conf > 1.8)
 
-                        pts = pred_pts[j].cpu().numpy()[0]
-                        conf = preds[j]["conf"].cpu().data.numpy()[0]
+                    pts_gt = gt_pts[j].detach().cpu().numpy()[0]
 
-                        # mask = mask & (conf > 1.8)
+                    H, W = image.shape[:2]
+                    cx = W // 2
+                    cy = H // 2
+                    l, t = cx - 112, cy - 112
+                    r, b = cx + 112, cy + 112
+                    image = image[t:b, l:r]
+                    mask = mask[t:b, l:r]
+                    pts = pts[t:b, l:r]
+                    pts_gt = pts_gt[t:b, l:r]
+                    conf = conf[t:b, l:r]
+                    # Pred-confidence gating for point-cloud evaluation.
+                    mask = mask & (conf >= eval_conf_thresh)
 
-                        pts_gt = gt_pts[j].detach().cpu().numpy()[0]
-
-                        H, W = image.shape[:2]
-                        cx = W // 2
-                        cy = H // 2
-                        l, t = cx - 112, cy - 112
-                        r, b = cx + 112, cy + 112
-                        image = image[t:b, l:r]
-                        mask = mask[t:b, l:r]
-                        pts = pts[t:b, l:r]
-                        pts_gt = pts_gt[t:b, l:r]
-
-                        images_all.append(image[None, ...])
-                        pts_all.append(pts[None, ...])
-                        pts_gt_all.append(pts_gt[None, ...])
-                        masks_all.append(mask[None, ...])
-                        conf_all.append(conf[None, ...])
+                    images_all.append(image[None, ...])
+                    pts_all.append(pts[None, ...])
+                    pts_gt_all.append(pts_gt[None, ...])
+                    masks_all.append(mask[None, ...])
+                    conf_all.append(conf[None, ...])
 
                 images_all = np.concatenate(images_all, axis=0)
                 pts_all = np.concatenate(pts_all, axis=0)
@@ -433,6 +464,7 @@ def main(args):
                 conf_all = np.concatenate(conf_all, axis=0) if len(conf_all) > 0 else None
 
                 scene_id = view["label"][0].rsplit("/", 1)[0]
+                scene_num_images = len(batch)
                 # Record average inference time per scene
                 try:
                     scene_infer_times[scene_id].append(float(inference_time_ms))
@@ -451,14 +483,17 @@ def main(args):
                 images_all_masked = images_all[masks_all > 0]
                 conf_all_masked = conf_all[masks_all > 0] if conf_all is not None else None
 
-                mask = np.isfinite(pts_all_masked)
-                pts_all_masked = pts_all_masked[mask]
-                if conf_all_masked is not None:
-                    conf_all_masked = conf_all_masked[mask]
+                # Keep per-point alignment across pred/gt/image/conf. Filter by point validity (all XYZ finite),
+                # not element-wise validity, to avoid shape corruption (e.g. turning Nx3 into 1D).
+                pred_valid = np.isfinite(pts_all_masked).all(axis=-1)
+                gt_valid = np.isfinite(pts_gt_all_masked).all(axis=-1)
+                point_valid = pred_valid & gt_valid
 
-                mask_gt = np.isfinite(pts_gt_all_masked)
-                pts_gt_all_masked = pts_gt_all_masked[mask_gt]
-                images_all_masked = images_all_masked[mask]
+                pts_all_masked = pts_all_masked[point_valid]
+                pts_gt_all_masked = pts_gt_all_masked[point_valid]
+                images_all_masked = images_all_masked[point_valid]
+                if conf_all_masked is not None:
+                    conf_all_masked = conf_all_masked[point_valid]
 
                 # Reshape to point cloud (N, 3) before sampling
                 pts_all_masked = pts_all_masked.reshape(-1, 3)
@@ -466,6 +501,10 @@ def main(args):
                 images_all_masked = images_all_masked.reshape(-1, 3)
                 if conf_all_masked is not None:
                     conf_all_masked = conf_all_masked.reshape(-1)
+
+                if pts_all_masked.shape[0] == 0 or pts_gt_all_masked.shape[0] == 0:
+                    print(f"[warn] skip {scene_id}: no valid finite points after masking")
+                    continue
 
                 # If number of points exceeds threshold, sample by points
                 if pts_all_masked.shape[0] > 999999:
@@ -618,10 +657,10 @@ def main(args):
                     pcd_gt.points, pcd.points, gt_normal, pred_normal
                 )
                 print(
-                    f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
+                    f"Idx: {scene_id}, NumImgs: {scene_num_images}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
                 )
                 print(
-                    f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}",
+                    f"Idx: {scene_id}, NumImgs: {scene_num_images}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}",
                     file=open(log_file, "a"),
                 )
 

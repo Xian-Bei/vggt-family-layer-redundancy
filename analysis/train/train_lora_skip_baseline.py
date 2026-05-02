@@ -1321,7 +1321,6 @@ def main() -> None:
                 "dev_data_root": str(args.dev_data_root),
                 "test_data_dir": str(args.test_data_dir),
                 "test_gt_ply_dir": str(args.test_gt_ply_dir),
-                "bounds_cache_file": str(args.bounds_cache_file) if args.bounds_cache_file else None,
                 "test_sanity_average_metrics_file": (
                     str(args.test_sanity_average_metrics_file) if args.test_sanity_average_metrics_file else None
                 ),

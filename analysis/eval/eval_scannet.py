@@ -109,6 +109,8 @@ if __name__ == "__main__":
         help="Max points saved into viser_points(.npz) per scene (0 = keep all).",
     )
     args = parser.parse_args()
+    # Evaluation-time confidence floor: keep only pred pixels/points with conf >= 1.0.
+    eval_conf_thresh = max(1.0, float(args.depth_conf_thresh))
     # Reproducibility (does NOT force CUDA/SDPA deterministic kernels).
     SEED = 33
     random.seed(SEED)
@@ -206,7 +208,7 @@ if __name__ == "__main__":
                 depth_raw_np,
                 depth_conf_np,
             ) = infer_vggt_and_reconstruct(
-                model, vgg_input, dtype, args.depth_conf_thresh, image_paths
+                model, vgg_input, dtype, eval_conf_thresh, image_paths
             )
             print(f"Inference time: {inference_time_ms:.2f}ms")
 
@@ -230,6 +232,18 @@ if __name__ == "__main__":
                 try:
                     pred_depth_for_metrics = _depth_or_conf_to_shw(
                         depth_raw_np, "depth"
+                    )
+                    pred_conf_for_metrics = _depth_or_conf_to_shw(
+                        depth_conf_np, "conf"
+                    )
+                    if pred_depth_for_metrics.shape != pred_conf_for_metrics.shape:
+                        raise ValueError(
+                            f"pred depth/conf shape mismatch: {pred_depth_for_metrics.shape} vs {pred_conf_for_metrics.shape}"
+                        )
+                    pred_depth_for_metrics = np.where(
+                        pred_conf_for_metrics >= eval_conf_thresh,
+                        pred_depth_for_metrics,
+                        np.nan,
                     )
                 except Exception as e:
                     print(f"[warn] pred depth layout normalize failed for {scene}: {e}")
@@ -322,7 +336,7 @@ if __name__ == "__main__":
                         conf_map = np.asarray(dc[fi])
                         valid = np.isfinite(d) & (d > 0) & np.isfinite(conf_map)
                         # Apply the same conf threshold used in reconstruction.
-                        valid &= conf_map >= float(args.depth_conf_thresh)
+                        valid &= conf_map >= eval_conf_thresh
                         if not np.any(valid):
                             continue
                         # Unprojected points are not retained per-pixel; fall back to concatenated valid points we already computed.

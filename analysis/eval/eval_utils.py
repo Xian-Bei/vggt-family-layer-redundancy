@@ -33,6 +33,18 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
+def _depth_or_conf_to_shw(arr: np.ndarray, name: str) -> np.ndarray:
+    """
+    Normalize depth/conf from [S,H,W] or [S,H,W,1] to [S,H,W].
+    """
+    out = np.asarray(arr)
+    if out.ndim == 4 and out.shape[-1] == 1:
+        out = out[..., 0]
+    if out.ndim != 3:
+        raise ValueError(f"Expected {name} shape [S,H,W] or [S,H,W,1], got {out.shape}")
+    return out
+
+
 def shuffle_deque(dq, seed=None):
     # Set the random seed for reproducibility
     if seed is not None:
@@ -708,14 +720,16 @@ def infer_vggt_and_reconstruct(
 ]:
     torch.cuda.synchronize()
     start = time.time()
+    # Keep input image tensors out of autocast: preserve explicit fp32 image pipeline
+    # and only autocast model forward for speed.
+    vgg_input_cuda = vgg_input.cuda()
+    if vgg_input_cuda.dim() == 4:
+        images_batched = vgg_input_cuda.unsqueeze(0)
+    elif vgg_input_cuda.dim() == 5:
+        images_batched = vgg_input_cuda
+    else:
+        raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_input_cuda.shape)}")
     with torch.cuda.amp.autocast(dtype=dtype):
-        vgg_input_cuda = vgg_input.cuda().to(dtype)
-        if vgg_input_cuda.dim() == 4:
-            images_batched = vgg_input_cuda.unsqueeze(0)
-        elif vgg_input_cuda.dim() == 5:
-            images_batched = vgg_input_cuda
-        else:
-            raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_input_cuda.shape)}")
         if hasattr(model, "forward_from_aggregated_tokens") and _aggregator_supports_return_layers(
             model.aggregator
         ):
@@ -736,9 +750,17 @@ def infer_vggt_and_reconstruct(
 
     depth_tensor = predictions["depth"]
     depth_conf = predictions["depth_conf"]
-    depth_conf_np = depth_conf[0].detach().float().cpu().numpy()
+    depth_conf_np = _depth_or_conf_to_shw(
+        depth_conf[0].detach().float().cpu().numpy(), "depth_conf"
+    )
     depth_mask = depth_conf_np >= depth_conf_thresh
-    depth_raw_np = depth_tensor[0].detach().float().cpu().numpy()
+    depth_raw_np = _depth_or_conf_to_shw(
+        depth_tensor[0].detach().float().cpu().numpy(), "depth"
+    )
+    if depth_raw_np.shape != depth_conf_np.shape:
+        raise ValueError(
+            f"depth/depth_conf shape mismatch after normalize: depth={depth_raw_np.shape}, conf={depth_conf_np.shape}"
+        )
     depth_filtered = depth_raw_np.copy()
     depth_filtered[~depth_mask] = np.nan
     depth_np = depth_filtered

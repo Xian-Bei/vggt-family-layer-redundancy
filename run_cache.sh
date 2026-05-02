@@ -21,9 +21,6 @@ DTYPE="${DTYPE:-float32}"
 MAX_SCENES="${MAX_SCENES:-0}"
 MAX_FRAMES="${MAX_FRAMES:-50}"
 MAX_TOKENS_PER_LAYER="${MAX_TOKENS_PER_LAYER:-0}"
-CHAMFER_MAX_DIST="${CHAMFER_MAX_DIST:-0.5}"
-DEPTH_CONF_THRESH="${DEPTH_CONF_THRESH:-1.0}"
-GT_PLY_DIR="${GT_PLY_DIR:-}"
 # Per-scene timing in logs (1/true=on, 0/false=off). Python defaults to on if unset.
 TIMING="${TIMING:-1}"
 
@@ -48,9 +45,6 @@ run_one_dataset() {
   echo "   timing=${TIMING}"
 
   extra_args=()
-  if [[ -n "${GT_PLY_DIR}" ]]; then
-    extra_args+=(--gt-ply-dir "${GT_PLY_DIR}")
-  fi
   if [[ "${skip_gt_eval}" == "1" ]]; then
     extra_args+=(--skip-gt-eval)
   fi
@@ -70,8 +64,6 @@ run_one_dataset() {
     --max-tokens-per-layer "${MAX_TOKENS_PER_LAYER}" \
     --kf "${KF}" \
     --size "${SIZE}" \
-    --chamfer-max-dist "${CHAMFER_MAX_DIST}" \
-    --depth-conf-thresh "${DEPTH_CONF_THRESH}" \
     "${extra_args[@]}"
 }
 
