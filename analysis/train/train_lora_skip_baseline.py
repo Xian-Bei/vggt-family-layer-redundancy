@@ -24,6 +24,16 @@ from tqdm.auto import tqdm
 # Keep OpenCV/Matplotlib in headless mode for eval_utils imports.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MPLBACKEND", "Agg")
+# evo.tools.plot has its own settings.plot_backend that is applied at import time
+# (`apply_settings(SETTINGS)`) and ignores MPLBACKEND. Without this override, on
+# systems with a hostile/empty $DISPLAY the import would fail with:
+#   "Cannot load backend 'Qt5Agg' ... as 'headless' is currently running".
+try:
+    from evo.tools.settings import SETTINGS as _EVO_SETTINGS  # type: ignore
+
+    _EVO_SETTINGS.plot_backend = "Agg"
+except Exception:
+    pass
 
 _TRAINING_DIR = Path(__file__).resolve().parents[2] / "training"
 if str(_TRAINING_DIR) not in sys.path:
@@ -40,6 +50,7 @@ from analysis.eval.eval_utils import (
     load_poses,
 )
 from analysis.eval import evaluate_scene_and_save
+from analysis.eval.eval_7andn_utils import evaluate_7andn_dataset
 from analysis.train.model import (
     IntervalRule,
     build_skipped_layer_indices,
@@ -48,12 +59,12 @@ from analysis.train.model import (
     lora_injection_plan_from_rules,
     replace_skipped_layers_with_identity,
 )
-from analysis.redundancy.collect import collect_batch
 from analysis.redundancy.metrics import (
     linear_cka_value_tensor,
     sample_cosine_similarity_tensor,
 )
 from analysis.redundancy.cache_layout import (
+    _replay_layer_files,
     load_scene_metadata,
     load_scene_pred,
     load_scene_replay_layer,
@@ -62,19 +73,17 @@ from analysis.eval.prediction_eval import (
     _depth_or_conf_to_shw,
     _load_gt_depth_for_scene,
     build_fastvggt_scene_eval_context,
-    build_scannet_eval_row_from_payload_with_context,
-    write_eval_scannet_json,
 )
-from analysis.redundancy.prediction_save import build_scene_prediction_payload
 from analysis.eval.scannet_eval import (
     SceneData,
-    aggregate_metric_dict,
     discover_scannet_scenes,
-    load_scene_images,
     select_scene_image_paths_fastvggt,
 )
 from training.loss import compute_camera_loss, compute_depth_loss
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+
+_ALLOWED_INTERVAL_KEYS = frozenset({"l", "r", "skip_frame_in_interval"})
 
 
 def _load_interval_rules(path: Path) -> List[IntervalRule]:
@@ -89,6 +98,12 @@ def _load_interval_rules(path: Path) -> List[IntervalRule]:
     for i, item in enumerate(rules_raw):
         if not isinstance(item, dict):
             raise SystemExit(f"intervals[{i}] must be an object.")
+        unknown = set(item.keys()) - _ALLOWED_INTERVAL_KEYS
+        if unknown:
+            raise SystemExit(
+                f"intervals[{i}] has unsupported keys: {sorted(unknown)}; "
+                f"allowed: {sorted(_ALLOWED_INTERVAL_KEYS)}."
+            )
         try:
             l = int(item["l"])
             r = int(item["r"])
@@ -96,22 +111,12 @@ def _load_interval_rules(path: Path) -> List[IntervalRule]:
             raise SystemExit(f"intervals[{i}] must provide integer l/r: {e}") from e
         if l < 0 or r < 0 or l > r:
             raise SystemExit(f"intervals[{i}] invalid range [{l},{r}]")
-        inject_prev = str(item.get("inject_prev", "global"))
-        if inject_prev not in ("global", "frame_global"):
-            raise SystemExit(f"intervals[{i}].inject_prev must be 'global' or 'frame_global'.")
         skip_frame = bool(item.get("skip_frame_in_interval", True))
-        inject_inside = bool(item.get("inject_frame_inside_interval", False))
-        if skip_frame and inject_inside:
-            raise SystemExit(
-                f"intervals[{i}] has skip_frame_in_interval=true and inject_frame_inside_interval=true; incompatible."
-            )
         parsed.append(
             IntervalRule(
                 l=l,
                 r=r,
                 skip_frame_in_interval=skip_frame,
-                inject_prev=inject_prev,  # type: ignore[arg-type]
-                inject_frame_inside_interval=inject_inside,
             )
         )
     parsed = sorted(parsed, key=lambda x: (int(x.l), int(x.r)))
@@ -247,6 +252,7 @@ def _replay_student_cache_first(
     frame_skip_intervals: Sequence[Tuple[int, int]],
     global_skip_intervals: Sequence[Tuple[int, int]],
     lora_anchor_prev_layers: Sequence[int],
+    alignment_capture_layers: Sequence[int] = (),
     use_checkpoint: bool,
     device: torch.device,
     dummy_images: torch.Tensor,
@@ -279,6 +285,7 @@ def _replay_student_cache_first(
 
     required = set(_required_head_layers(model, num_layers))
     required.update(int(x) for x in lora_anchor_prev_layers)
+    required.update(int(x) for x in alignment_capture_layers)
     concat_out: Dict[int, torch.Tensor] = {}
 
     global_prev = seed_global.view(bsz, seq_len * p, c)
@@ -644,7 +651,8 @@ def _infer_num_layers(cache_dir: Path, scenes: Sequence[Dict[str, Any]]) -> int:
         layers_dir = cache_dir / scene_dir_name / "layers"
         if not layers_dir.exists():
             continue
-        layer_files = sorted(layers_dir.glob("layer_*.pt"))
+        # Must match load_scene_replay_layer: layer_-1.pt is initial tokens, not a replay block.
+        layer_files = _replay_layer_files(layers_dir)
         if layer_files:
             return len(layer_files)
     raise SystemExit("Could not infer num_layers from cache.")
@@ -747,94 +755,38 @@ def _float_metrics_from_aggregate(agg: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
-def _evaluate_dev_stage1_style(
-    *,
-    model: VGGT,
-    data_root: Path,
-    out_dir: Path,
-    max_scenes: int,
-    max_frames: int,
-    depth_conf_thresh: float,
-    chamfer_max_dist: float,
-    eval_amp_dtype: torch.dtype,
-    write_json: bool = True,
-) -> Dict[str, float]:
-    scenes = discover_scannet_scenes(data_root)
-    if max_scenes > 0:
-        scenes = scenes[:max_scenes]
-    if not scenes:
-        raise RuntimeError(f"No scenes found under {data_root}")
-    eval_rows: List[Dict[str, Any]] = []
-    was_training = bool(model.training)
-    model.eval()
-    t_eval0 = time.perf_counter()
-    try:
-        for scene in tqdm(scenes, desc="eval dev", leave=False):
-            scene_eff = select_scene_image_paths_fastvggt(scene, max_frames)
-            if not scene_eff.image_paths:
-                continue
-            images = load_scene_images(scene_eff, mode="crop")
-            if images.dim() == 3:
-                images = images.unsqueeze(0)
-            images = images.to(next(model.parameters()).device)
-            use_amp = images.device.type == "cuda"
-            t0 = time.perf_counter()
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=eval_amp_dtype, enabled=use_amp):
-                batch = collect_batch(model, images, keep_activations_on_gpu=False, collect_full_cache=False)
-            infer_ms = (time.perf_counter() - t0) * 1000.0
-            pred_payload = build_scene_prediction_payload(
-                batch.predictions,
-                (int(images.shape[-2]), int(images.shape[-1])),
-            )
-            ctx = build_fastvggt_scene_eval_context(
-                scene_eff,
-                data_root,
-                data_root,
-                image_hw=(int(images.shape[-2]), int(images.shape[-1])),
-            )
-            eval_rows.append(
-                build_scannet_eval_row_from_payload_with_context(
-                    pred_payload,
-                    scene_eff,
-                    ctx,
-                    depth_conf_thresh=depth_conf_thresh,
-                    chamfer_max_dist=chamfer_max_dist,
-                    inference_time_ms=infer_ms,
-                )
-            )
-    finally:
-        if was_training:
-            model.train()
-    if not eval_rows:
-        raise RuntimeError("No dev evaluation rows produced.")
-    aggregate = aggregate_metric_dict(
-        [{k: v for k, v in row.items() if k != "scene_id" and isinstance(v, (int, float))} for row in eval_rows]
-    )
-    if write_json:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        write_eval_scannet_json(
-            out_dir,
-            eval_rows,
-            extra_top_level={
-                "stage": "lora_skip_baseline_eval_dev",
-                "elapsed_seconds": float(time.perf_counter() - t_eval0),
-            },
-        )
-    return _float_metrics_from_aggregate(aggregate)
+_SCANNET_KEEP_KEYS = (
+    "chamfer_distance",
+    "ate",
+    "are",
+    "rpe_rot",
+    "rpe_trans",
+    "inference_time_ms",
+    "depth_abs_rel",
+    "depth_delta1",
+)
 
 
-def _evaluate_test_run_eval_style(
+def _evaluate_scannet_run_eval_style(
     *,
     model: VGGT,
     data_dir: Path,
     gt_ply_dir: Path,
-    out_dir: Path,
     input_frame: int,
     num_scenes: int,
     depth_conf_thresh: float,
     chamfer_max_dist: float,
     eval_amp_dtype: torch.dtype,
+    desc: str = "eval scannet",
 ) -> Dict[str, float]:
+    """Evaluate a ScanNet split using the exact ``run_eval.sh`` / ``eval_scannet.py`` pipeline.
+
+    This is the single entry point for both dev (scans_dev50) and test (scans_test50)
+    evaluation: ``infer_vggt_and_reconstruct`` + ``evaluate_scene_and_save``. We do
+    not use ``collect_batch`` here because fastvggt's ``forward_from_aggregated_tokens``
+    disables autocast internally and would re-introduce the BFloat16/Float dtype
+    mismatch that motivated this refactor.
+    """
     scene_names = (
         get_all_scenes(data_dir, num_scenes)
         if num_scenes > 0
@@ -844,7 +796,7 @@ def _evaluate_test_run_eval_style(
     was_training = bool(model.training)
     model.eval()
     try:
-        for scene in tqdm(scene_names, desc="eval test", leave=False):
+        for scene in tqdm(scene_names, desc=desc, leave=False):
             scene_dir = data_dir / f"{scene}"
             images_dir = scene_dir / "color"
             pose_path = scene_dir / "pose"
@@ -919,23 +871,13 @@ def _evaluate_test_run_eval_style(
                 all_scenes_metrics[scene] = {
                     key: float(value)
                     for key, value in metrics.items()
-                    if key
-                    in (
-                        "chamfer_distance",
-                        "ate",
-                        "are",
-                        "rpe_rot",
-                        "rpe_trans",
-                        "inference_time_ms",
-                        "depth_abs_rel",
-                        "depth_delta1",
-                    )
+                    if key in _SCANNET_KEEP_KEYS
                 }
     finally:
         if was_training:
             model.train()
     if not all_scenes_metrics:
-        raise RuntimeError("No test evaluation rows produced.")
+        raise RuntimeError(f"No scannet evaluation rows produced for {data_dir}.")
     keys = sorted({k for row in all_scenes_metrics.values() for k in row.keys()})
     avg: Dict[str, float] = {}
     for k in keys:
@@ -943,6 +885,82 @@ def _evaluate_test_run_eval_style(
         if vals:
             avg[k] = float(sum(vals) / len(vals))
     return avg
+
+
+# Periodic eval covers four datasets. Two metric families:
+#   - scannet_dev50, scannet_test50 → ScanNet metrics (chamfer/ate/are/...)
+#   - 7scenes, nrgbd → reconstruction metrics (acc/comp/nc/...)
+# Plotting groups (`_write_eval_artifacts`) share these splits.
+EVAL_SCANNET_DATASETS = ("scannet_dev50", "scannet_test50")
+EVAL_7ANDN_DATASETS = ("7scenes", "nrgbd")
+EVAL_DATASETS_ALL = EVAL_SCANNET_DATASETS + EVAL_7ANDN_DATASETS
+
+# 7scenes/nrgbd average_metrics.json schema (matches eval_7andN.py / backfill).
+_7ANDN_KEEP_KEYS = ("acc", "comp", "nc", "acc_med", "comp_med", "nc_med")
+
+# Dataset → directory name conventions for `<EVAL_ROOT>/7andn/<model>_<backend>/<KF>/<dir>`.
+_7ANDN_DIR_NAME = {"7scenes": "7scenes", "nrgbd": "NRGBD"}
+
+
+def _build_7andn_dataset(name: str, root: Path, kf: int, size: int = 518):
+    """Lazy build of SevenScenes / NRGBD datasets. Imports live inside this helper
+    because the `data` module mutates sys.path on import (see eval_7andn_utils)."""
+    from analysis.eval.eval_7andn_utils import evaluate_7andn_dataset  # noqa: F401  ensures sys.path is set up
+    from data import NRGBD, SevenScenes  # type: ignore
+
+    if size == 512:
+        resolution = (512, 384)
+    elif size == 224:
+        resolution = 224
+    elif size == 518:
+        resolution = (518, 392)
+    else:
+        raise NotImplementedError(f"Unsupported 7andn eval size={size}")
+    common = dict(
+        split="test",
+        ROOT=str(root),
+        resolution=resolution,
+        num_seq=1,
+        full_video=True,
+        kf_every=int(kf),
+        seed=33,
+    )
+    if name == "7scenes":
+        return SevenScenes(**common)
+    if name == "nrgbd":
+        return NRGBD(**common)
+    raise ValueError(f"Unknown 7andn dataset: {name}")
+
+
+def _evaluate_7andn_run_eval_style(
+    *,
+    model: VGGT,
+    dataset_name: str,
+    root: Path,
+    kf: int,
+    eval_amp_dtype: torch.dtype,
+    max_scenes_per_dataset: int,
+    device: str = "cuda",
+) -> Dict[str, float]:
+    """Run 7Scenes or NRGBD eval against a live model (no logs/JSON written).
+
+    Mirrors the run_eval.sh path via :func:`evaluate_7andn_dataset`, returning a
+    metric dict that's directly appendable to the periodic-eval history.
+    """
+    dataset = _build_7andn_dataset(dataset_name, root, kf=kf)
+    if int(max_scenes_per_dataset) > 0 and hasattr(dataset, "scene_list"):
+        dataset.scene_list = dataset.scene_list[: int(max_scenes_per_dataset)]
+    metrics = evaluate_7andn_dataset(
+        model=model,
+        dataset=dataset,
+        device=device,
+        eval_amp_dtype=eval_amp_dtype,
+        save_path=None,
+        eval_conf_thresh=1.0,
+        rng_np=np.random.default_rng(33),
+        write_average_metrics_json=False,
+    )
+    return {k: float(v) for k, v in metrics.items() if k in _7ANDN_KEEP_KEYS}
 
 
 def _run_stage1_upper_sanity_check(
@@ -1003,42 +1021,143 @@ def _append_eval_history(
     history_rows: List[Dict[str, Any]],
     *,
     epoch: int,
-    split: str,
+    dataset: str,
     tag: str,
     metrics: Dict[str, float],
 ) -> None:
     for k, v in metrics.items():
-        history_rows.append({"epoch": int(epoch), "split": str(split), "tag": str(tag), "metric": str(k), "value": float(v)})
+        history_rows.append(
+            {
+                "epoch": int(epoch),
+                "dataset": str(dataset),
+                "tag": str(tag),
+                "metric": str(k),
+                "value": float(v),
+            }
+        )
 
 
 def _eval_epochs_metrics_payload(history_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """One nested summary for periodic eval: epoch → dev/test metric dicts (for eval_epochs_metrics.json)."""
-    ep_dev: Dict[int, Dict[str, float]] = {}
-    ep_test: Dict[int, Dict[str, float]] = {}
+    """One nested summary for periodic eval: epoch → {dataset: {metric: value}}."""
+    ep: Dict[int, Dict[str, Dict[str, float]]] = {}
     for r in history_rows:
         if str(r.get("tag", "")) != "train":
             continue
-        split = str(r.get("split", ""))
-        ep = int(r["epoch"])
+        ds = str(r.get("dataset", ""))
+        if not ds:
+            continue
+        e = int(r["epoch"])
         key = str(r["metric"])
         val = float(r["value"])
-        if split == "dev":
-            ep_dev.setdefault(ep, {})[key] = val
-        elif split == "test":
-            ep_test.setdefault(ep, {})[key] = val
-    epochs_sorted = sorted(set(ep_dev.keys()) | set(ep_test.keys()))
+        ep.setdefault(e, {}).setdefault(ds, {})[key] = val
+    epochs_sorted = sorted(ep.keys())
     epochs_out: List[Dict[str, Any]] = []
-    for ep in epochs_sorted:
-        row: Dict[str, Any] = {"epoch": ep}
-        if ep in ep_dev:
-            row["dev"] = {k: ep_dev[ep][k] for k in sorted(ep_dev[ep].keys())}
-        if ep in ep_test:
-            row["test"] = {k: ep_test[ep][k] for k in sorted(ep_test[ep].keys())}
+    for e in epochs_sorted:
+        row: Dict[str, Any] = {"epoch": e}
+        for ds in EVAL_DATASETS_ALL:
+            if ds in ep[e]:
+                row[ds] = {k: ep[e][ds][k] for k in sorted(ep[e][ds].keys())}
         epochs_out.append(row)
     return {"epochs": epochs_out}
 
 
-def _write_eval_artifacts(out_dir: Path, bounds: Dict[str, Dict[str, float]], history_rows: List[Dict[str, Any]]) -> None:
+def _plot_metric_group(
+    out_dir: Path,
+    history_rows: List[Dict[str, Any]],
+    bounds: Dict[str, Dict[str, Dict[str, float]]],
+    *,
+    group_name: str,
+    datasets: Sequence[str],
+    color_map: Dict[str, str],
+    metric_whitelist: Optional[Sequence[str]] = None,
+) -> None:
+    """Render one PNG per metric in this group: each dataset contributes upper/lower/curve.
+
+    A metric is plotted only when *all* datasets in the group have both bounds and
+    at least one history row, mirroring the previous all-or-nothing behavior. When
+    ``metric_whitelist`` is provided, only those metrics are considered (drops
+    plot-clutter rows like ``num_scenes`` / ``nc1`` / ``nc2`` that are stored in
+    bounds for transparency but not meaningful in periodic-eval curves).
+    """
+    import matplotlib.pyplot as plt  # type: ignore
+
+    train_rows = [r for r in history_rows if str(r.get("tag", "")) == "train"]
+    if not train_rows:
+        return
+    per_dataset = {ds: [r for r in train_rows if str(r.get("dataset", "")) == ds] for ds in datasets}
+    metric_sets = [{str(r["metric"]) for r in per_dataset[ds]} for ds in datasets]
+    if not metric_sets or any(not s for s in metric_sets):
+        return
+    candidate_metrics = sorted(set.intersection(*metric_sets))
+    if metric_whitelist is not None:
+        allowed = set(metric_whitelist)
+        candidate_metrics = [m for m in candidate_metrics if m in allowed]
+
+    for metric in candidate_metrics:
+        bound_pairs = []
+        rows_per_dataset = {}
+        all_have_bounds = True
+        all_have_rows = True
+        for ds in datasets:
+            ub = bounds.get(ds, {}).get("upper", {}).get(metric)
+            lb = bounds.get(ds, {}).get("lower", {}).get(metric)
+            if ub is None or lb is None:
+                all_have_bounds = False
+                break
+            ds_rows = sorted(
+                (r for r in per_dataset[ds] if str(r.get("metric", "")) == metric),
+                key=lambda r: int(r["epoch"]),
+            )
+            if not ds_rows:
+                all_have_rows = False
+                break
+            bound_pairs.append((ds, ub, lb))
+            rows_per_dataset[ds] = ds_rows
+        if not (all_have_bounds and all_have_rows):
+            continue
+
+        plt.figure(figsize=(10, 6))
+        z_band = 1
+        z_curve = 3
+        for ds, ub, lb in bound_pairs:
+            color = color_map.get(ds, "#444444")
+            plt.axhline(
+                float(ub), linestyle="-.", color=color, linewidth=1.6,
+                label=f"{ds}_upper", zorder=z_band, alpha=0.95,
+            )
+            plt.axhline(
+                float(lb), linestyle=":", color=color, linewidth=1.6,
+                label=f"{ds}_lower", zorder=z_band, alpha=0.95,
+            )
+        # `marker_for(idx)` keeps two-dataset groups visually distinct; extend list as datasets grow.
+        markers = ["o", "s", "^", "D"]
+        for i, ds in enumerate(datasets):
+            color = color_map.get(ds, "#444444")
+            xs = [int(r["epoch"]) for r in rows_per_dataset[ds]]
+            ys = [float(r["value"]) for r in rows_per_dataset[ds]]
+            plt.plot(
+                xs, ys,
+                marker=markers[i % len(markers)],
+                linestyle="-" if i == 0 else "--",
+                color=color, linewidth=2.0,
+                label=ds, zorder=z_curve,
+            )
+        plt.xlabel("epoch")
+        plt.ylabel(metric)
+        title_legend = " vs ".join(f"{ds}" for ds in datasets)
+        plt.title(f"{metric} ({title_legend}; upper/lower/curve per dataset)")
+        plt.legend(loc="best", fontsize=9)
+        plt.grid(True, alpha=0.25)
+        plt.tight_layout()
+        plt.savefig(out_dir / f"eval_plot_{group_name}_{metric}.png", dpi=150)
+        plt.close()
+
+
+def _write_eval_artifacts(
+    out_dir: Path,
+    bounds: Dict[str, Dict[str, Dict[str, float]]],
+    history_rows: List[Dict[str, Any]],
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "eval_bounds.json").write_text(json.dumps(bounds, indent=2), encoding="utf-8")
     (out_dir / "eval_epochs_metrics.json").write_text(
@@ -1046,116 +1165,34 @@ def _write_eval_artifacts(out_dir: Path, bounds: Dict[str, Dict[str, float]], hi
         encoding="utf-8",
     )
     with (out_dir / "eval_metrics_history.csv").open("w", encoding="utf-8", newline="") as f:
-        fields = ["epoch", "split", "tag", "metric", "value"]
+        fields = ["epoch", "dataset", "tag", "metric", "value"]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in history_rows:
             w.writerow(r)
     try:
-        import matplotlib.pyplot as plt  # type: ignore
-
-        train_rows = [r for r in history_rows if str(r.get("tag", "")) == "train"]
-        metrics_with_dev = {str(r["metric"]) for r in train_rows if str(r.get("split", "")) == "dev"}
-        metrics_with_test = {str(r["metric"]) for r in train_rows if str(r.get("split", "")) == "test"}
-        # Only metrics that appear in periodic eval for both splits.
-        candidate_metrics = sorted(metrics_with_dev & metrics_with_test)
-
-        dev_color = "#c62828"  # red
-        test_color = "#1565c0"  # blue
-
-        for metric in candidate_metrics:
-            dev_rows = sorted(
-                (r for r in train_rows if str(r.get("split", "")) == "dev" and str(r.get("metric", "")) == metric),
-                key=lambda r: int(r["epoch"]),
-            )
-            test_rows = sorted(
-                (r for r in train_rows if str(r.get("split", "")) == "test" and str(r.get("metric", "")) == metric),
-                key=lambda r: int(r["epoch"]),
-            )
-            dev_ub = bounds.get("dev", {}).get("upper", {}).get(metric)
-            dev_lb = bounds.get("dev", {}).get("lower", {}).get(metric)
-            test_ub = bounds.get("test", {}).get("upper", {}).get(metric)
-            test_lb = bounds.get("test", {}).get("lower", {}).get(metric)
-            # One figure = dev upper/lower/plot + test upper/lower/plot (six series); skip otherwise.
-            if not dev_rows or not test_rows:
-                continue
-            if dev_ub is None or dev_lb is None or test_ub is None or test_lb is None:
-                continue
-
-            plt.figure(figsize=(10, 6))
-            z_band = 1
-            z_curve = 3
-
-            plt.axhline(
-                float(dev_ub),
-                linestyle="-.",
-                color=dev_color,
-                linewidth=1.6,
-                label="dev_upper",
-                zorder=z_band,
-                alpha=0.95,
-            )
-            plt.axhline(
-                float(dev_lb),
-                linestyle=":",
-                color=dev_color,
-                linewidth=1.6,
-                label="dev_lower",
-                zorder=z_band,
-                alpha=0.95,
-            )
-            plt.axhline(
-                float(test_ub),
-                linestyle="-.",
-                color=test_color,
-                linewidth=1.6,
-                label="test_upper",
-                zorder=z_band,
-                alpha=0.95,
-            )
-            plt.axhline(
-                float(test_lb),
-                linestyle=":",
-                color=test_color,
-                linewidth=1.6,
-                label="test_lower",
-                zorder=z_band,
-                alpha=0.95,
-            )
-
-            dev_xs = [int(r["epoch"]) for r in dev_rows]
-            dev_ys = [float(r["value"]) for r in dev_rows]
-            test_xs = [int(r["epoch"]) for r in test_rows]
-            test_ys = [float(r["value"]) for r in test_rows]
-            plt.plot(
-                dev_xs,
-                dev_ys,
-                marker="o",
-                linestyle="-",
-                color=dev_color,
-                linewidth=2.0,
-                label="dev",
-                zorder=z_curve,
-            )
-            plt.plot(
-                test_xs,
-                test_ys,
-                marker="s",
-                linestyle="--",
-                color=test_color,
-                linewidth=2.0,
-                label="test",
-                zorder=z_curve,
-            )
-
-            plt.xlabel("epoch")
-            plt.ylabel(metric)
-            plt.title(f"{metric} (dev red vs test blue; upper/lower/plot per split)")
-            plt.legend(loc="best", fontsize=9)
-            plt.grid(True, alpha=0.25)
-            plt.tight_layout()
-            plt.savefig(out_dir / f"eval_plot_{metric}.png", dpi=150)
-            plt.close()
+        # Two metric families → two figures per metric. Reuse the established
+        # red/blue palette: first dataset = red, second = blue.
+        scannet_colors = {"scannet_dev50": "#c62828", "scannet_test50": "#1565c0"}
+        andn_colors = {"7scenes": "#c62828", "nrgbd": "#1565c0"}
+        _plot_metric_group(
+            out_dir,
+            history_rows,
+            bounds,
+            group_name="scannet",
+            datasets=EVAL_SCANNET_DATASETS,
+            color_map=scannet_colors,
+            metric_whitelist=_SCANNET_KEEP_KEYS,
+        )
+        _plot_metric_group(
+            out_dir,
+            history_rows,
+            bounds,
+            group_name="7andn",
+            datasets=EVAL_7ANDN_DATASETS,
+            color_map=andn_colors,
+            metric_whitelist=_7ANDN_KEEP_KEYS,
+        )
     except Exception:
         pass
 
@@ -1168,10 +1205,13 @@ def _fmt_metric_brief(metrics: Dict[str, float], keys: Sequence[str]) -> str:
     return " ".join(parts)
 
 
-def _extract_bound_payload(bounds: Dict[str, Dict[str, Dict[str, float]]], tag: Literal["upper", "lower"]) -> Dict[str, Dict[str, float]]:
+def _extract_bound_payload(
+    bounds: Dict[str, Dict[str, Dict[str, float]]],
+    tag: Literal["upper", "lower"],
+) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
-    for split in ("dev", "test"):
-        out[split] = dict(bounds.get(split, {}).get(tag, {}))
+    for ds in EVAL_DATASETS_ALL:
+        out[ds] = dict(bounds.get(ds, {}).get(tag, {}))
     return out
 
 
@@ -1221,6 +1261,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--eval-max-scenes", type=int, default=0, help="0 means full split.")
     p.add_argument("--eval-input-frame", type=int, default=30)
+    # 7scenes / NRGBD periodic eval (mirrors run_eval.sh defaults).
+    p.add_argument("--root-7scenes", type=Path, default=Path("data/7scenes"))
+    p.add_argument("--root-nrgbd", type=Path, default=Path("data/neural_rgbd_data"))
+    p.add_argument(
+        "--eval-7andn-kf",
+        type=int,
+        default=10,
+        help="Keyframe step for 7scenes/NRGBD eval (matches run_eval.sh KF=10).",
+    )
+    p.add_argument(
+        "--eval-7andn-max-scenes-per-dataset",
+        type=int,
+        default=0,
+        help="Cap scenes per 7andn dataset for fast eval. 0 = use full split.",
+    )
     p.add_argument(
         "--test-sanity-atol",
         type=float,
@@ -1347,9 +1402,14 @@ def main() -> None:
     skipped_frame_idxs = build_skipped_layer_indices(frame_skip_intervals)
     skipped_idxs = sorted(set(skipped_global_idxs).union(skipped_frame_idxs))
     eval_dir = out_dir
-    # Bounds are always read directly from analysis_outputs/evaluation/*average_metrics.json.
+    # Bounds are read directly from analysis_outputs/evaluation/*average_metrics.json.
+    # Layout per dataset:
+    #   - scannet_dev50/test50: <EVAL_ROOT>/<scans_set>_input_frame_<N>/{Baseline|Ours}_<backend>/average_metrics.json
+    #   - 7scenes/nrgbd:        <EVAL_ROOT>/7andn/{Baseline|Ours}_<backend>/<KF>/<7scenes|NRGBD>/average_metrics.json
     eval_history_rows: List[Dict[str, Any]] = []
-    bounds: Dict[str, Dict[str, Dict[str, float]]] = {"dev": {"upper": {}, "lower": {}}, "test": {"upper": {}, "lower": {}}}
+    bounds: Dict[str, Dict[str, Dict[str, float]]] = {
+        ds: {"upper": {}, "lower": {}} for ds in EVAL_DATASETS_ALL
+    }
 
     def _build_model_variant(*, prune: bool, inject_lora: bool) -> Tuple[VGGT, List[nn.Parameter], int, int]:
         m = VGGT.from_pretrained(args.hf_model).to(device).train()
@@ -1366,7 +1426,7 @@ def main() -> None:
             if idx < 0 or idx >= len(m.aggregator.global_blocks):
                 raise SystemExit(f"Invalid skipped global index {idx} for model depth {len(m.aggregator.global_blocks)}")
             skipped_modules_before.append(m.aggregator.global_blocks[idx])
-        pre_total = sum(p.numel() for p in m.parameters())
+        pre_total = sum(p.numel() for p in m.aggregator.parameters())
         removed = count_unique_params(skipped_modules_before) if prune else 0
         if prune:
             replace_skipped_layers_with_identity(
@@ -1402,9 +1462,9 @@ def main() -> None:
     dev_set = Path(args.dev_data_root).name
     test_set = Path(args.test_data_dir).name
     input_frame = int(args.eval_input_frame)
+    andn_kf = int(args.eval_7andn_kf)
 
-    def _read_avg(scans_set: str, model_name: str) -> Dict[str, float]:
-        p = eval_root / f"{scans_set}_input_frame_{input_frame}" / f"{model_name}_{backend}" / "average_metrics.json"
+    def _read_avg_json(p: Path) -> Dict[str, float]:
         if not p.exists():
             raise SystemExit(f"Missing bounds file: {p}")
         payload = json.loads(p.read_text(encoding="utf-8"))
@@ -1412,31 +1472,39 @@ def main() -> None:
             raise SystemExit(f"Invalid bounds payload (expect object): {p}")
         return {str(k): float(v) for k, v in payload.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
-    bounds["dev"]["upper"] = _read_avg(dev_set, "Baseline")
-    bounds["dev"]["lower"] = _read_avg(dev_set, "Ours")
-    bounds["test"]["upper"] = _read_avg(test_set, "Baseline")
-    bounds["test"]["lower"] = _read_avg(test_set, "Ours")
+    def _scannet_bound_path(scans_set: str, model_name: str) -> Path:
+        return eval_root / f"{scans_set}_input_frame_{input_frame}" / f"{model_name}_{backend}" / "average_metrics.json"
+
+    def _7andn_bound_path(model_name: str, dataset: str) -> Path:
+        sub = _7ANDN_DIR_NAME[dataset]
+        return eval_root / "7andn" / f"{model_name}_{backend}" / str(andn_kf) / sub / "average_metrics.json"
+
+    # Dataset → {upper, lower} bound source resolver.
+    bound_sources = {
+        "scannet_dev50": (_scannet_bound_path(dev_set, "Baseline"), _scannet_bound_path(dev_set, "Ours")),
+        "scannet_test50": (_scannet_bound_path(test_set, "Baseline"), _scannet_bound_path(test_set, "Ours")),
+        "7scenes": (_7andn_bound_path("Baseline", "7scenes"), _7andn_bound_path("Ours", "7scenes")),
+        "nrgbd": (_7andn_bound_path("Baseline", "nrgbd"), _7andn_bound_path("Ours", "nrgbd")),
+    }
+    for ds, (upper_p, lower_p) in bound_sources.items():
+        bounds[ds]["upper"] = _read_avg_json(upper_p)
+        bounds[ds]["lower"] = _read_avg_json(lower_p)
     _log(
         f"[eval] loaded bounds from {eval_root} "
-        f"(dev={dev_set} test={test_set} input_frame={input_frame} backend={backend})"
+        f"(scannet_dev={dev_set} scannet_test={test_set} input_frame={input_frame} "
+        f"7andn_kf={andn_kf} backend={backend})"
     )
 
     # Lower bound = pruned model metrics before any LoRA training; log as epoch 0 for eval CSV/plots.
-    if bounds["dev"]["lower"] and bounds["test"]["lower"]:
-        _append_eval_history(
-            eval_history_rows,
-            epoch=0,
-            split="dev",
-            tag="train",
-            metrics=dict(bounds["dev"]["lower"]),
-        )
-        _append_eval_history(
-            eval_history_rows,
-            epoch=0,
-            split="test",
-            tag="train",
-            metrics=dict(bounds["test"]["lower"]),
-        )
+    for ds in EVAL_DATASETS_ALL:
+        if bounds[ds]["lower"]:
+            _append_eval_history(
+                eval_history_rows,
+                epoch=0,
+                dataset=ds,
+                tag="train",
+                metrics=dict(bounds[ds]["lower"]),
+            )
 
     if eval_history_rows:
         _write_eval_artifacts(out_dir, bounds, eval_history_rows)
@@ -1451,14 +1519,15 @@ def main() -> None:
         if not gt_scene_map:
             raise SystemExit(f"No GT scenes discovered under --gt-data-root={args.gt_data_root}")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.aggregator.parameters())
+    trainable_params = sum(p.numel() for p in model.aggregator.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     post_vs_pre_ratio = (100.0 * total_params / pre_prune_total_params) if pre_prune_total_params > 0 else 0.0
     frozen_ratio = (100.0 * frozen_params / total_params) if total_params > 0 else 0.0
     train_ratio = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
     _log(
-        f"[params] pre_prune={_format_param_count(pre_prune_total_params)} "
+        f"[params] aggregator only (excludes heads): "
+        f"pre_prune={_format_param_count(pre_prune_total_params)} "
         f"post_prune={_format_param_count(total_params)} ({post_vs_pre_ratio:.2f}% of pre-prune) "
         f"frozen={_format_param_count(frozen_params)} ({frozen_ratio:.2f}% of post-prune) "
         f"trainable={_format_param_count(trainable_params)} ({train_ratio:.2f}% of post-prune) "
@@ -1544,6 +1613,10 @@ def main() -> None:
             t_pred = 0.0
             t_backward = 0.0
             t_optim = 0.0
+            alignment_capture_layers = [
+                int(rule.r) if not rule.skip_frame_in_interval else int(rule.prev_layer)
+                for rule in rules
+            ]
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 t_replay0 = time.perf_counter()
                 replay = _replay_student_cache_first(
@@ -1553,6 +1626,7 @@ def main() -> None:
                     frame_skip_intervals=frame_skip_intervals,
                     global_skip_intervals=global_skip_intervals,
                     lora_anchor_prev_layers=prev_layers,
+                    alignment_capture_layers=alignment_capture_layers,
                     use_checkpoint=bool(args.use_checkpoint),
                     device=device,
                     dummy_images=dummy_images,
@@ -1569,27 +1643,31 @@ def main() -> None:
                 n_terms = 0
                 t_align0 = time.perf_counter()
                 for rule in rules:
-                    pidx = int(rule.prev_layer)
-                    s_concat = replay.concat_by_layer[pidx]
-                    t_concat = _get_layer_cpu(int(rule.r)).to(device=device, non_blocking=(device.type == "cuda"))
-                    sf, sg = _split_concat(s_concat)
-                    tf, tg = _split_concat(t_concat)
+                    # Per-rule alignment target:
+                    #   skip_frame_in_interval=True  -> student global_{l-1} (post-LoRA)
+                    #   skip_frame_in_interval=False -> student frame_r       (post-LoRA)
+                    # Teacher target is always cache layer r global half.
+                    if rule.skip_frame_in_interval:
+                        s_layer = int(rule.prev_layer)
+                        s_concat = replay.concat_by_layer[s_layer]
+                        _, s_term = _split_concat(s_concat)
+                    else:
+                        s_layer = int(rule.r)
+                        s_concat = replay.concat_by_layer[s_layer]
+                        s_term, _ = _split_concat(s_concat)
+                    t_concat = _get_layer_cpu(int(rule.r)).to(
+                        device=device, non_blocking=(device.type == "cuda")
+                    )
+                    _, t_term = _split_concat(t_concat)
                     mse_i = torch.zeros((), device=device)
                     cos_i = torch.zeros((), device=device)
                     cka_i = torch.zeros((), device=device)
                     if wam != 0.0:
-                        mse_i = mse_i + _loss_mse(sg, tg)
+                        mse_i = mse_i + _loss_mse(s_term, t_term)
                     if wac != 0.0:
-                        cos_i = cos_i + _loss_cos(sg, tg)
+                        cos_i = cos_i + _loss_cos(s_term, t_term)
                     if wak != 0.0:
-                        cka_i = cka_i + _loss_cka(sg, tg)
-                    if bool(rule.has_frame_lora):
-                        if wam != 0.0:
-                            mse_i = mse_i + _loss_mse(sf, tf)
-                        if wac != 0.0:
-                            cos_i = cos_i + _loss_cos(sf, tf)
-                        if wak != 0.0:
-                            cka_i = cka_i + _loss_cka(sf, tf)
+                        cka_i = cka_i + _loss_cka(s_term, t_term)
                     loss_align = loss_align + wam * mse_i + wac * cos_i + wak * cka_i
                     align_mse = align_mse + mse_i
                     align_cos = align_cos + cos_i
@@ -1727,35 +1805,48 @@ def main() -> None:
         _save_checkpoint(out_dir / "checkpoints" / "latest.pt", epoch)
         _write_curves(out_dir, rows)
         if int(args.eval_epoch) > 0 and (((epoch + 1) % int(args.eval_epoch)) == 0):
-            _log(f"[eval] epoch={epoch+1}: evaluating current LoRA model on dev/test")
-            t_eval_dev0 = time.perf_counter()
-            dev_metrics = _evaluate_dev_stage1_style(
-                model=model,
-                data_root=args.dev_data_root,
-                out_dir=out_dir,
-                max_scenes=int(args.eval_max_scenes),
-                max_frames=int(args.eval_input_frame),
-                depth_conf_thresh=1.0,
-                chamfer_max_dist=0.5,
-                eval_amp_dtype=amp_dtype,
-                write_json=False,
+            _log(
+                f"[eval] epoch={epoch+1}: evaluating current LoRA model on "
+                f"{', '.join(EVAL_DATASETS_ALL)}"
             )
-            _log(f"[eval][epoch={epoch+1}][scans_dev50] elapsed={time.perf_counter() - t_eval_dev0:.2f}s")
-            t_eval_test0 = time.perf_counter()
-            test_metrics = _evaluate_test_run_eval_style(
-                model=model,
-                data_dir=args.test_data_dir,
-                gt_ply_dir=args.test_gt_ply_dir,
-                out_dir=out_dir,
-                input_frame=int(args.eval_input_frame),
-                num_scenes=int(args.eval_max_scenes),
-                depth_conf_thresh=1.0,
-                chamfer_max_dist=0.5,
-                eval_amp_dtype=amp_dtype,
-            )
-            _log(f"[eval][epoch={epoch+1}][scans_test50] elapsed={time.perf_counter() - t_eval_test0:.2f}s")
-            _append_eval_history(eval_history_rows, epoch=epoch + 1, split="dev", tag="train", metrics=dev_metrics)
-            _append_eval_history(eval_history_rows, epoch=epoch + 1, split="test", tag="train", metrics=test_metrics)
+            for ds in EVAL_DATASETS_ALL:
+                t0 = time.perf_counter()
+                if ds in EVAL_SCANNET_DATASETS:
+                    data_dir, gt_ply_dir = (
+                        (args.dev_data_root, args.dev_data_root)
+                        if ds == "scannet_dev50"
+                        else (args.test_data_dir, args.test_gt_ply_dir)
+                    )
+                    metrics = _evaluate_scannet_run_eval_style(
+                        model=model,
+                        data_dir=data_dir,
+                        gt_ply_dir=gt_ply_dir,
+                        input_frame=int(args.eval_input_frame),
+                        num_scenes=int(args.eval_max_scenes),
+                        depth_conf_thresh=1.0,
+                        chamfer_max_dist=0.5,
+                        eval_amp_dtype=amp_dtype,
+                        desc=f"eval {ds}",
+                    )
+                else:
+                    root = args.root_7scenes if ds == "7scenes" else args.root_nrgbd
+                    metrics = _evaluate_7andn_run_eval_style(
+                        model=model,
+                        dataset_name=ds,
+                        root=root,
+                        kf=int(args.eval_7andn_kf),
+                        eval_amp_dtype=amp_dtype,
+                        max_scenes_per_dataset=int(args.eval_7andn_max_scenes_per_dataset),
+                        device="cuda" if device.type == "cuda" else str(device),
+                    )
+                _log(f"[eval][epoch={epoch+1}][{ds}] elapsed={time.perf_counter() - t0:.2f}s")
+                _append_eval_history(
+                    eval_history_rows,
+                    epoch=epoch + 1,
+                    dataset=ds,
+                    tag="train",
+                    metrics=metrics,
+                )
             _write_eval_artifacts(out_dir, bounds, eval_history_rows)
         if int(args.max_steps) > 0 and global_step >= int(args.max_steps):
             break

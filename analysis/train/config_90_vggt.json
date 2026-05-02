@@ -1,0 +1,21 @@
+{
+  "intervals": [
+    {
+      "l": 4,
+      "r": 10,
+      "skip_frame_in_interval": true
+    },
+    {
+      "l": 19,
+      "r": 22,
+      "skip_frame_in_interval": false
+    }
+  ],
+  "params": {
+    "BACKEND": "vggt",
+    "W_ALIGN": 1.0,
+    "W_ALIGN_CKA": 1.0,
+    "W_ALIGN_COS": 1.0,
+    "W_PRED": 1.0
+  }
+}

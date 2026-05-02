@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
+from analysis.aggregator_compat import aggregator_supports_return_layers
 from vggt.models.vggt import VGGT
 from .metrics import pairwise_similarity_matrices, spectral_stats
 
@@ -205,24 +206,44 @@ def collect_batch(
             _sync_cuda_if_needed(dev)
             timing_ms["patch_embed_cache_ms"] = (time.perf_counter() - t0) * 1000.0
             t1 = time.perf_counter()
-        selected_outputs, patch_start_idx = model.aggregator(
-            images,
-            return_layers=selected_layer_set,
-            layer_callback=_layer_callback if collect_full_cache else None,
-        )
+
+        supports_sparse = aggregator_supports_return_layers(model.aggregator)
+        if supports_sparse:
+            selected_outputs, patch_start_idx = model.aggregator(
+                images,
+                return_layers=selected_layer_set,
+                layer_callback=_layer_callback if collect_full_cache else None,
+            )
+        else:
+            if collect_full_cache:
+                raise RuntimeError(
+                    "collect_batch(..., collect_full_cache=True) needs an aggregator with "
+                    "`return_layers` and `layer_callback` (per-layer cache). "
+                    "FastVGGT's aggregator does not support that API; use collect_full_cache=False "
+                    "or the standard VGGT backend."
+                )
+            selected_outputs, patch_start_idx = model.aggregator(images)
+
         if timing_ms is not None:
             _sync_cuda_if_needed(dev)
             timing_ms["aggregator_ms"] = (time.perf_counter() - t1) * 1000.0
             t2 = time.perf_counter()
-        if len(selected_outputs) != len(required_layers):
-            raise RuntimeError(
-                f"Aggregator returned {len(selected_outputs)} selected layers, expected {len(required_layers)}."
+
+        if supports_sparse:
+            if len(selected_outputs) != len(required_layers):
+                raise RuntimeError(
+                    f"Aggregator returned {len(selected_outputs)} selected layers, expected {len(required_layers)}."
+                )
+            for layer_idx, tensor in zip(required_layers, selected_outputs):
+                selected_layer_tensors[layer_idx] = tensor
+            token_list_for_heads = _sparse_layer_list(
+                num_layers, selected_layer_tensors, require_last=model.camera_head is not None
             )
-        for layer_idx, tensor in zip(required_layers, selected_outputs):
-            selected_layer_tensors[layer_idx] = tensor
-        sparse_layers = _sparse_layer_list(num_layers, selected_layer_tensors, require_last=model.camera_head is not None)
+        else:
+            token_list_for_heads = selected_outputs
+
         preds = model.forward_from_aggregated_tokens(
-            sparse_layers,
+            token_list_for_heads,
             patch_start_idx,
             images,
         )

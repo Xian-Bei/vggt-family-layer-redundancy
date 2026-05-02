@@ -9,7 +9,6 @@ import cv2
 import io
 import random
 import time
-import inspect
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from copy import deepcopy
@@ -27,6 +26,8 @@ import open3d as o3d  # for point cloud processing and Chamfer Distance computat
 
 from scipy.spatial.transform import Rotation
 from torchvision import transforms as TF
+
+from analysis.aggregator_compat import aggregator_supports_return_layers
 
 
 from vggt.utils.geometry import unproject_depth_map_to_point_map
@@ -689,15 +690,6 @@ def compute_original_coords(
     return original_coords
 
 
-def _aggregator_supports_return_layers(aggregator) -> bool:
-    """FastVGGT vendor :class:`Aggregator` has no ``return_layers`` kwarg; main-repo VGGT does."""
-    try:
-        sig = inspect.signature(aggregator.forward)
-    except (TypeError, ValueError):
-        return False
-    return "return_layers" in sig.parameters
-
-
 def _required_prediction_layers_for_sparse_heads(model, num_layers):
     required = set()
     if getattr(model, "camera_head", None) is not None and num_layers > 0:
@@ -749,17 +741,29 @@ def infer_vggt_and_reconstruct(
         images_batched = vgg_input_cuda
     else:
         raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_input_cuda.shape)}")
-    with torch.cuda.amp.autocast(dtype=dtype):
-        if hasattr(model, "forward_from_aggregated_tokens") and _aggregator_supports_return_layers(
-            model.aggregator
-        ):
+    if hasattr(model, "forward_from_aggregated_tokens") and aggregator_supports_return_layers(
+        model.aggregator
+    ):
+        with torch.cuda.amp.autocast(dtype=dtype):
             predictions = _forward_vggt_sparse_heads(model, images_batched)
-        else:
-            # FastVGGT / vendor: full aggregator forward (no partial-layer API).
-            try:
-                predictions = model(images_batched, image_paths=image_paths)
-            except TypeError:
-                predictions = model(images_batched)
+    else:
+        # FastVGGT vendor: ``forward_from_aggregated_tokens`` opens its own
+        # ``autocast(enabled=False)`` block but does NOT cast the bf16 aggregator
+        # outputs back to fp32 before feeding them through ``camera_head.token_norm``,
+        # which trips ``LayerNorm`` (input bf16, weight fp32) — the exact "expected
+        # scalar type BFloat16 but found Float" error the training periodic eval was
+        # hitting. Stage the aggregator inside ``autocast(dtype)`` for speed, then
+        # explicitly upcast to fp32 before driving the heads outside autocast.
+        with torch.cuda.amp.autocast(dtype=dtype):
+            aggregated_tokens_list, patch_start_idx = model.aggregator(images_batched)
+        aggregated_tokens_list = [
+            t.float() if isinstance(t, torch.Tensor) else t for t in aggregated_tokens_list
+        ]
+        predictions = model.forward_from_aggregated_tokens(
+            aggregated_tokens_list,
+            int(patch_start_idx),
+            images_batched,
+        )
     torch.cuda.synchronize()
     end = time.time()
     inference_time_ms = (end - start) * 1000.0

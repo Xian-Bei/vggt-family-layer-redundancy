@@ -43,16 +43,10 @@ class IntervalRule:
     l: int
     r: int
     skip_frame_in_interval: bool
-    inject_prev: Literal["global", "frame_global"]
-    inject_frame_inside_interval: bool
 
     @property
     def prev_layer(self) -> int:
         return int(self.l) - 1
-
-    @property
-    def has_frame_lora(self) -> bool:
-        return bool(self.inject_prev == "frame_global" or self.inject_frame_inside_interval)
 
 
 def lora_injection_plan_from_rules(
@@ -63,9 +57,8 @@ def lora_injection_plan_from_rules(
     for rule in rules:
         pidx = int(rule.prev_layer)
         global_idxs.add(pidx)
-        if rule.inject_prev == "frame_global":
-            frame_idxs.add(pidx)
-        if (not rule.skip_frame_in_interval) and bool(rule.inject_frame_inside_interval):
+        frame_idxs.add(pidx)
+        if not rule.skip_frame_in_interval:
             frame_idxs.update(range(int(rule.l), int(rule.r) + 1))
     return sorted(frame_idxs), sorted(global_idxs)
 
@@ -154,21 +147,27 @@ def count_unique_params(modules: Sequence[nn.Module]) -> int:
     return total
 
 
+_ALLOWED_INTERVAL_KEYS = frozenset({"l", "r", "skip_frame_in_interval"})
+
+
 def interval_rules_from_payload(rules_raw: Sequence[Dict[str, Any]]) -> List[IntervalRule]:
     parsed: List[IntervalRule] = []
     for i, item in enumerate(rules_raw):
         if not isinstance(item, dict):
             raise ValueError(f"interval_rules[{i}] must be an object.")
-        inject_prev = str(item.get("inject_prev", "global"))
-        if inject_prev not in ("global", "frame_global"):
-            raise ValueError(f"interval_rules[{i}].inject_prev must be 'global' or 'frame_global'.")
+        unknown = set(item.keys()) - _ALLOWED_INTERVAL_KEYS
+        if unknown:
+            raise ValueError(
+                f"interval_rules[{i}] has unsupported keys: {sorted(unknown)}; "
+                f"allowed: {sorted(_ALLOWED_INTERVAL_KEYS)}."
+            )
+        if "l" not in item or "r" not in item:
+            raise ValueError(f"interval_rules[{i}] must provide both 'l' and 'r'.")
         parsed.append(
             IntervalRule(
                 l=int(item["l"]),
                 r=int(item["r"]),
                 skip_frame_in_interval=bool(item.get("skip_frame_in_interval", True)),
-                inject_prev=inject_prev,  # type: ignore[arg-type]
-                inject_frame_inside_interval=bool(item.get("inject_frame_inside_interval", False)),
             )
         )
     return parsed

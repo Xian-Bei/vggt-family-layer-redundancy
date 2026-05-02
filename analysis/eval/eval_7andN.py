@@ -1,58 +1,34 @@
-import os
-import sys
-import random
+"""7Scenes / NRGBD evaluation entrypoint.
 
-# Ensure project root is on sys.path for absolute imports like `vggt.*`
+Per-scene forward + ICP + accuracy/completion + average_metrics.json aggregation
+all live in :mod:`analysis.eval.eval_7andn_utils` so the same code path is shared
+with the training-time periodic eval (`train_lora_skip_baseline.py`). This file
+just parses CLI args, builds the model and the SevenScenes/NRGBD datasets, and
+delegates each dataset to ``evaluate_7andn_dataset``.
+"""
+
+import os
+import os.path as osp
+import sys
+
+# Mirror prior behavior: ensure project root is importable for `vggt.*`.
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-import time
-import torch
 import argparse
+import random
+
 import numpy as np
-import open3d as o3d
-import os.path as osp
-from torch.utils.data import DataLoader
-from torch.utils.data._utils.collate import default_collate
-from tqdm import tqdm
-from collections import defaultdict
-import torchvision.transforms as transforms
-from analysis.train.model import (
-    build_model,
-    load_interval_rules,
-)
+import torch
+
+from analysis.eval.eval_7andn_utils import evaluate_7andn_dataset
+from analysis.train.model import build_model, load_interval_rules
 
 
-def _depth_to_bshw(depth: torch.Tensor) -> torch.Tensor:
-    """
-    VGGT depth head (exp activation) returns [B, S, H, W, 1]. Confidence is [B, S, H, W].
-    Squeeze the trailing channel before torch.where / unprojection: a 5D depth and 4D conf
-    broadcast incorrectly from the right (..., 518, 1) vs (..., 392, 518), causing
-    RuntimeError on dim 3. FastVGGT eval_7andN uses world_points and does not hit this path.
-    """
-    if depth.ndim == 5 and depth.size(-1) == 1:
-        return depth.squeeze(-1)
-    return depth
-
-
-def _conf_to_bshw(conf: torch.Tensor) -> torch.Tensor:
-    """
-    Normalize confidence layout to [B,S,H,W] to keep shape-consistent masking/cropping.
-    """
-    if conf.ndim == 5 and conf.size(-1) == 1:
-        return conf.squeeze(-1)
-    return conf
-
-
-def get_args_parser():
+def get_args_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser("3D Reconstruction evaluation", add_help=False)
-    parser.add_argument(
-        "--ckpt_path",
-        type=str,
-        default="",
-        help="ckpt name",
-    )
+    parser.add_argument("--ckpt_path", type=str, default="", help="ckpt name")
     parser.add_argument("--device", type=str, default="cuda:0", help="device")
     parser.add_argument("--model-name", type=str, default="Baseline", choices=("Baseline", "Ours"))
     parser.add_argument("--backend", type=str, default="vggt", choices=("vggt", "fastvggt"))
@@ -77,27 +53,24 @@ def get_args_parser():
     parser.add_argument("--revisit", type=int, default=1, help="revisit times")
     parser.add_argument("--freeze", action="store_true")
     parser.add_argument("--use_proj", action="store_true")
-    parser.add_argument(
-        "--merging", type=int, default=0, help="VGGT aggregator merging steps"
-    )
-    parser.add_argument(
-        "--merge_ratio",
-        type=float,
-        default=0.9,
-        help="Token merge ratio (0.0-1.0)",
-    )
+    parser.add_argument("--merging", type=int, default=0, help="VGGT aggregator merging steps")
+    parser.add_argument("--merge_ratio", type=float, default=0.9, help="Token merge ratio (0.0-1.0)")
     parser.add_argument("--kf", type=int, default=2, help="key frame")
+    parser.add_argument("--root_7scenes", type=str, default="/data/sy/7scenes", help="7Scenes dataset root")
+    parser.add_argument("--root_nrgbd", type=str, default="/data/sy/neural_rgbd_data", help="NRGBD dataset root")
     parser.add_argument(
-        "--root_7scenes",
-        type=str,
-        default="/data/sy/7scenes",
-        help="7Scenes dataset root",
+        "--enable-7scenes",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="Enable 7Scenes evaluation (1=on, 0=off).",
     )
     parser.add_argument(
-        "--root_nrgbd",
-        type=str,
-        default="/data/sy/neural_rgbd_data",
-        help="NRGBD dataset root",
+        "--enable-nrgbd",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="Enable NRGBD evaluation (1=on, 0=off).",
     )
     parser.add_argument(
         "--max_scenes_per_dataset",
@@ -120,7 +93,7 @@ def get_args_parser():
     parser.add_argument(
         "--export-visualization",
         action="store_true",
-        help="Export per-scene visualization assets under <output_dir>/<kf>/<dataset>/<scene_id>/vis/ for the Gradio+Viser panel.",
+        help="Export per-scene visualization assets under <output_dir>/<kf>/<dataset>/<scene_id>/vis/.",
     )
     parser.add_argument(
         "--vis-max-points",
@@ -131,11 +104,17 @@ def get_args_parser():
     return parser
 
 
-def main(args):
-    from data import SevenScenes, NRGBD
-    from utils import accuracy, completion
+def _resolve_resolution(size: int):
+    if size == 512:
+        return (512, 384)
+    if size == 224:
+        return 224
+    if size == 518:
+        return (518, 392)
+    raise NotImplementedError(f"Unsupported --size={size}")
 
-    # Reproducibility (does NOT force CUDA/SDPA deterministic kernels).
+
+def main(args: argparse.Namespace) -> None:
     SEED = 33
     random.seed(SEED)
     np.random.seed(SEED)
@@ -144,16 +123,17 @@ def main(args):
         torch.cuda.manual_seed_all(SEED)
     rng_np = np.random.default_rng(SEED)
 
-    if args.size == 512:
-        resolution = (512, 384)
-    elif args.size == 224:
-        resolution = 224
-    elif args.size == 518:
-        resolution = (518, 392)
-    else:
-        raise NotImplementedError
-    datasets_all = {
-        "7scenes": SevenScenes(
+    resolution = _resolve_resolution(int(args.size))
+
+    # data.py imports `from base import ...` and `import dataset_utils.cropping`,
+    # both of which require `analysis/eval/` on sys.path. eval_7andn_utils.py
+    # already injects that path on import; importing it ensures we're aligned.
+    from analysis.eval.eval_7andn_utils import evaluate_7andn_dataset  # noqa: F401
+    from data import NRGBD, SevenScenes  # type: ignore
+
+    datasets_all = {}
+    if int(args.enable_7scenes) == 1:
+        datasets_all["7scenes"] = SevenScenes(
             split="test",
             ROOT=args.root_7scenes,
             resolution=resolution,
@@ -161,8 +141,9 @@ def main(args):
             full_video=True,
             kf_every=args.kf,
             seed=SEED,
-        ),  # 20),
-        "NRGBD": NRGBD(
+        )
+    if int(args.enable_nrgbd) == 1:
+        datasets_all["NRGBD"] = NRGBD(
             split="test",
             ROOT=args.root_nrgbd,
             resolution=resolution,
@@ -170,67 +151,12 @@ def main(args):
             full_video=True,
             kf_every=args.kf,
             seed=SEED,
-        ),
-    }
+        )
+    if not datasets_all:
+        raise SystemExit("Both --enable-7scenes and --enable-nrgbd are 0; nothing to evaluate.")
 
-    device = args.device
-    # Evaluation-time confidence floor: keep only pred pixels/points with conf >= 1.0.
     eval_conf_thresh = max(1.0, float(args.conf_thresh))
 
-    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-    from criterion import Regr3D_t_ScaleShiftInv, L21
-
-    def _depth_to_world_points_torch(
-        depth_bshw: torch.Tensor,
-        extrinsics_bsx34: torch.Tensor,
-        intrinsics_bsx33: torch.Tensor,
-        eps: float = 1e-8,
-    ) -> torch.Tensor:
-        """Unproject depth to world points (OpenCV extrinsic: cam_from_world)."""
-        if depth_bshw.dim() != 4:
-            raise ValueError(f"Expected depth [B,S,H,W], got {tuple(depth_bshw.shape)}")
-        if extrinsics_bsx34.shape[-2:] != (3, 4):
-            raise ValueError(f"Expected extrinsics [B,S,3,4], got {tuple(extrinsics_bsx34.shape)}")
-        if intrinsics_bsx33.shape[-2:] != (3, 3):
-            raise ValueError(f"Expected intrinsics [B,S,3,3], got {tuple(intrinsics_bsx33.shape)}")
-
-        B, S, H, W = depth_bshw.shape
-        device = depth_bshw.device
-
-        depth = depth_bshw.float()
-        fx = intrinsics_bsx33[..., 0, 0].float().unsqueeze(-1).unsqueeze(-1)  # [B,S,1,1]
-        fy = intrinsics_bsx33[..., 1, 1].float().unsqueeze(-1).unsqueeze(-1)
-        cx = intrinsics_bsx33[..., 0, 2].float().unsqueeze(-1).unsqueeze(-1)
-        cy = intrinsics_bsx33[..., 1, 2].float().unsqueeze(-1).unsqueeze(-1)
-
-        # Pixel grid [H,W]
-        u = torch.arange(W, device=device, dtype=torch.float32).view(1, 1, 1, W).expand(B, S, H, W)
-        v = torch.arange(H, device=device, dtype=torch.float32).view(1, 1, H, 1).expand(B, S, H, W)
-
-        valid = torch.isfinite(depth) & (depth > eps)
-        x_cam = (u - cx) * depth / fx
-        y_cam = (v - cy) * depth / fy
-        z_cam = depth
-
-        # [B,S,H,W,3]
-        cam_points = torch.stack([x_cam, y_cam, z_cam], dim=-1)
-
-        # Invert OpenCV extrinsic (cam_from_world): world_from_cam.
-        R_cw = extrinsics_bsx34[..., :3].float()  # [B,S,3,3]
-        t_cw = extrinsics_bsx34[..., 3].float()   # [B,S,3]
-        R_wc = R_cw.transpose(-1, -2)
-        t_wc = -(R_wc @ t_cw.unsqueeze(-1)).squeeze(-1)  # [B,S,3]
-
-        # world = R_wc @ cam + t_wc
-        world = (
-            torch.matmul(R_wc[:, :, None, None, :, :], cam_points.unsqueeze(-1)).squeeze(-1)
-            + t_wc[:, :, None, None, :]
-        )
-
-        world = torch.where(valid.unsqueeze(-1), world, torch.full_like(world, float("nan")))
-        return world
-
-    dtype = torch.bfloat16
     interval_rules = None
     if str(args.model_name) == "Ours" and (not str(args.ckpt_path).strip()) and (not str(args.train_dir).strip()):
         if not str(args.interval_config_file).strip():
@@ -250,502 +176,32 @@ def main(args):
         epoch=args.epoch,
         eval_mode=True,
     )
-
     model = model.cuda().eval()
 
     os.makedirs(osp.join(args.output_dir, f"{args.kf}"), exist_ok=True)
 
-    criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode=False, gt_scale=True)
-
-    with torch.no_grad():
-        for name_data, dataset in datasets_all.items():
-            if args.max_scenes_per_dataset > 0 and hasattr(dataset, "scene_list"):
-                dataset.scene_list = dataset.scene_list[: args.max_scenes_per_dataset]
-            save_path = osp.join(osp.join(args.output_dir, f"{args.kf}"), name_data)
-            os.makedirs(save_path, exist_ok=True)
-            log_file = osp.join(save_path, "logs.txt")
-
-            acc_all = 0
-            acc_all_med = 0
-            comp_all = 0
-            comp_all_med = 0
-            nc1_all = 0
-            nc1_all_med = 0
-            nc2_all = 0
-            nc2_all_med = 0
-            scene_infer_times = defaultdict(list)
-
-            total_items = len(dataset)
-            if args.max_samples > 0:
-                total_items = min(total_items, args.max_samples)
-            for data_idx in tqdm(range(total_items)):
-                batch = default_collate([dataset[data_idx]])
-                ignore_keys = set(
-                    [
-                        "depthmap",
-                        "dataset",
-                        "label",
-                        "instance",
-                        "idx",
-                        "true_shape",
-                        "rng",
-                    ]
-                )
-                for view in batch:
-                    for name in view.keys():  # pseudo_focal
-                        if name in ignore_keys:
-                            continue
-                        if isinstance(view[name], tuple) or isinstance(
-                            view[name], list
-                        ):
-                            view[name] = [
-                                x.to(device, non_blocking=True) for x in view[name]
-                            ]
-                        else:
-                            view[name] = view[name].to(device, non_blocking=True)
-
-                pts_all = []
-                pts_gt_all = []
-                images_all = []
-                masks_all = []
-                conf_all = []
-                in_camera1 = None
-
-                dtype = torch.bfloat16
-                if isinstance(batch, dict) and "img" in batch:
-                    batch["img"] = (batch["img"] + 1.0) / 2.0
-                elif isinstance(batch, list) and all(
-                    isinstance(v, dict) and "img" in v for v in batch
-                ):
-                    for view in batch:
-                        view["img"] = (view["img"] + 1.0) / 2.0
-                    # Gather all `img` tensors into a single tensor of shape [N, C, H, W]
-                    imgs_tensor = torch.cat([v["img"] for v in batch], dim=0)
-
-                with torch.no_grad():
-                    torch.cuda.synchronize()
-                    start = time.time()
-                    # Keep input and post-processing out of autocast; only model forward is autocast.
-                    with torch.cuda.amp.autocast(dtype=dtype):
-                        preds = model(imgs_tensor)
-                    torch.cuda.synchronize()
-                    end = time.time()
-                    inference_time_ms = (end - start) * 1000
-                    print(f"Inference time: {inference_time_ms:.2f}ms")
-
-                # Wrap model outputs per-view to align with batch later
-                predictions = preds
-                views = batch  # list[dict]
-                if "pose_enc" in predictions:
-                    B, S = predictions["pose_enc"].shape[:2]
-                elif "world_points" in predictions:
-                    B, S = predictions["world_points"].shape[:2]
-                else:
-                    raise KeyError(
-                        "predictions is missing a key to infer sequence length"
-                    )
-
-                # Switch point cloud source: use depth unprojection (like eval_scannet.py),
-                # instead of point-head `world_points` output.
-                img_hw = (int(imgs_tensor.shape[2]), int(imgs_tensor.shape[3]))
-                extrinsics, intrinsics = pose_encoding_to_extri_intri(
-                    predictions["pose_enc"], img_hw
-                )  # [B,S,3,4], [B,S,3,3]
-                depth = _depth_to_bshw(predictions["depth"])  # [B,S,H,W]
-                depth_conf = predictions.get("depth_conf", None)
-                if depth_conf is None:
-                    raise KeyError("predictions missing required key `depth_conf` for depth->points.")
-                depth_conf = _conf_to_bshw(depth_conf)
-                depth_f = depth.float()
-                if depth_f.shape != depth_conf.shape:
-                    raise ValueError(
-                        f"Depth/conf shape mismatch after layout normalize: depth={tuple(depth_f.shape)} conf={tuple(depth_conf.shape)}"
-                    )
-                depth_f = torch.where(
-                    depth_conf.float() >= eval_conf_thresh,
-                    depth_f,
-                    torch.full_like(depth_f, float("nan")),
-                )
-                world_points_from_depth = _depth_to_world_points_torch(
-                    depth_f, extrinsics, intrinsics
-                )  # [B,S,H,W,3]
-
-                ress = []
-                for s in range(S):
-                    res = {
-                        "pts3d_in_other_view": world_points_from_depth[:, s],
-                        # Use depth confidence as point confidence (closest analogue to world_points_conf).
-                        "conf": depth_conf[:, s],
-                        "depth": depth[:, s],
-                        "depth_conf": depth_conf[:, s],
-                        "camera_pose": predictions["pose_enc"][:, s, :],
-                    }
-                    if (
-                        isinstance(views, list)
-                        and s < len(views)
-                        and "valid_mask" in views[s]
-                    ):
-                        res["valid_mask"] = views[s]["valid_mask"]
-                    if "track" in predictions:
-                        res.update(
-                            {
-                                "track": predictions["track"][:, s],
-                                "vis": (
-                                    predictions.get("vis", None)[:, s]
-                                    if "vis" in predictions
-                                    else None
-                                ),
-                                "track_conf": (
-                                    predictions.get("conf", None)[:, s]
-                                    if "conf" in predictions
-                                    else None
-                                ),
-                            }
-                        )
-                    ress.append(res)
-
-                preds = ress
-
-                valid_length = len(preds) // args.revisit
-                if args.revisit > 1:
-                    preds = preds[-valid_length:]
-                    batch = batch[-valid_length:]
-
-                # Evaluation
-                print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
-                gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = (
-                    criterion.get_all_pts3d_t(batch, preds)
-                )
-
-                in_camera1 = None
-                pts_all = []
-                pts_gt_all = []
-                images_all = []
-                masks_all = []
-                conf_all = []
-
-                for j, view in enumerate(batch):
-                    if in_camera1 is None:
-                        in_camera1 = view["camera_pose"][0].cpu()
-
-                    image = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]
-                    mask = view["valid_mask"].cpu().numpy()[0]
-
-                    pts = pred_pts[j].cpu().numpy()[0]
-                    conf = preds[j]["conf"].cpu().data.numpy()[0]
-
-                    # mask = mask & (conf > 1.8)
-
-                    pts_gt = gt_pts[j].detach().cpu().numpy()[0]
-
-                    H, W = image.shape[:2]
-                    cx = W // 2
-                    cy = H // 2
-                    l, t = cx - 112, cy - 112
-                    r, b = cx + 112, cy + 112
-                    image = image[t:b, l:r]
-                    mask = mask[t:b, l:r]
-                    pts = pts[t:b, l:r]
-                    pts_gt = pts_gt[t:b, l:r]
-                    conf = conf[t:b, l:r]
-                    # Pred-confidence gating for point-cloud evaluation.
-                    mask = mask & (conf >= eval_conf_thresh)
-
-                    images_all.append(image[None, ...])
-                    pts_all.append(pts[None, ...])
-                    pts_gt_all.append(pts_gt[None, ...])
-                    masks_all.append(mask[None, ...])
-                    conf_all.append(conf[None, ...])
-
-                images_all = np.concatenate(images_all, axis=0)
-                pts_all = np.concatenate(pts_all, axis=0)
-                pts_gt_all = np.concatenate(pts_gt_all, axis=0)
-                masks_all = np.concatenate(masks_all, axis=0)
-                conf_all = np.concatenate(conf_all, axis=0) if len(conf_all) > 0 else None
-
-                scene_id = view["label"][0].rsplit("/", 1)[0]
-                scene_num_images = len(batch)
-                # Record average inference time per scene
-                try:
-                    scene_infer_times[scene_id].append(float(inference_time_ms))
-                except Exception:
-                    pass
-
-                save_params = {}
-
-                save_params["images_all"] = images_all
-                save_params["pts_all"] = pts_all
-                save_params["pts_gt_all"] = pts_gt_all
-                save_params["masks_all"] = masks_all
-
-                pts_all_masked = pts_all[masks_all > 0]
-                pts_gt_all_masked = pts_gt_all[masks_all > 0]
-                images_all_masked = images_all[masks_all > 0]
-                conf_all_masked = conf_all[masks_all > 0] if conf_all is not None else None
-
-                # Keep per-point alignment across pred/gt/image/conf. Filter by point validity (all XYZ finite),
-                # not element-wise validity, to avoid shape corruption (e.g. turning Nx3 into 1D).
-                pred_valid = np.isfinite(pts_all_masked).all(axis=-1)
-                gt_valid = np.isfinite(pts_gt_all_masked).all(axis=-1)
-                point_valid = pred_valid & gt_valid
-
-                pts_all_masked = pts_all_masked[point_valid]
-                pts_gt_all_masked = pts_gt_all_masked[point_valid]
-                images_all_masked = images_all_masked[point_valid]
-                if conf_all_masked is not None:
-                    conf_all_masked = conf_all_masked[point_valid]
-
-                # Reshape to point cloud (N, 3) before sampling
-                pts_all_masked = pts_all_masked.reshape(-1, 3)
-                pts_gt_all_masked = pts_gt_all_masked.reshape(-1, 3)
-                images_all_masked = images_all_masked.reshape(-1, 3)
-                if conf_all_masked is not None:
-                    conf_all_masked = conf_all_masked.reshape(-1)
-
-                if pts_all_masked.shape[0] == 0 or pts_gt_all_masked.shape[0] == 0:
-                    print(f"[warn] skip {scene_id}: no valid finite points after masking")
-                    continue
-
-                # If number of points exceeds threshold, sample by points
-                if pts_all_masked.shape[0] > 999999:
-                    sample_indices = rng_np.choice(
-                        pts_all_masked.shape[0], 999999, replace=False
-                    )
-                    pts_all_masked = pts_all_masked[sample_indices]
-                    images_all_masked = images_all_masked[sample_indices]
-                    if conf_all_masked is not None:
-                        conf_all_masked = conf_all_masked[sample_indices]
-
-                # Apply the same sampling to GT point cloud
-                if pts_gt_all_masked.shape[0] > 999999:
-                    sample_indices_gt = rng_np.choice(
-                        pts_gt_all_masked.shape[0], 999999, replace=False
-                    )
-                    pts_gt_all_masked = pts_gt_all_masked[sample_indices_gt]
-
-                if args.export_visualization:
-                    try:
-                        from pathlib import Path
-
-                        from analysis.vis.vis_assets import write_cameras_json, write_viser_points_npz
-
-                        scene_out = Path(save_path) / str(scene_id)
-                        vis_pred_dir = scene_out / "vis" / "pred"
-                        vis_gt_dir = scene_out / "vis" / "gt"
-                        vis_pred_dir.mkdir(parents=True, exist_ok=True)
-                        vis_gt_dir.mkdir(parents=True, exist_ok=True)
-
-                        cols_u8 = (np.asarray(images_all_masked, dtype=np.float32) * 255.0).clip(0, 255).astype(np.uint8)
-                        write_viser_points_npz(
-                            vis_pred_dir / "viser_points.npz",
-                            points=np.asarray(pts_all_masked, dtype=np.float32),
-                            colors_uint8=cols_u8,
-                            confidence=None if conf_all_masked is None else np.asarray(conf_all_masked, dtype=np.float32),
-                            frame_indices=None,
-                            max_points=int(args.vis_max_points),
-                        )
-                        write_viser_points_npz(
-                            vis_gt_dir / "viser_points_gt.npz",
-                            points=np.asarray(pts_gt_all_masked, dtype=np.float32),
-                            colors_uint8=np.tile(
-                                np.array([[160, 160, 160]], dtype=np.uint8),
-                                (int(pts_gt_all_masked.shape[0]), 1),
-                            ),
-                            confidence=None,
-                            frame_indices=None,
-                            max_points=int(args.vis_max_points),
-                        )
-
-                        # Best-effort camera export: pred extrinsics from pose_enc are available above as `extrinsics` (B,S,3,4).
-                        # Here B=1; export cameras.json if shapes look valid.
-                        try:
-                            extr = extrinsics.detach().float().cpu().numpy()
-                            intr = intrinsics.detach().float().cpu().numpy()
-                            if extr.ndim == 4:
-                                extr = extr[0]
-                            if intr.ndim == 4:
-                                intr = intr[0]
-                            image_paths = []
-                            if isinstance(batch, list) and len(batch) > 0 and "path" in batch[0]:
-                                image_paths = [Path(v["path"][0]) for v in batch]
-                            write_cameras_json(
-                                vis_pred_dir / "cameras.json",
-                                scene_id=str(scene_id),
-                                image_paths=image_paths,
-                                extrinsic_cw=extr,
-                                intrinsic=intr,
-                                image_hw=None,
-                            )
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        print(f"[warn] 7andN visualization export failed for {scene_id}: {e}")
-
-                if args.use_proj:
-
-                    def umeyama_alignment(
-                        src: np.ndarray, dst: np.ndarray, with_scale: bool = True
-                    ):
-                        assert src.shape == dst.shape
-                        N, dim = src.shape
-
-                        mu_src = src.mean(axis=0)
-                        mu_dst = dst.mean(axis=0)
-                        src_c = src - mu_src
-                        dst_c = dst - mu_dst
-
-                        Sigma = dst_c.T @ src_c / N  # (3,3)
-
-                        U, D, Vt = np.linalg.svd(Sigma)
-
-                        S = np.eye(dim)
-                        if np.linalg.det(U) * np.linalg.det(Vt) < 0:
-                            S[-1, -1] = -1
-
-                        R = U @ S @ Vt
-
-                        if with_scale:
-                            var_src = (src_c**2).sum() / N
-                            s = (D * S.diagonal()).sum() / var_src
-                        else:
-                            s = 1.0
-
-                        t = mu_dst - s * R @ mu_src
-
-                        return s, R, t
-
-                    pts_all_masked = pts_all_masked.reshape(-1, 3)
-                    pts_gt_all_masked = pts_gt_all_masked.reshape(-1, 3)
-                    s, R, t = umeyama_alignment(
-                        pts_all_masked, pts_gt_all_masked, with_scale=True
-                    )
-                    pts_all_aligned = (s * (R @ pts_all_masked.T)).T + t  # (N,3)
-                    pts_all_masked = pts_all_aligned
-
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(pts_all_masked)
-                pcd.colors = o3d.utility.Vector3dVector(images_all_masked)
-
-                pcd_gt = o3d.geometry.PointCloud()
-                pcd_gt.points = o3d.utility.Vector3dVector(pts_gt_all_masked)
-                pcd_gt.colors = o3d.utility.Vector3dVector(images_all_masked)
-
-                trans_init = np.eye(4)
-
-                threshold = 0.1
-                reg_p2p = o3d.pipelines.registration.registration_icp(
-                    pcd,
-                    pcd_gt,
-                    threshold,
-                    trans_init,
-                    o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-                )
-
-                transformation = reg_p2p.transformation
-
-                pcd = pcd.transform(transformation)
-                pcd.estimate_normals()
-                pcd_gt.estimate_normals()
-
-                gt_normal = np.asarray(pcd_gt.normals)
-                pred_normal = np.asarray(pcd.normals)
-
-                acc, acc_med, nc1, nc1_med = accuracy(
-                    pcd_gt.points, pcd.points, gt_normal, pred_normal
-                )
-                comp, comp_med, nc2, nc2_med = completion(
-                    pcd_gt.points, pcd.points, gt_normal, pred_normal
-                )
-                print(
-                    f"Idx: {scene_id}, NumImgs: {scene_num_images}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
-                )
-                print(
-                    f"Idx: {scene_id}, NumImgs: {scene_num_images}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}",
-                    file=open(log_file, "a"),
-                )
-
-                acc_all += acc
-                comp_all += comp
-                nc1_all += nc1
-                nc2_all += nc2
-
-                acc_all_med += acc_med
-                comp_all_med += comp_med
-                nc1_all_med += nc1_med
-                nc2_all_med += nc2_med
-
-                # release cuda memory
-                torch.cuda.empty_cache()
-
-            # Get depth from pcd and run TSDFusion
-            to_write = ""
-            # Read the log file
-            if os.path.exists(osp.join(save_path, "logs.txt")):
-                with open(osp.join(save_path, "logs.txt"), "r") as f_sub:
-                    to_write += f_sub.read()
-
-            with open(osp.join(save_path, f"logs_all.txt"), "w") as f:
-                log_data = to_write
-                metrics = defaultdict(list)
-                for line in log_data.strip().split("\n"):
-                    match = regex.match(line)
-                    if match:
-                        data = match.groupdict()
-                        # Exclude 'scene_id' from metrics as it's an identifier
-                        for key, value in data.items():
-                            if key != "scene_id":
-                                metrics[key].append(float(value))
-                        metrics["nc"].append(
-                            (float(data["nc1"]) + float(data["nc2"])) / 2
-                        )
-                        metrics["nc_med"].append(
-                            (float(data["nc1_med"]) + float(data["nc2_med"])) / 2
-                        )
-                mean_metrics = {
-                    metric: sum(values) / len(values)
-                    for metric, values in metrics.items()
-                }
-
-                c_name = "mean"
-                print_str = f"{c_name.ljust(20)}: "
-                for m_name in mean_metrics:
-                    print_num = np.mean(mean_metrics[m_name])
-                    print_str = print_str + f"{m_name}: {print_num:.3f} | "
-                print_str = print_str + "\n"
-                # Summarize per-scene average inference time
-                time_lines = []
-                for sid, times in scene_infer_times.items():
-                    if len(times) > 0:
-                        time_lines.append(
-                            f"Idx: {sid}, Time_avg_ms: {np.mean(times):.2f}"
-                        )
-                time_block = "\n".join(time_lines) + (
-                    "\n" if len(time_lines) > 0 else ""
-                )
-
-                f.write(to_write + time_block + print_str)
-
-
-from collections import defaultdict
-import re
-
-pattern = r"""
-    Idx:\s*(?P<scene_id>[^,]+),\s*
-    Acc:\s*(?P<acc>[^,]+),\s*
-    Comp:\s*(?P<comp>[^,]+),\s*
-    NC1:\s*(?P<nc1>[^,]+),\s*
-    NC2:\s*(?P<nc2>[^,]+)\s*-\s*
-    Acc_med:\s*(?P<acc_med>[^,]+),\s*
-    Compc_med:\s*(?P<comp_med>[^,]+),\s*
-    NC1c_med:\s*(?P<nc1_med>[^,]+),\s*
-    NC2c_med:\s*(?P<nc2_med>[^,]+)
-"""
-
-regex = re.compile(pattern, re.VERBOSE)
+    for name_data, dataset in datasets_all.items():
+        if args.max_scenes_per_dataset > 0 and hasattr(dataset, "scene_list"):
+            dataset.scene_list = dataset.scene_list[: args.max_scenes_per_dataset]
+        save_path = osp.join(osp.join(args.output_dir, f"{args.kf}"), name_data)
+        evaluate_7andn_dataset(
+            model=model,
+            dataset=dataset,
+            device=args.device,
+            eval_amp_dtype=torch.bfloat16,
+            save_path=save_path,
+            eval_conf_thresh=eval_conf_thresh,
+            max_samples=int(args.max_samples),
+            revisit=int(args.revisit),
+            use_proj=bool(args.use_proj),
+            export_visualization=bool(args.export_visualization),
+            vis_max_points=int(args.vis_max_points),
+            rng_np=rng_np,
+            write_average_metrics_json=True,
+        )
 
 
 if __name__ == "__main__":
     parser = get_args_parser()
     args = parser.parse_args()
-
     main(args)

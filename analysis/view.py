@@ -77,7 +77,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--eval-root",
         type=Path,
-        default=Path("analysis_outputs/evaluation/scans_test50_input_frame_30/Baseline_vggt"),
+        default=Path("analysis_outputs/evaluation/scans_test50_input_frame_50/Baseline_vggt"),
         help="Optional evaluation output root containing per-scene folders with metrics.json and vis/ assets.",
     )
     p.add_argument("--viser-host", type=str, default="127.0.0.1", help="Host for embedded Viser server.")
