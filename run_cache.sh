@@ -18,7 +18,7 @@ HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
 DEVICE="${DEVICE:-cuda}"
 # Cache storage dtype only (Stage1 autocast is fixed to bf16 on CUDA).
 DTYPE="${DTYPE:-float32}"
-MAX_SCENES="${MAX_SCENES:-25}"
+MAX_SCENES="${MAX_SCENES:-0}"
 MAX_FRAMES="${MAX_FRAMES:-50}"
 MAX_TOKENS_PER_LAYER="${MAX_TOKENS_PER_LAYER:-0}"
 CHAMFER_MAX_DIST="${CHAMFER_MAX_DIST:-0.5}"

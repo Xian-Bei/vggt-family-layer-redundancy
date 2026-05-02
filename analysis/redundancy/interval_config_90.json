@@ -1,15 +1,15 @@
 {
   "intervals": [
     {
-      "l": 3,
-      "r": 8,
+      "l": 4,
+      "r": 10,
       "skip_frame_in_interval": true,
       "inject_prev": "global",
       "inject_frame_inside_interval": false
     },
     {
-      "l": 17,
-      "r": 23,
+      "l": 19,
+      "r": 22,
       "skip_frame_in_interval": false,
       "inject_prev": "global",
       "inject_frame_inside_interval": true
