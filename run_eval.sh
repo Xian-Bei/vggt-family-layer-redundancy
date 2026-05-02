@@ -40,16 +40,6 @@ OURS_TRAIN_DIR="${OURS_TRAIN_DIR:-}"
 OURS_EPOCH="${OURS_EPOCH:-}"
 RUN_SCANNET="${RUN_SCANNET:-1}"
 RUN_7ANDN="${RUN_7ANDN:-1}"
-RUN_SCANNET_DEV50="${RUN_SCANNET_DEV50:-1}"
-RUN_SCANNET_TEST50="${RUN_SCANNET_TEST50:-1}"
-RUN_7SCENES="${RUN_7SCENES:-1}"
-RUN_NRGBD="${RUN_NRGBD:-1}"
-
-is_truthy() {
-  local v
-  v="$(trim_spaces "${1:-}")"
-  [[ "${v}" == "1" || "${v}" == "true" || "${v}" == "TRUE" || "${v}" == "True" ]]
-}
 
 trim_spaces() {
   local s="$1"
@@ -150,14 +140,6 @@ run_7andn() {
   local out_dir="${OUTPUT_DIR}/7andn/${model_dir}"
   local max_scenes=0
   local max_samples=0
-  local enable_7scenes=0
-  local enable_nrgbd=0
-  if is_truthy "${RUN_7SCENES}"; then
-    enable_7scenes=1
-  fi
-  if is_truthy "${RUN_NRGBD}"; then
-    enable_nrgbd=1
-  fi
 
   args=(
     --device "${DEVICE}"
@@ -170,8 +152,6 @@ run_7andn() {
     --max_samples "${max_samples}"
     --model-name "${model_name}"
     --backend "${backend}"
-    --enable-7scenes "${enable_7scenes}"
-    --enable-nrgbd "${enable_nrgbd}"
   )
   if [[ -n "${CKPT_PATH}" ]]; then
     args+=(--ckpt_path "${CKPT_PATH}" --hf_model "${HF_MODEL}")
@@ -203,26 +183,13 @@ echo "   scannet_models: ${SCANNET_MODELS}"
 echo "   models_7andn: ${MODELS_7ANDN}"
 echo "   run_scannet: ${RUN_SCANNET}"
 echo "   run_7andn: ${RUN_7ANDN}"
-echo "   run_scannet_dev50: ${RUN_SCANNET_DEV50}"
-echo "   run_scannet_test50: ${RUN_SCANNET_TEST50}"
-echo "   run_7scenes: ${RUN_7SCENES}"
-echo "   run_nrgbd: ${RUN_NRGBD}"
 
-if is_truthy "${RUN_SCANNET}"; then
+if [[ "${RUN_SCANNET}" == "1" || "${RUN_SCANNET}" == "true" ]]; then
   IFS=',' read -r -a DATA_DIR_ARR <<< "${ROOT_SCANNET}"
   IFS=',' read -r -a SCANNET_MODEL_ARR <<< "${SCANNET_MODELS}"
   for dd in "${DATA_DIR_ARR[@]}"; do
     dd="$(trim_spaces "${dd}")"
     [[ -z "${dd}" ]] && continue
-    dd_base="$(basename "${dd}")"
-    if [[ "${dd_base}" == *"dev50"* ]] && ! is_truthy "${RUN_SCANNET_DEV50}"; then
-      echo "   [skip] scannet_dev50 disabled (${dd})"
-      continue
-    fi
-    if [[ "${dd_base}" == *"test50"* ]] && ! is_truthy "${RUN_SCANNET_TEST50}"; then
-      echo "   [skip] scannet_test50 disabled (${dd})"
-      continue
-    fi
     DATA_DIR="${dd}"
     SCANNET_TAG="$(basename "${DATA_DIR}")"
     for spec in "${SCANNET_MODEL_ARR[@]}"; do
@@ -234,7 +201,7 @@ else
   echo "   [skip] scannet evaluation disabled"
 fi
 
-if is_truthy "${RUN_7ANDN}" && (is_truthy "${RUN_7SCENES}" || is_truthy "${RUN_NRGBD}"); then
+if [[ "${RUN_7ANDN}" == "1" || "${RUN_7ANDN}" == "true" ]]; then
   IFS=',' read -r -a MODEL_7ANDN_ARR <<< "${MODELS_7ANDN}"
   for spec in "${MODEL_7ANDN_ARR[@]}"; do
     parse_model_spec "${spec}"

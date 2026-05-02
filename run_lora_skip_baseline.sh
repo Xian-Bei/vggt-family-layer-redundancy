@@ -32,14 +32,15 @@ CONFIG_FILE="${CONFIG_FILE:-analysis/train/config_90_fastvggt.json analysis/trai
 VARIANT="${VARIANT:-multi_interval_config}"
 DEVICE="${DEVICE:-cuda}"
 EPOCHS="${EPOCHS:-50}"
-MAX_SCENES="${MAX_SCENES:-1}"
+EVAL_EPOCH="${EVAL_EPOCH:-10}"
+MAX_SCENES="${MAX_SCENES:-0}"
 MAX_STEPS="${MAX_STEPS:-0}"
 SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-50}"
-LR="${LR:-5e-5}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
-MIN_LR="${MIN_LR:-1e-8}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
-GRAD_CLIP_MAX_NORM="${GRAD_CLIP_MAX_NORM:-1.0}"
+# Per-dataset periodic-eval toggles (1/true = enabled, 0/false = disabled).
+EVAL_SCANNET_DEV50="${EVAL_SCANNET_DEV50:-1}"
+EVAL_SCANNET_TEST50="${EVAL_SCANNET_TEST50:-1}"
+EVAL_7SCENES="${EVAL_7SCENES:-1}"
+EVAL_NRGBD="${EVAL_NRGBD:-1}"
 
 
 W_CAMERA="${W_CAMERA:-5.0}"
@@ -53,7 +54,11 @@ W_REG="${W_REG:-0.0}"
 USE_CHECKPOINT="${USE_CHECKPOINT:-1}"
 RESUME_FROM="${RESUME_FROM:-}"
 PRINT_STEP_TIMING="${PRINT_STEP_TIMING:-0}"
-EVAL_EPOCH="${EVAL_EPOCH:-1}"
+LR="${LR:-5e-5}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
+MIN_LR="${MIN_LR:-1e-8}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
+GRAD_CLIP_MAX_NORM="${GRAD_CLIP_MAX_NORM:-1.0}"
 
 LORA_RANK="${LORA_RANK:-128}"
 LORA_ALPHA="${LORA_ALPHA:-256}"
@@ -163,6 +168,7 @@ echo "  CONFIG_FILE=${CONFIG_FILE}"
 echo "  VARIANT=${VARIANT}"
 echo "  EPOCHS=${EPOCHS} MAX_SCENES=${MAX_SCENES} MAX_STEPS=${MAX_STEPS}"
 echo "  EVAL_EPOCH=${EVAL_EPOCH} EVAL_MAX_SCENES=${EVAL_MAX_SCENES} EVAL_INPUT_FRAME=${EVAL_INPUT_FRAME}"
+echo "  EVAL_SCANNET_DEV50=${EVAL_SCANNET_DEV50} EVAL_SCANNET_TEST50=${EVAL_SCANNET_TEST50} EVAL_7SCENES=${EVAL_7SCENES} EVAL_NRGBD=${EVAL_NRGBD}"
 echo "  ROOT_7SCENES=${ROOT_7SCENES} ROOT_NRGBD=${ROOT_NRGBD}"
 echo "  EVAL_7ANDN_KF=${EVAL_7ANDN_KF} EVAL_7ANDN_MAX_SCENES_PER_DATASET=${EVAL_7ANDN_MAX_SCENES_PER_DATASET}"
 echo "  BACKEND=${BACKEND}"
@@ -204,9 +210,20 @@ ensure_bounds_cache() {
   local p_lower_7s="${eval_root}/7andn/Ours_${BACKEND}/${EVAL_7ANDN_KF}/7scenes/average_metrics.json"
   local p_upper_nr="${eval_root}/7andn/Baseline_${BACKEND}/${EVAL_7ANDN_KF}/NRGBD/average_metrics.json"
   local p_lower_nr="${eval_root}/7andn/Ours_${BACKEND}/${EVAL_7ANDN_KF}/NRGBD/average_metrics.json"
-  for p in \
-    "${p_upper_dev}" "${p_lower_dev}" "${p_upper_test}" "${p_lower_test}" \
-    "${p_upper_7s}" "${p_lower_7s}" "${p_upper_nr}" "${p_lower_nr}"; do
+  local -a required_bounds=()
+  if [[ "${EVAL_SCANNET_DEV50}" == "1" || "${EVAL_SCANNET_DEV50}" == "true" ]]; then
+    required_bounds+=("${p_upper_dev}" "${p_lower_dev}")
+  fi
+  if [[ "${EVAL_SCANNET_TEST50}" == "1" || "${EVAL_SCANNET_TEST50}" == "true" ]]; then
+    required_bounds+=("${p_upper_test}" "${p_lower_test}")
+  fi
+  if [[ "${EVAL_7SCENES}" == "1" || "${EVAL_7SCENES}" == "true" ]]; then
+    required_bounds+=("${p_upper_7s}" "${p_lower_7s}")
+  fi
+  if [[ "${EVAL_NRGBD}" == "1" || "${EVAL_NRGBD}" == "true" ]]; then
+    required_bounds+=("${p_upper_nr}" "${p_lower_nr}")
+  fi
+  for p in "${required_bounds[@]}"; do
     if [[ ! -f "${p}" ]]; then
       echo "[error] Missing bounds file: ${p}" >&2
       exit 1
@@ -259,6 +276,10 @@ run_one_trial() {
     $( [[ -n "${TEST_SANITY_AVG_FILE}" ]] && printf '%s %s' --test-sanity-average-metrics-file "${TEST_SANITY_AVG_FILE}" ) \
     --eval-max-scenes "${EVAL_MAX_SCENES}" \
     --eval-input-frame "${EVAL_INPUT_FRAME}" \
+    $( [[ "${EVAL_SCANNET_DEV50}" == "1" || "${EVAL_SCANNET_DEV50}" == "true" ]] && echo "--eval-scannet-dev50" || echo "--no-eval-scannet-dev50" ) \
+    $( [[ "${EVAL_SCANNET_TEST50}" == "1" || "${EVAL_SCANNET_TEST50}" == "true" ]] && echo "--eval-scannet-test50" || echo "--no-eval-scannet-test50" ) \
+    $( [[ "${EVAL_7SCENES}" == "1" || "${EVAL_7SCENES}" == "true" ]] && echo "--eval-7scenes" || echo "--no-eval-7scenes" ) \
+    $( [[ "${EVAL_NRGBD}" == "1" || "${EVAL_NRGBD}" == "true" ]] && echo "--eval-nrgbd" || echo "--no-eval-nrgbd" ) \
     --root-7scenes "${ROOT_7SCENES}" \
     --root-nrgbd "${ROOT_NRGBD}" \
     --eval-7andn-kf "${EVAL_7ANDN_KF}" \

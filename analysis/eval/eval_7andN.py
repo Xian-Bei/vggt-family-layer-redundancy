@@ -59,20 +59,6 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root_7scenes", type=str, default="/data/sy/7scenes", help="7Scenes dataset root")
     parser.add_argument("--root_nrgbd", type=str, default="/data/sy/neural_rgbd_data", help="NRGBD dataset root")
     parser.add_argument(
-        "--enable-7scenes",
-        type=int,
-        default=1,
-        choices=(0, 1),
-        help="Enable 7Scenes evaluation (1=on, 0=off).",
-    )
-    parser.add_argument(
-        "--enable-nrgbd",
-        type=int,
-        default=1,
-        choices=(0, 1),
-        help="Enable NRGBD evaluation (1=on, 0=off).",
-    )
-    parser.add_argument(
         "--max_scenes_per_dataset",
         type=int,
         default=0,
@@ -131,9 +117,8 @@ def main(args: argparse.Namespace) -> None:
     from analysis.eval.eval_7andn_utils import evaluate_7andn_dataset  # noqa: F401
     from data import NRGBD, SevenScenes  # type: ignore
 
-    datasets_all = {}
-    if int(args.enable_7scenes) == 1:
-        datasets_all["7scenes"] = SevenScenes(
+    datasets_all = {
+        "7scenes": SevenScenes(
             split="test",
             ROOT=args.root_7scenes,
             resolution=resolution,
@@ -141,9 +126,8 @@ def main(args: argparse.Namespace) -> None:
             full_video=True,
             kf_every=args.kf,
             seed=SEED,
-        )
-    if int(args.enable_nrgbd) == 1:
-        datasets_all["NRGBD"] = NRGBD(
+        ),
+        "NRGBD": NRGBD(
             split="test",
             ROOT=args.root_nrgbd,
             resolution=resolution,
@@ -151,9 +135,8 @@ def main(args: argparse.Namespace) -> None:
             full_video=True,
             kf_every=args.kf,
             seed=SEED,
-        )
-    if not datasets_all:
-        raise SystemExit("Both --enable-7scenes and --enable-nrgbd are 0; nothing to evaluate.")
+        ),
+    }
 
     eval_conf_thresh = max(1.0, float(args.conf_thresh))
 

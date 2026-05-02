@@ -902,6 +902,20 @@ _7ANDN_KEEP_KEYS = ("acc", "comp", "nc", "acc_med", "comp_med", "nc_med")
 _7ANDN_DIR_NAME = {"7scenes": "7scenes", "nrgbd": "NRGBD"}
 
 
+def _resolve_enabled_eval_datasets(args: argparse.Namespace) -> Tuple[str, ...]:
+    """Return periodic-eval dataset order after per-dataset boolean switches."""
+    selected: List[str] = []
+    if bool(args.eval_scannet_dev50):
+        selected.append("scannet_dev50")
+    if bool(args.eval_scannet_test50):
+        selected.append("scannet_test50")
+    if bool(args.eval_7scenes):
+        selected.append("7scenes")
+    if bool(args.eval_nrgbd):
+        selected.append("nrgbd")
+    return tuple(selected)
+
+
 def _build_7andn_dataset(name: str, root: Path, kf: int, size: int = 518):
     """Lazy build of SevenScenes / NRGBD datasets. Imports live inside this helper
     because the `data` module mutates sys.path on import (see eval_7andn_utils)."""
@@ -1173,26 +1187,30 @@ def _write_eval_artifacts(
     try:
         # Two metric families → two figures per metric. Reuse the established
         # red/blue palette: first dataset = red, second = blue.
+        scannet_active = [ds for ds in EVAL_SCANNET_DATASETS if ds in bounds]
+        andn_active = [ds for ds in EVAL_7ANDN_DATASETS if ds in bounds]
         scannet_colors = {"scannet_dev50": "#c62828", "scannet_test50": "#1565c0"}
         andn_colors = {"7scenes": "#c62828", "nrgbd": "#1565c0"}
-        _plot_metric_group(
-            out_dir,
-            history_rows,
-            bounds,
-            group_name="scannet",
-            datasets=EVAL_SCANNET_DATASETS,
-            color_map=scannet_colors,
-            metric_whitelist=_SCANNET_KEEP_KEYS,
-        )
-        _plot_metric_group(
-            out_dir,
-            history_rows,
-            bounds,
-            group_name="7andn",
-            datasets=EVAL_7ANDN_DATASETS,
-            color_map=andn_colors,
-            metric_whitelist=_7ANDN_KEEP_KEYS,
-        )
+        if scannet_active:
+            _plot_metric_group(
+                out_dir,
+                history_rows,
+                bounds,
+                group_name="scannet",
+                datasets=scannet_active,
+                color_map={k: v for k, v in scannet_colors.items() if k in scannet_active},
+                metric_whitelist=_SCANNET_KEEP_KEYS,
+            )
+        if andn_active:
+            _plot_metric_group(
+                out_dir,
+                history_rows,
+                bounds,
+                group_name="7andn",
+                datasets=andn_active,
+                color_map={k: v for k, v in andn_colors.items() if k in andn_active},
+                metric_whitelist=_7ANDN_KEEP_KEYS,
+            )
     except Exception:
         pass
 
@@ -1210,7 +1228,7 @@ def _extract_bound_payload(
     tag: Literal["upper", "lower"],
 ) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
-    for ds in EVAL_DATASETS_ALL:
+    for ds in bounds.keys():
         out[ds] = dict(bounds.get(ds, {}).get(tag, {}))
     return out
 
@@ -1261,6 +1279,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--eval-max-scenes", type=int, default=0, help="0 means full split.")
     p.add_argument("--eval-input-frame", type=int, default=30)
+    p.add_argument(
+        "--eval-scannet-dev50",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable periodic eval on scannet_dev50.",
+    )
+    p.add_argument(
+        "--eval-scannet-test50",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable periodic eval on scannet_test50.",
+    )
+    p.add_argument(
+        "--eval-7scenes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable periodic eval on 7scenes.",
+    )
+    p.add_argument(
+        "--eval-nrgbd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable periodic eval on nrgbd.",
+    )
     # 7scenes / NRGBD periodic eval (mirrors run_eval.sh defaults).
     p.add_argument("--root-7scenes", type=Path, default=Path("data/7scenes"))
     p.add_argument("--root-nrgbd", type=Path, default=Path("data/neural_rgbd_data"))
@@ -1407,9 +1449,7 @@ def main() -> None:
     #   - scannet_dev50/test50: <EVAL_ROOT>/<scans_set>_input_frame_<N>/{Baseline|Ours}_<backend>/average_metrics.json
     #   - 7scenes/nrgbd:        <EVAL_ROOT>/7andn/{Baseline|Ours}_<backend>/<KF>/<7scenes|NRGBD>/average_metrics.json
     eval_history_rows: List[Dict[str, Any]] = []
-    bounds: Dict[str, Dict[str, Dict[str, float]]] = {
-        ds: {"upper": {}, "lower": {}} for ds in EVAL_DATASETS_ALL
-    }
+    bounds: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     def _build_model_variant(*, prune: bool, inject_lora: bool) -> Tuple[VGGT, List[nn.Parameter], int, int]:
         m = VGGT.from_pretrained(args.hf_model).to(device).train()
@@ -1463,6 +1503,7 @@ def main() -> None:
     test_set = Path(args.test_data_dir).name
     input_frame = int(args.eval_input_frame)
     andn_kf = int(args.eval_7andn_kf)
+    eval_datasets = _resolve_enabled_eval_datasets(args)
 
     def _read_avg_json(p: Path) -> Dict[str, float]:
         if not p.exists():
@@ -1486,17 +1527,19 @@ def main() -> None:
         "7scenes": (_7andn_bound_path("Baseline", "7scenes"), _7andn_bound_path("Ours", "7scenes")),
         "nrgbd": (_7andn_bound_path("Baseline", "nrgbd"), _7andn_bound_path("Ours", "nrgbd")),
     }
-    for ds, (upper_p, lower_p) in bound_sources.items():
+    bounds = {ds: {"upper": {}, "lower": {}} for ds in eval_datasets}
+    for ds in eval_datasets:
+        upper_p, lower_p = bound_sources[ds]
         bounds[ds]["upper"] = _read_avg_json(upper_p)
         bounds[ds]["lower"] = _read_avg_json(lower_p)
     _log(
         f"[eval] loaded bounds from {eval_root} "
         f"(scannet_dev={dev_set} scannet_test={test_set} input_frame={input_frame} "
-        f"7andn_kf={andn_kf} backend={backend})"
+        f"7andn_kf={andn_kf} backend={backend} datasets={list(eval_datasets)})"
     )
 
     # Lower bound = pruned model metrics before any LoRA training; log as epoch 0 for eval CSV/plots.
-    for ds in EVAL_DATASETS_ALL:
+    for ds in eval_datasets:
         if bounds[ds]["lower"]:
             _append_eval_history(
                 eval_history_rows,
@@ -1805,11 +1848,14 @@ def main() -> None:
         _save_checkpoint(out_dir / "checkpoints" / "latest.pt", epoch)
         _write_curves(out_dir, rows)
         if int(args.eval_epoch) > 0 and (((epoch + 1) % int(args.eval_epoch)) == 0):
+            if not eval_datasets:
+                _log(f"[eval] epoch={epoch+1}: skipped (no eval dataset enabled)")
+                continue
             _log(
                 f"[eval] epoch={epoch+1}: evaluating current LoRA model on "
-                f"{', '.join(EVAL_DATASETS_ALL)}"
+                f"{', '.join(eval_datasets)}"
             )
-            for ds in EVAL_DATASETS_ALL:
+            for ds in eval_datasets:
                 t0 = time.perf_counter()
                 if ds in EVAL_SCANNET_DATASETS:
                     data_dir, gt_ply_dir = (
