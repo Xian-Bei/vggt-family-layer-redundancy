@@ -35,13 +35,33 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 def _depth_or_conf_to_shw(arr: np.ndarray, name: str) -> np.ndarray:
     """
-    Normalize depth/conf from [S,H,W] or [S,H,W,1] to [S,H,W].
+    Normalize depth/conf to [S,H,W].
+
+    Accepts common VGGT/FastVGGT layouts such as:
+    - [S,H,W]
+    - [S,H,W,1]
+    - [S,1,H,W]
+    - [1,S,H,W]
+    - [1,S,1,H,W]
     """
-    out = np.asarray(arr)
-    if out.ndim == 4 and out.shape[-1] == 1:
-        out = out[..., 0]
+    out = np.asarray(arr, dtype=np.float64)
+
+    # Drop singleton leading batch dims first (e.g. [1,S,1,H,W] -> [S,1,H,W]).
+    while out.ndim >= 4 and out.shape[0] == 1:
+        out = out[0]
+
+    if out.ndim == 4:
+        if out.shape[1] == 1:  # [S,1,H,W]
+            out = out[:, 0, :, :]
+        elif out.shape[-1] == 1:  # [S,H,W,1]
+            out = out[..., 0]
+        else:
+            raise ValueError(
+                f"{name}: expected channel-last [S,H,W,1] or channel-first [S,1,H,W], got {out.shape}"
+            )
+
     if out.ndim != 3:
-        raise ValueError(f"Expected {name} shape [S,H,W] or [S,H,W,1], got {out.shape}")
+        raise ValueError(f"{name}: expected [S,H,W], got {out.shape}")
     return out
 
 
