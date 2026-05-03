@@ -396,6 +396,7 @@ def main() -> None:
         "hf_model": args.hf_model,
         "replay_cache_format": "aggregated_concat_per_layer_v2",
         "replay_layer_storage_dtype": str(args.dtype),
+        "num_heads": int(model.aggregator.global_blocks[0].attn.num_heads),
     }
     if eval_rows:
         manifest_payload["eval_file"] = "eval.json"

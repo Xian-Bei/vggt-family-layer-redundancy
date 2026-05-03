@@ -703,13 +703,15 @@ def _write_curves(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
         import matplotlib.pyplot as plt  # type: ignore
 
         epochs = [int(r.get("epoch", 0)) for r in epoch_rows]
-        total = [float(r.get("mean_loss_total", float("nan"))) for r in epoch_rows]
-        align = [float(r.get("mean_loss_align", float("nan"))) for r in epoch_rows]
-        pred = [float(r.get("mean_loss_pred", float("nan"))) for r in epoch_rows]
         plt.figure(figsize=(9, 5))
-        plt.plot(epochs, total, label="mean_loss_total")
-        plt.plot(epochs, align, label="mean_loss_align")
-        plt.plot(epochs, pred, label="mean_loss_pred")
+        for col, label in (
+            ("mean_loss_total", "mean_loss_total"),
+            ("mean_loss_align", "mean_loss_align"),
+            ("mean_loss_pred", "mean_loss_pred"),
+        ):
+            ys = [float(r.get(col, float("nan"))) for r in epoch_rows]
+            if any(np.isfinite(y) for y in ys):
+                plt.plot(epochs, ys, label=label)
         plt.xlabel("epoch")
         plt.ylabel("loss")
         plt.title("Train Curves (epoch average, scans_dev50)")
@@ -757,14 +759,22 @@ def _float_metrics_from_aggregate(agg: Dict[str, Any]) -> Dict[str, float]:
 
 _SCANNET_KEEP_KEYS = (
     "chamfer_distance",
+    "nc1",
+    "nc2",
+    "nc",
+    "nc1_med",
+    "nc2_med",
+    "nc_med",
     "ate",
     "are",
     "rpe_rot",
     "rpe_trans",
-    "inference_time_ms",
     "depth_abs_rel",
     "depth_delta1",
 )
+
+# Omitted from periodic-eval history / CSV / plots (still computed inside eval helpers).
+_EVAL_HISTORY_SKIP_KEYS = frozenset({"inference_time_ms", "infer_peak_vram_gb"})
 
 
 def _evaluate_scannet_run_eval_style(
@@ -818,7 +828,7 @@ def _evaluate_scannet_run_eval_style(
             if hasattr(model, "update_patch_dimensions"):
                 model.update_patch_dimensions(patch_width, patch_height)
             # Reuse run_eval/eval_scannet.py reconstruction + dense-depth GT path (for parity with average_metrics.json).
-            _, _, all_world_points, _, all_cam_to_world_mat, inference_time_ms, depth_raw_np, _depth_conf_np = (
+            _, _, all_world_points, _, all_cam_to_world_mat, inference_time_ms, depth_raw_np, _depth_conf_np, infer_peak_vram_gb = (
                 infer_vggt_and_reconstruct(
                     model,
                     vgg_input,
@@ -864,6 +874,7 @@ def _evaluate_scannet_run_eval_style(
                     chamfer_max_dist,
                     inference_time_ms,
                     False,
+                    infer_peak_vram_gb=infer_peak_vram_gb,
                     pred_depth=pred_depth_for_metrics,
                     gt_depth=gt_depth,
                 )
@@ -889,14 +900,31 @@ def _evaluate_scannet_run_eval_style(
 
 # Periodic eval covers four datasets. Two metric families:
 #   - scannet_dev50, scannet_test50 → ScanNet metrics (chamfer/ate/are/...)
-#   - 7scenes, nrgbd → reconstruction metrics (acc/comp/nc/...)
+#   - 7scenes, nrgbd → reconstruction + trajectory (acc/comp/nc/..., ate/are/rpe, timing)
 # Plotting groups (`_write_eval_artifacts`) share these splits.
 EVAL_SCANNET_DATASETS = ("scannet_dev50", "scannet_test50")
 EVAL_7ANDN_DATASETS = ("7scenes", "nrgbd")
 EVAL_DATASETS_ALL = EVAL_SCANNET_DATASETS + EVAL_7ANDN_DATASETS
 
-# 7scenes/nrgbd average_metrics.json schema (matches eval_7andN.py / backfill).
-_7ANDN_KEEP_KEYS = ("acc", "comp", "nc", "acc_med", "comp_med", "nc_med")
+# 7scenes/nrgbd metrics kept in periodic-eval history / plots (subset of average_metrics.json).
+_7ANDN_KEEP_KEYS = (
+    "acc",
+    "comp",
+    "cd",
+    "nc",
+    "acc_med",
+    "comp_med",
+    "cd_med",
+    "nc_med",
+    "ate",
+    "are",
+    "rpe_rot",
+    "rpe_trans",
+    "inference_time_ms",
+    "infer_peak_vram_gb",
+    "depth_abs_rel",
+    "depth_delta1",
+)
 
 # Dataset → directory name conventions for `<EVAL_ROOT>/7andn/<model>_<backend>/<KF>/<dir>`.
 _7ANDN_DIR_NAME = {"7scenes": "7scenes", "nrgbd": "NRGBD"}
@@ -973,6 +1001,7 @@ def _evaluate_7andn_run_eval_style(
         eval_conf_thresh=1.0,
         rng_np=np.random.default_rng(33),
         write_average_metrics_json=False,
+        quiet=True,
     )
     return {k: float(v) for k, v in metrics.items() if k in _7ANDN_KEEP_KEYS}
 
@@ -1040,6 +1069,8 @@ def _append_eval_history(
     metrics: Dict[str, float],
 ) -> None:
     for k, v in metrics.items():
+        if str(k) in _EVAL_HISTORY_SKIP_KEYS:
+            continue
         history_rows.append(
             {
                 "epoch": int(epoch),
@@ -1799,12 +1830,6 @@ def main() -> None:
                 "scene_id": sid,
                 "global_step": global_step,
                 "loss_total": float(loss_total.detach().item()),
-                "loss_align": float((wa * loss_align).detach().item()),
-                "loss_align_mse": float((wa * wam * align_mse).detach().item()),
-                "loss_align_cos": float((wa * wac * align_cos).detach().item()),
-                "loss_align_cka": float((wa * wak * align_cka).detach().item()),
-                "loss_pred": float((wp * loss_pred).detach().item()),
-                "loss_reg": float((wr * loss_reg).detach().item()),
                 "step_seconds": step_s,
                 "time_load_s": t_load,
                 "time_replay_s": t_replay,
@@ -1815,7 +1840,25 @@ def main() -> None:
                 "optim_lr": float(lr_now),
                 "grad_norm": float(grad_norm.detach().item()) if torch.is_tensor(grad_norm) else float(grad_norm),
             }
-            log_row.update(pred_logs)
+            if wa != 0.0:
+                log_row["loss_align"] = float((wa * loss_align).detach().item())
+                if wam != 0.0:
+                    log_row["loss_align_mse"] = float((wa * wam * align_mse).detach().item())
+                if wac != 0.0:
+                    log_row["loss_align_cos"] = float((wa * wac * align_cos).detach().item())
+                if wak != 0.0:
+                    log_row["loss_align_cka"] = float((wa * wak * align_cka).detach().item())
+            if wp != 0.0:
+                log_row["loss_pred"] = float((wp * loss_pred).detach().item())
+                pl = dict(pred_logs)
+                if float(args.w_camera) == 0.0:
+                    pl.pop("loss_camera", None)
+                if float(args.w_depth) == 0.0:
+                    for _k in ("loss_depth", "loss_depth_conf", "loss_depth_reg", "loss_depth_grad"):
+                        pl.pop(_k, None)
+                log_row.update(pl)
+            if wr != 0.0:
+                log_row["loss_reg"] = float((wr * loss_reg).detach().item())
             rows.append(log_row)
             pbar.update(1)
             pbar.set_postfix(
@@ -1823,8 +1866,8 @@ def main() -> None:
                     "epoch": f"{epoch+1}/{int(args.epochs)}",
                     "scene": sid,
                     "loss": f"{log_row['loss_total']:.2f}",
-                    "align_loss": f"{log_row['loss_align']:.2f}",
-                    "prd_loss": f"{log_row['loss_pred']:.2f}",
+                    "align_loss": f"{log_row.get('loss_align', 0.0):.2f}",
+                    "prd_loss": f"{log_row.get('loss_pred', 0.0):.2f}",
                     # "step_s": f"{step_s:.1f}",
                     "rep": f"{t_replay:.1f}s",
                     "align": f"{t_align:.1f}s",

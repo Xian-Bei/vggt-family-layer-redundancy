@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 from .eval_utils import (
-    compute_chamfer_distance,
+    compute_chamfer_and_normal_consistency,
     eval_trajectory,
     load_gt_pointcloud,
 )
@@ -71,6 +71,128 @@ def evaluate_depth_metrics_streamvggt(
     }
 
 
+def _seven_andn_gt_c2w_valid(c2w: np.ndarray) -> bool:
+    """True when GT cam-to-world is usable for trajectory metrics.
+
+    Neural RGB-D uses an identity matrix placeholder for frames whose ``poses.txt``
+    line contained ``nan``; those must be excluded.
+    """
+    T = np.asarray(c2w, dtype=np.float64)
+    if T.shape != (4, 4) or not np.isfinite(T).all():
+        return False
+    R = T[:3, :3]
+    t = T[:3, 3]
+    if np.allclose(R, np.eye(3), atol=1e-4) and np.allclose(t, 0.0, atol=1e-4):
+        return False
+    return True
+
+
+def evaluate_7andn_trajectory_metrics(
+    est_w2c: np.ndarray,
+    gt_c2w: np.ndarray,
+    frame_ids: List[int],
+    *,
+    plot_trajectory: bool = False,
+) -> Tuple[Dict[str, float], Optional[Image.Image]]:
+    """ATE / ARE / RPE vs GT for 7-Scenes / NRGBD, aligned with ScanNet trajectory eval.
+
+    ``est_w2c`` must be **camera-from-world** (same convention as
+    :func:`analysis.eval.eval_utils.infer_vggt_and_reconstruct` / ``pose_encoding_to_extri_intri``).
+    ``gt_c2w`` are dataset **camera-to-world** matrices (``data.SevenScenes`` / ``data.NRGBD``).
+
+    GT poses are normalized to the first **valid** frame (same idea as
+    :func:`analysis.eval.eval_utils.load_poses`), converted to w2c, then compared to
+    ``est_w2c`` via :func:`analysis.eval.eval_utils.eval_trajectory` with ``align=True``
+    (Sim(3) on camera centers), matching :func:`evaluate_scene_metrics`.
+    """
+    est_w2c = np.asarray(est_w2c, dtype=np.float64)
+    gt_c2w = np.asarray(gt_c2w, dtype=np.float64)
+    if est_w2c.ndim != 3 or est_w2c.shape[1:] != (4, 4):
+        raise ValueError(f"est_w2c must be [N,4,4], got {est_w2c.shape}")
+    if gt_c2w.ndim != 3 or gt_c2w.shape[1:] != (4, 4):
+        raise ValueError(f"gt_c2w must be [N,4,4], got {gt_c2w.shape}")
+    n_in = min(int(est_w2c.shape[0]), int(gt_c2w.shape[0]))
+    if n_in < 2:
+        return (
+            {
+                "ate": float("nan"),
+                "are": float("nan"),
+                "rpe_rot": float("nan"),
+                "rpe_trans": float("nan"),
+            },
+            None,
+        )
+
+    valid_mask = np.array(
+        [_seven_andn_gt_c2w_valid(gt_c2w[i]) for i in range(n_in)],
+        dtype=bool,
+    )
+    if int(np.count_nonzero(valid_mask)) < 2:
+        return (
+            {
+                "ate": float("nan"),
+                "are": float("nan"),
+                "rpe_rot": float("nan"),
+                "rpe_trans": float("nan"),
+            },
+            None,
+        )
+
+    est_w2c = est_w2c[:n_in][valid_mask]
+    gt_c2w = gt_c2w[:n_in][valid_mask]
+    n = int(est_w2c.shape[0])
+    if n < 2:
+        return (
+            {
+                "ate": float("nan"),
+                "are": float("nan"),
+                "rpe_rot": float("nan"),
+                "rpe_trans": float("nan"),
+            },
+            None,
+        )
+
+    t0_inv = np.linalg.inv(gt_c2w[0])
+    c2ws_rel = np.stack([t0_inv @ gt_c2w[i] for i in range(n)], axis=0)
+    w2cs_gt = np.linalg.inv(c2ws_rel)
+
+    try:
+        timestamps = [int(frame_ids[i]) for i in range(n_in) if bool(valid_mask[i])]
+        if len(timestamps) != n:
+            timestamps = list(range(n))
+    except Exception:
+        timestamps = list(range(n))
+    try:
+        stats_aligned, traj_plot, _ = eval_trajectory(
+            est_w2c[:n],
+            w2cs_gt[:n],
+            timestamps,
+            align=True,
+            plot_trajectory=plot_trajectory,
+        )
+        out = {
+            "ate": float(stats_aligned["ate"]),
+            "are": float(stats_aligned["are"]),
+            "rpe_rot": float(stats_aligned["rpe_rot"]),
+            "rpe_trans": float(stats_aligned["rpe_trans"]),
+        }
+        return out, traj_plot
+    except Exception as e:
+        msg = str(e)
+        if "Degenerate covariance rank" not in msg and "Umeyama alignment" not in msg:
+            raise
+        print(f"[warn] 7andn trajectory alignment failed ({msg}); writing NaN pose metrics.", flush=True)
+        return (
+            {
+                "ate": float("nan"),
+                "are": float("nan"),
+                "rpe_rot": float("nan"),
+                "rpe_trans": float("nan"),
+            },
+            None,
+        )
+
+
 def merge_numeric_metrics_into(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
     """Copy numeric fields from ``src`` into ``dst`` as Python ``float`` (skips ``bool``).
 
@@ -92,6 +214,7 @@ def evaluate_scene_metrics(
     chamfer_max_dist: float,
     inference_time_ms: float,
     *,
+    infer_peak_vram_gb: float = 0.0,
     gt_point_cloud: Optional[np.ndarray] = None,
     pred_depth: Optional[np.ndarray] = None,
     gt_depth: Optional[np.ndarray] = None,
@@ -139,10 +262,16 @@ def evaluate_scene_metrics(
         t = np.asarray(sim3_T[:3, 3], dtype=np.float64)
         world_points_scaled = (P @ R.T) + t[None, :]
 
-        cd_value = compute_chamfer_distance(
+        geom = compute_chamfer_and_normal_consistency(
             world_points_scaled, gt_point_cloud, max_dist=chamfer_max_dist
         )
-        stats_aligned["chamfer_distance"] = float(cd_value)
+        stats_aligned["chamfer_distance"] = float(geom["chamfer_distance"])
+        stats_aligned["nc1"] = float(geom["nc1"])
+        stats_aligned["nc2"] = float(geom["nc2"])
+        stats_aligned["nc"] = float(geom["nc"])
+        stats_aligned["nc1_med"] = float(geom["nc1_med"])
+        stats_aligned["nc2_med"] = float(geom["nc2_med"])
+        stats_aligned["nc_med"] = float(geom["nc_med"])
     except Exception as e:
         msg = str(e)
         if "Degenerate covariance rank" not in msg and "Umeyama alignment" not in msg:
@@ -154,10 +283,17 @@ def evaluate_scene_metrics(
             "rpe_rot": float("nan"),
             "rpe_trans": float("nan"),
             "chamfer_distance": float("nan"),
+            "nc1": float("nan"),
+            "nc2": float("nan"),
+            "nc": float("nan"),
+            "nc1_med": float("nan"),
+            "nc2_med": float("nan"),
+            "nc_med": float("nan"),
         }
 
     all_metrics: Dict[str, float] = deepcopy(stats_aligned)
     all_metrics["inference_time_ms"] = float(inference_time_ms)
+    all_metrics["infer_peak_vram_gb"] = float(infer_peak_vram_gb)
     if pred_depth is not None and gt_depth is not None:
         depth_metrics = evaluate_depth_metrics_streamvggt(
             pred_depth, gt_depth, max_depth=depth_max
@@ -181,6 +317,7 @@ def evaluate_scene_and_save(
     inference_time_ms: float,
     plot_flag: bool,
     *,
+    infer_peak_vram_gb: float = 0.0,
     pred_depth: Optional[np.ndarray] = None,
     gt_depth: Optional[np.ndarray] = None,
     depth_max: float = STREAMVGGT_DEPTH_MAX,
@@ -195,6 +332,7 @@ def evaluate_scene_and_save(
         gt_ply_dir,
         chamfer_max_dist,
         inference_time_ms,
+        infer_peak_vram_gb=infer_peak_vram_gb,
         pred_depth=pred_depth,
         gt_depth=gt_depth,
         depth_max=depth_max,
@@ -221,11 +359,18 @@ def compute_average_metrics_and_save(
 ) -> Dict[str, float]:
     metric_names = [
         "chamfer_distance",
+        "nc1",
+        "nc2",
+        "nc",
+        "nc1_med",
+        "nc2_med",
+        "nc_med",
         "ate",
         "are",
         "rpe_rot",
         "rpe_trans",
         "inference_time_ms",
+        "infer_peak_vram_gb",
         "depth_abs_rel",
         "depth_delta1",
     ]
@@ -261,11 +406,18 @@ def compute_average_metrics_and_save(
 
 FASTVGGT_CORE_METRICS = (
     "chamfer_distance",
+    "nc1",
+    "nc2",
+    "nc",
+    "nc1_med",
+    "nc2_med",
+    "nc_med",
     "ate",
     "are",
     "rpe_rot",
     "rpe_trans",
     "inference_time_ms",
+    "infer_peak_vram_gb",
 )
 
 
@@ -279,6 +431,7 @@ def evaluate_scene_metrics_fastvggt(
     gt_ply_dir: Path,
     chamfer_max_dist: float,
     inference_time_ms: float = 0.0,
+    infer_peak_vram_gb: float = 0.0,
     plot_trajectory: bool = False,
     plot_path: Optional[Path] = None,
     gt_point_cloud: Optional[np.ndarray] = None,
@@ -297,6 +450,7 @@ def evaluate_scene_metrics_fastvggt(
         gt_ply_dir,
         chamfer_max_dist,
         inference_time_ms,
+        infer_peak_vram_gb=infer_peak_vram_gb,
         gt_point_cloud=gt_point_cloud,
         pred_depth=pred_depth,
         gt_depth=gt_depth,

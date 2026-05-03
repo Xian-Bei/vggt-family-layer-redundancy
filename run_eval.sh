@@ -8,14 +8,14 @@ export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 # FastVGGT-aligned CLI knobs
-ROOT_SCANNET="${ROOT_SCANNET:-data/scans_test50,data/scans_dev50}"
+ROOT_SCANNET="${ROOT_SCANNET:-data/scans_dev50}"
 SCANNET_INPUT_FRAME="${SCANNET_INPUT_FRAME:-50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
 OUTPUT_DIR="${OUTPUT_DIR:-analysis_outputs/evaluation}"
 CKPT_PATH="${CKPT_PATH:-}"
 HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
-INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/train/config_90.json}"
+INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/train/config_90_vggt.json}"
 DEVICE="${DEVICE:-cuda:0}"
 NUM_SCENES="${NUM_SCENES:-0}"
 KF="${KF:-10}"
@@ -30,8 +30,8 @@ VIS_MAX_POINTS="${VIS_MAX_POINTS:-0}"
 BASELINE_BACKEND="${BASELINE_BACKEND:-vggt}"
 FAST_BACKEND="${FAST_BACKEND:-fastvggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
-SCANNET_MODELS="${SCANNET_MODELS:-Baseline(vggt),Baseline(fastvggt),Ours(vggt),Ours(fastvggt)}"
-MODELS_7ANDN="${MODELS_7ANDN:-Baseline(vggt),Baseline(fastvggt),Ours(vggt),Ours(fastvggt)}"
+SCANNET_MODELS="${SCANNET_MODELS:-Baseline(vggt),Ours(vggt)}"
+MODELS_7ANDN="${MODELS_7ANDN:-Baseline(vggt),Ours(vggt)}"
 # Tag used for ScanNet-style output directories. Defaults to basename of ROOT_SCANNET
 # (e.g. scans_dev50 / scans_test50), but you can override explicitly.
 SCANNET_TAG="${SCANNET_TAG:-$(basename "${ROOT_SCANNET}")}"
@@ -39,7 +39,9 @@ SCANNET_TAG="${SCANNET_TAG:-$(basename "${ROOT_SCANNET}")}"
 OURS_TRAIN_DIR="${OURS_TRAIN_DIR:-}"
 OURS_EPOCH="${OURS_EPOCH:-}"
 RUN_SCANNET="${RUN_SCANNET:-1}"
-RUN_7ANDN="${RUN_7ANDN:-1}"
+# 7-Scenes / Neural-RGBD eval (eval_7andN.py); set to 0 to skip that dataset only.
+RUN_7SCENES="${RUN_7SCENES:-1}"
+RUN_NRGBD="${RUN_NRGBD:-1}"
 
 trim_spaces() {
   local s="$1"
@@ -148,6 +150,7 @@ run_7andn() {
     --size "${SIZE}"
     --root_7scenes "${ROOT_7SCENES}"
     --root_nrgbd "${ROOT_NRGBD}"
+    --datasets "${DATASETS_7ANDN}"
     --max_scenes_per_dataset "${max_scenes}"
     --max_samples "${max_samples}"
     --model-name "${model_name}"
@@ -182,7 +185,8 @@ echo "   skip_depth_eval (ScanNet depth vs GT): ${SKIP_DEPTH_EVAL}"
 echo "   scannet_models: ${SCANNET_MODELS}"
 echo "   models_7andn: ${MODELS_7ANDN}"
 echo "   run_scannet: ${RUN_SCANNET}"
-echo "   run_7andn: ${RUN_7ANDN}"
+echo "   run_7scenes (7andn): ${RUN_7SCENES}"
+echo "   run_nrgbd (7andn): ${RUN_NRGBD}"
 
 if [[ "${RUN_SCANNET}" == "1" || "${RUN_SCANNET}" == "true" ]]; then
   IFS=',' read -r -a DATA_DIR_ARR <<< "${ROOT_SCANNET}"
@@ -201,14 +205,23 @@ else
   echo "   [skip] scannet evaluation disabled"
 fi
 
-if [[ "${RUN_7ANDN}" == "1" || "${RUN_7ANDN}" == "true" ]]; then
+DATASETS_7ANDN=""
+if [[ "${RUN_7SCENES}" == "1" || "${RUN_7SCENES}" == "true" ]]; then
+  DATASETS_7ANDN+="7scenes,"
+fi
+if [[ "${RUN_NRGBD}" == "1" || "${RUN_NRGBD}" == "true" ]]; then
+  DATASETS_7ANDN+="NRGBD,"
+fi
+DATASETS_7ANDN="${DATASETS_7ANDN%,}"
+
+if [[ -n "${DATASETS_7ANDN}" ]]; then
   IFS=',' read -r -a MODEL_7ANDN_ARR <<< "${MODELS_7ANDN}"
   for spec in "${MODEL_7ANDN_ARR[@]}"; do
     parse_model_spec "${spec}"
     run_7andn "${MODEL_NAME_PARSED}" "${MODEL_BACKEND_PARSED}" "${MODEL_CKPT_PARSED}"
   done
 else
-  echo "   [skip] 7scenes + NRGBD evaluation disabled"
+  echo "   [skip] 7scenes + NRGBD evaluation disabled (RUN_7SCENES=${RUN_7SCENES}, RUN_NRGBD=${RUN_NRGBD})"
 fi
 
 # Aggregate ScanNet average_metrics.json and 7andn/*/logs_all.txt into one markdown table.

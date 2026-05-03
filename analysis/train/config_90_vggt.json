@@ -1,4 +1,5 @@
 {
+  "name": "90_vggt_nocosine",
   "intervals": [
     {
       "l": 4,
@@ -15,7 +16,7 @@
     "BACKEND": "vggt",
     "W_ALIGN": 1.0,
     "W_ALIGN_CKA": 1.0,
-    "W_ALIGN_COS": 1.0,
+    "W_ALIGN_COS": 0.0,
     "W_PRED": 1.0
   }
 }

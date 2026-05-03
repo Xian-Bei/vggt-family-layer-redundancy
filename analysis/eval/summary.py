@@ -9,16 +9,43 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 SCANNET_METRIC_KEYS = (
     "chamfer_distance",
+    "nc1",
+    "nc2",
+    "nc",
+    "nc1_med",
+    "nc2_med",
+    "nc_med",
     "ate",
     "are",
     "rpe_rot",
     "rpe_trans",
     "inference_time_ms",
+    "infer_peak_vram_gb",
     "depth_abs_rel",
     "depth_delta1",
 )
 
-SEVEN_METRIC_KEYS = ("acc", "comp", "nc", "acc_med", "comp_med", "nc_med")
+# 7andn ``average_metrics.json`` columns for summary tables (superset of legacy 6-pack).
+SEVEN_ANDN_SUMMARY_KEYS = (
+    "acc",
+    "comp",
+    "cd",
+    "nc",
+    "acc_med",
+    "comp_med",
+    "cd_med",
+    "nc_med",
+    "inference_time_ms",
+    "infer_peak_vram_gb",
+    "ate",
+    "are",
+    "rpe_rot",
+    "rpe_trans",
+    "depth_abs_rel",
+    "depth_delta1",
+)
+
+SEVEN_METRIC_KEYS = ("acc", "comp", "cd", "nc", "acc_med", "comp_med", "cd_med", "nc_med")
 
 
 def _fmt_cell(v: Any) -> str:
@@ -28,7 +55,7 @@ def _fmt_cell(v: Any) -> str:
         return "nan"
     if fv != fv:
         return "nan"
-    return f"{fv:.6f}"
+    return f"{fv:.2f}"
 
 
 def _md_metric_table(title: str, mode_col: str, metric_keys: Iterable[str], rows: List[Tuple[str, Dict[str, Any]]]) -> List[str]:
@@ -76,9 +103,10 @@ def _scan_scannet_blocks(root: Path) -> List[Tuple[str, List[Tuple[str, Dict[str
 
 _IDX_7N_LINE = re.compile(
     r"Idx:\s*[^,]+,\s*(?:NumImgs:\s*[^,]+,\s*)?"
-    r"Acc:\s*(?P<acc>[^,]+),\s*Comp:\s*(?P<comp>[^,]+),\s*"
+    r"Acc:\s*(?P<acc>[^,]+),\s*Comp:\s*(?P<comp>[^,]+),\s*(?:Cd:\s*(?P<cd>[^,]+),\s*)?"
     r"NC1:\s*(?P<nc1>[^,]+),\s*NC2:\s*(?P<nc2>[^,]+)\s*-\s*"
     r"Acc_med:\s*(?P<acc_med>[^,]+),\s*Compc_med:\s*(?P<comp_med>[^,]+),\s*"
+    r"(?:Cd_med:\s*(?P<cd_med>[^,]+),\s*)?"
     r"NC1c_med:\s*(?P<nc1_med>[^,]+),\s*NC2c_med:\s*(?P<nc2_med>[^\s]+)"
 )
 
@@ -86,9 +114,11 @@ _IDX_7N_LINE = re.compile(
 def _aggregate_7n_from_idx_lines(text: str) -> Dict[str, float]:
     acc: List[float] = []
     comp: List[float] = []
+    cd: List[float] = []
     nc: List[float] = []
     acc_med: List[float] = []
     comp_med: List[float] = []
+    cd_med: List[float] = []
     nc_med: List[float] = []
     for line in text.splitlines():
         m = _IDX_7N_LINE.search(line)
@@ -97,9 +127,17 @@ def _aggregate_7n_from_idx_lines(text: str) -> Dict[str, float]:
         d = m.groupdict()
         acc.append(float(d["acc"]))
         comp.append(float(d["comp"]))
+        if d.get("cd") is not None:
+            cd.append(float(d["cd"]))
+        else:
+            cd.append(float(d["acc"]) + float(d["comp"]))
         nc.append((float(d["nc1"]) + float(d["nc2"])) / 2.0)
         acc_med.append(float(d["acc_med"]))
         comp_med.append(float(d["comp_med"]))
+        if d.get("cd_med") is not None:
+            cd_med.append(float(d["cd_med"]))
+        else:
+            cd_med.append(float(d["acc_med"]) + float(d["comp_med"]))
         nc_med.append((float(d["nc1_med"]) + float(d["nc2_med"])) / 2.0)
     if not acc:
         return {}
@@ -107,9 +145,11 @@ def _aggregate_7n_from_idx_lines(text: str) -> Dict[str, float]:
     return {
         "acc": sum(acc) / n,
         "comp": sum(comp) / n,
+        "cd": sum(cd) / n,
         "nc": sum(nc) / n,
         "acc_med": sum(acc_med) / n,
         "comp_med": sum(comp_med) / n,
+        "cd_med": sum(cd_med) / n,
         "nc_med": sum(nc_med) / n,
     }
 
@@ -185,8 +225,8 @@ def write_summary(output_dir: Path) -> Path:
     lines: List[str] = ["# Evaluation summary", ""]
     for title, rows in blocks:
         lines.extend(_md_metric_table(title, "mode", SCANNET_METRIC_KEYS, rows))
-    lines.extend(_md_metric_table("7Scenes", "mode", SEVEN_METRIC_KEYS, rows_7))
-    lines.extend(_md_metric_table("NRGBD", "mode", SEVEN_METRIC_KEYS, rows_n))
+    lines.extend(_md_metric_table("7Scenes", "mode", SEVEN_ANDN_SUMMARY_KEYS, rows_7))
+    lines.extend(_md_metric_table("NRGBD", "mode", SEVEN_ANDN_SUMMARY_KEYS, rows_n))
     while lines and lines[-1] == "":
         lines.pop()
     text = "\n".join(lines) + "\n"

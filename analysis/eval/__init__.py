@@ -13,7 +13,7 @@ from .prediction_eval import (
     resolve_gt_ply_dir,
     write_eval_scannet_json,
 )
-from .scannet_scene_metrics import (
+from .metrics import (
     FASTVGGT_CORE_METRICS,
     compute_average_metrics_and_save,
     evaluate_scene_and_save,

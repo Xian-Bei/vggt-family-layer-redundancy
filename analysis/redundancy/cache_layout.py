@@ -42,6 +42,18 @@ def _replay_layer_files(layers_dir: Path) -> List[Path]:
     )
 
 
+def count_scene_replay_layers_disk(cache_dir: Path, item: Dict[str, Any]) -> Optional[int]:
+    """Return layer count from ``scene_dir/layers/layer_*.pt`` without loading tensors."""
+    scene_dir = scene_cache_dir(cache_dir, item)
+    if scene_dir is None:
+        return None
+    layers_dir = scene_dir / "layers"
+    if not layers_dir.is_dir():
+        return None
+    files = _replay_layer_files(layers_dir)
+    return len(files) if files else None
+
+
 def load_scene_metadata(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, Any]:
     scene_dir = scene_cache_dir(cache_dir, item)
     if scene_dir is not None:

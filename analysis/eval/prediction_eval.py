@@ -31,7 +31,7 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 from analysis.eval.scannet_eval import SceneData, aggregate_metric_dict
 
-from .scannet_scene_metrics import (
+from .metrics import (
     STREAMVGGT_DEPTH_MAX,
     evaluate_depth_metrics_streamvggt,
     evaluate_scene_metrics_fastvggt,

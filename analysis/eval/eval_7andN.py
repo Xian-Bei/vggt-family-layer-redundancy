@@ -1,10 +1,10 @@
 """7Scenes / NRGBD evaluation entrypoint.
 
-Per-scene forward + ICP + accuracy/completion + average_metrics.json aggregation
-all live in :mod:`analysis.eval.eval_7andn_utils` so the same code path is shared
-with the training-time periodic eval (`train_lora_skip_baseline.py`). This file
-just parses CLI args, builds the model and the SevenScenes/NRGBD datasets, and
-delegates each dataset to ``evaluate_7andn_dataset``.
+Per-scene forward + ICP + accuracy/completion + trajectory (ATE/ARE/RPE, ScanNet
+protocol) + ``<scene>/metrics.json`` + ``average_metrics.json`` aggregation live
+in :mod:`analysis.eval.eval_7andn_utils`, shared with the training-time periodic
+eval (`train_lora_skip_baseline.py`). This file parses CLI args, builds the model
+and datasets, and delegates each dataset to ``evaluate_7andn_dataset``.
 """
 
 import os
@@ -58,6 +58,12 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kf", type=int, default=2, help="key frame")
     parser.add_argument("--root_7scenes", type=str, default="/data/sy/7scenes", help="7Scenes dataset root")
     parser.add_argument("--root_nrgbd", type=str, default="/data/sy/neural_rgbd_data", help="NRGBD dataset root")
+    parser.add_argument(
+        "--datasets",
+        type=str,
+        default="7scenes,NRGBD",
+        help="Comma-separated subset to evaluate. Keys: 7scenes, NRGBD.",
+    )
     parser.add_argument(
         "--max_scenes_per_dataset",
         type=int,
@@ -137,6 +143,12 @@ def main(args: argparse.Namespace) -> None:
             seed=SEED,
         ),
     }
+    requested = [p.strip() for p in str(args.datasets).split(",") if p.strip()]
+    valid_keys = frozenset(datasets_all.keys())
+    for key in requested:
+        if key not in valid_keys:
+            raise SystemExit(f"Unknown dataset {key!r} in --datasets. Valid: {sorted(valid_keys)}")
+    datasets_to_run = {k: datasets_all[k] for k in requested}
 
     eval_conf_thresh = max(1.0, float(args.conf_thresh))
 
@@ -163,7 +175,7 @@ def main(args: argparse.Namespace) -> None:
 
     os.makedirs(osp.join(args.output_dir, f"{args.kf}"), exist_ok=True)
 
-    for name_data, dataset in datasets_all.items():
+    for name_data, dataset in datasets_to_run.items():
         if args.max_scenes_per_dataset > 0 and hasattr(dataset, "scene_list"):
             dataset.scene_list = dataset.scene_list[: args.max_scenes_per_dataset]
         save_path = osp.join(osp.join(args.output_dir, f"{args.kf}"), name_data)

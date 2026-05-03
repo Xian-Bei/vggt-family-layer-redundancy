@@ -154,8 +154,15 @@ def umeyama_alignment(src, dst, estimate_scale=True):
         return scale, R, t
 
 
-def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0):
-    # Ensure point cloud size is not too large, which would cause slow computation
+def compute_chamfer_and_normal_consistency(points_pred, points_gt, max_dist=1.0):
+    """Voxel-downsampled ScanNet-style geometry: Chamfer (clipped means) + NC (7andn-style).
+
+    Chamfer matches the legacy ``compute_chamfer_distance`` definition (sum of directional
+    means after per-direction clipping). Normal consistency uses :mod:`analysis.eval.utils`
+    on the same downsampled points with Open3D-estimated normals.
+    """
+    from analysis.eval.utils import accuracy, completion
+
     MAX_POINTS = 100000
     if points_pred.shape[0] > MAX_POINTS:
         np.random.seed(33)  # Fix random seed
@@ -167,30 +174,53 @@ def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0):
         indices = np.random.choice(points_gt.shape[0], MAX_POINTS, replace=False)
         points_gt = points_gt[indices]
 
-    # Convert numpy point clouds to open3d point cloud objects
     pcd_pred = o3d.geometry.PointCloud()
     pcd_gt = o3d.geometry.PointCloud()
     pcd_pred.points = o3d.utility.Vector3dVector(points_pred)
     pcd_gt.points = o3d.utility.Vector3dVector(points_gt)
 
-    # Downsample point clouds to accelerate computation
     voxel_size = 0.05  # 5cm voxel size
     pcd_pred = pcd_pred.voxel_down_sample(voxel_size)
     pcd_gt = pcd_gt.voxel_down_sample(voxel_size)
 
-    # Compute distances from predicted point cloud to GT point cloud
     distances1 = np.asarray(pcd_pred.compute_point_cloud_distance(pcd_gt))
-    # Compute distances from GT point cloud to predicted point cloud
     distances2 = np.asarray(pcd_gt.compute_point_cloud_distance(pcd_pred))
 
-    # Apply distance clipping
-    distances1 = np.clip(distances1, 0, max_dist)
-    distances2 = np.clip(distances2, 0, max_dist)
+    distances1_c = np.clip(distances1, 0, max_dist)
+    distances2_c = np.clip(distances2, 0, max_dist)
+    chamfer_dist = float(np.mean(distances1_c) + np.mean(distances2_c))
 
-    # Chamfer Distance is the sum of mean distances in both directions
-    chamfer_dist = np.mean(distances1) + np.mean(distances2)
+    search_param = o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+    pcd_pred.estimate_normals(search_param)
+    pcd_gt.estimate_normals(search_param)
 
-    return chamfer_dist
+    gt_pts = np.asarray(pcd_gt.points, dtype=np.float64)
+    pred_pts = np.asarray(pcd_pred.points, dtype=np.float64)
+    gt_n = np.asarray(pcd_gt.normals, dtype=np.float64)
+    pred_n = np.asarray(pcd_pred.normals, dtype=np.float64)
+    if gt_pts.shape[0] < 4 or pred_pts.shape[0] < 4:
+        nan6 = {k: float("nan") for k in ("nc1", "nc2", "nc", "nc1_med", "nc2_med", "nc_med")}
+        return {"chamfer_distance": chamfer_dist, **nan6}
+
+    acc, acc_med, nc1, nc1_med = accuracy(gt_pts, pred_pts, gt_n, pred_n)
+    comp, comp_med, nc2, nc2_med = completion(gt_pts, pred_pts, gt_n, pred_n)
+    return {
+        "chamfer_distance": chamfer_dist,
+        "nc1": float(nc1),
+        "nc2": float(nc2),
+        "nc": float((nc1 + nc2) / 2.0),
+        "nc1_med": float(nc1_med),
+        "nc2_med": float(nc2_med),
+        "nc_med": float((nc1_med + nc2_med) / 2.0),
+    }
+
+
+def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0):
+    return float(
+        compute_chamfer_and_normal_consistency(points_pred, points_gt, max_dist=max_dist)[
+            "chamfer_distance"
+        ]
+    )
 
 
 def load_gt_pointcloud(scene_id, gt_ply_dir):
@@ -729,11 +759,11 @@ def infer_vggt_and_reconstruct(
     float,
     np.ndarray,
     np.ndarray,
+    float,
 ]:
     torch.cuda.synchronize()
-    start = time.time()
-    # Keep input image tensors out of autocast: preserve explicit fp32 image pipeline
-    # and only autocast model forward for speed.
+    # Keep H2D (.cuda) and batching outside the inference timer / peak-VRAM window
+    # (matches 7andN eval: timing is model forward only).
     vgg_input_cuda = vgg_input.cuda()
     if vgg_input_cuda.dim() == 4:
         images_batched = vgg_input_cuda.unsqueeze(0)
@@ -741,6 +771,12 @@ def infer_vggt_and_reconstruct(
         images_batched = vgg_input_cuda
     else:
         raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_input_cuda.shape)}")
+    if images_batched.is_cuda:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(images_batched.device.index)
+    start = time.time()
+    # Keep input image tensors out of autocast: preserve explicit fp32 image pipeline
+    # and only autocast model forward for speed.
     if hasattr(model, "forward_from_aggregated_tokens") and aggregator_supports_return_layers(
         model.aggregator
     ):
@@ -767,6 +803,11 @@ def infer_vggt_and_reconstruct(
     torch.cuda.synchronize()
     end = time.time()
     inference_time_ms = (end - start) * 1000.0
+    infer_peak_vram_gb = 0.0
+    if images_batched.is_cuda:
+        infer_peak_vram_gb = float(
+            torch.cuda.max_memory_allocated(images_batched.device.index)
+        ) / (1024.0**3)
 
     extrinsic, intrinsic = pose_encoding_to_extri_intri(
         predictions["pose_enc"], (vgg_input.shape[2], vgg_input.shape[3])
@@ -829,6 +870,7 @@ def infer_vggt_and_reconstruct(
         inference_time_ms,
         depth_raw_np,
         depth_conf_np,
+        infer_peak_vram_gb,
     )
 
 

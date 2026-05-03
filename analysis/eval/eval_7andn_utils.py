@@ -6,11 +6,14 @@ metric, and aggregation pipeline. The training script could not reuse it, so a
 parallel `collect_batch`-based path was used in dev eval which broke under
 fastvggt's `forward_from_aggregated_tokens(autocast=False)`. Centralizing the
 logic here lets both entry points share the same model forward + metric path
-and unifies output schemas (logs.txt / logs_all.txt / average_metrics.json).
+and unifies output schemas (logs.txt / logs_all.txt / average_metrics.json,
+per-scene ``<scene>/metrics.json`` with geometry + trajectory + timing + peak VRAM (GB)
++ dense depth (``depth_*``, ScanNet / StreamVGGT protocol).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import os.path as osp
 import sys
@@ -38,31 +41,76 @@ for _p in (_THIS_DIR, _ANALYSIS_DIR):
 SEVEN_ANDN_METRIC_KEYS = (
     "acc",
     "comp",
+    "cd",
     "nc1",
     "nc2",
     "nc",
     "acc_med",
     "comp_med",
+    "cd_med",
     "nc1_med",
     "nc2_med",
     "nc_med",
+    "ate",
+    "are",
+    "rpe_rot",
+    "rpe_trans",
+    "inference_time_ms",
+    "infer_peak_vram_gb",
+    "depth_abs_rel",
+    "depth_delta1",
+    "depth_valid_pixels",
 )
 
-# Output schema that must remain byte-equivalent across (a) live eval_7andN.py
-# runs and (b) the one-shot backfill from logs_all.txt. Keys ordered to ease diffing.
+# Output schema for ``average_metrics.json`` (ordered for stable diffs).
 AVERAGE_METRICS_SCHEMA_KEYS = (
     "acc",
     "comp",
+    "cd",
     "nc1",
     "nc2",
     "nc",
     "acc_med",
     "comp_med",
+    "cd_med",
     "nc1_med",
     "nc2_med",
     "nc_med",
+    "ate",
+    "are",
+    "rpe_rot",
+    "rpe_trans",
+    "inference_time_ms",
+    "infer_peak_vram_gb",
+    "depth_abs_rel",
+    "depth_delta1",
+    "depth_valid_pixels",
     "num_scenes",
 )
+
+
+def _center_crop_224_hw(arr: np.ndarray) -> np.ndarray:
+    """Match 7andn point-eval crop: 224×224 centered on VGGT-resolution frame."""
+    if arr.ndim != 2:
+        raise ValueError(f"Expected HxW depth slice, got {arr.shape}")
+    H, W = int(arr.shape[0]), int(arr.shape[1])
+    cx_, cy_ = W // 2, H // 2
+    l, t, r, b = cx_ - 112, cy_ - 112, cx_ + 112, cy_ + 112
+    return arr[t:b, l:r]
+
+
+def _view_depthmap_to_hw(view: Dict[str, Any]) -> np.ndarray:
+    """GT depth map in meters (CPU); ``depthmap`` is not moved to CUDA by ``_move_batch_to_device``."""
+    dm = view["depthmap"]
+    if isinstance(dm, torch.Tensor):
+        x = dm.detach().float().cpu().numpy()
+    else:
+        x = np.asarray(dm, dtype=np.float32)
+    while x.ndim > 2 and x.shape[0] == 1:
+        x = x[0]
+    if x.ndim != 2:
+        raise ValueError(f"Expected depthmap HxW after squeeze, got {x.shape}")
+    return x.astype(np.float32, copy=False)
 
 
 def _depth_to_bshw(depth: torch.Tensor) -> torch.Tensor:
@@ -125,12 +173,11 @@ def _depth_to_world_points_torch(
     return world
 
 
-def compute_7andn_average_metrics(per_scene_rows: List[Dict[str, float]]) -> Dict[str, Any]:
+def compute_7andn_average_metrics(per_scene_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Average per-scene metrics into the canonical average_metrics.json payload.
 
-    Both eval_7andn (live) and the backfill script feed this exact function so
-    the JSON they produce is byte-equivalent. Keys outside AVERAGE_METRICS_SCHEMA_KEYS
-    are ignored to keep the schema stable.
+    Both eval_7andn (live) and the backfill script feed this exact function.
+    Keys outside ``AVERAGE_METRICS_SCHEMA_KEYS`` are ignored when building the average.
     """
     if not per_scene_rows:
         raise ValueError("compute_7andn_average_metrics: empty per_scene_rows")
@@ -173,10 +220,13 @@ def _evaluate_one_scene_7andn(
     vis_max_points: int,
     log_file: Optional[str],
     scene_infer_times: defaultdict,
-) -> Optional[Dict[str, float]]:
-    """Run one 7andn scene through model + ICP + accuracy/completion.
+    scene_peak_vram_gb: defaultdict,
+    quiet: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Run one 7andn scene through model + ICP + accuracy/completion + trajectory.
 
-    Returns per-scene metrics dict ({acc, comp, nc1, nc2, nc, *_med, num_imgs})
+    Returns per-scene metrics dict (geometry, ``ate``/``are``/``rpe_*``, ``inference_time_ms``,
+    ``infer_peak_vram_gb``)
     or None if the scene was skipped for lack of valid points.
     """
     import open3d as o3d  # local import: not all eval consumers need open3d
@@ -193,6 +243,8 @@ def _evaluate_one_scene_7andn(
         raise RuntimeError("Unexpected 7andn batch layout (expected list[dict] with 'img').")
 
     torch.cuda.synchronize()
+    if imgs_tensor.is_cuda:
+        torch.cuda.reset_peak_memory_stats(imgs_tensor.device.index)
     start = time.time()
     # Confine autocast to the model forward only, matching eval_7andN.py and eval_scannet.py.
     # FastVGGT's ``forward_from_aggregated_tokens`` opens its own
@@ -224,6 +276,11 @@ def _evaluate_one_scene_7andn(
             preds = model(imgs_tensor)
     torch.cuda.synchronize()
     inference_time_ms = (time.time() - start) * 1000.0
+    infer_peak_vram_gb = 0.0
+    if imgs_tensor.is_cuda:
+        infer_peak_vram_gb = float(
+            torch.cuda.max_memory_allocated(imgs_tensor.device.index)
+        ) / (1024.0**3)
 
     predictions = preds
     views = batch
@@ -283,11 +340,20 @@ def _evaluate_one_scene_7andn(
 
     gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = criterion.get_all_pts3d_t(batch, preds)
 
+    dv = len(batch)
+    depth_sl = depth[:, -dv:, :, :]
+    depth_conf_sl = depth_conf[:, -dv:, :, :]
+    dep_s_hw = depth_sl[0].detach().float().cpu().numpy()
+    conf_s_hw = depth_conf_sl[0].detach().float().cpu().numpy()
+    pred_m_hw = np.where(conf_s_hw >= float(eval_conf_thresh), dep_s_hw, np.nan).astype(np.float32)
+
     pts_all: List[np.ndarray] = []
     pts_gt_all: List[np.ndarray] = []
     images_all: List[np.ndarray] = []
     masks_all: List[np.ndarray] = []
     conf_all: List[np.ndarray] = []
+    pred_depth_crops: List[np.ndarray] = []
+    gt_depth_crops: List[np.ndarray] = []
     for j, view in enumerate(batch):
         image = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]
         mask = view["valid_mask"].cpu().numpy()[0]
@@ -308,6 +374,8 @@ def _evaluate_one_scene_7andn(
         pts_gt_all.append(pts_gt[None, ...])
         masks_all.append(mask[None, ...])
         conf_all.append(conf_np[None, ...])
+        pred_depth_crops.append(_center_crop_224_hw(pred_m_hw[j]))
+        gt_depth_crops.append(_center_crop_224_hw(_view_depthmap_to_hw(view)))
 
     images_arr = np.concatenate(images_all, axis=0)
     pts_arr = np.concatenate(pts_all, axis=0)
@@ -319,8 +387,16 @@ def _evaluate_one_scene_7andn(
     scene_num_images = len(batch)
     try:
         scene_infer_times[scene_id].append(float(inference_time_ms))
+        scene_peak_vram_gb[scene_id].append(float(infer_peak_vram_gb))
     except Exception:
         pass
+
+    if not quiet:
+        print(
+            f"{scene_id} — Inference time: {inference_time_ms:.2f}ms, "
+            f"infer peak VRAM: {infer_peak_vram_gb:.4f} GB",
+            flush=True,
+        )
 
     pts_masked = pts_arr[masks_arr > 0]
     pts_gt_masked = pts_gt_arr[masks_arr > 0]
@@ -343,7 +419,8 @@ def _evaluate_one_scene_7andn(
         conf_masked = conf_masked.reshape(-1)
 
     if pts_masked.shape[0] == 0 or pts_gt_masked.shape[0] == 0:
-        print(f"[warn] skip {scene_id}: no valid finite points after masking", flush=True)
+        if not quiet:
+            print(f"[warn] skip {scene_id}: no valid finite points after masking", flush=True)
         return None
 
     if pts_masked.shape[0] > 999999:
@@ -403,7 +480,8 @@ def _evaluate_one_scene_7andn(
             except Exception:
                 pass
         except Exception as e:
-            print(f"[warn] 7andN visualization export failed for {scene_id}: {e}", flush=True)
+            if not quiet:
+                print(f"[warn] 7andN visualization export failed for {scene_id}: {e}", flush=True)
 
     if use_proj:
         def _umeyama(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
@@ -445,35 +523,123 @@ def _evaluate_one_scene_7andn(
     acc, acc_med, nc1, nc1_med = accuracy(pcd_gt.points, pcd.points, gt_normal, pred_normal)
     comp, comp_med, nc2, nc2_med = completion(pcd_gt.points, pcd.points, gt_normal, pred_normal)
 
+    pred_depth_stack = np.stack(pred_depth_crops, axis=0)
+    gt_depth_stack = np.stack(gt_depth_crops, axis=0)
+    depth_nan = {
+        "depth_abs_rel": float("nan"),
+        "depth_delta1": float("nan"),
+        "depth_valid_pixels": float("nan"),
+    }
+    depth_stats: Dict[str, float] = dict(depth_nan)
+    try:
+        from .metrics import STREAMVGGT_DEPTH_MAX, evaluate_depth_metrics_streamvggt
+
+        if pred_depth_stack.shape != gt_depth_stack.shape:
+            raise ValueError(
+                f"pred/gt depth shape mismatch: {pred_depth_stack.shape} vs {gt_depth_stack.shape}"
+            )
+        depth_stats = evaluate_depth_metrics_streamvggt(
+            pred_depth_stack.astype(np.float32, copy=False),
+            gt_depth_stack.astype(np.float32, copy=False),
+            max_depth=float(STREAMVGGT_DEPTH_MAX),
+        )
+    except Exception as e:
+        if not quiet:
+            print(f"[warn] 7andn depth metrics skipped for {scene_id}: {e}", flush=True)
+
+    extr_np = extrinsics.detach().float().cpu().numpy()
+    if extr_np.ndim == 4:
+        extr_np = extr_np[0]
+    if int(extr_np.shape[0]) > dv:
+        extr_np = extr_np[-dv:, :, :]
+    gt_pose_rows: List[np.ndarray] = []
+    for view in batch:
+        cp = view["camera_pose"]
+        if isinstance(cp, torch.Tensor):
+            t_pose = cp.detach().float().cpu().numpy()
+        else:
+            t_pose = np.asarray(cp, dtype=np.float64)
+        while t_pose.ndim > 2 and t_pose.shape[0] == 1:
+            t_pose = t_pose[0]
+        if t_pose.shape != (4, 4):
+            raise ValueError(f"Unexpected camera_pose shape {t_pose.shape} for scene {scene_id}")
+        gt_pose_rows.append(t_pose.astype(np.float64, copy=False))
+    gt_c2w = np.stack(gt_pose_rows, axis=0)
+
+    pose_nan = {
+        "ate": float("nan"),
+        "are": float("nan"),
+        "rpe_rot": float("nan"),
+        "rpe_trans": float("nan"),
+    }
+    pose_stats = dict(pose_nan)
+    try:
+        from .eval_utils import to_homogeneous
+        from .metrics import evaluate_7andn_trajectory_metrics
+
+        est_w2c = to_homogeneous(extr_np.astype(np.float32, copy=False))
+        frame_ids = list(range(int(gt_c2w.shape[0])))
+        pose_stats, _traj_plot = evaluate_7andn_trajectory_metrics(
+            est_w2c, gt_c2w, frame_ids, plot_trajectory=False
+        )
+    except ImportError as e:
+        if not quiet:
+            print(f"[warn] 7andn trajectory eval skipped (missing deps): {e}", flush=True)
+
+    cd = float(acc) + float(comp)
+    cd_med = float(acc_med) + float(comp_med)
     line = (
         f"Idx: {scene_id}, NumImgs: {scene_num_images}, "
-        f"Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - "
-        f"Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
+        f"Acc: {acc}, Comp: {comp}, Cd: {cd}, NC1: {nc1}, NC2: {nc2} - "
+        f"Acc_med: {acc_med}, Compc_med: {comp_med}, Cd_med: {cd_med}, "
+        f"NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
     )
-    print(line, flush=True)
+    if not quiet:
+        print(line, flush=True)
     if log_file is not None:
         with open(log_file, "a") as f:
             f.write(line + "\n")
     torch.cuda.empty_cache()
 
-    return {
+    row: Dict[str, float] = {
         "scene_id": scene_id,
         "num_imgs": float(scene_num_images),
         "acc": float(acc),
         "comp": float(comp),
+        "cd": cd,
         "nc1": float(nc1),
         "nc2": float(nc2),
         "nc": (float(nc1) + float(nc2)) / 2.0,
         "acc_med": float(acc_med),
         "comp_med": float(comp_med),
+        "cd_med": cd_med,
         "nc1_med": float(nc1_med),
         "nc2_med": float(nc2_med),
         "nc_med": (float(nc1_med) + float(nc2_med)) / 2.0,
+        "inference_time_ms": float(inference_time_ms),
+        "infer_peak_vram_gb": float(infer_peak_vram_gb),
+        "ate": float(pose_stats["ate"]),
+        "are": float(pose_stats["are"]),
+        "rpe_rot": float(pose_stats["rpe_rot"]),
+        "rpe_trans": float(pose_stats["rpe_trans"]),
+        "depth_abs_rel": float(depth_stats["depth_abs_rel"]),
+        "depth_delta1": float(depth_stats["depth_delta1"]),
+        "depth_valid_pixels": float(depth_stats["depth_valid_pixels"]),
     }
 
+    if save_path is not None:
+        scene_out = Path(save_path) / str(scene_id)
+        scene_out.mkdir(parents=True, exist_ok=True)
+        metrics_payload = {k: v for k, v in row.items() if k != "scene_id"}
+        metrics_payload["scene_id"] = str(scene_id)
+        with open(scene_out / "metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics_payload, f, indent=4)
 
-def _write_logs_all(save_path: str, scene_infer_times: defaultdict) -> None:
-    """Write logs_all.txt = logs.txt + per-scene Time_avg_ms block (kept for backward compat)."""
+    return row
+
+
+def _write_logs_all(save_path: str, scene_infer_times: defaultdict, scene_peak_vram_gb: defaultdict) -> None:
+    """Write logs_all.txt = logs.txt + per-scene Time_avg_ms + PeakVRAM_avg_GB blocks."""
     to_write = ""
     if os.path.exists(osp.join(save_path, "logs.txt")):
         with open(osp.join(save_path, "logs.txt"), "r") as f_sub:
@@ -484,8 +650,14 @@ def _write_logs_all(save_path: str, scene_infer_times: defaultdict) -> None:
         if len(times) > 0
     ]
     time_block = "\n".join(time_lines) + ("\n" if time_lines else "")
+    vram_lines = [
+        f"Idx: {sid}, PeakVRAM_avg_GB: {np.mean(vals):.4f}"
+        for sid, vals in scene_peak_vram_gb.items()
+        if len(vals) > 0
+    ]
+    vram_block = "\n".join(vram_lines) + ("\n" if vram_lines else "")
     with open(osp.join(save_path, "logs_all.txt"), "w") as f:
-        f.write(to_write + time_block)
+        f.write(to_write + time_block + vram_block)
 
 
 def evaluate_7andn_dataset(
@@ -503,11 +675,15 @@ def evaluate_7andn_dataset(
     vis_max_points: int = 0,
     rng_np: Optional[np.random.Generator] = None,
     write_average_metrics_json: bool = True,
+    quiet: bool = False,
 ) -> Dict[str, float]:
     """Run 7Scenes/NRGBD eval for one dataset and return mean metrics dict.
 
     When ``save_path`` is provided, writes ``logs.txt``, ``logs_all.txt`` and
     ``average_metrics.json`` under it (mirroring eval_7andN.py's layout).
+
+    When ``quiet`` is True, suppresses per-scene stdout and the inner tqdm bar
+    (e.g. when called from training next to another progress bar).
     """
     from criterion import L21, Regr3D_t_ScaleShiftInv  # type: ignore  # analysis/eval/criterion.py
 
@@ -522,18 +698,24 @@ def evaluate_7andn_dataset(
         open(log_file, "w").close()
 
     scene_infer_times: defaultdict = defaultdict(list)
+    scene_peak_vram_gb: defaultdict = defaultdict(list)
     criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode=False, gt_scale=True)
 
     total_items = len(dataset)
     if max_samples > 0:
         total_items = min(total_items, max_samples)
 
-    per_scene_rows: List[Dict[str, float]] = []
+    per_scene_rows: List[Dict[str, Any]] = []
     was_training = bool(model.training)
     model.eval()
     try:
         with torch.no_grad():
-            for data_idx in tqdm(range(total_items), desc="eval 7andn", leave=False):
+            for data_idx in tqdm(
+                range(total_items),
+                desc="eval 7andn",
+                leave=False,
+                disable=bool(quiet),
+            ):
                 batch = default_collate([dataset[data_idx]])
                 _move_batch_to_device(batch, device)
                 row = _evaluate_one_scene_7andn(
@@ -550,6 +732,8 @@ def evaluate_7andn_dataset(
                     vis_max_points=int(vis_max_points),
                     log_file=log_file,
                     scene_infer_times=scene_infer_times,
+                    scene_peak_vram_gb=scene_peak_vram_gb,
+                    quiet=bool(quiet),
                 )
                 if row is not None:
                     per_scene_rows.append(row)
@@ -558,7 +742,7 @@ def evaluate_7andn_dataset(
             model.train()
 
     if save_path is not None:
-        _write_logs_all(save_path, scene_infer_times)
+        _write_logs_all(save_path, scene_infer_times, scene_peak_vram_gb)
 
     if not per_scene_rows:
         # Empty mean is preferable to crashing the surrounding training loop.
@@ -567,9 +751,7 @@ def evaluate_7andn_dataset(
 
     average = compute_7andn_average_metrics(per_scene_rows)
     if save_path is not None and write_average_metrics_json:
-        import json
-
-        with open(osp.join(save_path, "average_metrics.json"), "w") as f:
+        with open(osp.join(save_path, "average_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(average, f, indent=4)
 
     return {k: float(v) for k, v in average.items() if k != "num_scenes"}

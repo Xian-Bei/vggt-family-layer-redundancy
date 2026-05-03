@@ -207,10 +207,14 @@ if __name__ == "__main__":
                 inference_time_ms,
                 depth_raw_np,
                 depth_conf_np,
+                infer_peak_vram_gb,
             ) = infer_vggt_and_reconstruct(
                 model, vgg_input, dtype, eval_conf_thresh, image_paths
             )
-            print(f"Inference time: {inference_time_ms:.2f}ms")
+            print(
+                f"Inference time: {inference_time_ms:.2f}ms, "
+                f"infer peak VRAM: {infer_peak_vram_gb:.4f} GB"
+            )
 
             # Process results
             if not all_cam_to_world_mat or not all_world_points:
@@ -282,6 +286,7 @@ if __name__ == "__main__":
                 args.chamfer_max_dist,
                 inference_time_ms,
                 args.plot,
+                infer_peak_vram_gb=infer_peak_vram_gb,
                 pred_depth=pred_depth_for_metrics,
                 gt_depth=gt_depth,
             )
@@ -426,11 +431,18 @@ if __name__ == "__main__":
             if metrics is not None:
                 summary_keys = [
                     "chamfer_distance",
+                    "nc1",
+                    "nc2",
+                    "nc",
+                    "nc1_med",
+                    "nc2_med",
+                    "nc_med",
                     "ate",
                     "are",
                     "rpe_rot",
                     "rpe_trans",
                     "inference_time_ms",
+                    "infer_peak_vram_gb",
                     "depth_abs_rel",
                     "depth_delta1",
                 ]

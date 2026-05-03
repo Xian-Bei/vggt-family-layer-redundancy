@@ -39,6 +39,7 @@ from vggt.models.vggt import VGGT
 
 from .redundancy.metrics import upper_triangle_unpack_for_heatmap
 from analysis.eval.scannet_eval import SceneData, load_scene_images
+from .redundancy.cache_layout import count_scene_replay_layers_disk, load_scene_metadata, scene_cache_dir
 from .redundancy.visualize_pair_attention import (
     _build_global_positions,
     _load_cache_row,
@@ -46,6 +47,43 @@ from .redundancy.visualize_pair_attention import (
     _reconstruct_qk,
 )
 from .vis import build_eval_tab, build_heatmaps_tab, build_lora_tab, build_pair_tab
+
+DEFAULT_LORA_ROOT = Path("analysis_outputs/lora_skip")
+
+
+def _repo_root() -> Path:
+    """Project root (parent of the ``analysis`` package). ``view.py`` lives in ``analysis/``."""
+    return Path(__file__).resolve().parent.parent
+
+
+def _resolve_path_cwd_then_repo(path: Path) -> Path:
+    """Resolve a CLI path that may be relative to cwd or to the repo root."""
+    path = Path(path)
+    if path.is_absolute():
+        return path.resolve()
+    cwd_candidate = (Path.cwd() / path).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return (_repo_root() / path).resolve()
+
+
+def _gradio_allowed_paths(controller: PairAttentionController) -> List[str]:
+    """Directories Gradio may serve when ``Image`` uses ``type='filepath'`` (Gradio 5)."""
+    roots: List[str] = [str(_repo_root())]
+    for raw in (
+        controller.lora_root,
+        controller.eval_root,
+        controller.cache_root,
+        controller.analysis_similarity_root,
+        controller.analysis_skip_root,
+    ):
+        if raw is None:
+            continue
+        try:
+            roots.append(str(Path(raw).resolve()))
+        except OSError:
+            continue
+    return sorted(set(roots))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -55,7 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--lora-dir",
         type=Path,
-        default=Path("analysis_outputs/lora_skip_baseline"),
+        default=DEFAULT_LORA_ROOT,
         help="Directory containing LoRA experiment subfolders (each subfolder is one run).",
     )
     p.add_argument(
@@ -77,8 +115,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--eval-root",
         type=Path,
-        default=Path("analysis_outputs/evaluation/scans_test50_input_frame_50/Baseline_vggt"),
-        help="Optional evaluation output root containing per-scene folders with metrics.json and vis/ assets.",
+        default=Path("analysis_outputs/evaluation"),
+        help=(
+            "Eval outputs directory. Either the shared bundle root ``analysis_outputs/evaluation`` "
+            "(suites: 7andn, scans_*) so the UI can pick model + dataset, or a single run folder "
+            "like ``.../scans_test50_input_frame_50/Ours_vggt`` with per-scene subdirs."
+        ),
     )
     p.add_argument("--viser-host", type=str, default="127.0.0.1", help="Host for embedded Viser server.")
     p.add_argument("--viser-port", type=int, default=8090, help="Port for embedded Viser server.")
@@ -139,7 +181,18 @@ class PairAttentionController:
         data_roots_by_dataset: Dict[str, Path],
         hf_model: str,
         device_arg: str,
+        *,
+        lora_root: Path = DEFAULT_LORA_ROOT,
+        eval_root: Optional[Path] = None,
+        viser_host: str = "127.0.0.1",
+        viser_port: int = 8090,
     ) -> None:
+        self.lora_root = _resolve_path_cwd_then_repo(Path(lora_root))
+        self.eval_root = (
+            _resolve_path_cwd_then_repo(Path(eval_root)) if eval_root is not None else None
+        )
+        self.viser_host = str(viser_host)
+        self.viser_port = int(viser_port)
         self.cache_root = cache_dir
         self.analysis_similarity_root = analysis_sim_dir
         self.analysis_skip_root = analysis_skip_dir
@@ -348,6 +401,53 @@ class PairAttentionController:
         num_frames = len(scene_cache.frame_ids)
         return num_layers, num_frames, list(scene_cache.frame_labels)
 
+    def scene_metadata_light(self, scene_id: str) -> Tuple[int, int, List[str]]:
+        """
+        Scene shape + frame labels without loading VGGT or replay tensors (per-scene directory layout).
+
+        Falls back to :meth:`scene_metadata` for legacy single-file caches (may load a large row once).
+        """
+        if scene_id not in self.scene_items:
+            raise KeyError(scene_id)
+        item = self.scene_items[scene_id]
+        if scene_cache_dir(self.cache_dir, item) is None:
+            return self.scene_metadata(scene_id)
+
+        n_disk = count_scene_replay_layers_disk(self.cache_dir, item)
+        meta = load_scene_metadata(self.cache_dir, item)
+        if n_disk and n_disk > 0:
+            num_layers = int(n_disk)
+        else:
+            ac = meta.get("aggregated_concat_per_layer")
+            if isinstance(ac, list) and ac:
+                num_layers = len(ac)
+            else:
+                return self.scene_metadata(scene_id)
+
+        frame_ids = [str(x) for x in item.get("frame_ids", [])]
+        if not frame_ids:
+            raise SystemExit(f"Manifest entry for {scene_id!r} lacks frame_ids.")
+        image_paths_raw = item.get("image_paths")
+        if not isinstance(image_paths_raw, list) or not image_paths_raw:
+            raise SystemExit(f"Manifest entry for {scene_id!r} lacks image_paths.")
+        image_paths = [Path(str(p)) for p in image_paths_raw]
+        num_frames = int(meta.get("num_frames", len(frame_ids)))
+        frame_labels = [
+            f"index={idx} | frame_id={frame_ids[idx]} | {image_paths[idx].name}"
+            for idx in range(len(frame_ids))
+        ]
+        return num_layers, num_frames, frame_labels
+
+    def pair_ui_num_heads(self) -> int:
+        """Attention head count for Pair UI sliders without loading checkpoint weights."""
+        raw = self.manifest.get("num_heads")
+        if raw is not None:
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                pass
+        return 16
+
     def frame_index_from_label(self, scene_id: str, label: str) -> int:
         scene_cache = self.get_scene_cache(scene_id)
         if label not in scene_cache.frame_label_to_index:
@@ -473,7 +573,7 @@ class EvalViserController:
     """Serve per-scene pointcloud/trajectory assets via a single Viser server."""
 
     def __init__(self, *, eval_root: Path, host: str, port: int) -> None:
-        self.eval_root = Path(eval_root)
+        self.eval_root = Path(eval_root).resolve()
         self.host = str(host)
         self.port = int(port)
         self._server = None
@@ -490,6 +590,10 @@ class EvalViserController:
         self._pred_pts = np.zeros((0, 3), dtype=np.float32)
         self._pred_cols = np.zeros((0, 3), dtype=np.uint8)
         self._pred_order = np.zeros((0,), dtype=np.int64)
+
+    def set_eval_root(self, eval_root: Path) -> None:
+        """Point the loader at a different on-disk eval run (e.g. another model or dataset)."""
+        self.eval_root = Path(eval_root).resolve()
 
     def _ensure_server(self):
         if self._server is not None:
@@ -809,22 +913,48 @@ def _first_existing(paths: Sequence[Path]) -> Path:
 
 
 def _lora_expected_plot_paths(exp_dir: Path) -> Dict[str, Path]:
+    """Paths for LoRA tab images.
+
+    Training now saves ``eval_plot_{group}_{metric}.png`` (see ``_plot_metric_group`` in
+    ``train_lora_skip_baseline.py``): ``scannet`` bundles dev/test ScanNet curves; ``7andn``
+    bundles 7-scenes / RGB-D style metrics. Legacy unprefixed filenames are still tried.
+    """
     return {
-        # Row 1
-        "eval_plot_are": exp_dir / "eval_plot_are.png",
-        "eval_plot_ate": exp_dir / "eval_plot_ate.png",
-        "eval_plot_rpe_rot": exp_dir / "eval_plot_rpe_rot.png",
-        "eval_plot_rpe_trans": exp_dir / "eval_plot_rpe_trans.png",
-        # Row 2
-        # Accept both legacy and current filenames.
+        # ScanNet group (row 1–2 in the LoRA tab)
+        "eval_plot_are": _first_existing(
+            [exp_dir / "eval_plot_scannet_are.png", exp_dir / "eval_plot_are.png"]
+        ),
+        "eval_plot_ate": _first_existing(
+            [exp_dir / "eval_plot_scannet_ate.png", exp_dir / "eval_plot_ate.png"]
+        ),
+        "eval_plot_rpe_rot": _first_existing(
+            [exp_dir / "eval_plot_scannet_rpe_rot.png", exp_dir / "eval_plot_rpe_rot.png"]
+        ),
+        "eval_plot_rpe_trans": _first_existing(
+            [exp_dir / "eval_plot_scannet_rpe_trans.png", exp_dir / "eval_plot_rpe_trans.png"]
+        ),
         "eval_plot_depth_abs_abs_rel": _first_existing(
-            [exp_dir / "eval_plot_depth_abs_abs_rel.png", exp_dir / "eval_plot_depth_abs_rel.png"]
+            [
+                exp_dir / "eval_plot_scannet_depth_abs_rel.png",
+                exp_dir / "eval_plot_depth_abs_abs_rel.png",
+                exp_dir / "eval_plot_depth_abs_rel.png",
+            ]
         ),
         "eval_plot_depth_abs_delta1": _first_existing(
-            [exp_dir / "eval_plot_depth_abs_delta1.png", exp_dir / "eval_plot_depth_delta1.png"]
+            [
+                exp_dir / "eval_plot_scannet_depth_delta1.png",
+                exp_dir / "eval_plot_depth_abs_delta1.png",
+                exp_dir / "eval_plot_depth_delta1.png",
+            ]
         ),
-        "eval_plot_chamfer_distance": exp_dir / "eval_plot_chamfer_distance.png",
-        # Row 3
+        "eval_plot_chamfer_distance": _first_existing(
+            [exp_dir / "eval_plot_scannet_chamfer_distance.png", exp_dir / "eval_plot_chamfer_distance.png"]
+        ),
+        # 7-scenes / NRGBD group (row 3)
+        "eval_plot_7andn_acc_med": exp_dir / "eval_plot_7andn_acc_med.png",
+        "eval_plot_7andn_comp_med": exp_dir / "eval_plot_7andn_comp_med.png",
+        "eval_plot_7andn_nc_med": exp_dir / "eval_plot_7andn_nc_med.png",
+        # Training curves (row 4)
         "train_curves": exp_dir / "train_curves.png",
         "train_loss_weighted_components": exp_dir / "train_loss_weighted_components.png",
     }
@@ -1629,8 +1759,8 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     pair_enabled = bool(scene_ids)
     initial_scene = scene_ids[0] if scene_ids else None
     if pair_enabled and initial_scene is not None:
-        num_layers, num_frames, frame_labels = controller.scene_metadata(initial_scene)
-        num_heads = controller.num_heads()
+        num_layers, num_frames, frame_labels = controller.scene_metadata_light(initial_scene)
+        num_heads = controller.pair_ui_num_heads()
     else:
         num_layers, num_frames, frame_labels = 0, 0, []
         num_heads = 1
@@ -1644,7 +1774,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     if not stage2_modes_all:
         stage2_modes_all = _discover_stage2_modes(controller.similarity_reports, controller.skip_reports)
     n_stage2_galleries = 5 * len(stage2_modes_all)
-    lora_root = getattr(controller, "lora_root", Path("analysis_outputs/lora_skip_baseline"))
+    lora_root = controller.lora_root
     stage2_last_render_key: Dict[str, Optional[Tuple[str, str, int, int, int]]] = {"cache_key": None}
     dataset_switch_output_len: Dict[str, int] = {"count": 0}
 
@@ -1873,7 +2003,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 "",
                 "",
             )
-        num_layers_, num_frames_, labels = controller.scene_metadata(scene_id)
+        num_layers_, num_frames_, labels = controller.scene_metadata_light(scene_id)
         max_layer = max(0, num_layers_ - 1)
         max_frame = max(0, num_frames_ - 1)
         info = f"layers: {num_layers_}, frames: {num_frames_}"
@@ -2117,10 +2247,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         """,
     ) as demo:
         build_lora_tab(
+            blocks=demo,
             lora_root=Path(lora_root),
             discover_lora_experiments=_discover_lora_experiments,
             lora_expected_plot_paths=_lora_expected_plot_paths,
-            load_image_if_exists=_load_image_if_exists,
         )
 
         pair_ui = build_pair_tab(
@@ -2216,6 +2346,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         )
 
         build_eval_tab(
+            blocks=demo,
             controller=controller,
             eval_viser_controller_cls=EvalViserController,
             load_image_if_exists=_load_image_if_exists,
@@ -2245,14 +2376,19 @@ def main() -> None:
         },
         hf_model=args.hf_model,
         device_arg=args.device,
+        lora_root=args.lora_dir,
+        eval_root=args.eval_root,
+        viser_host=args.viser_host,
+        viser_port=args.viser_port,
     )
-    setattr(controller, "lora_root", args.lora_dir)
-    # Optional eval visualization config.
-    setattr(controller, "eval_root", getattr(args, "eval_root", None))
-    setattr(controller, "viser_host", getattr(args, "viser_host", "127.0.0.1"))
-    setattr(controller, "viser_port", getattr(args, "viser_port", 8090))
     demo = _build_ui(controller)
-    demo.queue().launch(server_name=args.server_name, server_port=args.server_port, show_error=True, share=True)
+    demo.queue().launch(
+        server_name=args.server_name,
+        server_port=args.server_port,
+        show_error=True,
+        share=True,
+        allowed_paths=_gradio_allowed_paths(controller),
+    )
 
 
 if __name__ == "__main__":
