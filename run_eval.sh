@@ -38,9 +38,9 @@ SCANNET_TAG="${SCANNET_TAG:-$(basename "${ROOT_SCANNET}")}"
 # Ours checkpoint resolution (used when model spec is Ours(<backend>))
 OURS_TRAIN_DIR="${OURS_TRAIN_DIR:-}"
 OURS_EPOCH="${OURS_EPOCH:-}"
-RUN_SCANNET="${RUN_SCANNET:-1}"
+RUN_SCANNET="${RUN_SCANNET:-0}"
 # 7-Scenes / Neural-RGBD eval (eval_7andN.py); set to 0 to skip that dataset only.
-RUN_7SCENES="${RUN_7SCENES:-1}"
+RUN_7SCENES="${RUN_7SCENES:-0}"
 RUN_NRGBD="${RUN_NRGBD:-1}"
 
 trim_spaces() {

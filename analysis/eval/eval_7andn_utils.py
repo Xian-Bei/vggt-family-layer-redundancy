@@ -13,6 +13,7 @@ per-scene ``<scene>/metrics.json`` with geometry + trajectory + timing + peak VR
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import os.path as osp
@@ -192,8 +193,13 @@ def compute_7andn_average_metrics(per_scene_rows: List[Dict[str, Any]]) -> Dict[
 
 
 def _move_batch_to_device(batch: List[Dict[str, Any]], device: str) -> None:
-    """Mirror eval_7andN.py's per-batch device transfer (in place)."""
-    ignore_keys = {"depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng"}
+    """Mirror eval_7andN.py's per-batch device transfer (in place).
+
+    ``img`` is left on CPU so :func:`_evaluate_one_scene_7andn` can ``torch.cat`` then
+    ``.to(device)`` once. Moving every view's ``img`` to CUDA *and* catting duplicated
+    ~400MB+ of pixels on GPU for long NRGBD clips and pushed the next scene over OOM.
+    """
+    ignore_keys = {"depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng", "img"}
     for view in batch:
         for name in list(view.keys()):
             if name in ignore_keys:
@@ -209,6 +215,7 @@ def _evaluate_one_scene_7andn(
     *,
     model: torch.nn.Module,
     batch: List[Dict[str, Any]],
+    device: str,
     eval_amp_dtype: torch.dtype,
     eval_conf_thresh: float,
     criterion: Any,
@@ -235,13 +242,19 @@ def _evaluate_one_scene_7andn(
 
     if isinstance(batch, dict) and "img" in batch:
         batch["img"] = (batch["img"] + 1.0) / 2.0
+        imgs_tensor = batch["img"].to(device, non_blocking=True)
     elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
         for view in batch:
             view["img"] = (view["img"] + 1.0) / 2.0
-        imgs_tensor = torch.cat([v["img"] for v in batch], dim=0)
+        imgs_tensor = torch.cat([v["img"] for v in batch], dim=0).to(device, non_blocking=True)
     else:
         raise RuntimeError("Unexpected 7andn batch layout (expected list[dict] with 'img').")
 
+    # Defragment before the next forward: long runs leave the allocator unable to satisfy
+    # a new large contiguous block (e.g. last NRGBD scene with more views than prior ones).
+    if torch.cuda.is_available() and imgs_tensor.is_cuda:
+        gc.collect()
+        torch.cuda.empty_cache()
     torch.cuda.synchronize()
     if imgs_tensor.is_cuda:
         torch.cuda.reset_peak_memory_stats(imgs_tensor.device.index)
@@ -271,6 +284,7 @@ def _evaluate_one_scene_7andn(
             int(patch_start_idx),
             agg_input,
         )
+        del aggregated_tokens_list
     else:
         with torch.cuda.amp.autocast(dtype=eval_amp_dtype):
             preds = model(imgs_tensor)
@@ -282,6 +296,13 @@ def _evaluate_one_scene_7andn(
             torch.cuda.max_memory_allocated(imgs_tensor.device.index)
         ) / (1024.0**3)
 
+    # ``torch.cat`` buffer: no longer needed after forward; keeping it through ICP/trajectory
+    # inflated peak memory across scenes once extra post-forward work was added.
+    img_hw = (int(imgs_tensor.shape[2]), int(imgs_tensor.shape[3]))
+    del imgs_tensor
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     predictions = preds
     views = batch
     if "pose_enc" in predictions:
@@ -291,7 +312,6 @@ def _evaluate_one_scene_7andn(
     else:
         raise KeyError("predictions is missing a key to infer sequence length")
 
-    img_hw = (int(imgs_tensor.shape[2]), int(imgs_tensor.shape[3]))
     extrinsics, intrinsics = pose_encoding_to_extri_intri(predictions["pose_enc"], img_hw)
     depth = _depth_to_bshw(predictions["depth"])
     depth_conf = predictions.get("depth_conf", None)
@@ -382,6 +402,18 @@ def _evaluate_one_scene_7andn(
     pts_gt_arr = np.concatenate(pts_gt_all, axis=0)
     masks_arr = np.concatenate(masks_all, axis=0)
     conf_arr = np.concatenate(conf_all, axis=0) if conf_all else None
+
+    # ``preds = ress`` replaced the list name but ``predictions`` still referenced the full
+    # VGGT output dict (depth / pose_enc / …) until function end — extra trajectory + depth
+    # metrics extended that lifetime and caused OOM on the *next* scene. Drop GPU tensors
+    # once NumPy copies exist; keep ``extrinsics`` / ``intrinsics`` for vis + pose metrics.
+    del preds, pred_pts, gt_pts, gt_factor, pr_factor, masks, monitoring
+    del world_points_from_depth, depth_f, depth_sl, depth_conf_sl, depth, depth_conf, predictions
+    for _v in batch:
+        if isinstance(_v.get("img"), torch.Tensor) and _v["img"].is_cuda:
+            _v["img"] = _v["img"].detach().cpu()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     scene_id = view["label"][0].rsplit("/", 1)[0]
     scene_num_images = len(batch)
@@ -586,6 +618,12 @@ def _evaluate_one_scene_7andn(
         if not quiet:
             print(f"[warn] 7andn trajectory eval skipped (missing deps): {e}", flush=True)
 
+    # Pose path only needs ``extr_np`` (CPU); drop GPU pose tensors before writing logs / row.
+    del extrinsics, intrinsics
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+
     cd = float(acc) + float(comp)
     cd_med = float(acc_med) + float(comp_med)
     line = (
@@ -721,6 +759,7 @@ def evaluate_7andn_dataset(
                 row = _evaluate_one_scene_7andn(
                     model=model,
                     batch=batch,
+                    device=device,
                     eval_amp_dtype=eval_amp_dtype,
                     eval_conf_thresh=eval_conf_thresh,
                     criterion=criterion,
@@ -735,6 +774,10 @@ def evaluate_7andn_dataset(
                     scene_peak_vram_gb=scene_peak_vram_gb,
                     quiet=bool(quiet),
                 )
+                del batch
+                if torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 if row is not None:
                     per_scene_rows.append(row)
     finally:
