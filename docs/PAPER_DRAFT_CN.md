@@ -1,6 +1,6 @@
 # 视觉几何基础模型的层间冗余分析与 GT-Free 自蒸馏深度压缩
 
-> Inter-Layer Redundancy Analysis and GT-Free Self-Distillation for Depth Compression of Visual Geometry Foundation Models: A Case Study on VGGT
+> Inter-Layer Redundancy Analysis and GT-Free Self-Distillation for Depth Compression of Visual Geometry Foundation Models
 >
 > 投稿意向：NeurIPS 2026（草稿，数值结果以 `TBD` 占位，待最终评测回填）
 

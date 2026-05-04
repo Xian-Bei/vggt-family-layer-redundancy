@@ -28,7 +28,7 @@ OUT_DIR="${OUT_DIR:-analysis_outputs/lora_skip}"
 # Backend switching (match run_eval.sh semantics)
 BACKEND="${BACKEND:-vggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
-CONFIG_FILE="${CONFIG_FILE:-analysis/train/config_90_vggt.json analysis/train/config_90_fastvggt.json}"
+CONFIG_FILE="${CONFIG_FILE:-analysis/train/90_vggt_lora32_nocosine.json}"
 VARIANT="${VARIANT:-multi_interval_config}"
 DEVICE="${DEVICE:-cuda}"
 EPOCHS="${EPOCHS:-50}"

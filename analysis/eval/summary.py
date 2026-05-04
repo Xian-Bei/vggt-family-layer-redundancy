@@ -55,7 +55,7 @@ def _fmt_cell(v: Any) -> str:
         return "nan"
     if fv != fv:
         return "nan"
-    return f"{fv:.2f}"
+    return f"{fv:.3f}"
 
 
 def _md_metric_table(title: str, mode_col: str, metric_keys: Iterable[str], rows: List[Tuple[str, Dict[str, Any]]]) -> List[str]:

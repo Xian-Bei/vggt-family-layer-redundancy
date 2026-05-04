@@ -1,5 +1,4 @@
 {
-  "name": "90_vggt_nocosine",
   "intervals": [
     {
       "l": 4,
@@ -14,9 +13,11 @@
   ],
   "params": {
     "BACKEND": "vggt",
-    "W_ALIGN": 1.0,
+    "W_ALIGN": 2.0,
     "W_ALIGN_CKA": 1.0,
     "W_ALIGN_COS": 0.0,
-    "W_PRED": 1.0
+    "W_PRED": 1.0,
+    "LORA_RANK": 32,
+    "LORA_ALPHA": 64
   }
 }

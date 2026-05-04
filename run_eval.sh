@@ -8,7 +8,7 @@ export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 # FastVGGT-aligned CLI knobs
-ROOT_SCANNET="${ROOT_SCANNET:-data/scans_dev50}"
+ROOT_SCANNET="${ROOT_SCANNET:-data/scans_dev50,data/scans_test50}"
 SCANNET_INPUT_FRAME="${SCANNET_INPUT_FRAME:-50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
@@ -30,17 +30,17 @@ VIS_MAX_POINTS="${VIS_MAX_POINTS:-0}"
 BASELINE_BACKEND="${BASELINE_BACKEND:-vggt}"
 FAST_BACKEND="${FAST_BACKEND:-fastvggt}"
 FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
-SCANNET_MODELS="${SCANNET_MODELS:-Baseline(vggt),Ours(vggt)}"
-MODELS_7ANDN="${MODELS_7ANDN:-Baseline(vggt),Ours(vggt)}"
+SCANNET_MODELS="${SCANNET_MODELS:-Baseline(fastvggt),Ours(fastvggt)}"
+MODELS_7ANDN="${MODELS_7ANDN:-Baseline(vggt),Ours(vggt),Baseline(fastvggt),Ours(fastvggt)}"
 # Tag used for ScanNet-style output directories. Defaults to basename of ROOT_SCANNET
 # (e.g. scans_dev50 / scans_test50), but you can override explicitly.
 SCANNET_TAG="${SCANNET_TAG:-$(basename "${ROOT_SCANNET}")}"
 # Ours checkpoint resolution (used when model spec is Ours(<backend>))
 OURS_TRAIN_DIR="${OURS_TRAIN_DIR:-}"
 OURS_EPOCH="${OURS_EPOCH:-}"
-RUN_SCANNET="${RUN_SCANNET:-0}"
+RUN_SCANNET="${RUN_SCANNET:-1}"
 # 7-Scenes / Neural-RGBD eval (eval_7andN.py); set to 0 to skip that dataset only.
-RUN_7SCENES="${RUN_7SCENES:-0}"
+RUN_7SCENES="${RUN_7SCENES:-1}"
 RUN_NRGBD="${RUN_NRGBD:-1}"
 
 trim_spaces() {
