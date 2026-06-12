@@ -1,15 +1,4 @@
-"""Shared 7Scenes / NRGBD evaluation logic used by both eval_7andN.py and the
-training-time periodic eval in train_lora_skip_baseline.py.
-
-Why this module exists: previously eval_7andN.py inlined the per-scene forward,
-metric, and aggregation pipeline. The training script could not reuse it, so a
-parallel `collect_batch`-based path was used in dev eval which broke under
-fastvggt's `forward_from_aggregated_tokens(autocast=False)`. Centralizing the
-logic here lets both entry points share the same model forward + metric path
-and unifies output schemas (logs.txt / logs_all.txt / average_metrics.json,
-per-scene ``<scene>/metrics.json`` with geometry + trajectory + timing + peak VRAM (GB)
-+ dense depth (``depth_*``, ScanNet / StreamVGGT protocol).
-"""
+"""Shared 7Scenes / NRGBD per-scene evaluation (used by ``eval_v3``)."""
 
 from __future__ import annotations
 
@@ -27,6 +16,9 @@ import numpy as np
 import torch
 from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
+
+from analysis.amp_policy import amp_dtype_for_device, autocast_device_dtype
+from analysis.datasets.scene_id import scene_id_from_eval_views, scene_id_from_label
 
 # data.py / criterion.py / utils.py / base.py import each other using both
 # `analysis/eval/` and `analysis/`-relative paths (see eval_7andN.py top).
@@ -192,6 +184,38 @@ def compute_7andn_average_metrics(per_scene_rows: List[Dict[str, Any]]) -> Dict[
     return {k: out[k] for k in AVERAGE_METRICS_SCHEMA_KEYS if k in out}
 
 
+def _view_field_after_uncollate(key: str, vi: torch.Tensor) -> torch.Tensor:
+    """Restore per-view leading batch dims expected by criterion / crop loops."""
+    if key == "img" and vi.dim() == 3:
+        return vi.unsqueeze(0)
+    if key in ("valid_mask", "depthmap") and vi.dim() == 2:
+        return vi.unsqueeze(0)
+    if key == "pts3d" and vi.dim() == 3:
+        return vi.unsqueeze(0)
+    if key == "camera_pose" and vi.dim() == 2:
+        return vi.unsqueeze(0)
+    return vi
+
+
+def _uncollate_7andn_views(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Split a ``default_collate(views)`` dict back into per-frame view dicts."""
+    if "img" not in batch:
+        raise ValueError("collated 7andn batch missing key 'img'")
+    n = int(batch["img"].shape[0])
+    views: List[Dict[str, Any]] = []
+    for i in range(n):
+        view: Dict[str, Any] = {}
+        for key, val in batch.items():
+            if isinstance(val, torch.Tensor) and val.shape[0] == n:
+                view[key] = _view_field_after_uncollate(key, val[i])
+            elif isinstance(val, (list, tuple)) and len(val) == n:
+                view[key] = val[i]
+            else:
+                view[key] = val
+        views.append(view)
+    return views
+
+
 def _move_batch_to_device(batch: List[Dict[str, Any]], device: str) -> None:
     """Mirror eval_7andN.py's per-batch device transfer (in place).
 
@@ -216,7 +240,6 @@ def _evaluate_one_scene_7andn(
     model: torch.nn.Module,
     batch: List[Dict[str, Any]],
     device: str,
-    eval_amp_dtype: torch.dtype,
     eval_conf_thresh: float,
     criterion: Any,
     revisit: int,
@@ -224,6 +247,8 @@ def _evaluate_one_scene_7andn(
     rng_np: np.random.Generator,
     save_path: Optional[str],
     export_visualization: bool,
+    export_plot: bool = False,
+    write_scene_metrics: bool = True,
     vis_max_points: int,
     log_file: Optional[str],
     scene_infer_times: defaultdict,
@@ -238,57 +263,56 @@ def _evaluate_one_scene_7andn(
     """
     import open3d as o3d  # local import: not all eval consumers need open3d
     from utils import accuracy, completion  # type: ignore  # analysis/eval/utils.py
-    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    from analysis.backbones.registry import get_backbone
+    from analysis.backbones.vendor_inference.vggt_pose_enc import pose_encoding_to_extri_intri
 
     if isinstance(batch, dict) and "img" in batch:
         batch["img"] = (batch["img"] + 1.0) / 2.0
         imgs_tensor = batch["img"].to(device, non_blocking=True)
+        if imgs_tensor.dim() == 4:
+            imgs_tensor = imgs_tensor.unsqueeze(0)
+        batch = _uncollate_7andn_views(batch)
     elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
         for view in batch:
             view["img"] = (view["img"] + 1.0) / 2.0
-        imgs_tensor = torch.cat([v["img"] for v in batch], dim=0).to(device, non_blocking=True)
+        imgs = [v["img"] for v in batch]
+        if imgs[0].dim() == 4:
+            imgs_tensor = torch.cat(imgs, dim=0)
+        else:
+            imgs_tensor = torch.stack(imgs, dim=0)
+        imgs_tensor = imgs_tensor.to(device, non_blocking=True)
     else:
         raise RuntimeError("Unexpected 7andn batch layout (expected list[dict] with 'img').")
+
+    dev = torch.device(device)
+    amp_dt = amp_dtype_for_device(dev)
+    ac_kw = autocast_device_dtype(dev)
+    if amp_dt != torch.float32:
+        imgs_tensor = imgs_tensor.to(dtype=amp_dt)
 
     # Defragment before the next forward: long runs leave the allocator unable to satisfy
     # a new large contiguous block (e.g. last NRGBD scene with more views than prior ones).
     if torch.cuda.is_available() and imgs_tensor.is_cuda:
         gc.collect()
         torch.cuda.empty_cache()
-    torch.cuda.synchronize()
     if imgs_tensor.is_cuda:
+        torch.cuda.synchronize(imgs_tensor.device)
         torch.cuda.reset_peak_memory_stats(imgs_tensor.device.index)
     start = time.time()
-    # Confine autocast to the model forward only, matching eval_7andN.py and eval_scannet.py.
-    # FastVGGT's ``forward_from_aggregated_tokens`` opens its own
-    # ``autocast(enabled=False)`` but does not upcast the bf16 aggregator outputs
-    # before feeding them into ``camera_head.token_norm`` — that mismatch causes
-    # the "expected scalar type BFloat16 but found Float" LayerNorm error. Detect
-    # the vendor backend (no ``return_layers`` on aggregator), run the aggregator
-    # inside autocast, then upcast tokens to fp32 for the heads.
-    from analysis.aggregator_compat import aggregator_supports_return_layers
-
-    if hasattr(model, "forward_from_aggregated_tokens") and not aggregator_supports_return_layers(
-        getattr(model, "aggregator", None)
-    ):
-        # Match VGGT.forward's auto-unsqueeze ([S,3,H,W] -> [1,S,3,H,W]) so the
-        # aggregator sees the same [B,S,3,H,W] layout the heads expect.
+    with torch.autocast(**ac_kw):
         agg_input = imgs_tensor if imgs_tensor.dim() == 5 else imgs_tensor.unsqueeze(0)
-        with torch.cuda.amp.autocast(dtype=eval_amp_dtype):
-            aggregated_tokens_list, patch_start_idx = model.aggregator(agg_input)
-        aggregated_tokens_list = [
-            t.float() if isinstance(t, torch.Tensor) else t for t in aggregated_tokens_list
-        ]
-        preds = model.forward_from_aggregated_tokens(
+        aggregated_tokens_list, patch_start_idx = model.aggregator(agg_input)
+        idx = list(getattr(getattr(model, "depth_head", None), "intermediate_layer_idx", []) or [])
+        adapter = get_backbone("fastvggt" if idx == [0, 1, 2, 3] else "vggt")
+        preds = adapter.run_heads_from_aggregated_tokens(
+            model,
             aggregated_tokens_list,
             int(patch_start_idx),
             agg_input,
         )
         del aggregated_tokens_list
-    else:
-        with torch.cuda.amp.autocast(dtype=eval_amp_dtype):
-            preds = model(imgs_tensor)
-    torch.cuda.synchronize()
+    if imgs_tensor.is_cuda:
+        torch.cuda.synchronize(imgs_tensor.device)
     inference_time_ms = (time.time() - start) * 1000.0
     infer_peak_vram_gb = 0.0
     if imgs_tensor.is_cuda:
@@ -375,10 +399,10 @@ def _evaluate_one_scene_7andn(
     pred_depth_crops: List[np.ndarray] = []
     gt_depth_crops: List[np.ndarray] = []
     for j, view in enumerate(batch):
-        image = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]
-        mask = view["valid_mask"].cpu().numpy()[0]
-        pts = pred_pts[j].cpu().numpy()[0]
-        conf_np = preds[j]["conf"].cpu().data.numpy()[0]
+        image = view["img"].permute(0, 2, 3, 1).detach().cpu().numpy()[0]
+        mask = view["valid_mask"].detach().cpu().numpy()[0]
+        pts = pred_pts[j].detach().cpu().numpy()[0]
+        conf_np = preds[j]["conf"].detach().cpu().numpy()[0]
         pts_gt = gt_pts[j].detach().cpu().numpy()[0]
         H, W = image.shape[:2]
         cx_, cy_ = W // 2, H // 2
@@ -415,7 +439,7 @@ def _evaluate_one_scene_7andn(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    scene_id = view["label"][0].rsplit("/", 1)[0]
+    scene_id = scene_id_from_eval_views(batch)
     scene_num_images = len(batch)
     try:
         scene_infer_times[scene_id].append(float(inference_time_ms))
@@ -611,9 +635,13 @@ def _evaluate_one_scene_7andn(
 
         est_w2c = to_homogeneous(extr_np.astype(np.float32, copy=False))
         frame_ids = list(range(int(gt_c2w.shape[0])))
-        pose_stats, _traj_plot = evaluate_7andn_trajectory_metrics(
-            est_w2c, gt_c2w, frame_ids, plot_trajectory=False
+        pose_stats, traj_plot = evaluate_7andn_trajectory_metrics(
+            est_w2c, gt_c2w, frame_ids, plot_trajectory=bool(export_plot)
         )
+        if export_plot and save_path is not None and traj_plot is not None:
+            scene_out = Path(save_path) / str(scene_id)
+            scene_out.mkdir(parents=True, exist_ok=True)
+            traj_plot.save(scene_out / "plot.png")
     except ImportError as e:
         if not quiet:
             print(f"[warn] 7andn trajectory eval skipped (missing deps): {e}", flush=True)
@@ -665,7 +693,7 @@ def _evaluate_one_scene_7andn(
         "depth_valid_pixels": float(depth_stats["depth_valid_pixels"]),
     }
 
-    if save_path is not None:
+    if save_path is not None and write_scene_metrics:
         scene_out = Path(save_path) / str(scene_id)
         scene_out.mkdir(parents=True, exist_ok=True)
         metrics_payload = {k: v for k, v in row.items() if k != "scene_id"}
@@ -703,7 +731,6 @@ def evaluate_7andn_dataset(
     model: torch.nn.Module,
     dataset: Any,
     device: str = "cuda",
-    eval_amp_dtype: torch.dtype = torch.bfloat16,
     save_path: Optional[str] = None,
     eval_conf_thresh: float = 1.0,
     max_samples: int = 0,
@@ -754,13 +781,12 @@ def evaluate_7andn_dataset(
                 leave=False,
                 disable=bool(quiet),
             ):
-                batch = default_collate([dataset[data_idx]])
+                batch = default_collate(dataset[data_idx])
                 _move_batch_to_device(batch, device)
                 row = _evaluate_one_scene_7andn(
                     model=model,
                     batch=batch,
                     device=device,
-                    eval_amp_dtype=eval_amp_dtype,
                     eval_conf_thresh=eval_conf_thresh,
                     criterion=criterion,
                     revisit=int(revisit),

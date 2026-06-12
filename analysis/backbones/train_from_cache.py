@@ -1,0 +1,87 @@
+"""Launch shared cache-replay trainer for any registered backbone."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+from analysis.backbones.bootstrap import apply_pythonpath
+from analysis.backbones.contracts import TrainFromCacheArgs
+
+
+def launch_cache_replay_training(backbone: str, args: TrainFromCacheArgs) -> None:
+    name = backbone.strip().lower()
+    apply_pythonpath(name)
+    os.environ["BACKEND"] = name
+    train_dtype = str(args.dtype)
+    train_argv = [
+        sys.executable,
+        "-m",
+        "analysis.train.train_lora_skip_baseline",
+        "--backbone",
+        name,
+        "--cache-dir",
+        str(args.cache_dir),
+        "--hf-model",
+        str(args.hf_model),
+        "--output-dir",
+        str(args.output_dir),
+        "--prune-plan-file",
+        str(args.prune_plan_path),
+        "--plan-name",
+        str(getattr(args, "plan_name", "")),
+        "--device",
+        str(args.device),
+        "--dtype",
+        train_dtype,
+        "--epochs",
+        str(int(args.epochs)),
+        "--max-scenes",
+        str(int(args.max_scenes)),
+        "--max-steps",
+        str(int(args.max_steps)),
+        "--lr",
+        str(float(args.lr)),
+        "--save-every-epoch",
+        str(int(args.save_every_epoch)),
+        "--eval-epoch",
+        str(int(args.eval_epoch)),
+        "--eval-max-scenes",
+        str(int(args.eval_max_scenes)),
+        "--max-eval-views",
+        str(int(args.max_eval_views)),
+    ]
+    if bool(args.eval_at_start):
+        train_argv.append("--eval-at-start")
+    else:
+        train_argv.append("--no-eval-at-start")
+    train_argv.extend(
+        [
+        "--eval-bounds-root",
+        str(args.eval_bounds_root),
+        "--target-source",
+        "teacher",
+        ]
+    )
+    if bool(args.eval_scannet_dev50):
+        train_argv.append("--eval-scannet-dev50")
+    else:
+        train_argv.append("--no-eval-scannet-dev50")
+    if bool(args.eval_scannet_test50):
+        train_argv.append("--eval-scannet-test50")
+    else:
+        train_argv.append("--no-eval-scannet-test50")
+    if bool(args.eval_7scenes):
+        train_argv.append("--eval-7scenes")
+    else:
+        train_argv.append("--no-eval-7scenes")
+    train_argv.extend(["--eval-7scenes-split", str(args.eval_7scenes_split)])
+    if bool(args.eval_nrgbd):
+        train_argv.append("--eval-nrgbd")
+    else:
+        train_argv.append("--no-eval-nrgbd")
+    if name == "pi3":
+        train_argv.append("--use-checkpoint")
+    print("[train] launching cache replay:", " ".join(train_argv[2:]), flush=True)
+    subprocess.run(train_argv, check=True)

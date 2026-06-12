@@ -41,7 +41,7 @@ def build_lora_tab(
             details += " | all plots found" if not missing else f" | missing: {', '.join(missing)}"
             return (
                 imgs["eval_plot_are"],
-                imgs["eval_plot_ate"],
+                imgs["eval_plot_ape"],
                 imgs["eval_plot_rpe_rot"],
                 imgs["eval_plot_rpe_trans"],
                 imgs["eval_plot_depth_abs_delta1"],
@@ -64,8 +64,8 @@ def build_lora_tab(
                     lora_eval_are = gr.Image(
                         label="eval_plot_scannet_are", type="filepath", elem_classes=["results-media"]
                     )
-                    lora_eval_ate = gr.Image(
-                        label="eval_plot_scannet_ate", type="filepath", elem_classes=["results-media"]
+                    lora_eval_ape = gr.Image(
+                        label="eval_plot_scannet_ape", type="filepath", elem_classes=["results-media"]
                     )
                     lora_eval_rpe_rot = gr.Image(
                         label="eval_plot_scannet_rpe_rot", type="filepath", elem_classes=["results-media"]
@@ -106,7 +106,7 @@ def build_lora_tab(
 
         lora_outputs = [
             lora_eval_are,
-            lora_eval_ate,
+            lora_eval_ape,
             lora_eval_rpe_rot,
             lora_eval_rpe_trans,
             lora_eval_depth_delta1,

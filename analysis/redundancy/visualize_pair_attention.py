@@ -24,8 +24,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from vggt.models.vggt import VGGT
-
+from analysis.backbones.bootstrap import apply_pythonpath
+from analysis.backbones.registry import get_backbone
 from .cache_layout import build_scene_row_compat
 from analysis.eval.scannet_eval import SceneData, discover_scannet_scenes, load_scene_images
 
@@ -85,7 +85,13 @@ def _load_cache_row(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, Any]:
     return build_scene_row_compat(cache_dir, item, include_pred=False)
 
 
-def _build_global_positions(model: VGGT, *, num_frames: int, image_hw: Tuple[int, int], device: torch.device) -> torch.Tensor | None:
+def _build_global_positions(
+    model: torch.nn.Module,
+    *,
+    num_frames: int,
+    image_hw: Tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor | None:
     agg = model.aggregator
     if agg.rope is None:
         return None
@@ -111,7 +117,7 @@ def _build_global_positions(model: VGGT, *, num_frames: int, image_hw: Tuple[int
 
 
 def _reconstruct_qk(
-    model: VGGT,
+    model: torch.nn.Module,
     frame_layer: torch.Tensor,
     *,
     layer_idx: int,
@@ -278,7 +284,12 @@ def main() -> None:
     frame_a_id = frame_ids[args.frame_a_index]
     frame_b_id = frame_ids[args.frame_b_index]
 
-    model = VGGT.from_pretrained(hf_model).to(device).eval()
+    apply_pythonpath("vggt")
+    model = get_backbone("vggt").load_pretrained(
+        hf_model=hf_model,
+        device=str(device),
+        eval_mode=True,
+    )
     pos_global = _build_global_positions(model, num_frames=len(frame_ids), image_hw=image_hw, device=device)
 
     concat = replay_layers[layer_idx]

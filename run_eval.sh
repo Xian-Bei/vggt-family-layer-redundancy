@@ -4,231 +4,259 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
-export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
-export MPLBACKEND="${MPLBACKEND:-Agg}"
 
-# FastVGGT-aligned CLI knobs
-ROOT_SCANNET="${ROOT_SCANNET:-data/scans_dev50,data/scans_test50}"
-SCANNET_INPUT_FRAME="${SCANNET_INPUT_FRAME:-50}"
+BACKBONES="${BACKBONES:-vggt}"
+RUN_SCANNET_DEV50="${RUN_SCANNET_DEV50:-0}"
+RUN_SCANNET_TEST50="${RUN_SCANNET_TEST50:-0}"
+RUN_7SCENES="${RUN_7SCENES:-1}"
+RUN_NRGBD="${RUN_NRGBD:-0}"
+SPLIT_7SCENES="${SPLIT_7SCENES:-test}"
+
+EXPORT_VIS_2D="${EXPORT_VIS_2D:-1}"
+EXPORT_VIS_3D="${EXPORT_VIS_3D:-0}"
+
+PRUNE="${PRUNE:-0,1}"
+PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-${REPO_ROOT}/analysis/prune_plan}"
+PLAN_NAME="${PLAN_NAME:-}"
+MAX_SCENES="${MAX_SCENES:-0}"
+
+#############################################
+
+ROOT_SCANNET_DEV50="${ROOT_SCANNET_DEV50:-data/scans_dev50}"
+ROOT_SCANNET_TEST50="${ROOT_SCANNET_TEST50:-data/scans_test50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
-OUTPUT_DIR="${OUTPUT_DIR:-analysis_outputs/evaluation}"
-CKPT_PATH="${CKPT_PATH:-}"
-HF_MODEL="${HF_MODEL:-facebook/VGGT-1B}"
-INTERVAL_CONFIG_FILE="${INTERVAL_CONFIG_FILE:-analysis/train/config_90_vggt.json}"
-DEVICE="${DEVICE:-cuda:0}"
-NUM_SCENES="${NUM_SCENES:-0}"
-KF="${KF:-10}"
-SIZE="${SIZE:-518}"
-DEPTH_CONF_THRESH="${DEPTH_CONF_THRESH:-1.0}"
-CHAMFER_MAX_DIST="${CHAMFER_MAX_DIST:-0.5}"
-# Set to 1 to pass --skip_depth_eval (no depth_abs_rel / depth_delta1 vs ScanNet GT).
-SKIP_DEPTH_EVAL="${SKIP_DEPTH_EVAL:-0}"
-# Export per-scene visualization assets for the Gradio+Viser panel.
-EXPORT_VIS="${EXPORT_VIS:-1}"
-VIS_MAX_POINTS="${VIS_MAX_POINTS:-0}"
-BASELINE_BACKEND="${BASELINE_BACKEND:-vggt}"
-FAST_BACKEND="${FAST_BACKEND:-fastvggt}"
-FASTVGGT_VENDOR_PATH="${FASTVGGT_VENDOR_PATH:-${REPO_ROOT}/third_party/fastvggt}"
-SCANNET_MODELS="${SCANNET_MODELS:-Baseline(fastvggt),Ours(fastvggt)}"
-MODELS_7ANDN="${MODELS_7ANDN:-Baseline(vggt),Ours(vggt),Baseline(fastvggt),Ours(fastvggt)}"
-# Tag used for ScanNet-style output directories. Defaults to basename of ROOT_SCANNET
-# (e.g. scans_dev50 / scans_test50), but you can override explicitly.
-SCANNET_TAG="${SCANNET_TAG:-$(basename "${ROOT_SCANNET}")}"
-# Ours checkpoint resolution (used when model spec is Ours(<backend>))
-OURS_TRAIN_DIR="${OURS_TRAIN_DIR:-}"
-OURS_EPOCH="${OURS_EPOCH:-}"
-RUN_SCANNET="${RUN_SCANNET:-1}"
-# 7-Scenes / Neural-RGBD eval (eval_7andN.py); set to 0 to skip that dataset only.
-RUN_7SCENES="${RUN_7SCENES:-1}"
-RUN_NRGBD="${RUN_NRGBD:-1}"
+DEVICE="${DEVICE:-cuda}"
+CONDA_ENV="${CONDA_ENV:-vggt}"
+CHECKPOINT="${CHECKPOINT:-}"
+HF_MODEL="${HF_MODEL:-}"
 
-trim_spaces() {
-  local s="$1"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
-  printf '%s' "${s}"
-}
+# shellcheck source=run_backbones_lib.sh
+source "${REPO_ROOT}/run_backbones_lib.sh"
+parse_backbones_list
 
-parse_model_spec() {
-  local spec
-  spec="$(trim_spaces "$1")"
-  # Accept optional ckpt suffix, e.g. Ours(vggt)ckpt
-  if [[ "${spec}" =~ ^([^()]+)\(([^()]+)\)(ckpt)?$ ]]; then
-    MODEL_NAME_PARSED="$(trim_spaces "${BASH_REMATCH[1]}")"
-    MODEL_BACKEND_PARSED="$(trim_spaces "${BASH_REMATCH[2]}")"
-    MODEL_CKPT_PARSED="$(trim_spaces "${BASH_REMATCH[3]:-}")" # "" or "ckpt"
-    if [[ -z "${MODEL_NAME_PARSED}" || -z "${MODEL_BACKEND_PARSED}" ]]; then
-      echo "[error] Invalid model spec: '${spec}'" >&2
+PRUNE_N=0
+parse_prune_list() {
+  local raw="${PRUNE//,/ }"
+  read -r -a PRUNE_LIST <<< "${raw}"
+  PRUNE_N=0
+  local p
+  for p in "${PRUNE_LIST[@]}"; do
+    p="${p//[[:space:]]/}"
+    [[ -z "${p}" ]] && continue
+    if [[ "${p}" != "0" && "${p}" != "1" ]]; then
+      echo "error: PRUNE entries must be 0 or 1, got: ${p}" >&2
       exit 1
     fi
-  else
-    echo "[error] Invalid model spec: '${spec}', expected <model>(<backend>)[ckpt]" >&2
+    PRUNE_N=$((PRUNE_N + 1))
+  done
+  if [[ "${PRUNE_N}" -eq 0 ]]; then
+    echo "error: PRUNE is empty" >&2
     exit 1
   fi
 }
+parse_prune_list
 
-set_backend_pythonpath() {
-  local backend="$1"
-  if [[ "${backend}" == "fastvggt" ]]; then
-    export PYTHONPATH="${FASTVGGT_VENDOR_PATH}:${REPO_ROOT}:${PYTHONPATH:-}"
-  else
-    export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
-  fi
+truthy() {
+  [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
 }
 
-run_scannet() {
-  local model_name="$1"
-  local backend="$2"
-  local ckpt_flag="${3:-}" # "" or "ckpt"
-  local scannet_data_dir="${DATA_DIR:-${ROOT_SCANNET}}"
-  local model_dir="${model_name}_${backend}"
-  if [[ "${ckpt_flag}" == "ckpt" ]]; then
-    model_dir="${model_dir}_ckpt"
+validate_split_7scenes() {
+  if [[ "${SPLIT_7SCENES}" != "train" && "${SPLIT_7SCENES}" != "test" ]]; then
+    echo "error: SPLIT_7SCENES must be train or test, got: ${SPLIT_7SCENES}" >&2
+    exit 1
   fi
-  local out_dir="${OUTPUT_DIR}/${SCANNET_TAG}_input_frame_${SCANNET_INPUT_FRAME}/${model_dir}"
-  local num_scenes_arg="${NUM_SCENES}"
-  local input_frame_arg="${SCANNET_INPUT_FRAME}"
+}
+validate_split_7scenes
 
-  args=(
-    --data_dir "${scannet_data_dir}"
-    --output_path "${out_dir}"
-    --input_frame "${input_frame_arg}"
-    --depth_conf_thresh "${DEPTH_CONF_THRESH}"
-    --chamfer_max_dist "${CHAMFER_MAX_DIST}"
-    --model-name "${model_name}"
-    --backend "${backend}"
-  )
-  # Always pass num_scenes so eval_scannet can interpret 0 as \"all scenes\".
-  args+=(--num_scenes "${num_scenes_arg}")
-  # Checkpoint routing:
-  # - If CKPT_PATH is set globally, evaluate that checkpoint (legacy mode).
-  # - Else if evaluating Ours(<backend>)ckpt, resolve ckpt from OURS_TRAIN_DIR/OURS_EPOCH (required).
-  # - Else if evaluating Ours(<backend>) (no ckpt suffix), evaluate lowerbound (skip-only; requires INTERVAL_CONFIG_FILE).
-  if [[ -n "${CKPT_PATH}" ]]; then
-    args+=(--ckpt_path "${CKPT_PATH}" --hf_model "${HF_MODEL}")
-  elif [[ "${model_name}" == "Ours" && "${ckpt_flag}" == "ckpt" ]]; then
-    if [[ -z "${OURS_TRAIN_DIR}" || -z "${OURS_EPOCH}" ]]; then
-      echo "[error] ${model_name}(${backend})ckpt requires OURS_TRAIN_DIR and OURS_EPOCH" >&2
-      exit 1
+# upper: no prune; lower: prune only; model: prune + finetuned checkpoint
+resolve_eval_mode() {
+  local prune_flag="$1"
+  if truthy "${prune_flag}"; then
+    if [[ -n "${CHECKPOINT}" ]]; then
+      echo "model"
+    else
+      echo "lower"
     fi
-    args+=(--hf_model "${HF_MODEL}" --train-dir "${OURS_TRAIN_DIR}" --epoch "${OURS_EPOCH}")
-  elif [[ "${model_name}" == "Ours" ]]; then
-    args+=(--hf_model "${HF_MODEL}" --interval-config-file "${INTERVAL_CONFIG_FILE}")
   else
-    args+=(--hf_model "${HF_MODEL}")
+    echo "upper"
   fi
-  if [[ "${SKIP_DEPTH_EVAL}" == "1" || "${SKIP_DEPTH_EVAL}" == "true" ]]; then
-    args+=(--skip_depth_eval)
-  fi
-  if [[ "${EXPORT_VIS}" == "1" || "${EXPORT_VIS}" == "true" ]]; then
-    args+=(--export-visualization --vis-max-points "${VIS_MAX_POINTS}")
-  fi
-
-  set_backend_pythonpath "${backend}"
-  rm -rf "${out_dir}"
-  echo "   [scannet/${model_name}] backend=${backend} ckpt=${ckpt_flag:-none}"
-  python "analysis/eval/eval_scannet.py" "${args[@]}"
 }
 
-run_7andn() {
-  local model_name="$1"
-  local backend="$2"
-  local ckpt_flag="${3:-}" # "" or "ckpt"
-  local model_dir="${model_name}_${backend}"
-  if [[ "${ckpt_flag}" == "ckpt" ]]; then
-    model_dir="${model_dir}_ckpt"
+checkpoint_for_model_mode() {
+  local backbone="$1"
+  local scannet_tag="${2:-scannet_dev50}"
+  if [[ -n "${CHECKPOINT}" ]]; then
+    echo "${CHECKPOINT}"
+    return
   fi
-  local out_dir="${OUTPUT_DIR}/7andn/${model_dir}"
-  local max_scenes=0
-  local max_samples=0
+  echo "${REPO_ROOT}/analysis_outputs_v3/${backbone}/${scannet_tag}/train/checkpoints/latest.pt"
+}
 
-  args=(
-    --device "${DEVICE}"
-    --output_dir "${out_dir}"
-    --kf "${KF}"
-    --size "${SIZE}"
-    --root_7scenes "${ROOT_7SCENES}"
-    --root_nrgbd "${ROOT_NRGBD}"
-    --datasets "${DATASETS_7ANDN}"
-    --max_scenes_per_dataset "${max_scenes}"
-    --max_samples "${max_samples}"
+run_eval_dataset() {
+  local dataset="$1"
+  local data_root="$2"
+  local backbone="$3"
+  local mode="$4"
+  local model_name="$5"
+  local output_dataset="${6:-${dataset}}"
+  local plan_name="${7:-}"
+  set_backend_pythonpath "${backbone}"
+
+  local out_dir="${REPO_ROOT}/analysis_outputs_v3/${backbone}/${output_dataset}/eval/${model_name}"
+  if [[ -n "${plan_name}" && "${mode}" == "lower" ]]; then
+    out_dir="${out_dir}/${plan_name}"
+  fi
+  local extra=(
+    --eval-mode "${mode}"
+    --prune-plan-root "${PRUNE_PLAN_ROOT}"
+    --plan-name "${plan_name}"
     --model-name "${model_name}"
-    --backend "${backend}"
+    --output-dir "${out_dir}"
   )
-  if [[ -n "${CKPT_PATH}" ]]; then
-    args+=(--ckpt_path "${CKPT_PATH}" --hf_model "${HF_MODEL}")
-  elif [[ "${model_name}" == "Ours" && "${ckpt_flag}" == "ckpt" ]]; then
-    if [[ -z "${OURS_TRAIN_DIR}" || -z "${OURS_EPOCH}" ]]; then
-      echo "[error] ${model_name}(${backend})ckpt requires OURS_TRAIN_DIR and OURS_EPOCH" >&2
-      exit 1
-    fi
-    args+=(--hf_model "${HF_MODEL}" --train-dir "${OURS_TRAIN_DIR}" --epoch "${OURS_EPOCH}")
-  elif [[ "${model_name}" == "Ours" ]]; then
-    args+=(--hf_model "${HF_MODEL}" --interval-config-file "${INTERVAL_CONFIG_FILE}")
-  else
-    args+=(--hf_model "${HF_MODEL}")
+  if [[ -n "${HF_MODEL}" ]]; then
+    extra+=(--hf-model "${HF_MODEL}")
   fi
-  if [[ "${EXPORT_VIS}" == "1" || "${EXPORT_VIS}" == "true" ]]; then
-    args+=(--export-visualization --vis-max-points "${VIS_MAX_POINTS}")
+  extra+=(--max-frames "${MAX_FRAMES}")
+  if [[ "${dataset}" == "7scenes" ]]; then
+    extra+=(--split "${SPLIT_7SCENES}")
   fi
 
-  set_backend_pythonpath "${backend}"
-  rm -rf "${out_dir}"
-  echo "   [7andn/${model_name}] backend=${backend} ckpt=${ckpt_flag:-none}"
-  python "analysis/eval/eval_7andN.py" "${args[@]}"
+  if truthy "${EXPORT_VIS:-0}"; then
+    EXPORT_VIS_2D=1
+    EXPORT_VIS_3D=1
+  fi
+  if truthy "${EXPORT_VIS_2D}"; then
+    extra+=(--export-vis-2d)
+  fi
+  if truthy "${EXPORT_VIS_3D}"; then
+    extra+=(--export-vis-3d)
+  fi
+  if [[ "${VIS_MAX_POINTS:-0}" -gt 0 ]]; then
+    extra+=(--vis-max-points "${VIS_MAX_POINTS}")
+  fi
+
+  case "${mode}" in
+    upper)
+      if [[ -n "${CHECKPOINT}" && -f "${CHECKPOINT}" ]]; then
+        extra+=(--checkpoint "${CHECKPOINT}")
+      elif [[ -n "${CHECKPOINT}" ]]; then
+        echo "warning: CHECKPOINT set but missing for upper mode: ${CHECKPOINT}" >&2
+        extra+=(--checkpoint "${CHECKPOINT}")
+      fi
+      ;;
+    lower)
+      ;;
+    model)
+      local ckpt
+      local ckpt_tag="${output_dataset}"
+      if [[ "${dataset}" == "scannet" ]]; then
+        ckpt_tag="scannet_dev50"
+      fi
+      ckpt="$(checkpoint_for_model_mode "${backbone}" "${ckpt_tag}")"
+      if [[ -f "${ckpt}" ]]; then
+        extra+=(--checkpoint "${ckpt}")
+      else
+        echo "error: model mode requires checkpoint (set CHECKPOINT or train first): ${ckpt}" >&2
+        return 1
+      fi
+      ;;
+  esac
+
+  echo "   [eval/${output_dataset}] ${model_name}/${backbone} mode=${mode}"
+  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.eval_v3 \
+    --experiment "${backbone}" \
+    --dataset "${dataset}" \
+    --data-root "${data_root}" \
+    --backbone "${backbone}" \
+    --device "${DEVICE}" \
+    --max-scenes "${MAX_SCENES}" \
+    "${extra[@]}"
 }
 
-echo "== FastVGGT-aligned evaluation =="
-echo "   output: ${OUTPUT_DIR}"
-echo "   skip_depth_eval (ScanNet depth vs GT): ${SKIP_DEPTH_EVAL}"
-echo "   scannet_models: ${SCANNET_MODELS}"
-echo "   models_7andn: ${MODELS_7ANDN}"
-echo "   run_scannet: ${RUN_SCANNET}"
-echo "   run_7scenes (7andn): ${RUN_7SCENES}"
-echo "   run_nrgbd (7andn): ${RUN_NRGBD}"
+run_datasets_for_backbone() {
+  local backbone="$1"
+  local prune_flag="$2"
+  local plan_name="${3:-}"
+  local mode
+  mode="$(resolve_eval_mode "${prune_flag}")"
+  local model_name="${MODEL_NAME:-${mode}}"
 
-if [[ "${RUN_SCANNET}" == "1" || "${RUN_SCANNET}" == "true" ]]; then
-  IFS=',' read -r -a DATA_DIR_ARR <<< "${ROOT_SCANNET}"
-  IFS=',' read -r -a SCANNET_MODEL_ARR <<< "${SCANNET_MODELS}"
-  for dd in "${DATA_DIR_ARR[@]}"; do
-    dd="$(trim_spaces "${dd}")"
-    [[ -z "${dd}" ]] && continue
-    DATA_DIR="${dd}"
-    SCANNET_TAG="$(basename "${DATA_DIR}")"
-    for spec in "${SCANNET_MODEL_ARR[@]}"; do
-      parse_model_spec "${spec}"
-      run_scannet "${MODEL_NAME_PARSED}" "${MODEL_BACKEND_PARSED}" "${MODEL_CKPT_PARSED}"
-    done
+  echo "   [eval] ${backbone} PRUNE=${prune_flag} -> ${mode}/${model_name}${plan_name:+ plan=${plan_name}}"
+  if truthy "${prune_flag}"; then
+    if [[ -n "${plan_name}" ]]; then
+      echo "   [prune] ${PRUNE_PLAN_ROOT}/${plan_name}.json"
+    else
+      echo "   [prune] ${PRUNE_PLAN_ROOT}/${backbone}.json"
+    fi
+  fi
+
+  if truthy "${RUN_SCANNET_DEV50}"; then
+    run_eval_dataset "scannet" "${ROOT_SCANNET_DEV50}" "${backbone}" "${mode}" "${model_name}" "scannet_dev50" "${plan_name}"
+  fi
+  if truthy "${RUN_SCANNET_TEST50}"; then
+    run_eval_dataset "scannet" "${ROOT_SCANNET_TEST50}" "${backbone}" "${mode}" "${model_name}" "scannet_test50" "${plan_name}"
+  fi
+  if [[ "${RUN_7SCENES}" == "1" || "${RUN_7SCENES}" == "true" ]]; then
+    run_eval_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "${mode}" "${model_name}" "7scenes_${SPLIT_7SCENES}" "${plan_name}"
+  fi
+  if [[ "${RUN_NRGBD}" == "1" || "${RUN_NRGBD}" == "true" ]]; then
+    run_eval_dataset "nrgbd" "${ROOT_NRGBD}" "${backbone}" "${mode}" "${model_name}" "nrgbd" "${plan_name}"
+  fi
+}
+
+run_eval_for_prune_variants() {
+  local bb="$1"
+  if [[ -n "${PLAN_NAME}" ]]; then
+    run_datasets_for_backbone "${bb}" "1" "${PLAN_NAME}"
+    return
+  fi
+  local root="${PRUNE_PLAN_ROOT}"
+  if [[ "${root}" == "${REPO_ROOT}/analysis/prune_plan" || "${root}" == "analysis/prune_plan" ]]; then
+    run_datasets_for_backbone "${bb}" "1" ""
+    return
+  fi
+  if [[ ! -d "${root}" ]]; then
+    echo "error: PRUNE_PLAN_ROOT not found: ${root}" >&2
+    exit 1
+  fi
+  local plans=()
+  local f
+  for f in "${root}"/plan_t*_l*.json; do
+    [[ -e "${f}" ]] || continue
+    plans+=("$(basename "${f}" .json)")
   done
-else
-  echo "   [skip] scannet evaluation disabled"
-fi
-
-DATASETS_7ANDN=""
-if [[ "${RUN_7SCENES}" == "1" || "${RUN_7SCENES}" == "true" ]]; then
-  DATASETS_7ANDN+="7scenes,"
-fi
-if [[ "${RUN_NRGBD}" == "1" || "${RUN_NRGBD}" == "true" ]]; then
-  DATASETS_7ANDN+="NRGBD,"
-fi
-DATASETS_7ANDN="${DATASETS_7ANDN%,}"
-
-if [[ -n "${DATASETS_7ANDN}" ]]; then
-  IFS=',' read -r -a MODEL_7ANDN_ARR <<< "${MODELS_7ANDN}"
-  for spec in "${MODEL_7ANDN_ARR[@]}"; do
-    parse_model_spec "${spec}"
-    run_7andn "${MODEL_NAME_PARSED}" "${MODEL_BACKEND_PARSED}" "${MODEL_CKPT_PARSED}"
+  IFS=$'\n' plans=($(printf '%s\n' "${plans[@]}" | sort)); unset IFS
+  if [[ "${#plans[@]}" -eq 0 ]]; then
+    echo "error: no plan files found under ${root} (expected plan_t*_l*.json)" >&2
+    exit 1
+  fi
+  local p
+  for p in "${plans[@]}"; do
+    run_datasets_for_backbone "${bb}" "1" "${p}"
   done
-else
-  echo "   [skip] 7scenes + NRGBD evaluation disabled (RUN_7SCENES=${RUN_7SCENES}, RUN_NRGBD=${RUN_NRGBD})"
-fi
+}
 
-# Aggregate ScanNet average_metrics.json and 7andn/*/logs_all.txt into one markdown table.
-echo "   [summary] ${OUTPUT_DIR}/summary_comparison.md"
-python -m analysis.eval.summary --output-dir "${OUTPUT_DIR}"
+echo "== eval v3 backbones=${BACKBONES} (n=${BB_N}) PRUNE=${PRUNE} (n=${PRUNE_N}) MAX_FRAMES=${MAX_FRAMES} VIS_2D=${EXPORT_VIS_2D} VIS_3D=${EXPORT_VIS_3D} =="
 
-echo "== Done =="
-echo "   ScanNet outputs:  ${OUTPUT_DIR}/<scannet_tag>_input_frame_${SCANNET_INPUT_FRAME}/<model>_<backend>[_ckpt]"
-echo "   7N outputs:       ${OUTPUT_DIR}/7andn/<model>_<backend>[_ckpt]"
+for bb in "${BB_LIST[@]}"; do
+  bb="${bb//[[:space:]]/}"
+  [[ -z "${bb}" ]] && continue
+  for prune_flag in "${PRUNE_LIST[@]}"; do
+    prune_flag="${prune_flag//[[:space:]]/}"
+    [[ -z "${prune_flag}" ]] && continue
+    if truthy "${prune_flag}"; then
+      run_eval_for_prune_variants "${bb}"
+    else
+      run_datasets_for_backbone "${bb}" "${prune_flag}" ""
+    fi
+  done
+  echo "   [summary] analysis_outputs_v3/${bb}/summary_comparison.md"
+  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.summary_v3 \
+    --experiment "${bb}" \
+    --prune-plan-root "${PRUNE_PLAN_ROOT}" \
+    --plan-name "${PLAN_NAME}"
+done
 
+echo "== done =="
+experiment_output_hint "Eval outputs"

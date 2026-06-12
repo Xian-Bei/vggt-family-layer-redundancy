@@ -16,7 +16,7 @@ import argparse
 import io
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -35,8 +35,8 @@ except ImportError as exc:  # pragma: no cover - import guard for optional demo 
         "for example: `pip install -r requirements_demo.txt` or `pip install .[demo]`."
     ) from exc
 
-from vggt.models.vggt import VGGT
-
+from analysis.backbones.bootstrap import apply_pythonpath
+from analysis.backbones.registry import get_backbone
 from .redundancy.metrics import upper_triangle_unpack_for_heatmap
 from analysis.eval.scannet_eval import SceneData, load_scene_images
 from .redundancy.cache_layout import count_scene_replay_layers_disk, load_scene_metadata, scene_cache_dir
@@ -46,7 +46,8 @@ from .redundancy.visualize_pair_attention import (
     _overlay_patch_map,
     _reconstruct_qk,
 )
-from .vis import build_eval_tab, build_heatmaps_tab, build_lora_tab, build_pair_tab
+from .vis import build_eval_tab, build_heatmaps_tab, build_lora_tab
+# from .vis import build_pair_tab  # Pair Attention tab disabled
 
 DEFAULT_LORA_ROOT = Path("analysis_outputs/lora_skip")
 
@@ -88,7 +89,9 @@ def _gradio_allowed_paths(controller: PairAttentionController) -> List[str]:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Interactive browser panel for pair attention.")
-    p.add_argument("--dataset", type=str, default="scannet", choices=["scannet", "7scenes", "nrgbd"])
+    # v3 datasets live under analysis_outputs_v3/<backbone>/<dataset_tag>/...
+    # Keep this free-form so new tags like scannet_dev50/scannet_test50 work.
+    p.add_argument("--dataset", type=str, default="scannet_dev50")
     p.add_argument("--cache-dir", type=Path, default=Path("analysis_outputs/cache"))
     p.add_argument(
         "--lora-dir",
@@ -106,6 +109,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--analysis-skip-dir", type=Path, default=Path("analysis_outputs/skip"))
     p.add_argument("--data-root", type=Path, default=Path("data/scans_dev50/"))
     p.add_argument("--scannet-root", type=Path, default=Path("data/scans_dev50/"))
+    p.add_argument("--scannet-test-root", type=Path, default=Path("data/scans_test50/"))
     p.add_argument("--root-7scenes", type=Path, default=Path("data/7scenes"))
     p.add_argument("--root-nrgbd", type=Path, default=Path("data/neural_rgbd_data"))
     p.add_argument("--hf-model", type=str, default="", help="Optional HF model override; default reads manifest.")
@@ -118,12 +122,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path("analysis_outputs/evaluation"),
         help=(
             "Eval outputs directory. Either the shared bundle root ``analysis_outputs/evaluation`` "
-            "(suites: 7andn, scans_*) so the UI can pick model + dataset, or a single run folder "
+            "(suites: 7andn, scans_*) so the UI can pick model + infer_s, or a single run folder "
             "like ``.../scans_test50_input_frame_50/Ours_vggt`` with per-scene subdirs."
         ),
     )
     p.add_argument("--viser-host", type=str, default="127.0.0.1", help="Host for embedded Viser server.")
     p.add_argument("--viser-port", type=int, default=8090, help="Port for embedded Viser server.")
+    p.add_argument(
+        "--v3-backbone",
+        type=str,
+        default="",
+        help="Initial backbone under analysis_outputs_v3/ (default: first discovered).",
+    )
     return p
 
 
@@ -186,7 +196,24 @@ class PairAttentionController:
         eval_root: Optional[Path] = None,
         viser_host: str = "127.0.0.1",
         viser_port: int = 8090,
+        v3_backbone: str = "",
     ) -> None:
+        from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT
+        from analysis.view_v3_loader import discover_v3_backbones
+
+        self.v3_output_root = OUTPUT_ROOT_DEFAULT
+        self.v3_mode = self.v3_output_root.is_dir()
+        self.v3_backbones: List[str] = []
+        self.v3_backbone = ""
+        if self.v3_mode:
+            self.v3_backbones = discover_v3_backbones(self.v3_output_root)
+            preferred = str(v3_backbone).strip()
+            if preferred and preferred in self.v3_backbones:
+                self.v3_backbone = preferred
+            elif self.v3_backbones:
+                self.v3_backbone = self.v3_backbones[0]
+            else:
+                self.v3_backbone = preferred or "vggt"
         self.lora_root = _resolve_path_cwd_then_repo(Path(lora_root))
         self.eval_root = (
             _resolve_path_cwd_then_repo(Path(eval_root)) if eval_root is not None else None
@@ -200,6 +227,8 @@ class PairAttentionController:
         self.data_roots_by_dataset = dict(data_roots_by_dataset)
         self.device = torch.device(device_arg if torch.cuda.is_available() or device_arg == "cpu" else "cpu")
         self.dataset = str(dataset).strip().lower()
+        if self.v3_mode:
+            self._apply_v3_backbone_paths()
         self.cache_root_exists = self.cache_root.exists() and self.cache_root.is_dir()
 
         self.cache_dir = self._resolve_dataset_dir(self.cache_root, self.dataset)
@@ -207,24 +236,14 @@ class PairAttentionController:
         self.analysis_skip_dir = self._resolve_dataset_dir(self.analysis_skip_root, self.dataset)
         self.data_root = self.data_roots_by_dataset.get(self.dataset, self.data_root)
 
-        manifest_path = self.cache_dir / "manifest.json"
-        self.cache_available = manifest_path.exists()
-        self.manifest: Dict[str, Any] = {}
-        if self.cache_available:
-            self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.scene_items: Dict[str, Dict[str, Any]] = {}
-        for item in self.manifest.get("scenes", []):
-            scene_id = str(item.get("scene_id", "")).strip()
-            has_dir = str(item.get("dir", "")).strip() != ""
-            has_file = str(item.get("file", "")).strip() != ""
-            if scene_id and (has_dir or has_file):
-                self.scene_items[scene_id] = item
+        self.manifest, self.scene_items = self._load_manifest_and_scenes()
+        self.cache_available = self._cache_available_on_disk()
 
         self.hf_model = hf_model.strip() or str(self.manifest.get("hf_model", "")).strip()
         # Model is required only for Pair Attention reconstruction; Stage2/LoRA/Eval tabs can work without it.
         self.pair_available = self.cache_available and bool(self.scene_items) and bool(self.hf_model)
 
-        self.model: Optional[VGGT] = None
+        self.model: Optional[Any] = None
         self.scene_cache: Dict[str, SceneCache] = {}
         self.qk_cache: Dict[Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         self.stage1_eval_by_scene = self._load_stage1_eval_by_scene()
@@ -233,35 +252,140 @@ class PairAttentionController:
         self.stage2_render_cache: Dict[Tuple[str, str, int, int, int], Tuple[Dict[str, List[np.ndarray]], str]] = {}
         self.stage2_request_seq = 0
 
+    def v3_backbone_root(self) -> Path:
+        return self.v3_output_root / self.v3_backbone
+
+    def _apply_v3_backbone_paths(self) -> None:
+        root = self.v3_backbone_root()
+        self.cache_root = root
+        self.eval_root = root / self.dataset / "eval"
+
+    def _reload_v3_artifacts(self) -> None:
+        self.manifest, self.scene_items = self._load_manifest_and_scenes()
+        self.cache_available = self._cache_available_on_disk()
+        self.hf_model = str(self.manifest.get("hf_model", "")).strip() or self.hf_model
+        self.pair_available = self.cache_available and bool(self.scene_items) and bool(self.hf_model)
+        self.scene_cache = {}
+        self.qk_cache = {}
+        self.stage2_render_cache = {}
+        self.stage1_eval_by_scene = self._load_stage1_eval_by_scene()
+        self.similarity_reports = self._discover_similarity_reports()
+        self.skip_reports = self._discover_skip_reports()
+        self.stage2_request_seq += 1
+
+    def switch_backbone(self, backbone: str) -> None:
+        if not self.v3_mode:
+            return
+        bb = str(backbone).strip()
+        if not bb or bb == self.v3_backbone:
+            return
+        self.v3_backbone = bb
+        self._apply_v3_backbone_paths()
+        self.cache_root_exists = self.cache_root.exists() and self.cache_root.is_dir()
+        self.cache_dir = self._resolve_dataset_dir(self.cache_root, self.dataset)
+        self._reload_v3_artifacts()
+
+    def _v3_cache_manifest_path(self) -> Path:
+        return self.v3_backbone_root() / self.dataset / "cache" / "cache_manifest_v3.json"
+
+    def _cache_available_on_disk(self) -> bool:
+        if self.v3_mode:
+            return self._v3_cache_manifest_path().is_file()
+        return bool(self.manifest)
+
     def _resolve_dataset_dir(self, root: Path, dataset: str) -> Path:
         p = Path(root)
+        if self.v3_mode:
+            cand = p / dataset / "cache"
+            if (cand / "cache_manifest_v3.json").exists():
+                return cand
+            ds_root = p / dataset
+            if (ds_root / "redundancy" / "redundancy_graph_v3.npz").is_file():
+                return ds_root
         cand = p / dataset
         if (cand / "manifest.json").exists() or (cand / "per_scene").exists() or cand.exists():
             return cand
+        if (cand / "cache_manifest_v3.json").exists():
+            return cand
         return p
 
-    def switch_dataset(self, dataset: str) -> None:
-        new_ds = str(dataset).strip().lower()
-        self.dataset = new_ds
-        self.cache_dir = self._resolve_dataset_dir(self.cache_root, self.dataset)
-        self.analysis_similarity_dir = self._resolve_dataset_dir(self.analysis_similarity_root, self.dataset)
-        self.analysis_skip_dir = self._resolve_dataset_dir(self.analysis_skip_root, self.dataset)
-        self.data_root = self.data_roots_by_dataset.get(self.dataset, self.data_root)
+    def _load_manifest_and_scenes(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+        if self.v3_mode:
+            from analysis.view_v3_loader import load_v3_bundle
+
+            exp_root = self.v3_backbone_root()
+            bundle = load_v3_bundle(exp_root, self.dataset)
+            manifest_obj = bundle.get("manifest")
+            from analysis.view_v3_loader import scene_item_from_v3_row
+
+            if manifest_obj is None:
+                self.analysis_similarity_dir = exp_root / self.dataset / "redundancy"
+                self.analysis_skip_dir = exp_root / self.dataset / "prune"
+                return {}, {}
+
+            manifest: Dict[str, Any] = {
+                "schema_version": "v3",
+                "hf_model": manifest_obj.hf_model,
+                "backbone": manifest_obj.backbone,
+                "scenes": manifest_obj.scenes,
+                "layer_units": [asdict(u) for u in manifest_obj.layer_units],
+                "num_heads": int(manifest_obj.num_heads),
+            }
+            scene_items: Dict[str, Dict[str, Any]] = {}
+            for item in manifest_obj.scenes:
+                sid = str(item.get("scene_id", "")).strip()
+                if not sid:
+                    continue
+                scene_items[sid] = scene_item_from_v3_row(sid, item, self.cache_dir)
+            if self.eval_root is None:
+                self.eval_root = exp_root / self.dataset / "eval"
+            self.analysis_similarity_dir = exp_root / self.dataset / "redundancy"
+            self.analysis_skip_dir = exp_root / self.dataset / "prune"
+            return manifest, scene_items
 
         manifest_path = self.cache_dir / "manifest.json"
-        self.cache_available = manifest_path.exists()
-        self.manifest = {}
-        if self.cache_available:
-            self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-
-        self.scene_items = {}
-        for item in self.manifest.get("scenes", []):
+        if not manifest_path.exists():
+            v3_path = self.cache_dir / "cache_manifest_v3.json"
+            if v3_path.exists():
+                raise SystemExit(
+                    f"Found v3 cache at {v3_path} but v3 layout is not active. "
+                    f"Ensure {self.v3_output_root} exists or pass --v3-backbone <name>."
+                )
+            return {}, {}
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        scene_items: Dict[str, Dict[str, Any]] = {}
+        for item in manifest.get("scenes", []):
             scene_id = str(item.get("scene_id", "")).strip()
             has_dir = str(item.get("dir", "")).strip() != ""
             has_file = str(item.get("file", "")).strip() != ""
             if scene_id and (has_dir or has_file):
-                self.scene_items[scene_id] = item
+                scene_items[scene_id] = item
+        return manifest, scene_items
 
+    def switch_dataset(self, dataset: str) -> None:
+        new_ds = str(dataset).strip().lower()
+        if new_ds == STAGE2_MIN_DATASET:
+            self.dataset = new_ds
+            self.stage2_render_cache = {}
+            self.similarity_reports = {}
+            self.skip_reports = {}
+            self.stage2_request_seq += 1
+            return
+        self.dataset = new_ds
+        if self.v3_mode:
+            self._apply_v3_backbone_paths()
+        self.cache_dir = self._resolve_dataset_dir(self.cache_root, self.dataset)
+        if not self.v3_mode:
+            self.analysis_similarity_dir = self._resolve_dataset_dir(self.analysis_similarity_root, self.dataset)
+            self.analysis_skip_dir = self._resolve_dataset_dir(self.analysis_skip_root, self.dataset)
+        self.data_root = self.data_roots_by_dataset.get(self.dataset, self.data_root)
+
+        if self.v3_mode:
+            self._reload_v3_artifacts()
+            return
+
+        self.manifest, self.scene_items = self._load_manifest_and_scenes()
+        self.cache_available = self._cache_available_on_disk()
         self.hf_model = str(self.manifest.get("hf_model", "")).strip() or self.hf_model
         self.pair_available = self.cache_available and bool(self.scene_items) and bool(self.hf_model)
         self.scene_cache = {}
@@ -272,19 +396,26 @@ class PairAttentionController:
         self.skip_reports = self._discover_skip_reports()
         self.stage2_request_seq = 0
 
-    def _get_model(self) -> VGGT:
+    def _get_model(self) -> Any:
         if not self.hf_model:
             raise SystemExit(
                 "Pair Attention unavailable: no HF model provided and cache manifest lacks 'hf_model'."
             )
         if self.model is None:
-            self.model = VGGT.from_pretrained(self.hf_model).to(self.device).eval()
+            apply_pythonpath("vggt")
+            self.model = get_backbone("vggt").load_pretrained(
+                hf_model=self.hf_model,
+                device=str(self.device),
+                eval_mode=True,
+            )
         return self.model
 
     def scene_ids(self) -> List[str]:
         return sorted(self.scene_items.keys())
 
     def stage2_scene_ids(self) -> List[str]:
+        if self.dataset == STAGE2_MIN_DATASET:
+            return ["mean"]
         all_ids = set(self.similarity_reports.keys()) | set(self.skip_reports.keys())
         scene_ids: List[str] = []
         if "mean" in all_ids and self.resolve_stage2_num_layers("mean") > 0:
@@ -292,11 +423,57 @@ class PairAttentionController:
         scene_ids.extend(sorted(k for k in all_ids if k != "mean"))
         return scene_ids
 
+    def get_similarity_report_for_dataset(
+        self, dataset: str, scene_id: str, *, backbone: Optional[str] = None
+    ) -> Optional[Stage2SceneReport]:
+        ds = str(dataset).strip().lower()
+        sid = str(scene_id).strip()
+        if self.v3_mode:
+            root = self.v3_backbone_root()
+            if backbone is not None:
+                root = self.v3_output_root / str(backbone).strip()
+            sim_dir = root / ds / "redundancy"
+            reports = self._discover_v3_similarity_reports(sim_dir)
+        else:
+            sim_dir = self._resolve_dataset_dir(self.analysis_similarity_root, ds)
+            reports = self._discover_similarity_reports_in_dir(sim_dir)
+        return reports.get(sid)
+
+    def has_cross_dataset_min_similarity(self) -> bool:
+        return any(
+            self.get_similarity_report_for_dataset(ds, "mean") is not None
+            for ds in getattr(self, "stage2_real_datasets", [])
+        )
+
     def num_heads(self) -> int:
         model = self._get_model()
         return int(model.aggregator.global_blocks[0].attn.num_heads)
 
+    def _ensure_scene_viz_meta(self, scene_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill ``frame_ids`` / ``image_paths`` for v3 caches (manifest, metadata, or data-root fallback)."""
+        out = dict(item)
+        if out.get("frame_ids") and out.get("image_paths"):
+            return out
+        meta = out.get("metadata_v3")
+        if isinstance(meta, dict):
+            if meta.get("frame_ids") and meta.get("image_paths"):
+                out["frame_ids"] = list(meta["frame_ids"])
+                out["image_paths"] = list(meta["image_paths"])
+                return out
+        if self.dataset.startswith("scannet") and self.data_root.exists():
+            from analysis.eval.scannet_eval import discover_scannet_scenes, select_scene_image_paths_fastvggt
+
+            scenes = {s.scene_id: s for s in discover_scannet_scenes(self.data_root)}
+            if scene_id in scenes:
+                n = int(out.get("num_frames") or (meta or {}).get("num_frames") or 0)
+                max_frames = n if n > 0 else 50
+                scene = select_scene_image_paths_fastvggt(scenes[scene_id], max_frames)
+                out["frame_ids"] = [p.stem for p in scene.image_paths]
+                out["image_paths"] = [str(p.resolve()) for p in scene.image_paths]
+        return out
+
     def _resolve_scene_eff(self, scene_id: str, item: Dict[str, Any]) -> SceneData:
+        item = self._ensure_scene_viz_meta(scene_id, item)
         image_paths_raw = item.get("image_paths")
         if not isinstance(image_paths_raw, list) or not image_paths_raw:
             raise SystemExit(
@@ -311,10 +488,14 @@ class PairAttentionController:
         if cached is not None:
             return cached
 
-        item = self.scene_items[scene_id]
+        item = self._ensure_scene_viz_meta(scene_id, self.scene_items[scene_id])
+        self.scene_items[scene_id] = item
         frame_ids = [str(x) for x in item.get("frame_ids", [])]
         if not frame_ids:
-            raise SystemExit(f"Manifest entry for {scene_id!r} lacks frame_ids.")
+            raise SystemExit(
+                f"Manifest entry for {scene_id!r} lacks frame_ids. "
+                "Re-run cache+redundancy (run_cache_redundancy.sh) so manifest includes frame_ids/image_paths."
+            )
         row = _load_cache_row(self.cache_dir, item)
         replay_layers = row.get("aggregated_concat_per_layer")
         if not isinstance(replay_layers, list) or not replay_layers:
@@ -409,7 +590,8 @@ class PairAttentionController:
         """
         if scene_id not in self.scene_items:
             raise KeyError(scene_id)
-        item = self.scene_items[scene_id]
+        item = self._ensure_scene_viz_meta(scene_id, self.scene_items[scene_id])
+        self.scene_items[scene_id] = item
         if scene_cache_dir(self.cache_dir, item) is None:
             return self.scene_metadata(scene_id)
 
@@ -512,19 +694,77 @@ class PairAttentionController:
                     result[scene_id] = Stage2SceneReport(scene_id=scene_id, report=payload)
         return result
 
+    def _discover_v3_similarity_reports(self, redundancy_dir: Path) -> Dict[str, Stage2SceneReport]:
+        from analysis.view_v3_loader import discover_v3_similarity_reports
+
+        raw = discover_v3_similarity_reports(redundancy_dir)
+        return {
+            sid: Stage2SceneReport(scene_id=sid, report=rep)
+            for sid, rep in raw.items()
+        }
+
+    def _discover_v3_skip_reports(self, skip_eval_dir: Path) -> Dict[str, Stage2SceneReport]:
+        from analysis.view_v3_loader import discover_v3_skip_reports
+
+        raw = discover_v3_skip_reports(skip_eval_dir)
+        return {
+            sid: Stage2SceneReport(scene_id=sid, report=rep)
+            for sid, rep in raw.items()
+        }
+
     def _discover_similarity_reports(self) -> Dict[str, Stage2SceneReport]:
+        if self.v3_mode:
+            reports = self._discover_v3_similarity_reports(Path(self.analysis_similarity_dir))
+            if reports:
+                return reports
         return self._discover_similarity_reports_in_dir(self.analysis_similarity_dir)
 
     def _discover_skip_reports(self) -> Dict[str, Stage2SceneReport]:
+        if self.v3_mode:
+            skip_v3_dir = self.v3_backbone_root() / self.dataset / "skip_eval"
+            reports = self._discover_v3_skip_reports(skip_v3_dir)
+            if reports:
+                return reports
         return self._discover_skip_reports_in_dir(self.analysis_skip_dir)
 
-    def stage2_modes_for_dataset(self, dataset: str) -> List[str]:
+    def stage2_modes_for_dataset(self, dataset: str, *, backbone: Optional[str] = None) -> List[str]:
         ds = str(dataset).strip().lower()
-        sim_dir = self._resolve_dataset_dir(self.analysis_similarity_root, ds)
-        skip_dir = self._resolve_dataset_dir(self.analysis_skip_root, ds)
-        similarity_reports = self._discover_similarity_reports_in_dir(sim_dir)
-        skip_reports = self._discover_skip_reports_in_dir(skip_dir)
+        if self.v3_mode:
+            root = self.v3_backbone_root()
+            if backbone is not None:
+                root = self.v3_output_root / str(backbone).strip()
+            sim_dir = root / ds / "redundancy"
+            skip_dir = root / ds / "skip_eval"
+        else:
+            sim_dir = self._resolve_dataset_dir(self.analysis_similarity_root, ds)
+            skip_dir = self._resolve_dataset_dir(self.analysis_skip_root, ds)
+        if self.v3_mode:
+            similarity_reports = self._discover_v3_similarity_reports(sim_dir)
+            skip_reports = self._discover_v3_skip_reports(skip_dir)
+            if not skip_reports:
+                skip_reports = self._discover_skip_reports_in_dir(root / ds / "prune")
+        else:
+            similarity_reports = self._discover_similarity_reports_in_dir(sim_dir)
+            skip_reports = self._discover_skip_reports_in_dir(skip_dir)
         return _discover_stage2_modes(similarity_reports, skip_reports)
+
+    def union_stage2_modes(self, dataset_choices: Sequence[str]) -> List[str]:
+        modes: List[str] = []
+        if self.v3_mode:
+            backbones = self.v3_backbones or [self.v3_backbone]
+            for bb in backbones:
+                for ds in dataset_choices:
+                    for mode in self.stage2_modes_for_dataset(ds, backbone=bb):
+                        if mode not in modes:
+                            modes.append(mode)
+        else:
+            for ds in dataset_choices:
+                for mode in self.stage2_modes_for_dataset(ds):
+                    if mode not in modes:
+                        modes.append(mode)
+        if not modes:
+            modes = _discover_stage2_modes(self.similarity_reports, self.skip_reports)
+        return modes
 
     def get_similarity_report(self, scene_id: str) -> Optional[Stage2SceneReport]:
         return self.similarity_reports.get(scene_id)
@@ -538,6 +778,15 @@ class PairAttentionController:
                 return int(report.get("num_layers", 0))
             except Exception:
                 return 0
+
+        if self.dataset == STAGE2_MIN_DATASET:
+            for ds in getattr(self, "stage2_real_datasets", []):
+                rep = self.get_similarity_report_for_dataset(ds, "mean")
+                if rep is not None:
+                    n = _num_layers_from_report(rep.report)
+                    if n > 0:
+                        return n
+            return 0
 
         sim = self.get_similarity_report(scene_id)
         if sim is not None:
@@ -797,6 +1046,42 @@ STAGE2_METRIC_ROW_POINT = "point"
 STAGE2_TOKEN_ROW_SPECIAL = "special"
 STAGE2_TOKEN_ROW_PATCH = "patch"
 STAGE2_TOKEN_ROW_ALL = "all"
+# v3 redundancy + heatmaps: only all-token similarity (special/patch rows stay in layout but hidden).
+STAGE2_TOKEN_ROWS_ENABLED = [STAGE2_TOKEN_ROW_ALL]
+STAGE2_MIN_DATASET = "min"
+
+
+def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
+    """Discover dataset tags under analysis_outputs_v3/<backbone>/.
+
+    For Heatmap Stage2 we only care about datasets that actually have v3 redundancy
+    outputs (similarity/skip reports). Datasets with only v3 cache but no redundancy
+    should be omitted from the dropdown and excluded from "min" aggregation.
+    """
+    root = Path(backbone_root)
+    if not root.is_dir():
+        return ["scannet_dev50", "scannet_test50", "7scenes", "nrgbd"]
+    tags: List[str] = []
+    for p in sorted(root.iterdir()):
+        if not p.is_dir():
+            continue
+        name = str(p.name).strip()
+        if not name or name.startswith(".") or name == STAGE2_MIN_DATASET:
+            continue
+        # Only include datasets with actual v3 redundancy outputs.
+        # Stage2 similarity reports are built from `redundancy_graph_v3.npz`.
+        if (p / "redundancy" / "redundancy_graph_v3.npz").is_file():
+            tags.append(name)
+    # Prefer ScanNet splits first for UX.
+    prefer = ["scannet_dev50", "scannet_test50", "scannet", "7scenes", "nrgbd"]
+    out: List[str] = []
+    for t in prefer:
+        if t in tags and t not in out:
+            out.append(t)
+    for t in tags:
+        if t not in out:
+            out.append(t)
+    return out
 
 
 def _heatmaps_resolve_filters(
@@ -820,8 +1105,12 @@ def _heatmaps_resolve_filters(
         vm = "absolute"
     if vm not in choices_vm:
         vm = "absolute"
-    has_skip = bool(scene_id) and controller.get_skip_report(scene_id) is not None
-    has_sim = bool(scene_id) and controller.get_similarity_report(scene_id) is not None
+    if controller.dataset == STAGE2_MIN_DATASET:
+        has_skip = False
+        has_sim = controller.has_cross_dataset_min_similarity()
+    else:
+        has_skip = bool(scene_id) and controller.get_skip_report(scene_id) is not None
+        has_sim = bool(scene_id) and controller.get_similarity_report(scene_id) is not None
 
     if has_skip:
         allowed_m = {STAGE2_METRIC_ROW_POSE, STAGE2_METRIC_ROW_POINT}
@@ -833,11 +1122,13 @@ def _heatmaps_resolve_filters(
         m_val = []
 
     if has_sim:
-        allowed_t = {STAGE2_TOKEN_ROW_SPECIAL, STAGE2_TOKEN_ROW_PATCH, STAGE2_TOKEN_ROW_ALL}
+        allowed_t = set(STAGE2_TOKEN_ROWS_ENABLED)
         if token_rows is None:
-            t_val = [STAGE2_TOKEN_ROW_SPECIAL, STAGE2_TOKEN_ROW_PATCH, STAGE2_TOKEN_ROW_ALL]
+            t_val = list(STAGE2_TOKEN_ROWS_ENABLED)
         else:
             t_val = [x for x in token_rows if x in allowed_t]
+            if not t_val:
+                t_val = list(STAGE2_TOKEN_ROWS_ENABLED)
     else:
         t_val = []
 
@@ -861,12 +1152,15 @@ def _heatmaps_gr_controls_from_resolved(
     if not pct_ok:
         cls_vm.append("hm-value-mode-pct-locked")
     metric_update: Dict[str, Any] = {"interactive": has_skip}
-    token_update: Dict[str, Any] = {"interactive": has_sim}
+    token_update: Dict[str, Any] = {
+        "interactive": False,
+        "choices": list(STAGE2_TOKEN_ROWS_ENABLED),
+    }
     sim_gamma_update: Dict[str, Any] = {"interactive": has_sim}
     sim_cutoff_update: Dict[str, Any] = {"interactive": has_sim}
     if write_values:
         metric_update["value"] = m_val
-        token_update["value"] = t_val
+        token_update["value"] = list(t_val) if has_sim else []
         sim_gamma_update["value"] = float(sim_gamma)
         sim_cutoff_update["value"] = float(sim_cutoff)
     return (
@@ -924,8 +1218,13 @@ def _lora_expected_plot_paths(exp_dir: Path) -> Dict[str, Path]:
         "eval_plot_are": _first_existing(
             [exp_dir / "eval_plot_scannet_are.png", exp_dir / "eval_plot_are.png"]
         ),
-        "eval_plot_ate": _first_existing(
-            [exp_dir / "eval_plot_scannet_ate.png", exp_dir / "eval_plot_ate.png"]
+        "eval_plot_ape": _first_existing(
+            [
+                exp_dir / "eval_plot_scannet_ape.png",
+                exp_dir / "eval_plot_scannet_ate.png",
+                exp_dir / "eval_plot_ape.png",
+                exp_dir / "eval_plot_ate.png",
+            ]
         ),
         "eval_plot_rpe_rot": _first_existing(
             [exp_dir / "eval_plot_scannet_rpe_rot.png", exp_dir / "eval_plot_rpe_rot.png"]
@@ -976,17 +1275,20 @@ def _stage2_row_visibility_flags(
         out.append(on and STAGE2_TOKEN_ROW_SPECIAL in tokens)
         out.append(on and STAGE2_METRIC_ROW_POINT in metrics)
         out.append(on and STAGE2_TOKEN_ROW_PATCH in tokens)
-        out.append(on and STAGE2_TOKEN_ROW_ALL in tokens)
+        sim_all_on = on and STAGE2_TOKEN_ROW_ALL in tokens
+        out.append(sim_all_on)
+        out.append(sim_all_on)
     return out
 
 
-def _stage2_block_keys_for_mode(mode: str) -> Tuple[str, str, str, str, str]:
+def _stage2_block_keys_for_mode(mode: str) -> Tuple[str, str, str, str, str, str]:
     return (
         f"skip_{mode}_main",
         f"sim_{mode}_special",
         f"skip_{mode}_depth",
         f"sim_{mode}_patch",
         f"sim_{mode}_all",
+        f"sim_{mode}_all_odd",
     )
 
 
@@ -1003,7 +1305,7 @@ def _stage2_requested_block_keys(
     for mode in mode_order:
         if mode not in active_modes:
             continue
-        skip_main, sim_special, skip_depth, sim_patch, sim_all = _stage2_block_keys_for_mode(mode)
+        skip_main, sim_special, skip_depth, sim_patch, sim_all, sim_all_odd = _stage2_block_keys_for_mode(mode)
         if STAGE2_METRIC_ROW_POSE in metrics:
             requested.add(skip_main)
         if STAGE2_TOKEN_ROW_SPECIAL in tokens:
@@ -1014,6 +1316,7 @@ def _stage2_requested_block_keys(
             requested.add(sim_patch)
         if STAGE2_TOKEN_ROW_ALL in tokens:
             requested.add(sim_all)
+            requested.add(sim_all_odd)
     return requested
 
 
@@ -1038,13 +1341,22 @@ def _canonical_skip_mode(mode: str) -> str:
 
 def _extract_skip_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str, Dict[str, List[float]]]:
     out: Dict[str, Dict[str, List[float]]] = {}
+    prefer_pct = str(report.get("skip_value_mode", "")).strip().lower() == "pct"
 
     fusion_by_mode = report.get("fusion_by_mode")
     if isinstance(fusion_by_mode, dict):
         for mode, mode_payload in fusion_by_mode.items():
             if not isinstance(mode_payload, dict):
                 continue
-            metric_map = mode_payload.get("gt_delta_upper_by_metric")
+            metric_map = None
+            if prefer_pct:
+                metric_map = mode_payload.get("gt_degrade_pct_upper_by_metric")
+                if not isinstance(metric_map, dict):
+                    metric_map = mode_payload.get("gt_delta_upper_by_metric")
+            else:
+                metric_map = mode_payload.get("gt_delta_upper_by_metric")
+                if not isinstance(metric_map, dict):
+                    metric_map = mode_payload.get("gt_degrade_pct_upper_by_metric")
             if not isinstance(metric_map, dict):
                 continue
             clean = {
@@ -1302,6 +1614,25 @@ def _packed_delta_to_pct(
     return out
 
 
+def _packed_drop_1based_odd_rows_reindex(packed: List[float], num_layers: int) -> Tuple[List[float], int]:
+    """Drop 1-based odd layer rows (0-based even i); reindex kept layers to 0..L'-1."""
+    grid = upper_triangle_unpack_for_heatmap(packed, num_layers, float("nan"))
+    kept = [i for i in range(num_layers) if i % 2 == 1]
+    if not kept:
+        return packed, num_layers
+    lp = len(kept)
+    sub: List[List[float]] = [[float("nan")] * lp for _ in range(lp)]
+    for ii, i_old in enumerate(kept):
+        for jj in range(ii, lp):
+            j_old = kept[jj]
+            sub[ii][jj] = grid[i_old][j_old]
+    out: List[float] = []
+    for ii in range(lp):
+        for jj in range(ii, lp):
+            out.append(float(sub[ii][jj]))
+    return out, lp
+
+
 def _heatmap_rgb_from_packed(
     packed: List[float],
     num_layers: int,
@@ -1311,7 +1642,11 @@ def _heatmap_rgb_from_packed(
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     tick_suffix: str = "",
+    drop_odd_rows: bool = False,
+    markers: Optional[List[Tuple[int, int, str]]] = None,
 ) -> np.ndarray:
+    if drop_odd_rows:
+        packed, num_layers = _packed_drop_1based_odd_rows_reindex(packed, num_layers)
     grid = upper_triangle_unpack_for_heatmap(packed, num_layers, fill_value)
     arr = np.asarray(grid, dtype=np.float64)
     finite_vals = arr[np.isfinite(arr)]
@@ -1336,6 +1671,16 @@ def _heatmap_rgb_from_packed(
     cbar.ax.tick_params(labelsize=tick_fs, width=2.0, length=6)
     for lb in cbar.ax.get_yticklabels():
         lb.set_fontweight("bold")
+    if markers:
+        style_map = {
+            "0": dict(marker="o", s=140, c="red", edgecolors="white", linewidths=2.0),
+            "1": dict(marker="^", s=160, c="orange", edgecolors="white", linewidths=2.0),
+            "2": dict(marker="s", s=160, c="magenta", edgecolors="white", linewidths=2.0),
+            "3": dict(marker="D", s=160, c="cyan", edgecolors="white", linewidths=2.0),
+        }
+        for (mi, mj, tag) in markers:
+            kw = style_map.get(str(tag), style_map["0"])
+            ax.scatter([int(mj)], [int(mi)], **kw)
     data_min = float(vmin) if vmin is not None else (float(finite_vals.min()) if finite_vals.size else None)
     data_max = float(vmax) if vmax is not None else (float(finite_vals.max()) if finite_vals.size else None)
     if data_min is not None and data_max is not None:
@@ -1401,6 +1746,24 @@ def _similarity_packed_gamma_01(
     return out
 
 
+def _packed_elementwise_min(packs: Sequence[List[float]]) -> List[float]:
+    if not packs:
+        return []
+    length = max(len(p) for p in packs)
+    out: List[float] = []
+    for idx in range(length):
+        vals: List[float] = []
+        for packed in packs:
+            if idx >= len(packed):
+                continue
+            scalar = float(packed[idx])
+            if math.isnan(scalar):
+                continue
+            vals.append(scalar)
+        out.append(float(min(vals)) if vals else float("nan"))
+    return out
+
+
 def _similarity_packed_cutoff_01(
     packed: List[float],
     sim_cutoff: float,
@@ -1418,6 +1781,64 @@ def _similarity_packed_cutoff_01(
     return out
 
 
+def _similarity_metric_entries(similarity_upper: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Metrics present in this report (subset of :data:`SIMILARITY_METRICS`)."""
+    available = {str(k) for k in similarity_upper.keys()}
+    return [(k, label) for k, label in SIMILARITY_METRICS if k in available]
+
+
+def _build_cross_dataset_min_similarity_all(
+    controller: PairAttentionController,
+    mode_order: List[str],
+    *,
+    sim_gamma: float,
+    sim_cutoff: float,
+) -> Dict[str, Dict[str, List[float]]]:
+    """Per skip mode: all-token similarity packed vectors = element-wise min over real datasets (scene mean)."""
+    per_dataset_maps: List[Dict[str, Dict[str, Dict[str, List[float]]]]] = []
+    for ds in getattr(controller, "stage2_real_datasets", []):
+        report = controller.get_similarity_report_for_dataset(ds, "mean")
+        if report is None:
+            continue
+        per_dataset_maps.append(_extract_similarity_metric_maps_by_mode(report.report))
+
+    if not per_dataset_maps:
+        return {}
+
+    out: Dict[str, Dict[str, List[float]]] = {}
+    for mode in mode_order:
+        metric_packs: Dict[str, List[List[float]]] = {}
+        for by_mode in per_dataset_maps:
+            all_map = by_mode.get(mode, {}).get("all", {})
+            if not isinstance(all_map, dict):
+                continue
+            for metric_key, packed in all_map.items():
+                if not packed:
+                    continue
+                processed = list(packed)
+                if metric_key in {"cka", "cosine"}:
+                    if abs(sim_gamma - 1.0) > 1e-12:
+                        processed = _similarity_packed_gamma_01(processed, sim_gamma)
+                    if sim_cutoff > 0.0:
+                        processed = _similarity_packed_cutoff_01(processed, sim_cutoff)
+                metric_packs.setdefault(str(metric_key), []).append(processed)
+        if metric_packs:
+            out[mode] = {k: _packed_elementwise_min(v) for k, v in metric_packs.items()}
+    return out
+
+
+def _metric_entries_for_similarity_maps(
+    similarity_upper: Dict[str, Any],
+    *,
+    report_metrics: Optional[Sequence[str]] = None,
+) -> List[Tuple[str, str]]:
+    if report_metrics:
+        keys = {str(m) for m in report_metrics}
+        return [(k, lbl) for k, lbl in SIMILARITY_METRICS if k in keys]
+    keys = {str(k) for k in similarity_upper.keys()}
+    return [(k, lbl) for k, lbl in SIMILARITY_METRICS if k in keys]
+
+
 def _render_similarity_gallery(
     similarity_upper: Dict[str, Any],
     num_layers: int,
@@ -1425,11 +1846,51 @@ def _render_similarity_gallery(
     role_short: str,
     sim_gamma: float,
     sim_cutoff: float,
+    metric_entries: Optional[List[Tuple[str, str]]] = None,
+    drop_odd_rows: bool = False,
+    prune_overlay: bool = False,
+    prune_metric_key: str = "cka",
+    prune_n: int = 2,
 ) -> List[np.ndarray]:
     """role_short: one-letter tag, e.g. S (special) / P (patch) / A (all tokens)."""
     images: List[np.ndarray] = []
     tag = (role_short or "?").strip()[:1].upper()
-    for metric_key, metric_label in SIMILARITY_METRICS:
+    entries = metric_entries if metric_entries is not None else _metric_entries_for_similarity_maps(similarity_upper)
+    if not entries:
+        entries = list(SIMILARITY_METRICS)
+
+    overlay_markers: Optional[List[Tuple[int, int, str]]] = None
+    prune_key = str(prune_metric_key or "").strip().lower()
+    if prune_overlay and not drop_odd_rows and prune_key in {"cka", "cosine"}:
+        packed_for_prune = _coerce_packed(similarity_upper.get(prune_key))
+        if packed_for_prune is not None:
+            processed = list(packed_for_prune)
+            if abs(sim_gamma - 1.0) > 1e-12:
+                processed = _similarity_packed_gamma_01(processed, sim_gamma)
+            triangle_thresh = float(sim_cutoff) if float(sim_cutoff) > 1e-9 else 0.9
+            for_triangle = (
+                _similarity_packed_cutoff_01(processed, sim_cutoff)
+                if float(sim_cutoff) > 1e-9
+                else processed
+            )
+            grid = upper_triangle_unpack_for_heatmap(for_triangle, num_layers, float("nan"))
+            sim_mat = np.zeros((num_layers, num_layers), dtype=np.float64)
+            for i in range(num_layers):
+                sim_mat[i, i] = 1.0
+                for j in range(i + 1, num_layers):
+                    v = grid[i][j]
+                    if v == v:
+                        sim_mat[i, j] = float(v)
+            from analysis.redundancy.triangle_prune import greedy_dense_triangles
+
+            picks, _ = greedy_dense_triangles(
+                sim_mat,
+                unit_ids=[f"u{i}" for i in range(num_layers)],
+                threshold=triangle_thresh,
+                max_triangles=int(max(0, prune_n)),
+            )
+            overlay_markers = [(p.i, p.j, str(k)) for k, p in enumerate(picks)]
+    for metric_key, metric_label in entries:
         packed = _coerce_packed(similarity_upper.get(metric_key))
         if packed is None:
             continue
@@ -1440,6 +1901,7 @@ def _render_similarity_gallery(
                 packed = _similarity_packed_cutoff_01(packed, sim_cutoff)
         vmin = 0.0 if metric_key != "neg_mse" else None
         vmax = 1.0 if metric_key != "neg_mse" else None
+        markers = overlay_markers if overlay_markers and str(metric_key).lower() == prune_key else None
         images.append(
             _heatmap_rgb_from_packed(
                 packed,
@@ -1447,6 +1909,8 @@ def _render_similarity_gallery(
                 f"{tag}·{metric_label}",
                 vmin=vmin,
                 vmax=vmax,
+                drop_odd_rows=drop_odd_rows,
+                markers=markers,
             )
         )
     return images
@@ -1592,10 +2056,20 @@ def _build_stage2_skip_maps(
     skip_report_entry = controller.get_skip_report(scene_id)
     if skip_report_entry is None:
         return {}, "skip report missing"
-    report = skip_report_entry.report
+    report = dict(skip_report_entry.report)
+    report["skip_value_mode"] = "pct" if value_mode != "absolute" else "absolute"
     skip_by_mode = _extract_skip_metric_maps_by_mode(report)
     if value_mode == "absolute":
         return skip_by_mode, "skip rows use saved absolute delta"
+
+    fusion_by_mode = report.get("fusion_by_mode")
+    if isinstance(fusion_by_mode, dict):
+        has_pct = any(
+            isinstance(payload, dict) and isinstance(payload.get("gt_degrade_pct_upper_by_metric"), dict)
+            for payload in fusion_by_mode.values()
+        )
+        if has_pct:
+            return skip_by_mode, "skip rows use saved pct degrade vs upper"
 
     if scene_id == "mean":
         if not skip_by_mode:
@@ -1660,6 +2134,88 @@ def _build_stage2_skip_maps(
     return pct_by_mode, "skip rows use on-the-fly pct vs Stage1 baseline"
 
 
+def _normalize_prune_n(value: Any, *, default: int = 2) -> int:
+    try:
+        v = float(value)
+        if not math.isfinite(v):
+            raise ValueError("non-finite prune n")
+        n = int(round(v))
+    except (TypeError, ValueError):
+        n = int(default)
+    return max(0, min(n, 20))
+
+
+def _stage2_prune_render_sig(
+    *,
+    prune_overlay: bool,
+    prune_metric_key: str,
+    prune_n: int,
+    sim_cutoff: float,
+) -> Tuple[bool, str, int, int]:
+    return (
+        bool(prune_overlay),
+        str(prune_metric_key or "cka").strip().lower(),
+        int(prune_n),
+        _sim_cutoff_key(sim_cutoff),
+    )
+
+
+def _stage2_prune_status_text(
+    similarity_upper: Dict[str, Any],
+    *,
+    num_layers: int,
+    sim_gamma: float,
+    sim_cutoff: float,
+    prune_metric_key: str,
+    prune_n: int,
+    prune_overlay: bool,
+) -> str:
+    if not bool(prune_overlay):
+        return ""
+    metric_key = str(prune_metric_key or "").strip().lower()
+    if metric_key not in {"cka", "cosine"}:
+        return f"Prune status unavailable: metric={metric_key} not supported."
+    packed = _coerce_packed(similarity_upper.get(metric_key))
+    if packed is None:
+        return f"Prune status unavailable: missing {metric_key} similarity."
+    processed = list(packed)
+    if abs(float(sim_gamma) - 1.0) > 1e-12:
+        processed = _similarity_packed_gamma_01(processed, float(sim_gamma))
+    threshold = float(sim_cutoff) if float(sim_cutoff) > 1e-9 else 0.9
+    for_triangle = (
+        _similarity_packed_cutoff_01(processed, float(sim_cutoff))
+        if float(sim_cutoff) > 1e-9
+        else processed
+    )
+    grid = upper_triangle_unpack_for_heatmap(for_triangle, int(num_layers), float("nan"))
+    sim_mat = np.zeros((int(num_layers), int(num_layers)), dtype=np.float64)
+    for i in range(int(num_layers)):
+        sim_mat[i, i] = 1.0
+        for j in range(i + 1, int(num_layers)):
+            v = grid[i][j]
+            if v == v:
+                sim_mat[i, j] = float(v)
+    from analysis.redundancy.triangle_prune import greedy_dense_triangles
+
+    picks, _ = greedy_dense_triangles(
+        sim_mat,
+        unit_ids=[f"u{i}" for i in range(int(num_layers))],
+        threshold=float(threshold),
+        max_triangles=int(max(0, prune_n)),
+    )
+    if not picks:
+        return f"No dense triangles found (metric={metric_key}, threshold={threshold:.3f})."
+    lines = [f"metric={metric_key} threshold={threshold:.3f} n={int(max(0, prune_n))}"]
+    for idx, p in enumerate(picks, start=1):
+        start = int(p.i) + 1
+        length = int(p.j) - int(p.i)
+        corner = float(sim_mat[int(p.i), int(p.j)])
+        lines.append(
+            f"[{idx}] start={start} len={length} corner_sim={corner:.4f} (i={int(p.i)}, j={int(p.j)})"
+        )
+    return "\n".join(lines)
+
+
 def _prepare_stage2_render(
     controller: PairAttentionController,
     scene_id: str,
@@ -1670,47 +2226,99 @@ def _prepare_stage2_render(
     mode_order: List[str],
     *,
     requested_blocks: Optional[set[str]] = None,
-) -> Tuple[Dict[str, List[np.ndarray]], str]:
+    prune_overlay: bool = False,
+    prune_metric_key: str = "cka",
+    prune_n: int = 2,
+) -> Tuple[Dict[str, List[np.ndarray]], str, str]:
+    min_view = controller.dataset == STAGE2_MIN_DATASET
+    if min_view:
+        scene_id = "mean"
+
     clip_key = int(round(float(np.clip(pct_clip_percent, 0.0, 100.0))))
     gamma_key = _sim_gamma_key(sim_gamma)
     cutoff_key = _sim_cutoff_key(sim_cutoff)
-    cache_key = (scene_id, value_mode, clip_key, gamma_key, cutoff_key)
+    prune_n_i = _normalize_prune_n(prune_n)
+    prune_metric = str(prune_metric_key or "cka").strip().lower()
+    prune_sig = _stage2_prune_render_sig(
+        prune_overlay=bool(prune_overlay),
+        prune_metric_key=prune_metric,
+        prune_n=prune_n_i,
+        sim_cutoff=sim_cutoff,
+    )
+    cache_key = (scene_id, value_mode, clip_key, gamma_key, cutoff_key, min_view, *prune_sig)
     cached = controller.stage2_render_cache.get(cache_key)
     if cached is not None:
-        galleries, info = cached
+        galleries = dict(cached[0])
+        info = cached[1]
+        prune_status = cached[2] if len(cached) > 2 else ""
     else:
         galleries = {}
         info = ""
+        prune_status = ""
 
     all_blocks: set[str] = set()
     for mode in mode_order:
         all_blocks.update(_stage2_block_keys_for_mode(mode))
     target_blocks = set(requested_blocks) if requested_blocks is not None else all_blocks
-    if all(key in galleries for key in target_blocks) and info:
-        return galleries, info
+    if all(key in galleries for key in target_blocks) and info and not bool(prune_overlay):
+        return galleries, info, prune_status
 
-    similarity_report = controller.get_similarity_report(scene_id)
     num_layers = int(controller.resolve_stage2_num_layers(scene_id))
     if num_layers <= 0:
-        raise gr.Error(f"No similarity/skip report with num_layers found for {scene_id!r}.")
+        label = "dataset=min (mean)" if min_view else scene_id
+        raise gr.Error(f"No similarity report with num_layers found for {label!r}.")
 
-    similarity_by_mode: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
-    if similarity_report is not None:
-        similarity_by_mode = _extract_similarity_metric_maps_by_mode(similarity_report.report)
-
-    skip_by_mode, skip_source = _build_stage2_skip_maps(controller, scene_id, value_mode, float(clip_key))
+    min_all_by_mode: Dict[str, Dict[str, List[float]]] = {}
+    if min_view:
+        if not controller.has_cross_dataset_min_similarity():
+            ds_list = list(getattr(controller, "stage2_real_datasets", []))
+            raise gr.Error(
+                "Dataset min needs full_report_similarity.json (mean) under each of "
+                f"{', '.join(ds_list) if ds_list else '<no datasets discovered>'}."
+            )
+        min_all_by_mode = _build_cross_dataset_min_similarity_all(
+            controller,
+            mode_order,
+            sim_gamma=sim_gamma,
+            sim_cutoff=sim_cutoff,
+        )
+        similarity_report = None
+        similarity_by_mode = {}
+        skip_by_mode: Dict[str, Dict[str, List[float]]] = {}
+        skip_source = (
+            "min view: element-wise min of all-token similarity (mean) over "
+            + ", ".join(list(getattr(controller, "stage2_real_datasets", [])))
+        )
+    else:
+        similarity_report = controller.get_similarity_report(scene_id)
+        similarity_by_mode = {}
+        if similarity_report is not None:
+            similarity_by_mode = _extract_similarity_metric_maps_by_mode(similarity_report.report)
+        skip_by_mode, skip_source = _build_stage2_skip_maps(controller, scene_id, value_mode, float(clip_key))
 
     for mode in mode_order:
-        skip_main, sim_special, skip_depth, sim_patch, sim_all = _stage2_block_keys_for_mode(mode)
-        if skip_main in target_blocks and skip_main not in galleries:
+        skip_main, sim_special, skip_depth, sim_patch, sim_all, sim_all_odd = _stage2_block_keys_for_mode(mode)
+        if not min_view and skip_main in target_blocks and skip_main not in galleries:
             galleries[skip_main] = _render_skip_gallery(
                 skip_by_mode.get(mode, {}),
                 num_layers,
                 SKIP_MAIN_METRICS,
                 value_mode=value_mode,
             )
-        sim_entry = _similarity_maps_for_skip_mode(similarity_by_mode, mode)
-        if sim_special in target_blocks and sim_special not in galleries:
+        if min_view:
+            all_maps = min_all_by_mode.get(mode, {})
+            if not all_maps:
+                continue
+            sim_entry = {"all": all_maps, "special": {}, "patch": {}}
+            report_metrics = list(all_maps.keys())
+        else:
+            sim_entry = _similarity_maps_for_skip_mode(similarity_by_mode, mode)
+            report_metrics = list(similarity_report.report.get("metrics", [])) if similarity_report else None
+        metric_entries = _metric_entries_for_similarity_maps(
+            sim_entry.get("all", {}),
+            report_metrics=report_metrics,
+        )
+        if not min_view and sim_special in target_blocks and sim_special not in galleries:
             galleries[sim_special] = _render_similarity_gallery(
                 sim_entry.get("special", {}),
                 num_layers,
@@ -1718,14 +2326,14 @@ def _prepare_stage2_render(
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
             )
-        if skip_depth in target_blocks and skip_depth not in galleries:
+        if not min_view and skip_depth in target_blocks and skip_depth not in galleries:
             galleries[skip_depth] = _render_skip_gallery(
                 skip_by_mode.get(mode, {}),
                 num_layers,
                 SKIP_DEPTH_METRICS,
                 value_mode=value_mode,
             )
-        if sim_patch in target_blocks and sim_patch not in galleries:
+        if not min_view and sim_patch in target_blocks and sim_patch not in galleries:
             galleries[sim_patch] = _render_similarity_gallery(
                 sim_entry.get("patch", {}),
                 num_layers,
@@ -1733,58 +2341,107 @@ def _prepare_stage2_render(
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
             )
-        if sim_all in target_blocks and sim_all not in galleries:
+        if sim_all in target_blocks and (sim_all not in galleries or bool(prune_overlay)):
+            sim_all_maps = sim_entry.get("all", {})
             galleries[sim_all] = _render_similarity_gallery(
+                sim_all_maps,
+                num_layers,
+                role_short="A",
+                sim_gamma=sim_gamma,
+                sim_cutoff=sim_cutoff,
+                metric_entries=metric_entries,
+                prune_overlay=bool(prune_overlay),
+                prune_metric_key=prune_metric,
+                prune_n=prune_n_i,
+            )
+            if bool(prune_overlay):
+                prune_status = _stage2_prune_status_text(
+                    sim_all_maps,
+                    num_layers=num_layers,
+                    sim_gamma=sim_gamma,
+                    sim_cutoff=sim_cutoff,
+                    prune_metric_key=prune_metric,
+                    prune_n=prune_n_i,
+                    prune_overlay=bool(prune_overlay),
+                )
+        if sim_all_odd in target_blocks and sim_all_odd not in galleries:
+            galleries[sim_all_odd] = _render_similarity_gallery(
                 sim_entry.get("all", {}),
                 num_layers,
                 role_short="A",
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
+                metric_entries=metric_entries,
+                drop_odd_rows=True,
             )
 
     rendered = len(galleries)
     total = len(all_blocks)
-    info = f"scene={scene_id} | view={value_mode} | rendered={rendered}/{total} blocks | {skip_source} | pct_clip={clip_key}%"
+    if min_view:
+        info = (
+            f"dataset=min | scene=mean | rendered={rendered}/{total} blocks | {skip_source} | "
+            f"pct_clip={clip_key}%"
+        )
+    else:
+        info = f"scene={scene_id} | view={value_mode} | rendered={rendered}/{total} blocks | {skip_source} | pct_clip={clip_key}%"
     if abs(sim_gamma - 1.0) > 1e-12:
         info += f" | sim_gamma={gamma_key / 1000.0:.3f}"
     if cutoff_key > 0:
         info += f" | sim_cutoff={cutoff_key / 1000.0:.3f}"
-    controller.stage2_render_cache[cache_key] = (galleries, info)
-    return galleries, info
+    if bool(prune_overlay):
+        info += f" | prune_metric={prune_metric} n={prune_n_i}"
+    controller.stage2_render_cache[cache_key] = (galleries, info, prune_status)
+    return galleries, info, prune_status
+
+
+def _stage2_modes_for_controller(controller: PairAttentionController) -> List[str]:
+    if controller.dataset == STAGE2_MIN_DATASET:
+        modes = controller.union_stage2_modes(getattr(controller, "stage2_real_datasets", []))
+        if modes:
+            return modes
+    return _discover_stage2_modes(controller.similarity_reports, controller.skip_reports)
 
 
 def _build_ui(controller: PairAttentionController) -> gr.Blocks:
-    dataset_choices = ["scannet", "7scenes", "nrgbd"]
-    scene_ids = controller.scene_ids()
-    pair_enabled = bool(scene_ids)
-    initial_scene = scene_ids[0] if scene_ids else None
-    if pair_enabled and initial_scene is not None:
-        num_layers, num_frames, frame_labels = controller.scene_metadata_light(initial_scene)
-        num_heads = controller.pair_ui_num_heads()
-    else:
-        num_layers, num_frames, frame_labels = 0, 0, []
-        num_heads = 1
-    initial_frame_a = 0
-    initial_frame_b = min(1, len(frame_labels) - 1) if frame_labels else 0
-    stage2_modes_all: List[str] = []
-    for ds in dataset_choices:
-        for mode in controller.stage2_modes_for_dataset(ds):
-            if mode not in stage2_modes_all:
-                stage2_modes_all.append(mode)
-    if not stage2_modes_all:
-        stage2_modes_all = _discover_stage2_modes(controller.similarity_reports, controller.skip_reports)
-    n_stage2_galleries = 5 * len(stage2_modes_all)
+    # Stage2 dataset tags come from v3 outputs on disk.
+    stage2_real = _discover_v3_dataset_tags(controller.v3_backbone_root()) if controller.v3_mode else []
+    # If no dataset tag has v3 redundancy for this backbone, keep empty.
+    # This prevents "only-cache" datasets (e.g. scannet_test50) from showing up
+    # and from participating in "min" computations.
+    controller.stage2_real_datasets = list(stage2_real)  # type: ignore[attr-defined]
+    dataset_choices = [STAGE2_MIN_DATASET, *stage2_real]
+    if controller.dataset not in dataset_choices:
+        if stage2_real:
+            controller.switch_dataset(stage2_real[0])
+        else:
+            controller.switch_dataset(STAGE2_MIN_DATASET)
+    # scene_ids = controller.scene_ids()  # Pair Attention tab disabled
+    # Pair Attention tab disabled — skip pair-tab metadata.
+    # pair_enabled = bool(scene_ids)
+    # initial_scene = scene_ids[0] if scene_ids else None
+    # if pair_enabled and initial_scene is not None:
+    #     num_layers, num_frames, frame_labels = controller.scene_metadata_light(initial_scene)
+    #     num_heads = controller.pair_ui_num_heads()
+    # else:
+    #     num_layers, num_frames, frame_labels = 0, 0, []
+    #     num_heads = 1
+    # initial_frame_a = 0
+    # initial_frame_b = min(1, len(frame_labels) - 1) if frame_labels else 0
+    stage2_modes_all = controller.union_stage2_modes(stage2_real)
+    n_stage2_galleries = 6 * len(stage2_modes_all)
     lora_root = controller.lora_root
-    stage2_last_render_key: Dict[str, Optional[Tuple[str, str, int, int, int]]] = {"cache_key": None}
+    stage2_last_render_key: Dict[str, Any] = {"cache_key": None}
     dataset_switch_output_len: Dict[str, int] = {"count": 0}
 
     def _empty_stage2_visual_updates() -> Tuple[Any, ...]:
         gal = tuple(gr.update(value=[]) for _ in range(n_stage2_galleries))
         col = tuple(gr.update(visible=False) for _ in range(n_stage2_galleries))
-        return (*gal, *col, "No Stage2 scenes for this dataset.")
+        # outputs: galleries, cols, prune_status, stage2_info, then 6 controls
+        return (*gal, *col, gr.update(value=""), "No Stage2 scenes for this dataset.")
 
     def _stage2_noop_updates() -> Tuple[Any, ...]:
-        return tuple(gr.update() for _ in range(2 * n_stage2_galleries + 7))
+        # outputs: 2*n_galleries + prune_status + stage2_info + 6 controls
+        return tuple(gr.update() for _ in range(2 * n_stage2_galleries + 8))
 
     def _dataset_noop_updates() -> Tuple[Any, ...]:
         count = max(0, int(dataset_switch_output_len["count"]))
@@ -1794,11 +2451,13 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         scene_id: Optional[str],
         value_mode: str,
         pct_clip_percent: float,
-        filter_modes: List[str] | None,
         filter_metric_rows: List[str] | None,
         filter_token_rows: List[str] | None,
         sim_gamma_value: float,
         sim_cutoff_value: float,
+        prune_overlay: bool,
+        prune_metric_key: str,
+        prune_n: float,
         *,
         request_seq: Optional[int],
         force_gallery_refresh: bool,
@@ -1816,6 +2475,17 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         if not math.isfinite(sim_cutoff):
             sim_cutoff = 0.0
         sim_cutoff = float(np.clip(sim_cutoff, 0.0, 1.0))
+        prune_on = bool(prune_overlay)
+        prune_metric = str(prune_metric_key or "cka").strip().lower()
+        prune_n_i = _normalize_prune_n(prune_n)
+        prune_sig = _stage2_prune_render_sig(
+            prune_overlay=prune_on,
+            prune_metric_key=prune_metric,
+            prune_n=prune_n_i,
+            sim_cutoff=sim_cutoff,
+        )
+        if controller.dataset == STAGE2_MIN_DATASET:
+            scene_id = "mean"
         if not scene_id:
             stage2_last_render_key["cache_key"] = None
             vm, m_val, t_val, choices_vm, has_skip, has_sim, pct_ok = _heatmaps_resolve_filters(
@@ -1848,24 +2518,24 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             list(filter_metric_rows) if filter_metric_rows is not None else None,
             list(filter_token_rows) if filter_token_rows is not None else None,
         )
-        current_modes = _discover_stage2_modes(controller.similarity_reports, controller.skip_reports)
-        allowed_modes = set(current_modes)
-        if filter_modes is None:
-            selected_modes = list(current_modes)
-        else:
-            selected_modes = [str(m) for m in filter_modes if str(m) in allowed_modes]
-            if filter_modes and not selected_modes and current_modes:
-                selected_modes = list(current_modes)
+        current_modes = _stage2_modes_for_controller(controller)
+        selected_modes = list(current_modes)
 
         clip_key = int(round(float(np.clip(float(pct_clip_percent), 0.0, 100.0))))
         gamma_key = _sim_gamma_key(sim_gamma)
         cutoff_key = _sim_cutoff_key(sim_cutoff)
-        cache_key = (str(scene_id), vm, clip_key, gamma_key, cutoff_key)
-        force_updates = force_gallery_refresh or stage2_last_render_key["cache_key"] != cache_key
+        min_view = controller.dataset == STAGE2_MIN_DATASET
+        cache_key = (str(scene_id), vm, clip_key, gamma_key, cutoff_key, min_view, *prune_sig)
+        prune_sig_changed = stage2_last_render_key.get("prune_sig") != prune_sig
+        force_updates = (
+            force_gallery_refresh
+            or stage2_last_render_key["cache_key"] != cache_key
+            or prune_sig_changed
+        )
         cached_before = controller.stage2_render_cache.get(cache_key)
         before_keys = set(cached_before[0].keys()) if cached_before is not None else set()
         requested_blocks = _stage2_requested_block_keys(stage2_modes_all, selected_modes, m_val, t_val)
-        galleries, details = _prepare_stage2_render(
+        galleries, details, prune_status_text = _prepare_stage2_render(
             controller,
             scene_id,
             vm,
@@ -1874,9 +2544,15 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             sim_cutoff,
             stage2_modes_all,
             requested_blocks=requested_blocks,
+            prune_overlay=prune_on,
+            prune_metric_key=prune_metric,
+            prune_n=prune_n_i,
         )
         after_keys = set(galleries.keys())
         keys_to_update = (requested_blocks & after_keys) if force_updates else (requested_blocks - before_keys)
+        if prune_sig_changed:
+            for mode in selected_modes:
+                keys_to_update.add(f"sim_{mode}_all")
 
         if request_seq is not None and request_seq != controller.stage2_request_seq:
             return _stage2_noop_updates()
@@ -1917,7 +2593,8 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             write_values=write_values,
         )
         stage2_last_render_key["cache_key"] = cache_key
-        return tuple([*block_updates, *vis_updates, details, *ctrl])
+        stage2_last_render_key["prune_sig"] = prune_sig
+        return tuple([*block_updates, *vis_updates, prune_status_text, details, *ctrl])
 
     def _refresh_outputs(
         scene_id: str,
@@ -2029,101 +2706,79 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             frame_b_info,
         )
 
-    def _dataset_changed(
+    def _heatmaps_scope_changed(
         dataset: str,
+        backbone: str | None,
         cur_value_mode: str,
         pct_clip: float,
-        filter_modes: List[str] | None,
         filter_metric_rows: List[str] | None,
         filter_token_rows: List[str] | None,
         sim_gamma: float,
         sim_cutoff: float,
+        prune_overlay: bool,
+        prune_metric_key: str,
+        prune_n: float,
     ):
-        # Invalidate outstanding Stage2 refresh requests from previous state.
         controller.stage2_request_seq += 1
-        controller.switch_dataset(dataset)
-        current_modes = _discover_stage2_modes(controller.similarity_reports, controller.skip_reports)
-        current_modes_set = set(current_modes)
-        if filter_modes is None:
-            selected_modes = list(current_modes)
+        if controller.v3_mode and backbone:
+            controller.switch_backbone(backbone)
+        ds_key = str(dataset).strip().lower()
+        if ds_key != controller.dataset:
+            controller.switch_dataset(dataset)
+        min_view = controller.dataset == STAGE2_MIN_DATASET
+        if min_view:
+            stage2_scene_ids_new = ["mean"]
+            initial_stage2_scene_new = "mean"
         else:
-            selected_modes = [str(m) for m in filter_modes if str(m) in current_modes_set]
-            if filter_modes and not selected_modes and current_modes:
-                selected_modes = list(current_modes)
-        scene_ids_new = controller.scene_ids()
-        stage2_scene_ids_new = controller.stage2_scene_ids()
-        initial_scene_new = scene_ids_new[0] if scene_ids_new else None
-        initial_stage2_scene_new = stage2_scene_ids_new[0] if stage2_scene_ids_new else None
+            stage2_scene_ids_new = controller.stage2_scene_ids()
+            initial_stage2_scene_new = stage2_scene_ids_new[0] if stage2_scene_ids_new else None
         tup_hm = _stage2_visual_bundle(
             initial_stage2_scene_new,
             str(cur_value_mode or "absolute"),
             float(pct_clip),
-            selected_modes,
             list(filter_metric_rows) if filter_metric_rows is not None else None,
             list(filter_token_rows) if filter_token_rows is not None else None,
             float(sim_gamma),
             float(sim_cutoff),
+            bool(prune_overlay),
+            str(prune_metric_key or "cka"),
+            float(prune_n),
             request_seq=None,
             force_gallery_refresh=True,
         )
-        hm_main = tup_hm[:-7]
+        # tup_hm tail: prune_status, info, then 6 filter controls
+        hm_main = tup_hm[:-8]
+        hm_prune_status = tup_hm[-8]
         hm_info = tup_hm[-7]
         hm_ctrl = tup_hm[-6:]
 
-        if initial_scene_new is None:
-            return (
-                gr.update(value=controller.dataset),
-                gr.update(value=controller.dataset),
-                gr.update(choices=scene_ids_new, value=None),
-                "layers: 0, frames: 0",
-                gr.update(maximum=0, value=0),
-                gr.update(maximum=0, value=0),
-                gr.update(maximum=0, value=0),
-                None,
-                f"No scenes found under {controller.cache_dir}",
-                "",
-                "",
-                gr.update(choices=stage2_scene_ids_new, value=initial_stage2_scene_new),
-                gr.update(choices=current_modes, value=selected_modes),
-                *hm_main,
-                hm_info,
-                *hm_ctrl,
-            )
-
-        max_layer_u, fa_u, fb_u, info_u, panel_u, summary_u, fa_info_u, fb_info_u = _scene_changed(
-            initial_scene_new,
-            score_space="before_softmax",
-            head_mode="mean",
-            head_index=0,
-        )
-        return (
+        updates: List[Any] = [
             gr.update(value=controller.dataset),
-            gr.update(value=controller.dataset),
-            gr.update(choices=scene_ids_new, value=initial_scene_new),
-            info_u,
-            max_layer_u,
-            fa_u,
-            fb_u,
-            panel_u,
-            summary_u,
-            fa_info_u,
-            fb_info_u,
-            gr.update(choices=stage2_scene_ids_new, value=initial_stage2_scene_new),
-            gr.update(choices=current_modes, value=selected_modes),
+            gr.update(
+                choices=stage2_scene_ids_new,
+                value=initial_stage2_scene_new,
+                interactive=not min_view,
+            ),
             *hm_main,
+            hm_prune_status,
             hm_info,
             *hm_ctrl,
-        )
+        ]
+        if controller.v3_mode:
+            updates.insert(1, gr.update(value=controller.v3_backbone))
+        return tuple(updates)
 
     def _refresh_stage2_full(
         scene_id: str,
         value_mode: str,
         pct_clip_percent: float,
-        filter_modes: List[str] | None,
         filter_metric_rows: List[str] | None,
         filter_token_rows: List[str] | None,
         sim_gamma: float,
         sim_cutoff: float,
+        prune_overlay: bool,
+        prune_metric_key: str,
+        prune_n: float,
     ):
         controller.stage2_request_seq += 1
         request_seq = int(controller.stage2_request_seq)
@@ -2131,11 +2786,13 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             scene_id,
             str(value_mode or "absolute"),
             float(pct_clip_percent),
-            filter_modes,
             filter_metric_rows,
             filter_token_rows,
             float(sim_gamma),
             float(sim_cutoff),
+            bool(prune_overlay),
+            str(prune_metric_key or "cka"),
+            float(prune_n),
             request_seq=request_seq,
             force_gallery_refresh=False,
         )
@@ -2253,29 +2910,29 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             lora_expected_plot_paths=_lora_expected_plot_paths,
         )
 
-        pair_ui = build_pair_tab(
-            controller=controller,
-            dataset_choices=dataset_choices,
-            scene_ids=scene_ids,
-            initial_scene=initial_scene,
-            num_layers=num_layers,
-            num_frames=num_frames,
-            frame_labels=frame_labels,
-            initial_frame_a=initial_frame_a,
-            initial_frame_b=initial_frame_b,
-            num_heads=num_heads,
-            scene_changed_cb=_scene_changed,
-            refresh_outputs_cb=_refresh_outputs,
-        )
+        # pair_ui = build_pair_tab(
+        #     controller=controller,
+        #     dataset_choices=dataset_choices,
+        #     scene_ids=scene_ids,
+        #     initial_scene=initial_scene,
+        #     num_layers=num_layers,
+        #     num_frames=num_frames,
+        #     frame_labels=frame_labels,
+        #     initial_frame_a=initial_frame_a,
+        #     initial_frame_b=initial_frame_b,
+        #     num_heads=num_heads,
+        #     scene_changed_cb=_scene_changed,
+        #     refresh_outputs_cb=_refresh_outputs,
+        # )
 
         stage2_scene_ids = controller.stage2_scene_ids()
         initial_stage2_scene = stage2_scene_ids[0] if stage2_scene_ids else None
-        initial_stage2_modes = _discover_stage2_modes(controller.similarity_reports, controller.skip_reports)
         heatmaps_ui = build_heatmaps_tab(
             controller=controller,
             dataset_choices=dataset_choices,
+            backbone_choices=controller.v3_backbones if controller.v3_mode else [],
+            initial_backbone=controller.v3_backbone if controller.v3_mode else None,
             stage2_modes=stage2_modes_all,
-            initial_mode_values=initial_stage2_modes,
             stage2_scene_ids=stage2_scene_ids,
             initial_stage2_scene=initial_stage2_scene,
             stage2_metric_row_pose=STAGE2_METRIC_ROW_POSE,
@@ -2287,22 +2944,17 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             refresh_stage2_full_cb=_refresh_stage2_full,
         )
 
-        dataset_switch_outputs = [
-            pair_ui["dataset_dd"],
+        dataset_switch_outputs: List[Any] = [
             heatmaps_ui["stage2_dataset_dd"],
-            pair_ui["scene_dd"],
-            pair_ui["scene_info"],
-            pair_ui["layer_slider"],
-            pair_ui["frame_a_slider"],
-            pair_ui["frame_b_slider"],
-            pair_ui["panel"],
-            pair_ui["summary"],
-            pair_ui["frame_a_info"],
-            pair_ui["frame_b_info"],
+        ]
+        if heatmaps_ui.get("stage2_backbone_dd") is not None:
+            dataset_switch_outputs.append(heatmaps_ui["stage2_backbone_dd"])
+        dataset_switch_outputs.extend(
+            [
             heatmaps_ui["stage2_scene_dd"],
-            heatmaps_ui["stage2_mode_filter"],
             *heatmaps_ui["stage2_mode_galleries"],
             *heatmaps_ui["stage2_row_body_cols"],
+            heatmaps_ui["stage2_prune_status"],
             heatmaps_ui["stage2_info"],
             heatmaps_ui["stage2_value_mode"],
             heatmaps_ui["stage2_pct_clip_slider"],
@@ -2310,39 +2962,195 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             heatmaps_ui["stage2_token_rows_filter"],
             heatmaps_ui["stage2_sim_gamma_slider"],
             heatmaps_ui["stage2_sim_cutoff_slider"],
-        ]
+            ]
+        )
         dataset_switch_output_len["count"] = len(dataset_switch_outputs)
-        pair_ui["dataset_dd"].change(
-            _dataset_changed,
-            inputs=[
-                pair_ui["dataset_dd"],
-                heatmaps_ui["stage2_value_mode"],
-                heatmaps_ui["stage2_pct_clip_slider"],
-                heatmaps_ui["stage2_mode_filter"],
-                heatmaps_ui["stage2_metric_rows_filter"],
-                heatmaps_ui["stage2_token_rows_filter"],
-                heatmaps_ui["stage2_sim_gamma_slider"],
-                heatmaps_ui["stage2_sim_cutoff_slider"],
-            ],
+        scope_switch_inputs: List[Any] = [
+            heatmaps_ui["stage2_dataset_dd"],
+            heatmaps_ui["stage2_value_mode"],
+            heatmaps_ui["stage2_pct_clip_slider"],
+            heatmaps_ui["stage2_metric_rows_filter"],
+            heatmaps_ui["stage2_token_rows_filter"],
+            heatmaps_ui["stage2_sim_gamma_slider"],
+            heatmaps_ui["stage2_sim_cutoff_slider"],
+            heatmaps_ui["stage2_prune_show"],
+            heatmaps_ui["stage2_prune_metric"],
+            heatmaps_ui["stage2_prune_n"],
+        ]
+        if heatmaps_ui.get("stage2_backbone_dd") is not None:
+            scope_switch_inputs = [
+                heatmaps_ui["stage2_dataset_dd"],
+                heatmaps_ui["stage2_backbone_dd"],
+                *scope_switch_inputs[1:],
+            ]
+        else:
+            scope_switch_inputs = [heatmaps_ui["stage2_dataset_dd"], gr.State(None), *scope_switch_inputs[1:]]
+
+        # pair_ui["dataset_dd"].change(...)  # Pair Attention tab disabled
+        heatmaps_ui["stage2_dataset_dd"].change(
+            _heatmaps_scope_changed,
+            inputs=scope_switch_inputs,
             outputs=dataset_switch_outputs,
             show_progress="minimal",
             trigger_mode="always_last",
         )
-        heatmaps_ui["stage2_dataset_dd"].change(
-            _dataset_changed,
-            inputs=[
-                heatmaps_ui["stage2_dataset_dd"],
-                heatmaps_ui["stage2_value_mode"],
-                heatmaps_ui["stage2_pct_clip_slider"],
-                heatmaps_ui["stage2_mode_filter"],
-                heatmaps_ui["stage2_metric_rows_filter"],
-                heatmaps_ui["stage2_token_rows_filter"],
-                heatmaps_ui["stage2_sim_gamma_slider"],
-                heatmaps_ui["stage2_sim_cutoff_slider"],
-            ],
-            outputs=dataset_switch_outputs,
+        if heatmaps_ui.get("stage2_backbone_dd") is not None:
+            heatmaps_ui["stage2_backbone_dd"].change(
+                _heatmaps_scope_changed,
+                inputs=scope_switch_inputs,
+                outputs=dataset_switch_outputs,
+                show_progress="minimal",
+                trigger_mode="always_last",
+            )
+
+        def _save_prune_plan(
+            scene_id: str,
+            value_mode: str,
+            pct_clip_percent: float,
+            filter_metric_rows: List[str] | None,
+            filter_token_rows: List[str] | None,
+            sim_gamma: float,
+            sim_cutoff: float,
+            prune_overlay: bool,
+            prune_metric_key: str,
+            prune_n: float,
+        ) -> str:
+            # Save uses the *same* settings as current visualization.
+            if not prune_overlay:
+                raise gr.Error("Enable 'Show dense-triangle markers' before saving.")
+            metric = str(prune_metric_key or "cka").strip().lower()
+            if metric not in {"cka", "cosine"}:
+                raise gr.Error(f"Unsupported prune metric: {metric}")
+            n_tri = _normalize_prune_n(prune_n)
+            if n_tri <= 0:
+                raise gr.Error("n must be > 0 to save a prune plan.")
+            cutoff = float(np.clip(float(sim_cutoff), 0.0, 1.0))
+            if cutoff <= 0.0:
+                raise gr.Error("Cutoff must be > 0 to generate a prune plan.")
+
+            allowed_modes = _stage2_modes_for_controller(controller)
+            mode = allowed_modes[0] if allowed_modes else ""
+            if not mode:
+                raise gr.Error("No Stage2 mode available to save prune plan.")
+
+            rep = controller.get_similarity_report(str(scene_id))
+            if controller.dataset == STAGE2_MIN_DATASET:
+                # Build min similarity maps as displayed (already includes gamma/cutoff in builder).
+                maps_by_mode = _build_cross_dataset_min_similarity_all(
+                    controller,
+                    [mode],
+                    sim_gamma=float(sim_gamma),
+                    sim_cutoff=cutoff,
+                )
+                all_map = maps_by_mode.get(mode, {})
+                packed = _coerce_packed(all_map.get(metric))
+                unit_ids = [f"u{i}" for i in range(int(controller.resolve_stage2_num_layers('mean')))]
+            else:
+                if rep is None:
+                    raise gr.Error("Missing similarity report for this scene.")
+                unit_ids = [str(u) for u in list(rep.report.get("unit_ids", []))]
+                by_mode = _extract_similarity_metric_maps_by_mode(rep.report)
+                sim_entry = _similarity_maps_for_skip_mode(by_mode, mode)
+                packed = _coerce_packed(sim_entry.get("all", {}).get(metric))
+            if packed is None:
+                raise gr.Error(f"Missing packed similarity for metric={metric}")
+            num_layers = len(unit_ids) if unit_ids else int(rep.report.get("num_layers", 0)) if rep else 0
+            if num_layers <= 0:
+                raise gr.Error("Cannot resolve num_layers for prune plan.")
+
+            # Apply gamma/cutoff exactly as in rendering.
+            processed = list(packed)
+            if metric in {"cka", "cosine"}:
+                if abs(float(sim_gamma) - 1.0) > 1e-12:
+                    processed = _similarity_packed_gamma_01(processed, float(sim_gamma))
+                processed = _similarity_packed_cutoff_01(processed, cutoff)
+
+            grid = upper_triangle_unpack_for_heatmap(processed, num_layers, float("nan"))
+            sim_mat = np.zeros((num_layers, num_layers), dtype=np.float64)
+            for i in range(num_layers):
+                sim_mat[i, i] = 1.0
+                for j in range(i + 1, num_layers):
+                    v = grid[i][j]
+                    if v == v:
+                        sim_mat[i, j] = float(v)
+
+            from analysis.prune_plan import UnitLoraSpec, UnitPrunePlan, default_prune_plan_root
+            from analysis.redundancy.triangle_prune import build_triangle_prune_actions
+
+            actions, extra, picks = build_triangle_prune_actions(
+                sim_mat,
+                unit_ids,
+                threshold=cutoff,
+                max_triangles=n_tri,
+                lora_rank=32,
+                lora_alpha=64.0,
+            )
+            extra = dict(extra)
+            extra.setdefault("view_save", {})
+            extra["view_save"].update(
+                {
+                    "scene_id": str(scene_id),
+                    "mode": str(mode),
+                    "metric": metric,
+                    "sim_cutoff": cutoff,
+                    "sim_gamma": float(sim_gamma),
+                    "n": int(n_tri),
+                }
+            )
+
+            drop_indices: set[int] = set()
+            lora_specs: dict[str, UnitLoraSpec] = {}
+            for p in picks:
+                for idx in range(int(p.i) + 1, int(p.j) + 1):
+                    drop_indices.add(int(idx))
+                lora_specs[str(int(p.i))] = UnitLoraSpec(
+                    rank=32,
+                    alpha=64.0,
+                    dropout=0.0,
+                    target_submodules=("qkv", "proj"),
+                    alignment_teacher_unit_index=int(p.j),
+                )
+            drop_sorted = sorted(drop_indices)
+            plan = UnitPrunePlan(
+                backbone=str(controller.v3_backbone or controller.backbone or ""),
+                dataset=str(controller.dataset),
+                num_units=int(num_layers),
+                drop=drop_sorted,
+                drop_length=len(drop_sorted),
+                lora=lora_specs,
+                source_cache=str(controller.v3_output_root / str(controller.v3_backbone) / str(controller.dataset) / "cache")
+                if controller.v3_mode
+                else "",
+                extra=extra,
+            )
+            out_root = default_prune_plan_root()
+            json_path = out_root / f"{str(controller.v3_backbone).strip().lower()}.json"
+            plan.save(json_path)
+
+            # Render and save the exact image shown (with markers).
+            markers = [(p.i, p.j, str(k)) for k, p in enumerate(picks)]
+            img = _heatmap_rgb_from_packed(
+                processed,
+                num_layers,
+                f"A·{metric.upper()} (saved)",
+                vmin=0.0,
+                vmax=1.0,
+                markers=markers,
+            )
+            png_path = out_root / f"{str(controller.v3_backbone).strip().lower()}_{controller.dataset}_{metric}_triangles.png"
+            png_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.imsave(png_path, img)
+
+            return (
+                f"Saved plan={json_path.name} (drop_length={plan.drop_length}) "
+                f"and viz={png_path.name} (scene={scene_id}, mode={mode})."
+            )
+
+        heatmaps_ui["stage2_prune_save_btn"].click(
+            _save_prune_plan,
+            inputs=heatmaps_ui["stage2_inputs"],
+            outputs=[heatmaps_ui["stage2_prune_status"]],
             show_progress="minimal",
-            trigger_mode="always_last",
         )
 
         build_eval_tab(
@@ -2363,23 +3171,37 @@ def main() -> None:
     else:
         analysis_sim_dir = args.analysis_sim_dir
         analysis_skip_dir = args.analysis_skip_dir
+    from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT
+    from analysis.view_v3_loader import discover_v3_backbones
+
+    cache_dir = args.cache_dir
+    eval_root = args.eval_root
+    v3_backbone = str(args.v3_backbone).strip()
+    if OUTPUT_ROOT_DEFAULT.is_dir():
+        backbones = discover_v3_backbones(OUTPUT_ROOT_DEFAULT)
+        v3_backbone = v3_backbone or (backbones[0] if backbones else "vggt")
+        cache_dir = OUTPUT_ROOT_DEFAULT / v3_backbone
+        eval_root = cache_dir / args.dataset / "eval"
     controller = PairAttentionController(
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
         analysis_sim_dir=analysis_sim_dir,
         analysis_skip_dir=analysis_skip_dir,
         data_root=args.data_root,
         dataset=args.dataset,
         data_roots_by_dataset={
             "scannet": args.scannet_root,
+            "scannet_dev50": args.scannet_root,
+            "scannet_test50": args.scannet_test_root,
             "7scenes": args.root_7scenes,
             "nrgbd": args.root_nrgbd,
         },
         hf_model=args.hf_model,
         device_arg=args.device,
         lora_root=args.lora_dir,
-        eval_root=args.eval_root,
+        eval_root=eval_root,
         viser_host=args.viser_host,
         viser_port=args.viser_port,
+        v3_backbone=v3_backbone,
     )
     demo = _build_ui(controller)
     demo.queue().launch(
@@ -2393,4 +3215,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -25,7 +25,7 @@
 - 训练入口：`training/launch.py`
 - 默认配置（fine-tuning）：`training/config/default.yaml` + `training/config/default_dataset.yaml`
 - 训练循环：`training/trainer.py`
-- loss：`training/loss.py`
+- loss：`analysis/loss.py`（源自 VGGT 官方 `backbones/vggt/training/loss.py`）
 - 动态 dataloader：`training/data/dynamic_dataloader.py`
 - 数据组装：`training/data/composed_dataset.py`
 - scheduler/optimizer wrapper：`training/train_utils/optimizer.py`
@@ -138,7 +138,7 @@
   
 ## 5) Prediction 与 Loss 设计（复用官方 camera/depth；删除 point）
   
-`training/loss.py` 的 `MultitaskLoss` 会根据模型输出的 key 自动启用分支。我们的方案中只保留：
+`analysis/loss.py` 的 `MultitaskLoss` 会根据模型输出的 key 自动启用分支。我们的方案中只保留：
 - camera：需要 `pose_enc_list`
 - depth：需要 `depth` 与 `depth_conf`
 

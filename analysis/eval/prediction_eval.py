@@ -25,9 +25,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 from PIL import Image
-
-from vggt.utils.geometry import unproject_depth_map_to_point_map
 
 from analysis.eval.scannet_eval import SceneData, aggregate_metric_dict
 
@@ -79,17 +78,30 @@ def prediction_payload_to_fastvggt_reconstruction(
 
     extr = _squeeze_batch_to_ndim(payload["extrinsic"].float().numpy(), 3)
     intr = _squeeze_batch_to_ndim(payload["intrinsic"].float().numpy(), 3)
-    depth_np = _depth_or_conf_to_shw(payload["depth"].float().numpy(), "depth").copy()
+    depth_t = payload["depth"]
+    if not torch.is_tensor(depth_t):
+        depth_t = torch.as_tensor(depth_t)
+    depth_np = _depth_or_conf_to_shw(depth_t.float().numpy(), "depth").copy()
 
     dc = payload.get("depth_conf")
     if dc is not None:
-        dcn = _depth_or_conf_to_shw(dc.float().numpy(), "depth_conf")
+        dcn = _depth_or_conf_to_shw(
+            dc.float().numpy() if torch.is_tensor(dc) else dc,
+            "depth_conf",
+        )
         if dcn.shape != depth_np.shape:
             raise ValueError(f"depth_conf shape {dcn.shape} != depth shape {depth_np.shape}")
         mask = dcn >= depth_conf_thresh
         depth_np[~mask] = np.nan
 
-    world_points = unproject_depth_map_to_point_map(depth_np.astype(np.float64), extr, intr)
+    from analysis.backbones.pose_geometry import unproject_depth_payload
+
+    world_points = unproject_depth_payload(
+        depth_t,
+        torch.as_tensor(extr),
+        torch.as_tensor(intr),
+        backbone=payload.get("backbone") or "vggt",
+    )
     all_points: List[np.ndarray] = []
     for frame_idx in range(world_points.shape[0]):
         pts = world_points[frame_idx].reshape(-1, 3)

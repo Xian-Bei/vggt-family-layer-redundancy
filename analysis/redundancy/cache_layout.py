@@ -43,7 +43,16 @@ def _replay_layer_files(layers_dir: Path) -> List[Path]:
 
 
 def count_scene_replay_layers_disk(cache_dir: Path, item: Dict[str, Any]) -> Optional[int]:
-    """Return layer count from ``scene_dir/layers/layer_*.pt`` without loading tensors."""
+    """Return layer count from on-disk replay tensors without loading them."""
+    from analysis.redundancy.cache_layout_v3 import is_v3_cache_dir, load_v3_manifest
+
+    if is_v3_cache_dir(cache_dir):
+        manifest = load_v3_manifest(cache_dir)
+        if manifest.layer_units:
+            return max(
+                (u.index for u in manifest.layer_units if u.kind in ("frame", "global")),
+                default=-1,
+            ) + 1
     scene_dir = scene_cache_dir(cache_dir, item)
     if scene_dir is None:
         return None
@@ -55,6 +64,10 @@ def count_scene_replay_layers_disk(cache_dir: Path, item: Dict[str, Any]) -> Opt
 
 
 def load_scene_metadata(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, Any]:
+    from analysis.redundancy.cache_layout_v3 import is_v3_cache_dir, load_scene_metadata_v3
+
+    if is_v3_cache_dir(cache_dir):
+        return load_scene_metadata_v3(cache_dir, item)
     scene_dir = scene_cache_dir(cache_dir, item)
     if scene_dir is not None:
         meta_path = scene_dir / "metadata.json"
@@ -77,6 +90,10 @@ def load_scene_metadata(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, Any]
 
 
 def load_scene_pred(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    from analysis.redundancy.cache_layout_v3 import is_v3_cache_dir, load_scene_pred_v3
+
+    if is_v3_cache_dir(cache_dir):
+        return load_scene_pred_v3(cache_dir, item)
     scene_dir = scene_cache_dir(cache_dir, item)
     if scene_dir is not None:
         pred_path = scene_dir / "pred.pt"
@@ -99,6 +116,12 @@ def load_scene_replay_layers(
     *,
     expected_num_layers: Optional[int] = None,
 ) -> List[torch.Tensor]:
+    from analysis.redundancy.cache_layout_v3 import is_v3_cache_dir, load_scene_replay_layers_v3
+
+    if is_v3_cache_dir(cache_dir):
+        return load_scene_replay_layers_v3(
+            cache_dir, item, num_layers=expected_num_layers
+        )
     scene_dir = scene_cache_dir(cache_dir, item)
     if scene_dir is not None:
         layers_dir = scene_dir / "layers"
@@ -159,50 +182,23 @@ def load_scene_replay_layer(
     layer_idx: int,
     *,
     expected_num_layers: Optional[int] = None,
+    map_location: Optional[str] = None,
 ) -> torch.Tensor:
-    """
-    Load a single replay layer tensor for one scene.
-
-    This is the lazy/on-demand counterpart of ``load_scene_replay_layers`` and avoids
-    deserializing all layers when only a subset is needed.
-    """
+    """Load one per-layer [B,S,P,2C] concat tensor from v3 frame_i + global_i unit files."""
     if layer_idx < 0:
         raise SystemExit(f"layer_idx must be >= 0, got {layer_idx}")
 
-    scene_dir = scene_cache_dir(cache_dir, item)
-    if scene_dir is not None:
-        layers_dir = scene_dir / "layers"
-        if layers_dir.exists():
-            layer_files = _replay_layer_files(layers_dir)
-            if not layer_files:
-                raise SystemExit(f"No layer_*.pt files found under {layers_dir}")
-            if expected_num_layers is not None and len(layer_files) != int(expected_num_layers):
-                raise SystemExit(
-                    f"Expected {expected_num_layers} replay layers under {layers_dir}, found {len(layer_files)}."
-                )
-            if layer_idx >= len(layer_files):
-                raise SystemExit(
-                    f"Requested layer_idx={layer_idx}, but only {len(layer_files)} layers exist under {layers_dir}."
-                )
-            t = _torch_load_cpu(layer_files[layer_idx])
-            if not isinstance(t, torch.Tensor) or t.dim() != 4:
-                raise SystemExit(f"Invalid replay layer tensor in {layer_files[layer_idx]}: expected 4D torch.Tensor.")
-            return t.contiguous()
+    from analysis.redundancy.cache_layout_v3 import is_v3_cache_dir, load_scene_replay_layer_v3
 
-    row = load_scene_metadata(cache_dir, item)
-    replay_layers = row.get("aggregated_concat_per_layer")
-    if not isinstance(replay_layers, list) or not replay_layers:
-        raise SystemExit("Cache row lacks aggregated_concat_per_layer. Please rerun Stage1.")
-    if expected_num_layers is not None and len(replay_layers) != int(expected_num_layers):
-        raise SystemExit(
-            f"Expected aggregated_concat_per_layer len={expected_num_layers}, got {len(replay_layers)}."
-        )
-    if layer_idx >= len(replay_layers):
-        raise SystemExit(f"Requested layer_idx={layer_idx}, but only {len(replay_layers)} replay layers exist.")
-    t = replay_layers[layer_idx]
-    if not isinstance(t, torch.Tensor) or t.dim() != 4:
-        raise SystemExit(f"Invalid replay cache tensor at layer {layer_idx}: expected 4D torch.Tensor.")
-    return t.contiguous()
+    if not is_v3_cache_dir(cache_dir):
+        raise SystemExit(f"Expected v3 cache at {cache_dir}; re-run run_cache_redundancy.sh")
+    return load_scene_replay_layer_v3(
+        cache_dir,
+        item,
+        int(layer_idx),
+        num_layers=expected_num_layers,
+        map_location=map_location,
+    )
 
 
 def build_scene_row_compat(

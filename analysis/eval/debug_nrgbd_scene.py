@@ -25,6 +25,10 @@ import os.path as osp
 import sys
 from pathlib import Path
 
+import torch
+
+from analysis.amp_policy import amp_dtype_for_device, autocast_device_dtype
+
 
 def _nrgbd_img_indices(*, root: str, scene: str, kf_every: int) -> tuple[list[str], int, int]:
     """Mirror ``NRGBD._get_views`` index logic (no image loading)."""
@@ -135,7 +139,6 @@ def main() -> None:
         test_id=scene,
     )
     batch = default_collate([ds[0]])
-    import torch  # noqa: E402
 
     imgs_list = [v["img"] for v in batch]
     stacked = torch.cat(imgs_list, dim=0)
@@ -162,22 +165,27 @@ def main() -> None:
         backend="vggt",
         hf_model=str(args.hf_model),
         device="cpu",
-        interval_rules=None,
+        unit_plan=None,
         ckpt_path=None,
         train_dir=None,
         epoch=None,
         eval_mode=True,
     ).to(dev).eval()
+    amp_dt = amp_dtype_for_device(dev)
+    if amp_dt != torch.float32:
+        model = model.to(amp_dt)
 
     x = stacked.to(dev, non_blocking=True)
     if x.dim() == 4:
         x = x.unsqueeze(0)
+    if amp_dt != torch.float32:
+        x = x.to(dtype=amp_dt)
     with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with torch.autocast(**autocast_device_dtype(dev)):
             _ = model(x)
     torch.cuda.synchronize(dev)
     peak_gb = torch.cuda.max_memory_allocated(dev) / (1024.0**3)
-    print(f"\n== GPU forward (Baseline vggt, bfloat16 autocast) ==")
+    print(f"\n== GPU forward (Baseline vggt, amp_dtype={amp_dt}) ==")
     print(f"  peak VRAM (max_memory_allocated): {peak_gb:.3f} GiB")
 
 

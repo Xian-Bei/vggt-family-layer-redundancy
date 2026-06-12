@@ -8,8 +8,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from vggt.utils.load_fn import load_and_preprocess_images
-
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -80,6 +78,8 @@ def discover_scannet_scenes(data_root: Path) -> List[SceneData]:
 
 
 def load_scene_images(scene: SceneData, mode: str = "crop") -> torch.Tensor:
+    from vggt.utils.load_fn import load_and_preprocess_images
+
     image_list = [str(p) for p in scene.image_paths]
     return load_and_preprocess_images(image_list, mode=mode)
 
@@ -126,6 +126,34 @@ def build_frame_selection(
     return selected_frame_ids, selected_image_paths, selected_pose_indices
 
 
+def load_poses(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    pose_files = sorted(path.glob("*.txt"), key=lambda x: int(x.stem))
+    if not pose_files:
+        raise FileNotFoundError(f"No pose files (.txt) found in directory {path}")
+
+    c2ws = []
+    available_frame_ids = []
+    for pose_file in pose_files:
+        try:
+            nums = [float(x) for x in pose_file.read_text(encoding="utf-8").strip().split()]
+            pose = np.array(nums, dtype=np.float64).reshape(4, 4)
+        except Exception as e:
+            print(f"Error reading pose file {pose_file}: {e}")
+            continue
+        if np.isinf(pose).any() or np.isnan(pose).any():
+            continue
+        c2ws.append(pose)
+        available_frame_ids.append(int(pose_file.stem))
+
+    if not c2ws:
+        raise ValueError(f"No valid pose files found in directory {path}")
+
+    c2w_arr = np.stack(c2ws)
+    first_gt_pose = c2w_arr[0].copy()
+    c2w_arr = np.linalg.inv(c2w_arr[0]) @ c2w_arr
+    return c2w_arr, first_gt_pose, np.asarray(available_frame_ids)
+
+
 def select_scene_image_paths_fastvggt(scene: SceneData, max_frames: int) -> SceneData:
     """
     Pick RGB frames the same way as FastVGGT ``eval_scannet.py``: require ``scene_dir/pose/``,
@@ -136,8 +164,6 @@ def select_scene_image_paths_fastvggt(scene: SceneData, max_frames: int) -> Scen
         raise FileNotFoundError(
             f"Scene {scene.scene_id} is missing required pose directory: {pose_path}"
         )
-
-    from analysis.eval.eval_utils import load_poses
 
     _, _, available = load_poses(pose_path)
     _ids, selected_paths, _ = build_frame_selection(scene.image_paths, available, max_frames)
@@ -183,4 +209,3 @@ def load_schemes_json(path: Path) -> List[Dict[str, object]]:
     if not isinstance(payload, list):
         raise ValueError("schemes json must be a list or {\"schemes\": [...]}")
     return payload
-

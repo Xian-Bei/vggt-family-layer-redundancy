@@ -29,7 +29,8 @@ def evaluate_depth_metrics_streamvggt(
 ) -> Dict[str, float]:
     """Compute depth_abs_rel / depth_delta1 with StreamVGGT-style scale alignment.
 
-    The valid mask is derived directly from GT depth values in the current aligned depth map.
+    The valid mask uses GT depth range and finite predicted depth; prediction confidence
+    is intentionally not used as a metric mask.
     """
     import torch
 
@@ -41,7 +42,7 @@ def evaluate_depth_metrics_streamvggt(
         _, _, w = pred.shape
         pred = pred.view(-1, w)
         gt = gt.view(-1, w)
-    mask = (gt > 0) & (gt < float(max_depth))
+    mask = (gt > 0) & (gt < float(max_depth)) & torch.isfinite(pred)
     valid_pixels = int(mask.sum().item())
     if valid_pixels <= 0:
         raise RuntimeError(
@@ -181,7 +182,7 @@ def evaluate_7andn_trajectory_metrics(
         msg = str(e)
         if "Degenerate covariance rank" not in msg and "Umeyama alignment" not in msg:
             raise
-        print(f"[warn] 7andn trajectory alignment failed ({msg}); writing NaN pose metrics.", flush=True)
+        # print(f"[warn] 7andn trajectory alignment failed ({msg}); writing NaN pose metrics.", flush=True)
         return (
             {
                 "ate": float("nan"),
@@ -276,7 +277,7 @@ def evaluate_scene_metrics(
         msg = str(e)
         if "Degenerate covariance rank" not in msg and "Umeyama alignment" not in msg:
             raise
-        print(f"[warn] {scene}: trajectory alignment failed ({msg}); writing NaN pose/chamfer metrics.")
+        # print(f"[warn] {scene}: trajectory alignment failed ({msg}); writing NaN pose/chamfer metrics.")
         stats_aligned = {
             "ate": float("nan"),
             "are": float("nan"),

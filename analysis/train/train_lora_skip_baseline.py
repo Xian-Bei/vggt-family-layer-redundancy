@@ -7,18 +7,14 @@ import math
 import os
 import random
 import sys
-import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image
-from torch.utils.checkpoint import checkpoint
 from tqdm.auto import tqdm
 
 # Keep OpenCV/Matplotlib in headless mode for eval_utils imports.
@@ -35,115 +31,60 @@ try:
 except Exception:
     pass
 
-_TRAINING_DIR = Path(__file__).resolve().parents[2] / "training"
-if str(_TRAINING_DIR) not in sys.path:
-    sys.path.append(str(_TRAINING_DIR))
-
-from vggt.models.vggt import VGGT
 from analysis.eval.eval_utils import (
-    build_frame_selection,
-    get_all_scenes,
-    get_sorted_image_paths,
     get_vgg_input_imgs,
-    infer_vggt_and_reconstruct,
     load_images_rgb,
     load_poses,
 )
-from analysis.eval import evaluate_scene_and_save
-from analysis.eval.eval_7andn_utils import evaluate_7andn_dataset
-from analysis.train.model import (
-    IntervalRule,
-    build_skipped_layer_indices,
-    count_unique_params,
-    inject_lora_attn,
-    lora_injection_plan_from_rules,
-    replace_skipped_layers_with_identity,
+from analysis.backbones.cache_replay import get_cache_replay_engine
+from analysis.backbones.registry import get_backbone
+from analysis.backbones.cache_replay.common import (
+    align_activation_term,
+    infer_num_layers,
+    teacher_pred_to_map,
 )
-from analysis.redundancy.metrics import (
-    linear_cka_value_tensor,
-    sample_cosine_similarity_tensor,
+from analysis.prune_plan import (
+    UnitPrunePlan,
+    drop_intervals_from_plan,
+    lora_layers_from_plan,
+    prune_actions_from_plan,
+    replay_seed_spec,
 )
+from analysis.schema.v3 import dataset_output_tag, parse_7scenes_plugin_args
+from analysis.backbones.cache_replay.vggt_family import mask_from_depth
+from analysis.train.model import build_skipped_layer_indices
 from analysis.redundancy.cache_layout import (
     _replay_layer_files,
     load_scene_metadata,
     load_scene_pred,
     load_scene_replay_layer,
 )
-from analysis.eval.prediction_eval import (
-    _depth_or_conf_to_shw,
-    _load_gt_depth_for_scene,
-    build_fastvggt_scene_eval_context,
-)
+from analysis.eval.prediction_eval import _load_gt_depth_for_scene
 from analysis.eval.scannet_eval import (
     SceneData,
     discover_scannet_scenes,
     select_scene_image_paths_fastvggt,
 )
-from training.loss import compute_camera_loss, compute_depth_loss
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
-_ALLOWED_INTERVAL_KEYS = frozenset({"l", "r", "skip_frame_in_interval"})
-
-
-def _load_interval_rules(path: Path) -> List[IntervalRule]:
+def _load_unit_prune_plan(path: Path) -> UnitPrunePlan:
     if not path.exists():
-        raise SystemExit(f"Missing --interval-config-file: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    rules_raw: Any = payload.get("intervals") if isinstance(payload, dict) else payload
-    if not isinstance(rules_raw, list) or not rules_raw:
-        raise SystemExit("Interval config must be a non-empty list (or {\"intervals\": [...]}).")
-
-    parsed: List[IntervalRule] = []
-    for i, item in enumerate(rules_raw):
-        if not isinstance(item, dict):
-            raise SystemExit(f"intervals[{i}] must be an object.")
-        unknown = set(item.keys()) - _ALLOWED_INTERVAL_KEYS
-        if unknown:
-            raise SystemExit(
-                f"intervals[{i}] has unsupported keys: {sorted(unknown)}; "
-                f"allowed: {sorted(_ALLOWED_INTERVAL_KEYS)}."
-            )
-        try:
-            l = int(item["l"])
-            r = int(item["r"])
-        except Exception as e:
-            raise SystemExit(f"intervals[{i}] must provide integer l/r: {e}") from e
-        if l < 0 or r < 0 or l > r:
-            raise SystemExit(f"intervals[{i}] invalid range [{l},{r}]")
-        skip_frame = bool(item.get("skip_frame_in_interval", True))
-        parsed.append(
-            IntervalRule(
-                l=l,
-                r=r,
-                skip_frame_in_interval=skip_frame,
-            )
-        )
-    parsed = sorted(parsed, key=lambda x: (int(x.l), int(x.r)))
-    for i in range(1, len(parsed)):
-        pl, pr = int(parsed[i - 1].l), int(parsed[i - 1].r)
-        l, r = int(parsed[i].l), int(parsed[i].r)
-        if l <= pr:
-            raise SystemExit(f"Overlapped intervals in config: [{pl},{pr}] and [{l},{r}]")
-    return parsed
-
-
-def _intervals_from_rules(rules: Sequence[IntervalRule]) -> List[Tuple[int, int]]:
-    return [(int(x.l), int(x.r)) for x in rules]
-
-
-def _global_skip_intervals_from_rules(rules: Sequence[IntervalRule]) -> List[Tuple[int, int]]:
-    return _intervals_from_rules(rules)
-
-
-def _frame_skip_intervals_from_rules(rules: Sequence[IntervalRule]) -> List[Tuple[int, int]]:
-    return [(int(x.l), int(x.r)) for x in rules if bool(x.skip_frame_in_interval)]
+        raise SystemExit(f"Missing --prune-plan-file: {path}")
+    return UnitPrunePlan.load(path)
 
 
 def _load_manifest(cache_dir: Path) -> List[Dict[str, Any]]:
+    from analysis.redundancy.cache_layout_v3 import is_v3_cache_dir, load_v3_manifest, manifest_scenes_for_training
+
+    if is_v3_cache_dir(cache_dir):
+        manifest = load_v3_manifest(cache_dir)
+        scenes = manifest_scenes_for_training(manifest)
+        if not scenes:
+            raise SystemExit(f"v3 manifest has no scenes: {cache_dir / 'cache_manifest_v3.json'}")
+        return scenes
     p = cache_dir / "manifest.json"
     if not p.exists():
-        raise SystemExit(f"Missing cache manifest: {p}")
+        raise SystemExit(f"Missing cache manifest: {p} (or cache_manifest_v3.json for v3)")
     payload = json.loads(p.read_text(encoding="utf-8"))
     scenes = payload.get("scenes", [])
     if not isinstance(scenes, list) or not scenes:
@@ -155,260 +96,6 @@ def _load_scene_cache_row(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, An
     row = dict(load_scene_metadata(cache_dir, item))
     row["pred"] = load_scene_pred(cache_dir, item)
     return row
-
-
-def _split_concat(layer_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    # [B,S,P,2C] -> [B,S,P,C] frame/global
-    if layer_t.dim() != 4:
-        raise ValueError(f"Expected 4D tensor, got {tuple(layer_t.shape)}")
-    two_c = int(layer_t.shape[-1])
-    if two_c % 2 != 0:
-        raise ValueError(f"Expected even channel dimension, got {two_c}")
-    c = two_c // 2
-    return layer_t[..., :c], layer_t[..., c:]
-
-
-def _is_skipped(layer_idx: int, intervals: Sequence[Tuple[int, int]]) -> bool:
-    for l, r in intervals:
-        if l <= layer_idx <= r:
-            return True
-    return False
-
-
-def _build_pos(model: VGGT, images: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    agg = model.aggregator
-    if agg.rope is None:
-        return None, None
-    if images.dim() == 4:
-        images = images.unsqueeze(0)
-    if images.dim() != 5:
-        raise ValueError(f"Expected [B,S,3,H,W], got {tuple(images.shape)}")
-    bsz, seq_len, _, h, w = images.shape
-    ph = h // int(agg.patch_size)
-    pw = w // int(agg.patch_size)
-    pos = agg.position_getter(bsz * seq_len, ph, pw, device=images.device)
-    if int(agg.patch_start_idx) > 0:
-        pos = pos + 1
-        pos_special = torch.zeros(bsz * seq_len, int(agg.patch_start_idx), 2, device=images.device, dtype=pos.dtype)
-        pos = torch.cat([pos_special, pos], dim=1)
-    p = int(pos.shape[1])
-    pos_frame = pos.view(bsz * seq_len, p, 2)
-    pos_global = pos_frame.view(bsz, seq_len, p, 2).view(bsz, seq_len * p, 2)
-    return pos_frame, pos_global
-
-
-def _run_block_with_checkpoint(
-    block: nn.Module,
-    x: torch.Tensor,
-    *,
-    pos: Optional[torch.Tensor],
-    training: bool,
-    use_checkpoint: bool,
-    use_reentrant: bool,
-) -> torch.Tensor:
-    """
-    Match official aggregator behavior: training-time checkpointing with use_reentrant=False.
-    """
-    if (not training) or (not use_checkpoint):
-        return block(x, pos=pos)
-    if pos is None:
-        return checkpoint(lambda _x: block(_x, pos=None), x, use_reentrant=use_reentrant)
-    return checkpoint(lambda _x, _p: block(_x, pos=_p), x, pos, use_reentrant=use_reentrant)
-
-
-def _required_head_layers(model: VGGT, num_layers: int) -> List[int]:
-    # FastVGGT returns a compact list of 4 aggregated token tensors (for DPT),
-    # whose indices [0,1,2,3] correspond to flat block indices [4,11,17,23].
-    # Our replay/cache layout uses flat layer indices, so we must map the fast
-    # head's compact indexing back to flat indices when determining required layers.
-    FAST_DPT_FLAT_LAYERS = (4, 11, 17, 23)
-
-    def _is_fast_backend(m: VGGT) -> bool:
-        idx = list(getattr(getattr(m, "depth_head", None), "intermediate_layer_idx", []) or [])
-        return idx == [0, 1, 2, 3]
-
-    keep: set[int] = set()
-    if model.camera_head is not None and num_layers > 0:
-        keep.add(num_layers - 1)
-    if model.depth_head is not None:
-        if _is_fast_backend(model):
-            keep.update(int(i) for i in FAST_DPT_FLAT_LAYERS)
-        else:
-            keep.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
-    return sorted(i for i in keep if 0 <= i < num_layers)
-
-
-@dataclass
-class ReplayResult:
-    concat_by_layer: Dict[int, torch.Tensor]
-    pred: Dict[str, torch.Tensor]
-
-
-def _replay_student_cache_first(
-    model: VGGT,
-    get_layer_cpu: Callable[[int], torch.Tensor],
-    num_layers: int,
-    *,
-    frame_skip_intervals: Sequence[Tuple[int, int]],
-    global_skip_intervals: Sequence[Tuple[int, int]],
-    lora_anchor_prev_layers: Sequence[int],
-    alignment_capture_layers: Sequence[int] = (),
-    use_checkpoint: bool,
-    device: torch.device,
-    dummy_images: torch.Tensor,
-) -> ReplayResult:
-    FAST_DPT_FLAT_LAYERS = (4, 11, 17, 23)
-
-    def _is_fast_backend(m: VGGT) -> bool:
-        idx = list(getattr(getattr(m, "depth_head", None), "intermediate_layer_idx", []) or [])
-        return idx == [0, 1, 2, 3]
-
-    _get_layer_cpu = get_layer_cpu
-    if num_layers <= 0:
-        raise ValueError("Replay cache is empty.")
-    start_layer = min(int(x) for x in lora_anchor_prev_layers)
-    if start_layer <= 0:
-        raise ValueError(f"Expected start_layer>0, got {start_layer}")
-    if start_layer >= num_layers:
-        raise ValueError(f"start_layer={start_layer} out of range for num_layers={num_layers}")
-
-    # Seed from cached global of layer start-1
-    seed_concat = _get_layer_cpu(start_layer - 1).to(device=device, non_blocking=(device.type == "cuda"))
-    _, seed_global = _split_concat(seed_concat)
-    bsz, seq_len, p, c = seed_global.shape
-
-    pos_frame, pos_global = _build_pos(model, dummy_images)
-    if pos_frame is not None and pos_frame.shape[0] != bsz * seq_len:
-        raise RuntimeError(
-            f"Position mismatch: pos_frame={tuple(pos_frame.shape)}, replay b*s={bsz*seq_len}"
-        )
-
-    required = set(_required_head_layers(model, num_layers))
-    required.update(int(x) for x in lora_anchor_prev_layers)
-    required.update(int(x) for x in alignment_capture_layers)
-    concat_out: Dict[int, torch.Tensor] = {}
-
-    global_prev = seed_global.view(bsz, seq_len * p, c)
-    use_reentrant = bool(getattr(model.aggregator, "use_reentrant", False))
-    for layer_idx in range(start_layer, num_layers):
-        frame_in = global_prev.view(bsz * seq_len, p, c)
-        if _is_skipped(layer_idx, frame_skip_intervals):
-            frame_out = frame_in
-        else:
-            frame_out = _run_block_with_checkpoint(
-                model.aggregator.frame_blocks[layer_idx],
-                frame_in,
-                pos=pos_frame,
-                training=bool(model.training),
-                use_checkpoint=use_checkpoint,
-                use_reentrant=use_reentrant,
-            )
-        frame_view = frame_out.view(bsz, seq_len, p, c)
-
-        global_in = frame_view.view(bsz, seq_len * p, c)
-        if _is_skipped(layer_idx, global_skip_intervals):
-            global_out = global_in
-        else:
-            global_out = _run_block_with_checkpoint(
-                model.aggregator.global_blocks[layer_idx],
-                global_in,
-                pos=pos_global,
-                training=bool(model.training),
-                use_checkpoint=use_checkpoint,
-                use_reentrant=use_reentrant,
-            )
-        if layer_idx in required:
-            global_view = global_out.view(bsz, seq_len, p, c)
-            concat_out[layer_idx] = torch.cat([frame_view, global_view], dim=-1)
-        global_prev = global_out
-
-    selected: Dict[int, torch.Tensor] = {}
-    for idx in required:
-        if idx < start_layer:
-            selected[idx] = _get_layer_cpu(idx).to(device=device, non_blocking=(device.type == "cuda"))
-        else:
-            if idx not in concat_out:
-                raise RuntimeError(f"Missing replay output at required layer {idx}")
-            selected[idx] = concat_out[idx]
-    if _is_fast_backend(model):
-        # Adapter: replay/cache uses flat indices, but fast heads index a compact 4-list.
-        # Ensure we feed the four DPT layers in the expected compact order.
-        compact = [selected[int(i)] for i in FAST_DPT_FLAT_LAYERS]
-        pred = model.forward_from_aggregated_tokens(
-            compact,
-            int(model.aggregator.patch_start_idx),
-            dummy_images,
-        )
-    else:
-        agg_list: List[torch.Tensor] = [None] * num_layers  # type: ignore[list-item]
-        for idx, t in selected.items():
-            agg_list[idx] = t
-        pred = model.forward_from_aggregated_tokens(
-            agg_list,
-            int(model.aggregator.patch_start_idx),
-            dummy_images,
-        )
-    return ReplayResult(concat_by_layer=concat_out, pred=pred)
-
-
-def _loss_mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    # Keep elementwise :func:`torch.nn.functional.mse_loss` on raw tensors for AMP parity with
-    # bf16/fp16 activations. Redundancy ``neg_mse`` uses :func:`token_mean_squared_error_tensor`
-    # (flatten + float32) in ``analysis.redundancy.metrics``.
-    return F.mse_loss(a, b)
-
-
-def _loss_cos(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return 1.0 - sample_cosine_similarity_tensor(a, b, eps=eps)
-
-
-def _loss_cka(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return 1.0 - linear_cka_value_tensor(a, b, eps=eps)
-
-
-def _spatial_grad_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    # Supports [B,S,H,W,C] or [B,S,H,W]
-    if pred.dim() == 5:
-        p = pred.permute(0, 1, 4, 2, 3).contiguous()
-        t = target.permute(0, 1, 4, 2, 3).contiguous()
-    elif pred.dim() == 4:
-        p = pred.unsqueeze(2)
-        t = target.unsqueeze(2)
-    else:
-        return torch.zeros((), device=pred.device, dtype=pred.dtype)
-    if p.shape[-2] < 2 or p.shape[-1] < 2:
-        return torch.zeros((), device=pred.device, dtype=pred.dtype)
-    px = p[..., 1:, :] - p[..., :-1, :]
-    tx = t[..., 1:, :] - t[..., :-1, :]
-    py = p[..., :, 1:] - p[..., :, :-1]
-    ty = t[..., :, 1:] - t[..., :, :-1]
-    return 0.5 * (F.l1_loss(px, tx) + F.l1_loss(py, ty))
-
-
-def _teacher_pred_to_map(pred: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    out: Dict[str, torch.Tensor] = {}
-    for k, v in pred.items():
-        if isinstance(v, torch.Tensor):
-            # Keep teacher targets on CPU to reduce persistent GPU memory.
-            t = v.contiguous()
-            if t.dim() >= 1 and t.shape[0] != 1:
-                t = t.unsqueeze(0)
-            out[k] = t
-    return out
-
-
-def _depth_to_bshw(depth: torch.Tensor) -> torch.Tensor:
-    if depth.dim() == 5 and depth.shape[-1] == 1:
-        return depth[..., 0]
-    if depth.dim() == 5 and depth.shape[2] == 1:
-        return depth[:, :, 0]
-    if depth.dim() == 4:
-        return depth
-    raise ValueError(f"Unsupported depth shape: {tuple(depth.shape)}")
-
-
-def _mask_from_depth(depth_bshw: torch.Tensor) -> torch.Tensor:
-    return torch.isfinite(depth_bshw) & (depth_bshw > 1e-6)
 
 
 def _load_scannet_intrinsics(scene_dir: Path) -> np.ndarray:
@@ -454,29 +141,6 @@ def _resize_intrinsics_like_vgg_input(
         start_y = (new_height - 518) // 2
         k[1, 2] -= float(start_y)
     return k
-
-
-def _build_target_batch_from_teacher(
-    teacher_pred: Dict[str, torch.Tensor],
-    *,
-    images_batched: torch.Tensor,
-    device: torch.device,
-) -> Dict[str, torch.Tensor]:
-    if "pose_enc" not in teacher_pred or "depth" not in teacher_pred:
-        raise RuntimeError("teacher target mode requires teacher keys: pose_enc and depth")
-    h = int(images_batched.shape[-2])
-    w = int(images_batched.shape[-1])
-    t_pose = teacher_pred["pose_enc"].float().to(device)
-    extrinsics, intrinsics = pose_encoding_to_extri_intri(t_pose, (h, w))
-    t_depth = _depth_to_bshw(teacher_pred["depth"].float().to(device))
-    point_masks = _mask_from_depth(t_depth)
-    return {
-        "images": images_batched.float(),
-        "extrinsics": extrinsics.float(),
-        "intrinsics": intrinsics.float(),
-        "depths": t_depth.float(),
-        "point_masks": point_masks.bool(),
-    }
 
 
 def _select_scannet_scene_with_frames(
@@ -534,7 +198,7 @@ def _build_target_batch_from_dataset(
 
     depths = torch.from_numpy(gt_depth_np).float().unsqueeze(0).to(device)
     images = vgg_input.float().unsqueeze(0).to(device)
-    point_masks = _mask_from_depth(depths)
+    point_masks = mask_from_depth(depths)
     return {
         "images": images,
         "extrinsics": torch.from_numpy(w2cs).float().unsqueeze(0).to(device),
@@ -542,53 +206,6 @@ def _build_target_batch_from_dataset(
         "depths": depths,
         "point_masks": point_masks.bool(),
     }
-
-
-def _prediction_official_camera_depth(
-    student_pred: Dict[str, torch.Tensor],
-    target_batch: Dict[str, torch.Tensor],
-    *,
-    w_pred: float,
-    w_camera: float,
-    w_depth: float,
-    camera_loss_type: str,
-    depth_valid_range: float,
-    depth_gradient_loss_fn: str,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    device = next(iter(student_pred.values())).device
-    total = torch.zeros((), device=device)
-    logs: Dict[str, float] = {}
-    wp = float(w_pred)
-
-    if "pose_enc_list" in student_pred:
-        camera_loss_dict = compute_camera_loss(
-            {"pose_enc_list": student_pred["pose_enc_list"]},
-            target_batch,
-            loss_type=camera_loss_type,
-        )
-        l_camera = camera_loss_dict["loss_camera"]
-        total = total + float(w_camera) * l_camera
-        logs["loss_camera"] = float((wp * float(w_camera) * l_camera).detach().item())
-
-    if "depth" in student_pred and "depth_conf" in student_pred:
-        depth_loss_dict = compute_depth_loss(
-            {"depth": student_pred["depth"], "depth_conf": student_pred["depth_conf"]},
-            target_batch,
-            gradient_loss_fn=depth_gradient_loss_fn,
-            valid_range=depth_valid_range,
-        )
-        l_conf = depth_loss_dict["loss_conf_depth"]
-        l_reg = depth_loss_dict["loss_reg_depth"]
-        l_grad = depth_loss_dict["loss_grad_depth"]
-        l_depth = l_conf + l_reg + l_grad
-        total = total + float(w_depth) * l_depth
-        wd = float(w_depth)
-        logs["loss_depth"] = float((wp * wd * l_depth).detach().item())
-        logs["loss_depth_conf"] = float((wp * wd * l_conf).detach().item())
-        logs["loss_depth_reg"] = float((wp * wd * l_reg).detach().item())
-        logs["loss_depth_grad"] = float((wp * wd * l_grad).detach().item())
-
-    return total, logs
 
 
 def _lr_with_warmup_cosine(
@@ -628,34 +245,6 @@ def _format_param_count(n: int) -> str:
     if v >= 1e3:
         return f"{v / 1e3:.2f}K"
     return str(int(v))
-
-
-def _validate_schema(row: Dict[str, Any], num_layers: int) -> None:
-    pred = row.get("pred")
-    if not isinstance(pred, dict):
-        raise SystemExit("Invalid cache row: missing dict key 'pred'.")
-    required = ("pose_enc", "depth", "depth_conf")
-    missing = [k for k in required if k not in pred]
-    if missing:
-        raise SystemExit(f"Invalid cache row pred: missing keys {missing}")
-
-
-def _infer_num_layers(cache_dir: Path, scenes: Sequence[Dict[str, Any]]) -> int:
-    for item in scenes:
-        scene_dir_name = str(item.get("dir", "")).strip()
-        if not scene_dir_name:
-            sid = str(item.get("scene_id", "")).strip()
-            scene_dir_name = sid.replace("/", "_") if sid else ""
-        if not scene_dir_name:
-            continue
-        layers_dir = cache_dir / scene_dir_name / "layers"
-        if not layers_dir.exists():
-            continue
-        # Must match load_scene_replay_layer: layer_-1.pt is initial tokens, not a replay block.
-        layer_files = _replay_layer_files(layers_dir)
-        if layer_files:
-            return len(layer_files)
-    raise SystemExit("Could not infer num_layers from cache.")
 
 
 def _write_curves(out_dir: Path, rows: List[Dict[str, Any]]) -> None:
@@ -765,7 +354,7 @@ _SCANNET_KEEP_KEYS = (
     "nc1_med",
     "nc2_med",
     "nc_med",
-    "ate",
+    "ape",
     "are",
     "rpe_rot",
     "rpe_trans",
@@ -777,130 +366,9 @@ _SCANNET_KEEP_KEYS = (
 _EVAL_HISTORY_SKIP_KEYS = frozenset({"inference_time_ms", "infer_peak_vram_gb"})
 
 
-def _evaluate_scannet_run_eval_style(
-    *,
-    model: VGGT,
-    data_dir: Path,
-    gt_ply_dir: Path,
-    input_frame: int,
-    num_scenes: int,
-    depth_conf_thresh: float,
-    chamfer_max_dist: float,
-    eval_amp_dtype: torch.dtype,
-    desc: str = "eval scannet",
-) -> Dict[str, float]:
-    """Evaluate a ScanNet split using the exact ``run_eval.sh`` / ``eval_scannet.py`` pipeline.
-
-    This is the single entry point for both dev (scans_dev50) and test (scans_test50)
-    evaluation: ``infer_vggt_and_reconstruct`` + ``evaluate_scene_and_save``. We do
-    not use ``collect_batch`` here because fastvggt's ``forward_from_aggregated_tokens``
-    disables autocast internally and would re-introduce the BFloat16/Float dtype
-    mismatch that motivated this refactor.
-    """
-    scene_names = (
-        get_all_scenes(data_dir, num_scenes)
-        if num_scenes > 0
-        else sorted([d.name for d in Path(data_dir).iterdir() if d.is_dir()])
-    )
-    all_scenes_metrics: Dict[str, Dict[str, float]] = {}
-    was_training = bool(model.training)
-    model.eval()
-    try:
-        for scene in tqdm(scene_names, desc=desc, leave=False):
-            scene_dir = data_dir / f"{scene}"
-            images_dir = scene_dir / "color"
-            pose_path = scene_dir / "pose"
-            image_paths = get_sorted_image_paths(images_dir)
-            poses_gt, first_gt_pose, available_pose_frame_ids = load_poses(pose_path)
-            selected_frame_ids, selected_image_paths, selected_pose_indices = build_frame_selection(
-                image_paths,
-                available_pose_frame_ids,
-                input_frame,
-            )
-            c2ws = poses_gt[selected_pose_indices]
-            if len(selected_image_paths) == 0:
-                continue
-            images = load_images_rgb(selected_image_paths)
-            if not images or len(images) < 3:
-                continue
-            images_array = np.stack(images)
-            vgg_input, patch_width, patch_height = get_vgg_input_imgs(images_array)
-            if hasattr(model, "update_patch_dimensions"):
-                model.update_patch_dimensions(patch_width, patch_height)
-            # Reuse run_eval/eval_scannet.py reconstruction + dense-depth GT path (for parity with average_metrics.json).
-            _, _, all_world_points, _, all_cam_to_world_mat, inference_time_ms, depth_raw_np, _depth_conf_np, infer_peak_vram_gb = (
-                infer_vggt_and_reconstruct(
-                    model,
-                    vgg_input,
-                    eval_amp_dtype,
-                    depth_conf_thresh,
-                    selected_image_paths,
-                )
-            )
-            gt_depth = None
-            pred_depth_for_metrics = None
-            try:
-                pred_depth_for_metrics = _depth_or_conf_to_shw(depth_raw_np, "depth")
-            except Exception as e:
-                print(f"[warn] pred depth layout normalize failed for {scene}: {e}")
-                pred_depth_for_metrics = np.asarray(depth_raw_np, dtype=np.float32)
-            try:
-                scene_data = SceneData(
-                    scene_id=scene,
-                    scene_dir=scene_dir,
-                    image_paths=list(selected_image_paths),
-                )
-                ctx = build_fastvggt_scene_eval_context(
-                    scene_data,
-                    data_dir,
-                    gt_ply_dir,
-                    image_hw=(int(vgg_input.shape[2]), int(vgg_input.shape[3])),
-                )
-                gt_depth = ctx.gt_depth
-            except Exception as e:
-                print(
-                    f"[warn] depth GT load skipped for {scene} (align with eval_scannet when data is complete): {e}"
-                )
-            with tempfile.TemporaryDirectory(prefix="lora_eval_scannet_") as tmpd:
-                metrics = evaluate_scene_and_save(
-                    scene,
-                    c2ws,
-                    first_gt_pose,
-                    selected_frame_ids,
-                    all_cam_to_world_mat,
-                    all_world_points,
-                    Path(tmpd),
-                    gt_ply_dir,
-                    chamfer_max_dist,
-                    inference_time_ms,
-                    False,
-                    infer_peak_vram_gb=infer_peak_vram_gb,
-                    pred_depth=pred_depth_for_metrics,
-                    gt_depth=gt_depth,
-                )
-            if metrics is not None:
-                all_scenes_metrics[scene] = {
-                    key: float(value)
-                    for key, value in metrics.items()
-                    if key in _SCANNET_KEEP_KEYS
-                }
-    finally:
-        if was_training:
-            model.train()
-    if not all_scenes_metrics:
-        raise RuntimeError(f"No scannet evaluation rows produced for {data_dir}.")
-    keys = sorted({k for row in all_scenes_metrics.values() for k in row.keys()})
-    avg: Dict[str, float] = {}
-    for k in keys:
-        vals = [float(row[k]) for row in all_scenes_metrics.values() if k in row]
-        if vals:
-            avg[k] = float(sum(vals) / len(vals))
-    return avg
-
-
 # Periodic eval covers four datasets. Two metric families:
-#   - scannet_dev50, scannet_test50 → ScanNet metrics (chamfer/ate/are/...)
-#   - 7scenes, nrgbd → reconstruction + trajectory (acc/comp/nc/..., ate/are/rpe, timing)
+#   - scannet_dev50, scannet_test50 → ScanNet metrics (chamfer/ape/are/...)
+#   - 7scenes, nrgbd → reconstruction + trajectory (acc/comp/nc/..., ape/are/rpe, timing)
 # Plotting groups (`_write_eval_artifacts`) share these splits.
 EVAL_SCANNET_DATASETS = ("scannet_dev50", "scannet_test50")
 EVAL_7ANDN_DATASETS = ("7scenes", "nrgbd")
@@ -916,7 +384,7 @@ _7ANDN_KEEP_KEYS = (
     "comp_med",
     "cd_med",
     "nc_med",
-    "ate",
+    "ape",
     "are",
     "rpe_rot",
     "rpe_trans",
@@ -938,126 +406,73 @@ def _resolve_enabled_eval_datasets(args: argparse.Namespace) -> Tuple[str, ...]:
     if bool(args.eval_scannet_test50):
         selected.append("scannet_test50")
     if bool(args.eval_7scenes):
-        selected.append("7scenes")
+        selected.append(dataset_output_tag("7scenes", args.eval_7scenes_split))
     if bool(args.eval_nrgbd):
         selected.append("nrgbd")
     return tuple(selected)
 
 
-def _build_7andn_dataset(name: str, root: Path, kf: int, size: int = 518):
-    """Lazy build of SevenScenes / NRGBD datasets. Imports live inside this helper
-    because the `data` module mutates sys.path on import (see eval_7andn_utils)."""
-    from analysis.eval.eval_7andn_utils import evaluate_7andn_dataset  # noqa: F401  ensures sys.path is set up
-    from data import NRGBD, SevenScenes  # type: ignore
-
-    if size == 512:
-        resolution = (512, 384)
-    elif size == 224:
-        resolution = 224
-    elif size == 518:
-        resolution = (518, 392)
-    else:
-        raise NotImplementedError(f"Unsupported 7andn eval size={size}")
-    common = dict(
-        split="test",
-        ROOT=str(root),
-        resolution=resolution,
-        num_seq=1,
-        full_video=True,
-        kf_every=int(kf),
-        seed=33,
-    )
-    if name == "7scenes":
-        return SevenScenes(**common)
-    if name == "nrgbd":
-        return NRGBD(**common)
-    raise ValueError(f"Unknown 7andn dataset: {name}")
+def _dataset_for_bounds(eval_dataset_name: str) -> str:
+    # Bounds are stored under analysis_outputs_v3/<backbone>/<dataset_tag>/eval/...
+    # Keep ScanNet splits distinct (scannet_dev50 vs scannet_test50).
+    if eval_dataset_name in ("scannet_dev50", "scannet_test50"):
+        return eval_dataset_name
+    if eval_dataset_name.startswith("7scenes"):
+        return eval_dataset_name
+    if eval_dataset_name == "nrgbd":
+        return eval_dataset_name
+    raise ValueError(f"Unsupported periodic eval dataset: {eval_dataset_name}")
 
 
-def _evaluate_7andn_run_eval_style(
+def _load_eval_bounds_from_v3(
     *,
-    model: VGGT,
-    dataset_name: str,
-    root: Path,
-    kf: int,
-    eval_amp_dtype: torch.dtype,
-    max_scenes_per_dataset: int,
-    device: str = "cuda",
-) -> Dict[str, float]:
-    """Run 7Scenes or NRGBD eval against a live model (no logs/JSON written).
-
-    Mirrors the run_eval.sh path via :func:`evaluate_7andn_dataset`, returning a
-    metric dict that's directly appendable to the periodic-eval history.
-    """
-    dataset = _build_7andn_dataset(dataset_name, root, kf=kf)
-    if int(max_scenes_per_dataset) > 0 and hasattr(dataset, "scene_list"):
-        dataset.scene_list = dataset.scene_list[: int(max_scenes_per_dataset)]
-    metrics = evaluate_7andn_dataset(
-        model=model,
-        dataset=dataset,
-        device=device,
-        eval_amp_dtype=eval_amp_dtype,
-        save_path=None,
-        eval_conf_thresh=1.0,
-        rng_np=np.random.default_rng(33),
-        write_average_metrics_json=False,
-        quiet=True,
-    )
-    return {k: float(v) for k, v in metrics.items() if k in _7ANDN_KEEP_KEYS}
-
-
-def _run_stage1_upper_sanity_check(
-    *,
-    dev_upper_metrics: Dict[str, float],
-    cache_dir: Path,
-    rtol: float,
-    atol: float,
-) -> None:
-    path = cache_dir / "eval_scannet.json"
-    if not path.exists():
-        raise SystemExit(f"Stage1 sanity check failed: missing {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    ref = _float_metrics_from_aggregate(payload.get("aggregate", {}))
-    keys = ("ate", "are", "rpe_rot", "rpe_trans", "chamfer_distance", "depth_abs_rel", "depth_delta1")
-    missing = [k for k in keys if k not in dev_upper_metrics or k not in ref]
-    if missing:
-        raise SystemExit(f"Stage1 sanity check failed: missing metrics {missing}")
-    mismatch: List[str] = []
-    for k in keys:
-        a = float(dev_upper_metrics[k])
-        b = float(ref[k])
-        if not math.isclose(a, b, rel_tol=rtol, abs_tol=atol):
-            mismatch.append(f"{k}: upper={a:.8f} stage1={b:.8f}")
-    if mismatch:
-        msg = "\n".join(mismatch)
-        raise SystemExit(f"Stage1 sanity check failed (upper(dev) != stage1 eval):\n{msg}")
-
-
-def _run_test_upper_sanity_check(
-    *,
-    test_upper_metrics: Dict[str, float],
-    ref_average_metrics_path: Path,
-    rtol: float,
-    atol: float,
-) -> None:
-    if not ref_average_metrics_path.exists():
-        raise SystemExit(f"Test sanity check failed: missing {ref_average_metrics_path}")
-    ref_payload = json.loads(ref_average_metrics_path.read_text(encoding="utf-8"))
-    ref = _float_metrics_from_aggregate(ref_payload)
-    # Keep sanity focused on quality metrics; inference latency is environment-sensitive.
-    keys = ("ate", "are", "rpe_rot", "rpe_trans", "chamfer_distance", "depth_abs_rel", "depth_delta1")
-    missing = [k for k in keys if k not in test_upper_metrics or k not in ref]
-    if missing:
-        raise SystemExit(f"Test sanity check failed: missing metrics {missing}")
-    mismatch: List[str] = []
-    for k in keys:
-        a = float(test_upper_metrics[k])
-        b = float(ref[k])
-        if not math.isclose(a, b, rel_tol=rtol, abs_tol=atol):
-            mismatch.append(f"{k}: upper={a:.8f} run_eval={b:.8f}")
-    if mismatch:
-        msg = "\n".join(mismatch)
-        raise SystemExit(f"Test sanity check failed (upper(test) != run_eval average):\n{msg}")
+    eval_bounds_root: Path,
+    backbone: str,
+    eval_datasets: Sequence[str],
+    plan_name: str = "",
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    bounds: Dict[str, Dict[str, Dict[str, float]]] = {}
+    backbone_key = str(backbone).strip().lower()
+    for ds in eval_datasets:
+        source_ds = _dataset_for_bounds(str(ds))
+        ds_root = Path(eval_bounds_root) / backbone_key / source_ds / "eval"
+        upper_path = ds_root / "upper" / "eval_record_v3.json"
+        lower_path = ds_root / "lower" / "eval_record_v3.json"
+        if not upper_path.exists():
+            # Backward-compat for legacy naming.
+            upper_legacy = ds_root / f"upper_{backbone_key}" / "eval_record_v3.json"
+            if upper_legacy.exists():
+                upper_path = upper_legacy
+        if not lower_path.exists():
+            plan_key = str(plan_name or "").strip()
+            if plan_key:
+                lower_plan = ds_root / "lower" / plan_key / "eval_record_v3.json"
+                if lower_plan.exists():
+                    lower_path = lower_plan
+        if not lower_path.exists():
+            lower_legacy = ds_root / f"lower_{backbone_key}" / "eval_record_v3.json"
+            if lower_legacy.exists():
+                lower_path = lower_legacy
+        if not upper_path.exists() or not lower_path.exists():
+            missing = []
+            if not upper_path.exists():
+                missing.append(str(upper_path))
+            if not lower_path.exists():
+                missing.append(str(lower_path))
+            raise SystemExit(
+                "Missing periodic-eval bound files:\n" + "\n".join(missing)
+            )
+        upper_payload = json.loads(upper_path.read_text(encoding="utf-8"))
+        lower_payload = json.loads(lower_path.read_text(encoding="utf-8"))
+        upper_avg = _float_metrics_from_aggregate(dict(upper_payload.get("average", {})))
+        lower_avg = _float_metrics_from_aggregate(dict(lower_payload.get("average", {})))
+        if not upper_avg or not lower_avg:
+            raise SystemExit(
+                f"Invalid bound payload for dataset={ds}: empty average in "
+                f"{upper_path} or {lower_path}"
+            )
+        bounds[str(ds)] = {"upper": upper_avg, "lower": lower_avg}
+    return bounds
 
 
 def _append_eval_history(
@@ -1080,6 +495,103 @@ def _append_eval_history(
                 "value": float(v),
             }
         )
+
+
+def _run_periodic_eval_for_epoch(
+    *,
+    eval_epoch: int,
+    model: nn.Module,
+    eval_datasets: Sequence[str],
+    args: argparse.Namespace,
+    backbone: str,
+    device: torch.device,
+    out_dir: Path,
+    eval_history_rows: List[Dict[str, Any]],
+    log_fn,
+) -> None:
+    """Run periodic eval (eval_v3) and append metrics for ``eval_epoch`` (0 = before training)."""
+    from analysis.datasets.registry import get_dataset
+    from analysis.eval.eval_v3 import evaluate_model_v3
+
+    adapter = get_backbone(backbone)
+    model_was_training = bool(model.training)
+    model.eval()
+    log_fn(f"[eval] epoch={eval_epoch}: evaluating current LoRA model on {', '.join(eval_datasets)}")
+    for ds in eval_datasets:
+        t0 = time.perf_counter()
+        if ds == "scannet_dev50":
+            ds_plugin = get_dataset("scannet")
+            out_p = out_dir / "eval_epochs" / f"epoch_{eval_epoch}" / "scannet_dev50"
+            evaluate_model_v3(
+                adapter=adapter,
+                model=model,
+                ds_plugin=ds_plugin,
+                experiment="train",
+                dataset="scannet",
+                data_root=Path(args.dev_data_root),
+                backbone=backbone,
+                model_name=f"Train_epoch_{eval_epoch}",
+                device=device,
+                output_dir=out_p,
+                skip_depth=adapter.periodic_eval_skip_depth(),
+                max_scenes=int(args.eval_max_scenes),
+                max_frames=int(args.max_eval_views),
+            )
+        elif ds == "scannet_test50":
+            ds_plugin = get_dataset("scannet")
+            out_p = out_dir / "eval_epochs" / f"epoch_{eval_epoch}" / "scannet_test50"
+            evaluate_model_v3(
+                adapter=adapter,
+                model=model,
+                ds_plugin=ds_plugin,
+                experiment="train",
+                dataset="scannet",
+                data_root=Path(args.test_data_dir),
+                backbone=backbone,
+                model_name=f"Train_epoch_{eval_epoch}",
+                device=device,
+                output_dir=out_p,
+                skip_depth=adapter.periodic_eval_skip_depth(),
+                max_scenes=int(args.eval_max_scenes),
+                max_frames=int(args.max_eval_views),
+            )
+        else:
+            plugin_name, split = parse_7scenes_plugin_args(ds)
+            root = args.root_7scenes if plugin_name == "7scenes" else args.root_nrgbd
+            ds_plugin = get_dataset(plugin_name)
+            out_p = out_dir / "eval_epochs" / f"epoch_{eval_epoch}" / ds
+            evaluate_model_v3(
+                adapter=adapter,
+                model=model,
+                ds_plugin=ds_plugin,
+                experiment="train",
+                dataset=plugin_name,
+                data_root=Path(root),
+                backbone=backbone,
+                model_name=f"Train_epoch_{eval_epoch}",
+                device=device,
+                output_dir=out_p,
+                skip_depth=adapter.periodic_eval_skip_depth(),
+                max_scenes=int(args.eval_max_scenes),
+                max_frames=int(args.max_eval_views),
+                split=split,
+                output_dataset=ds,
+            )
+        log_fn(f"[eval][epoch={eval_epoch}][{ds}] elapsed={time.perf_counter() - t0:.2f}s")
+        avg_path = out_p / "eval_record_v3.json"
+        if not avg_path.exists():
+            raise SystemExit(f"Periodic eval missing output: {avg_path}")
+        payload = json.loads(avg_path.read_text(encoding="utf-8"))
+        avg_metrics = _float_metrics_from_aggregate(dict(payload.get("average", {})))
+        _append_eval_history(
+            eval_history_rows,
+            epoch=int(eval_epoch),
+            dataset=str(ds),
+            tag="train",
+            metrics=avg_metrics,
+        )
+    if model_was_training:
+        model.train()
 
 
 def _eval_epochs_metrics_payload(history_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1220,8 +732,14 @@ def _write_eval_artifacts(
         # red/blue palette: first dataset = red, second = blue.
         scannet_active = [ds for ds in EVAL_SCANNET_DATASETS if ds in bounds]
         andn_active = [ds for ds in EVAL_7ANDN_DATASETS if ds in bounds]
+        andn_active.extend(
+            ds for ds in bounds if ds.startswith("7scenes_") and ds not in andn_active
+        )
         scannet_colors = {"scannet_dev50": "#c62828", "scannet_test50": "#1565c0"}
-        andn_colors = {"7scenes": "#c62828", "nrgbd": "#1565c0"}
+        andn_colors = {"nrgbd": "#1565c0"}
+        for ds in andn_active:
+            if ds.startswith("7scenes"):
+                andn_colors[ds] = "#c62828"
         if scannet_active:
             _plot_metric_group(
                 out_dir,
@@ -1265,24 +783,31 @@ def _extract_bound_payload(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("Train cache-first multi-interval skip+LoRA baseline.")
+    p = argparse.ArgumentParser("Train cache-first unit-prune + LoRA baseline.")
+    p.add_argument(
+        "--backbone",
+        type=str,
+        default=None,
+        help="Backbone name (default: BACKEND env var, else vggt).",
+    )
     p.add_argument("--cache-dir", type=Path, required=True)
     p.add_argument("--hf-model", type=str, default="facebook/VGGT-1B")
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--interval-config-file", type=Path, required=True, help="JSON file path for interval rules.")
+    p.add_argument("--prune-plan-file", type=Path, required=True, help="JSON file path for unit prune plan.")
     p.add_argument(
-        "--variant",
+        "--plan-name",
         type=str,
-        default="multi_interval_config",
-        choices=("multi_interval_config",),
+        default="",
+        help="Plan name for resolving periodic-eval lower bounds (new layout: eval/lower/<plan_name>/...).",
     )
+    p.add_argument("--variant", type=str, default="unit_prune_plan", choices=("unit_prune_plan",))
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--dtype", type=str, default="bfloat16", choices=("float32", "bfloat16", "float16"))
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--max-scenes", type=int, default=0, help="0 means all scenes.")
     p.add_argument("--max-steps", type=int, default=0, help="0 means no early stop.")
-    p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--min-lr", type=float, default=1e-8)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
@@ -1299,6 +824,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--eval-epoch", type=int, default=0, help="Run dev/test eval every N epochs. 0 disables periodic eval.")
+    p.add_argument(
+        "--eval-at-start",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run periodic eval once before training (epoch=0), independent of --eval-epoch.",
+    )
+    p.add_argument(
+        "--eval-bounds-root",
+        type=Path,
+        default=Path("analysis_outputs_v3"),
+        help="Root containing precomputed upper/lower eval_record_v3.json for periodic-eval plots.",
+    )
     p.add_argument("--dev-data-root", type=Path, default=Path("data/scans_dev50"))
     p.add_argument("--test-data-dir", type=Path, default=Path("data/scans_test50"))
     p.add_argument("--test-gt-ply-dir", type=Path, default=Path("data/scans_test50"))
@@ -1310,6 +847,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--eval-max-scenes", type=int, default=0, help="0 means full split.")
     p.add_argument("--eval-input-frame", type=int, default=30)
+    p.add_argument(
+        "--max-eval-views",
+        type=int,
+        default=50,
+        help="Max frames per scene for periodic eval (passed to eval_v3 --max-frames).",
+    )
     p.add_argument(
         "--eval-scannet-dev50",
         action=argparse.BooleanOptionalAction,
@@ -1327,6 +870,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable periodic eval on 7scenes.",
+    )
+    p.add_argument(
+        "--eval-7scenes-split",
+        type=str,
+        default="test",
+        choices=("train", "test"),
+        help="7scenes split for periodic eval (output tag: 7scenes_<split>).",
     )
     p.add_argument(
         "--eval-nrgbd",
@@ -1369,9 +919,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--w-align-cos", type=float, default=1.0)
     p.add_argument("--w-align-cka", type=float, default=0.0)
     p.add_argument("--w-pred", type=float, default=1.0)
-    p.add_argument("--w-camera", type=float, default=1.0)
+    p.add_argument("--w-camera", type=float, default=5.0)
     p.add_argument("--w-depth", type=float, default=1.0)
-    p.add_argument("--w-depth-grad", type=float, default=1.0)
     p.add_argument("--depth-valid-range", type=float, default=0.98)
     p.add_argument("--depth-gradient-loss-fn", type=str, default="grad")
     p.add_argument("--camera-loss-type", type=str, default="l1", choices=("l1", "l2"))
@@ -1399,6 +948,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    backbone = str(args.backbone or os.environ.get("BACKEND", "vggt")).strip() or "vggt"
+    engine = get_cache_replay_engine(backbone)
     torch.manual_seed(int(args.seed))
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
@@ -1410,13 +961,15 @@ def main() -> None:
         else Path("analysis_outputs/evaluation/scans_test50/baseline") / f"input_frame_{int(args.eval_input_frame)}" / "average_metrics.json"
     )
 
-    rules = _load_interval_rules(args.interval_config_file)
-    intervals = _intervals_from_rules(rules)
-    global_skip_intervals = _global_skip_intervals_from_rules(rules)
-    frame_skip_intervals = _frame_skip_intervals_from_rules(rules)
-    prev_layers = [int(x.prev_layer) for x in rules]
-    if any(p < 0 for p in prev_layers):
-        raise SystemExit(f"Interval starts must be >0: {intervals}")
+    prune_plan = _load_unit_prune_plan(args.prune_plan_file)
+    frame_skip_intervals, global_skip_intervals, frame_layers, global_layers = drop_intervals_from_plan(prune_plan)
+    intervals = sorted(set(frame_skip_intervals).union(set(global_skip_intervals)))
+    lora_unit_indices = sorted(int(k) for k in prune_plan.lora.keys())
+    lora_anchor_layers = lora_layers_from_plan(prune_plan)
+    seed_layer, seed_kind, _replay_start = replay_seed_spec(prune_plan)
+    drop_actions, lora_actions = prune_actions_from_plan(prune_plan)
+    if not lora_anchor_layers:
+        raise SystemExit("Prune plan has no lora entries; nothing to train.")
 
     scenes = _load_manifest(args.cache_dir)
     if int(args.max_scenes) > 0:
@@ -1424,9 +977,16 @@ def main() -> None:
     if not scenes:
         raise SystemExit("No scenes selected from cache.")
 
-    num_layers = _infer_num_layers(args.cache_dir, scenes)
-    if any(r >= num_layers for (_l, r) in intervals):
-        raise SystemExit(f"Interval out of range for num_layers={num_layers}: {intervals}")
+    num_layers = infer_num_layers(args.cache_dir, scenes)
+    if prune_plan.num_units != int(num_layers * 2):
+        raise SystemExit(
+            f"prune plan num_units={prune_plan.num_units} != expected {int(num_layers * 2)} from cache"
+        )
+    if any(r >= num_layers for (_l, r) in frame_skip_intervals + global_skip_intervals):
+        raise SystemExit(
+            f"Plan-derived drop intervals out of range for num_layers={num_layers}: "
+            f"frame={frame_skip_intervals}, global={global_skip_intervals}"
+        )
 
     out_dir: Path = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1434,16 +994,21 @@ def main() -> None:
     (out_dir / "config.json").write_text(
         json.dumps(
             {
+                "backbone": backbone,
                 "cache_dir": str(args.cache_dir),
                 "hf_model": args.hf_model,
-                "intervals": intervals,
-                "interval_rules": [vars(x) for x in rules],
+                "drop_indices": sorted(set(int(x) for x in prune_plan.drop)),
+                "lora_indices": lora_unit_indices,
+                "frame_drop_layers": frame_layers,
+                "global_drop_layers": global_layers,
                 "variant": args.variant,
                 "epochs": int(args.epochs),
                 "max_scenes": int(args.max_scenes),
                 "max_steps": int(args.max_steps),
                 "save_every_epoch": int(args.save_every_epoch),
                 "eval_epoch": int(args.eval_epoch),
+                "eval_at_start": bool(args.eval_at_start),
+                "eval_bounds_root": str(args.eval_bounds_root),
                 "eval_max_scenes": int(args.eval_max_scenes),
                 "eval_input_frame": int(args.eval_input_frame),
                 "dev_data_root": str(args.dev_data_root),
@@ -1455,7 +1020,7 @@ def main() -> None:
                 "test_sanity_atol": float(args.test_sanity_atol),
                 "test_sanity_rtol": float(args.test_sanity_rtol),
                 "resume_from": str(args.resume_from) if args.resume_from else None,
-                "interval_config_file": str(args.interval_config_file),
+                "prune_plan_file": str(args.prune_plan_file),
                 "device": str(device),
                 "dtype": str(args.dtype),
             },
@@ -1474,133 +1039,57 @@ def main() -> None:
     skipped_global_idxs = build_skipped_layer_indices(global_skip_intervals)
     skipped_frame_idxs = build_skipped_layer_indices(frame_skip_intervals)
     skipped_idxs = sorted(set(skipped_global_idxs).union(skipped_frame_idxs))
-    eval_dir = out_dir
-    # Bounds are read directly from analysis_outputs/evaluation/*average_metrics.json.
-    # Layout per dataset:
-    #   - scannet_dev50/test50: <EVAL_ROOT>/<scans_set>_input_frame_<N>/{Baseline|Ours}_<backend>/average_metrics.json
-    #   - 7scenes/nrgbd:        <EVAL_ROOT>/7andn/{Baseline|Ours}_<backend>/<KF>/<7scenes|NRGBD>/average_metrics.json
+    # Periodic eval uses the same implementation as stage-4 eval (`analysis.eval.eval_v3`),
+    # and runs on the in-memory model (current LoRA weights).
+    eval_datasets = _resolve_enabled_eval_datasets(args) if engine.supports_periodic_eval() else ()
+    eval_bounds: Dict[str, Dict[str, Dict[str, float]]] = {}
     eval_history_rows: List[Dict[str, Any]] = []
-    bounds: Dict[str, Dict[str, Dict[str, float]]] = {}
+    periodic_eval_enabled = int(args.eval_epoch) > 0
+    eval_at_start_enabled = bool(args.eval_at_start)
+    if eval_datasets and (periodic_eval_enabled or eval_at_start_enabled):
+        eval_bounds = _load_eval_bounds_from_v3(
+            eval_bounds_root=Path(args.eval_bounds_root),
+            backbone=backbone,
+            eval_datasets=eval_datasets,
+            plan_name=str(args.plan_name),
+        )
+        _log(
+            "[eval] loaded periodic bounds from "
+            f"{Path(args.eval_bounds_root)} for datasets={','.join(eval_datasets)}"
+        )
 
-    def _build_model_variant(*, prune: bool, inject_lora: bool) -> Tuple[VGGT, List[nn.Parameter], int, int]:
-        m = VGGT.from_pretrained(args.hf_model).to(device).train()
-        # We never train/evaluate point in this script path.
-        m.point_head = None
-        for pp in m.parameters():
-            pp.requires_grad_(False)
-        skipped_modules_before: List[nn.Module] = []
-        for idx in skipped_frame_idxs:
-            if idx < 0 or idx >= len(m.aggregator.frame_blocks):
-                raise SystemExit(f"Invalid skipped frame index {idx} for model depth {len(m.aggregator.frame_blocks)}")
-            skipped_modules_before.append(m.aggregator.frame_blocks[idx])
-        for idx in skipped_global_idxs:
-            if idx < 0 or idx >= len(m.aggregator.global_blocks):
-                raise SystemExit(f"Invalid skipped global index {idx} for model depth {len(m.aggregator.global_blocks)}")
-            skipped_modules_before.append(m.aggregator.global_blocks[idx])
-        pre_total = sum(p.numel() for p in m.aggregator.parameters())
-        removed = count_unique_params(skipped_modules_before) if prune else 0
-        if prune:
-            replace_skipped_layers_with_identity(
-                m,
-                frame_intervals=frame_skip_intervals,
-                global_intervals=global_skip_intervals,
-            )
-        trainable_local: List[nn.Parameter] = []
-        if inject_lora:
-            frame_lora_idxs, global_lora_idxs = lora_injection_plan_from_rules(rules)
-            for pidx in frame_lora_idxs:
-                trainable_local.extend(
-                    inject_lora_attn(
-                        m.aggregator.frame_blocks[pidx],
-                        rank=int(args.lora_rank),
-                        alpha=float(args.lora_alpha),
-                        dropout=float(args.lora_dropout),
-                    )
-                )
-            for pidx in global_lora_idxs:
-                trainable_local.extend(
-                    inject_lora_attn(
-                        m.aggregator.global_blocks[pidx],
-                        rank=int(args.lora_rank),
-                        alpha=float(args.lora_alpha),
-                        dropout=float(args.lora_dropout),
-                    )
-                )
-        return m, trainable_local, pre_total, removed
-
-    backend = str(os.environ.get("BACKEND", "vggt")).strip() or "vggt"
-    eval_root = Path(os.environ.get("EVAL_ROOT", "analysis_outputs/evaluation"))
-    dev_set = Path(args.dev_data_root).name
-    test_set = Path(args.test_data_dir).name
-    input_frame = int(args.eval_input_frame)
-    andn_kf = int(args.eval_7andn_kf)
-    eval_datasets = _resolve_enabled_eval_datasets(args)
-
-    def _read_avg_json(p: Path) -> Dict[str, float]:
-        if not p.exists():
-            raise SystemExit(f"Missing bounds file: {p}")
-        payload = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise SystemExit(f"Invalid bounds payload (expect object): {p}")
-        return {str(k): float(v) for k, v in payload.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
-
-    def _scannet_bound_path(scans_set: str, model_name: str) -> Path:
-        return eval_root / f"{scans_set}_input_frame_{input_frame}" / f"{model_name}_{backend}" / "average_metrics.json"
-
-    def _7andn_bound_path(model_name: str, dataset: str) -> Path:
-        sub = _7ANDN_DIR_NAME[dataset]
-        return eval_root / "7andn" / f"{model_name}_{backend}" / str(andn_kf) / sub / "average_metrics.json"
-
-    # Dataset → {upper, lower} bound source resolver.
-    bound_sources = {
-        "scannet_dev50": (_scannet_bound_path(dev_set, "Baseline"), _scannet_bound_path(dev_set, "Ours")),
-        "scannet_test50": (_scannet_bound_path(test_set, "Baseline"), _scannet_bound_path(test_set, "Ours")),
-        "7scenes": (_7andn_bound_path("Baseline", "7scenes"), _7andn_bound_path("Ours", "7scenes")),
-        "nrgbd": (_7andn_bound_path("Baseline", "nrgbd"), _7andn_bound_path("Ours", "nrgbd")),
-    }
-    bounds = {ds: {"upper": {}, "lower": {}} for ds in eval_datasets}
-    for ds in eval_datasets:
-        upper_p, lower_p = bound_sources[ds]
-        bounds[ds]["upper"] = _read_avg_json(upper_p)
-        bounds[ds]["lower"] = _read_avg_json(lower_p)
-    _log(
-        f"[eval] loaded bounds from {eval_root} "
-        f"(scannet_dev={dev_set} scannet_test={test_set} input_frame={input_frame} "
-        f"7andn_kf={andn_kf} backend={backend} datasets={list(eval_datasets)})"
+    model, trainable, pre_prune_total_params, removed_params = engine.build_train_model(
+        hf_model=args.hf_model,
+        device=device,
+        drop_actions=drop_actions,
+        frame_skip_intervals=frame_skip_intervals,
+        global_skip_intervals=global_skip_intervals,
+        skipped_frame_idxs=skipped_frame_idxs,
+        skipped_global_idxs=skipped_global_idxs,
+        lora_actions=lora_actions,
+        prune=True,
+        inject_lora=True,
     )
-
-    # Lower bound = pruned model metrics before any LoRA training; log as epoch 0 for eval CSV/plots.
-    for ds in eval_datasets:
-        if bounds[ds]["lower"]:
-            _append_eval_history(
-                eval_history_rows,
-                epoch=0,
-                dataset=ds,
-                tag="train",
-                metrics=dict(bounds[ds]["lower"]),
-            )
-
-    if eval_history_rows:
-        _write_eval_artifacts(out_dir, bounds, eval_history_rows)
-
-    model, trainable, pre_prune_total_params, removed_params = _build_model_variant(prune=True, inject_lora=True)
     if not trainable:
         raise SystemExit("No LoRA parameters were injected; nothing to train.")
     gt_scene_map: Dict[str, SceneData] = {}
     if str(args.target_source) == "dataset":
+        if not engine.supports_dataset_targets():
+            raise SystemExit(f"--target-source=dataset is not supported for backbone={backbone}")
         gt_scenes = discover_scannet_scenes(Path(args.gt_data_root))
         gt_scene_map = {str(s.scene_id): s for s in gt_scenes}
         if not gt_scene_map:
             raise SystemExit(f"No GT scenes discovered under --gt-data-root={args.gt_data_root}")
 
-    total_params = sum(p.numel() for p in model.aggregator.parameters())
-    trainable_params = sum(p.numel() for p in model.aggregator.parameters() if p.requires_grad)
+    param_mod = engine.trainable_param_module(model)
+    total_params = sum(p.numel() for p in param_mod.parameters())
+    trainable_params = sum(p.numel() for p in param_mod.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     post_vs_pre_ratio = (100.0 * total_params / pre_prune_total_params) if pre_prune_total_params > 0 else 0.0
     frozen_ratio = (100.0 * frozen_params / total_params) if total_params > 0 else 0.0
     train_ratio = (100.0 * trainable_params / total_params) if total_params > 0 else 0.0
     _log(
-        f"[params] aggregator only (excludes heads): "
+        f"[params] {backbone} trainable stack (excludes heads): "
         f"pre_prune={_format_param_count(pre_prune_total_params)} "
         f"post_prune={_format_param_count(total_params)} ({post_vs_pre_ratio:.2f}% of pre-prune) "
         f"frozen={_format_param_count(frozen_params)} ({frozen_ratio:.2f}% of post-prune) "
@@ -1628,6 +1117,27 @@ def main() -> None:
         global_step = int(ckpt.get("global_step", 0))
         start_epoch = int(ckpt.get("epoch", -1)) + 1
         _log(f"[resume] from={ckpt_path} start_epoch={start_epoch} global_step={global_step}")
+
+    if (
+        engine.supports_periodic_eval()
+        and eval_at_start_enabled
+        and start_epoch == 0
+        and eval_datasets
+    ):
+        _log("[eval] pre-train: running epoch=0 eval (--eval-at-start)")
+        _run_periodic_eval_for_epoch(
+            eval_epoch=0,
+            model=model,
+            eval_datasets=eval_datasets,
+            args=args,
+            backbone=backbone,
+            device=device,
+            out_dir=out_dir,
+            eval_history_rows=eval_history_rows,
+            log_fn=_log,
+        )
+        _write_eval_artifacts(out_dir, eval_bounds, eval_history_rows)
+
     t0_train = time.perf_counter()
     remaining_epochs = max(0, int(args.epochs) - int(start_epoch))
     total_steps = _compute_total_steps(len(scenes), remaining_epochs, int(args.max_steps))
@@ -1638,13 +1148,15 @@ def main() -> None:
                 "global_step": global_step,
                 "epoch": int(epoch_idx),
                 "epochs": int(args.epochs),
-                "intervals": intervals,
-                "interval_rules": [vars(x) for x in rules],
+                "drop_indices": sorted(set(int(x) for x in prune_plan.drop)),
+                "lora_indices": lora_unit_indices,
+                "prune_plan": json.loads(args.prune_plan_file.read_text(encoding="utf-8")),
                 "variant": args.variant,
                 "save_every_epoch": int(args.save_every_epoch),
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optim.state_dict(),
                 "scaler_state_dict": scaler.state_dict(),
+                "prune_plan": json.loads(args.prune_plan_file.read_text(encoding="utf-8")),
                 "args": vars(args),
             },
             ckpt_path,
@@ -1658,28 +1170,34 @@ def main() -> None:
             sid = str(item.get("scene_id", ""))
             t_load0 = time.perf_counter()
             row = _load_scene_cache_row(args.cache_dir, item)
-            _validate_schema(row, num_layers=num_layers)
-            teacher_pred = _teacher_pred_to_map(row["pred"])
+            engine.validate_cache_row(row, num_layers=num_layers)
             layer_cpu_cache: Dict[int, torch.Tensor] = {}
 
             def _get_layer_cpu(idx: int) -> torch.Tensor:
                 cached = layer_cpu_cache.get(idx)
                 if cached is not None:
                     return cached
+                map_loc = str(device) if device.type == "cuda" else "cpu"
                 t = load_scene_replay_layer(
                     args.cache_dir,
                     item,
                     int(idx),
                     expected_num_layers=num_layers,
+                    map_location=map_loc,
                 )
                 layer_cpu_cache[idx] = t
                 return t
 
-            hw = row.get("image_hw", [518, 518])
-            h = int(hw[0])
-            w = int(hw[1])
-            seq_len = int(row.get("num_frames", _get_layer_cpu(0).shape[1]))
-            dummy_images = torch.zeros((1, seq_len, 3, h, w), device=device, dtype=torch.float32)
+            from analysis.redundancy.cache_layout_v3 import require_minimal_cache_geometry
+
+            require_minimal_cache_geometry(row, cache_dir=args.cache_dir)
+
+            teacher_pred = teacher_pred_to_map(row["pred"])
+            adapter = get_backbone(backbone)
+            h, w, seq_len, _patch_start = adapter.infer_train_cache_geometry(
+                row, model, _get_layer_cpu, cache_dir=args.cache_dir
+            )
+            dummy_images = adapter.build_train_dummy_images(row, model, device, _get_layer_cpu)
             t_load = time.perf_counter() - t_load0
 
             t_replay = 0.0
@@ -1687,23 +1205,35 @@ def main() -> None:
             t_pred = 0.0
             t_backward = 0.0
             t_optim = 0.0
-            alignment_capture_layers = [
-                int(rule.r) if not rule.skip_frame_in_interval else int(rule.prev_layer)
-                for rule in rules
-            ]
+            alignment_capture_layers = sorted({int(k) // 2 for k in prune_plan.lora.keys()})
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 t_replay0 = time.perf_counter()
-                replay = _replay_student_cache_first(
-                    model,
-                    get_layer_cpu=_get_layer_cpu,
-                    num_layers=int(num_layers),
+                initial_tokens = None
+                if str(seed_kind).strip().lower() == "none":
+                    from analysis.redundancy.cache_layout import load_scene_initial_tokens
+
+                    initial_tokens = load_scene_initial_tokens(args.cache_dir, item).to(
+                        device=device, non_blocking=(device.type == "cuda")
+                    )
+                replay_kw: Dict[str, Any] = dict(
                     frame_skip_intervals=frame_skip_intervals,
                     global_skip_intervals=global_skip_intervals,
-                    lora_anchor_prev_layers=prev_layers,
+                    lora_anchor_layers=lora_anchor_layers,
                     alignment_capture_layers=alignment_capture_layers,
+                    seed_layer=int(seed_layer),
+                    seed_kind=str(seed_kind),
+                    initial_tokens=initial_tokens,
                     use_checkpoint=bool(args.use_checkpoint),
                     device=device,
                     dummy_images=dummy_images,
+                    **adapter.train_replay_extra_kwargs(h=int(h), w=int(w)),
+                    **engine.train_replay_extra_kwargs(h=int(h), w=int(w)),
+                )
+                replay = engine.replay_student_cache_first(
+                    model,
+                    get_layer_cpu=_get_layer_cpu,
+                    num_layers=int(num_layers),
+                    **replay_kw,
                 )
                 t_replay = time.perf_counter() - t_replay0
 
@@ -1716,33 +1246,34 @@ def main() -> None:
                 wak = float(args.w_align_cka)
                 n_terms = 0
                 t_align0 = time.perf_counter()
-                for rule in rules:
-                    # Per-rule alignment target:
-                    #   skip_frame_in_interval=True  -> student global_{l-1} (post-LoRA)
-                    #   skip_frame_in_interval=False -> student frame_r       (post-LoRA)
-                    # Teacher target is always cache layer r global half.
-                    if rule.skip_frame_in_interval:
-                        s_layer = int(rule.prev_layer)
-                        s_concat = replay.concat_by_layer[s_layer]
-                        _, s_term = _split_concat(s_concat)
-                    else:
-                        s_layer = int(rule.r)
-                        s_concat = replay.concat_by_layer[s_layer]
-                        s_term, _ = _split_concat(s_concat)
-                    t_concat = _get_layer_cpu(int(rule.r)).to(
-                        device=device, non_blocking=(device.type == "cuda")
+                for k, spec in prune_plan.lora.items():
+                    s_idx = int(k)
+                    if spec.alignment_teacher_unit_index is None:
+                        raise RuntimeError(f"lora[{k}] missing alignment_teacher_unit_index")
+                    t_idx = int(spec.alignment_teacher_unit_index)
+                    if s_idx < 0 or s_idx >= int(num_layers * 2) or t_idx < 0 or t_idx >= int(num_layers * 2):
+                        raise RuntimeError(
+                            f"Alignment index out of range: student={s_idx}, teacher={t_idx}, "
+                            f"num_units={int(num_layers * 2)}"
+                        )
+                    s_layer = s_idx // 2
+                    t_layer = t_idx // 2
+                    s_kind = "frame" if (s_idx % 2 == 0) else "global"
+                    t_kind = "frame" if (t_idx % 2 == 0) else "global"
+                    s_concat = replay.concat_by_layer[s_layer]
+                    t_concat = _get_layer_cpu(int(t_layer)).to(device=device, non_blocking=(device.type == "cuda"))
+                    c_s = int(s_concat.shape[-1] // 2)
+                    c_t = int(t_concat.shape[-1] // 2)
+                    s_term = s_concat[..., :c_s] if s_kind == "frame" else s_concat[..., c_s:]
+                    t_term = t_concat[..., :c_t] if t_kind == "frame" else t_concat[..., c_t:]
+                    mse_i, cos_i, cka_i, term_loss = align_activation_term(
+                        s_term,
+                        t_term,
+                        w_mse=wam,
+                        w_cos=wac,
+                        w_cka=wak,
                     )
-                    _, t_term = _split_concat(t_concat)
-                    mse_i = torch.zeros((), device=device)
-                    cos_i = torch.zeros((), device=device)
-                    cka_i = torch.zeros((), device=device)
-                    if wam != 0.0:
-                        mse_i = mse_i + _loss_mse(s_term, t_term)
-                    if wac != 0.0:
-                        cos_i = cos_i + _loss_cos(s_term, t_term)
-                    if wak != 0.0:
-                        cka_i = cka_i + _loss_cka(s_term, t_term)
-                    loss_align = loss_align + wam * mse_i + wac * cos_i + wak * cka_i
+                    loss_align = loss_align + term_loss
                     align_mse = align_mse + mse_i
                     align_cos = align_cos + cos_i
                     align_cka = align_cka + cka_i
@@ -1753,9 +1284,16 @@ def main() -> None:
                     align_cos = align_cos / n_terms
                     align_cka = align_cka / n_terms
                 t_align = time.perf_counter() - t_align0
+                adapter.after_train_replay_release_cpu(
+                    layer_cpu_cache,
+                    rules=alignment_capture_layers,
+                    prev_layers=lora_anchor_layers,
+                    num_layers=int(num_layers),
+                    seed_layer=int(seed_layer),
+                )
                 t_pred0 = time.perf_counter()
                 if str(args.target_source) == "teacher":
-                    target_batch = _build_target_batch_from_teacher(
+                    target_batch = engine.build_target_batch_from_teacher(
                         teacher_pred,
                         images_batched=dummy_images,
                         device=device,
@@ -1771,7 +1309,7 @@ def main() -> None:
                         expected_seq_len=int(seq_len),
                         device=device,
                     )
-                loss_pred, pred_logs = _prediction_official_camera_depth(
+                loss_pred, pred_logs = engine.prediction_loss(
                     replay.pred,
                     target_batch,
                     w_pred=float(args.w_pred),
@@ -1890,53 +1428,26 @@ def main() -> None:
             _save_checkpoint(out_dir / "checkpoints" / f"epoch_{epoch+1}.pt", epoch)
         _save_checkpoint(out_dir / "checkpoints" / "latest.pt", epoch)
         _write_curves(out_dir, rows)
-        if int(args.eval_epoch) > 0 and (((epoch + 1) % int(args.eval_epoch)) == 0):
+        if (
+            engine.supports_periodic_eval()
+            and periodic_eval_enabled
+            and (((epoch + 1) % int(args.eval_epoch)) == 0)
+        ):
             if not eval_datasets:
                 _log(f"[eval] epoch={epoch+1}: skipped (no eval dataset enabled)")
                 continue
-            _log(
-                f"[eval] epoch={epoch+1}: evaluating current LoRA model on "
-                f"{', '.join(eval_datasets)}"
+            _run_periodic_eval_for_epoch(
+                eval_epoch=int(epoch + 1),
+                model=model,
+                eval_datasets=eval_datasets,
+                args=args,
+                backbone=backbone,
+                device=device,
+                out_dir=out_dir,
+                eval_history_rows=eval_history_rows,
+                log_fn=_log,
             )
-            for ds in eval_datasets:
-                t0 = time.perf_counter()
-                if ds in EVAL_SCANNET_DATASETS:
-                    data_dir, gt_ply_dir = (
-                        (args.dev_data_root, args.dev_data_root)
-                        if ds == "scannet_dev50"
-                        else (args.test_data_dir, args.test_gt_ply_dir)
-                    )
-                    metrics = _evaluate_scannet_run_eval_style(
-                        model=model,
-                        data_dir=data_dir,
-                        gt_ply_dir=gt_ply_dir,
-                        input_frame=int(args.eval_input_frame),
-                        num_scenes=int(args.eval_max_scenes),
-                        depth_conf_thresh=1.0,
-                        chamfer_max_dist=0.5,
-                        eval_amp_dtype=amp_dtype,
-                        desc=f"eval {ds}",
-                    )
-                else:
-                    root = args.root_7scenes if ds == "7scenes" else args.root_nrgbd
-                    metrics = _evaluate_7andn_run_eval_style(
-                        model=model,
-                        dataset_name=ds,
-                        root=root,
-                        kf=int(args.eval_7andn_kf),
-                        eval_amp_dtype=amp_dtype,
-                        max_scenes_per_dataset=int(args.eval_7andn_max_scenes_per_dataset),
-                        device="cuda" if device.type == "cuda" else str(device),
-                    )
-                _log(f"[eval][epoch={epoch+1}][{ds}] elapsed={time.perf_counter() - t0:.2f}s")
-                _append_eval_history(
-                    eval_history_rows,
-                    epoch=epoch + 1,
-                    dataset=ds,
-                    tag="train",
-                    metrics=metrics,
-                )
-            _write_eval_artifacts(out_dir, bounds, eval_history_rows)
+            _write_eval_artifacts(out_dir, eval_bounds, eval_history_rows)
         if int(args.max_steps) > 0 and global_step >= int(args.max_steps):
             break
     pbar.close()
@@ -1950,16 +1461,18 @@ def main() -> None:
         "best_train_loss_total": best.get("loss_total"),
         "best_train_step": best.get("global_step"),
         "num_scenes": len(scenes),
-        "intervals": intervals,
-        "interval_rules": [vars(x) for x in rules],
+        "drop_indices": sorted(set(int(x) for x in prune_plan.drop)),
+        "lora_indices": lora_unit_indices,
+        "prune_plan_file": str(args.prune_plan_file),
         "variant": args.variant,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     _write_curves(out_dir, rows)
+    if eval_bounds and eval_history_rows:
+        _write_eval_artifacts(out_dir, eval_bounds, eval_history_rows)
     _log(f"[done] out_dir={out_dir} steps={global_step}")
     log_file.close()
 
 
 if __name__ == "__main__":
     main()
-

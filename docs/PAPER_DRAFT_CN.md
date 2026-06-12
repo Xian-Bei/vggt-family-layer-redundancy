@@ -10,15 +10,9 @@
 
 前馈式多视图几何基础模型（如 VGGT）在相机位姿、稠密深度与三维点云任务上达到了强基线，但在长序列、多视角输入下面临显著的显存与延迟压力。现有加速工作（FastVGGT、Faster VGGT、FlashVGGT 等）几乎全部聚焦于 **token 数量** 与 **注意力算子** 层面的冗余，而 **网络深度方向** 是否存在可被系统识别和消除的冗余，仍缺乏与下游几何评测直接对齐的分析与压缩范式。
 
-本文从 **冗余度量** 与 **冗余消除** 两个层面给出系统答案。在度量层面，我们以"实际删除中间层后最终预测相对全模型的指标退化"作为冗余的真值，比较 Linear CKA、cosine similarity 与 −MSE 三种相似性指标，发现 **CKA 与真实任务退化的 pattern 高度匹配**，是更适合 VGGT 层间冗余分析的指标；进一步在 ScanNet、7Scenes、NRGBD 三个数据集上比较 CKA 热图，发现 **VGGT 的层间冗余在不同数据集上呈现几乎一致的模式，是模型的内禀属性而非数据特性**。
+本文从 **冗余度量** 与 **冗余消除** 两个层面给出系统答案。在度量层面，我们以“实际删除层段后最终预测相对全模型的几何指标退化”为参照，比较线性 CKA、余弦相似度与负均方误差等表征相似性指标，发现 **CKA 与上述任务退化的空间分布模式高度一致**，更适合作为 VGGT 层间冗余的可解释度量；进一步在 ScanNet、7Scenes、NRGBD 三个数据集上比较层间 CKA 热图，发现 **VGGT 的冗余结构在不同数据上几乎一致，表明层间冗余主要由模型本身决定，而非特定数据集分布**。
 
-在消除层面，我们提出"基于阈值 + 最大面积矩形"的 **冗余区间发现算法**：先在 skip\_both 热图上找最长冗余区间 \(I_1\)，再在 skip\_global 热图上剔除 \(I_1\) 后找剩余最长区间 \(I_2\)。随后以原 VGGT 为 teacher、删层 + LoRA 注入后的网络为 student，进行 **GT-free 自蒸馏较准**——损失只来自 teacher 的中间层与最终预测，**完全不使用任何 GT 标签**，仅用 50 个 ScanNet 场景训练 50 epoch、且只有 LoRA 参数可训。以 **config\_85** 为例（删除 8 层 frame+global、额外 6 层 global-only），相比原 VGGT，**推理时间降低 TBD% (TBD× speedup)**、**峰值显存降低 TBD%**，在 ScanNet / 7Scenes / NRGBD 上的精度 comparable 甚至部分指标更高；推理期 LoRA 可与原 attention 权重合并，**实现零额外推理参数**。本方法与 token 级加速（FastVGGT 等）正交可组合，主表中我们直接给出 "Ours(vggt)" 与 "Ours(fastvggt)" 两个 backbone 的对照以验证组合性。
-
-**Contributions**：
-
-1. **(Findings)** 通过对比 CKA / cosine / −MSE 与"删层后 GT 指标退化"的 pattern，发现 **CKA 是最贴合真实任务退化的层间相似性指标**；并据此首次系统揭示 **VGGT 具有显著且与数据集无关的层间冗余**——跨 ScanNet / 7Scenes / NRGBD 的 CKA 热图几乎完全一致，且 frame block 与 global block 的冗余 **异质**（global block 普遍更冗余）。
-2. **(Design)** 提出"基于阈值 + CKA 热图最大面积矩形"的 **冗余区间发现算法**：先 skip\_both 选最长 \(I_1\)、再 skip\_global 剔除 \(I_1\) 后选剩余最长 \(I_2\)；并提出 **GT-free LoRA 自蒸馏较准** 范式，以原 VGGT 为 teacher、删层+LoRA 为 student，只用 teacher 的中间层 hidden state 与最终预测作为监督信号，**完全不使用 GT**。
-3. **(Advantages)** 在 ScanNet / 7Scenes / NRGBD 上与 VGGT、纯删层 lower bound、FastVGGT 全面对照：**精度 comparable / 部分更优**；**推理时间 ↓ TBD%、峰值显存 ↓ TBD%**；**部署期 LoRA 合并 → 零额外参数**；训练成本极低（50 场景、50 epoch、单卡）；与 token 级加速 **正交可组合**。
+在消除层面，我们提出一种 **基于阈值与最大面积高相似子区域的冗余层段选取策略**：第一阶段在“帧内子模块与全局子模块可同时视为冗余”的设定下，从层间相似性矩阵中选取覆盖层数最多的连续层段；第二阶段在“仅全局子模块可折叠、帧内子模块保留”的设定下，在排除第一阶段已选层段后的矩阵上继续选取覆盖层数最多的连续层段。随后以完整 VGGT 为教师网络、在选定层段上删除子模块并注入低秩适配（LoRA）的学生网络为对象，进行 **不依赖任何真值标注的自蒸馏较准**：监督信号仅来自教师的中间层表征与最终预测。训练仅需少量无标注多视图场景（本文使用 50 个 ScanNet 场景、50 个训练轮次、仅更新 LoRA 参数）,部署阶段可将 LoRA 权重合并回注意力线性层，**不增加推理期参数量**。相比原始 VGGT，**推理时间降低 TBD%（约 TBD× 加速）**、**峰值显存降低 TBD%**，在 ScanNet、7Scenes、NRGBD 上几何精度与原始模型 **相当**，部分指标 **更优**；本文压缩与 token 级加速正交，实验中还报告了 **以原始 VGGT 为骨干** 与 **在 FastVGGT 的 token 合并骨干上叠加本文删层与较准** 两种实现，以验证二者可组合。
 
 ---
 
@@ -28,11 +22,11 @@
 
 为缓解这一瓶颈，近期一系列工作分别从不同维度切入：**FastVGGT** [2] 利用 attention 中的 token collapse 现象提出 training-free 的 token merging；**Faster VGGT** [3] 用 block-sparse 全局注意力替换稠密算子，无需重训 backbone 即可实现量级推理加速；**FlashVGGT** [4] 引入 descriptor token 与 cross-attention 进一步重构全局推理。可以看出，**token 数量与注意力实现层面的冗余** 已被积极挖掘。但 **深度方向（即 layer 维度）的冗余** 是否存在、能否被系统识别与消除，目前仍缺少与下游几何评测直接对齐的研究。
 
-我们从一个朴素问题出发：**给定 VGGT 这样的多视图几何基础模型，哪一种相似性指标能可靠地反映"删除某层/某段层之后，最终预测会退化多少"？** 围绕这一问题，本文给出了一条贯穿"度量 → 区间发现 → GT-free 较准"的完整压缩管线。在度量层面，我们以删层后 GT 指标退化为真值，比较了 Linear CKA、cosine 与 −MSE 三种指标，发现 CKA 与真实退化的 pattern 高度匹配；并在 ScanNet / 7Scenes / NRGBD 上进一步发现 VGGT 的 CKA 热图几乎完全一致、frame 与 global 的冗余呈现异质模式——这些观察支持"层间冗余是 VGGT 的模型内禀属性"。在消除层面，我们基于"阈值 + 最大面积矩形"识别冗余区间，并提出 **GT-free LoRA 自蒸馏较准**：以原 VGGT 为 teacher，删层 + LoRA 为 student，只用 teacher 输出作为监督，无需任何 GT 标签。
+我们从一个朴素问题出发：**VGGT 这样的多视图几何基础模型，是否每层都同样重要? 用什么指标可以衡量? 发现冗余后如何精简？** 围绕这一问题，本文给出了一条贯穿"度量 → 区间发现 → GT-free 较准"的完整压缩管线。在度量层面，我们以删层后 GT 指标退化为真值，比较了 Linear CKA、cosine 与 −MSE 三种指标，发现 CKA 与真实退化的 **空间分布模式** 高度匹配；并在 ScanNet / 7Scenes / NRGBD 上进一步发现 VGGT 的 CKA 热图几乎完全一致、frame 与 global 的冗余呈现异质模式——这些观察支持"层间冗余是 VGGT 的模型内禀属性"。在消除层面，我们基于"阈值 + 最大面积矩形"识别冗余区间，并提出 **GT-free LoRA 自蒸馏较准**：以原 VGGT 为 teacher，删层 + LoRA 为 student，只用 teacher 输出作为监督，无需任何 GT 标签。
 
-**标志性数字**：以本文 **config\_85** 配置为例——删除 8 层 frame+global 与额外 6 层 global-only block——在 ScanNet (`scans_test50`, input\_frame=50)、7Scenes、NRGBD 三个数据集上：
+**标志性数字**：以本文 **压缩率较高的一档实验配置** 为例——在连续八层上同时移除帧内与全局子模块，并再在连续六层上仅折叠全局子模块而保留帧内子模块——在与既有工作一致的评测划分及固定帧数输入下，在 ScanNet、7Scenes、NRGBD 三个数据集上：
 
-- 精度 **comparable / 部分指标更高**（详见 §4.3 表 4–6）；
+- 精度与原始 VGGT **相当**，部分指标 **更高**（详见 §4.3 表 4–6）；
 - **推理时间相对原 VGGT 降低 TBD% (TBD× speedup)**；
 - **峰值显存相对原 VGGT 降低 TBD%**；
 - LoRA 训练 **仅 50 ScanNet 场景、50 epoch**、单卡可完成，**完全不使用任何 GT 标签**；
@@ -40,9 +34,9 @@
 
 **贡献小结**（与正文章节一一对应）：
 
-1. **(Findings, §3.2–§3.3)** CKA 是更贴合任务退化的 VGGT 层间冗余指标；VGGT 层间冗余在三个数据集上呈现几乎一致的 pattern，是 **模型内禀属性**，且 frame / global 冗余 **异质**。
+1. **(Findings, §3.2–§3.3)** CKA 是更贴合任务退化的 VGGT 层间冗余指标；VGGT 层间冗余在三个数据集上呈现几乎一致的 **空间分布模式**，是 **模型内禀属性**，且 frame / global 冗余 **异质**。
 2. **(Design, §3.4–§3.5)** "阈值 + 最大面积矩形"两阶段冗余区间发现算法 + **GT-free LoRA 自蒸馏较准**，无需任何 GT 标签、仅 50 场景 50 epoch、仅 LoRA 可训。
-3. **(Advantages, §4)** 在 ScanNet / 7Scenes / NRGBD 上精度 comparable / 部分更优、推理时间 ↓ TBD%、峰值显存 ↓ TBD%、零额外推理参数、与 token 级加速正交可组合。
+3. **(Advantages, §4)** 在 ScanNet / 7Scenes / NRGBD 上精度与原始 VGGT **相当**、部分指标 **更优**；推理时间 ↓ TBD%、峰值显存 ↓ TBD%；零额外推理参数；与 token 级加速正交可组合。
 
 ---
 
@@ -86,7 +80,7 @@
 - **FlashVGGT** [4]：**compressed descriptor attention**，把每帧空间信息压缩为少量 descriptor token 并支持基于 descriptor cache 的 chunk-recursive 推理。
 - **TAPTQ** [5]：**Tail-Aware Post-Training Quantization**，针对 3D 几何模型激活分布尾部更重的特性提出的 PTQ 方法，主要面向部署友好。
 
-**与本文关系。** 上述工作几乎全部聚焦于 **token 数 / 注意力算子 / 量化**，**深度方向 layer-level 压缩在 3D 几何基础模型上仍是空白**。我们填补这条线，且本文方法与上述 token / attention 加速 **正交可组合**。在主表（§4.3）中我们直接给出 "Ours(vggt)" 与 "Ours(fastvggt)" 两个 backbone 的结果以验证组合性：在 FastVGGT 之上叠加我们的删层 + LoRA 较准，可同时享受 token merging 与 layer reduction 的收益。
+**与本文关系。** 上述工作几乎全部聚焦于 **token 数 / 注意力算子 / 量化**，**深度方向 layer-level 压缩在 3D 几何基础模型上仍是空白**。我们填补这条线，且本文方法与上述 token / attention 加速 **正交可组合**。在主表（§4.3）中我们同时报告 **以原始 VGGT 为骨干** 与 **在 FastVGGT 的 token 合并骨干上叠加本文删层与较准** 两种实现，以验证组合性：后者可同时获得 token 侧合并与深度侧删层的收益。
 
 ---
 
@@ -182,20 +176,20 @@ function BuildSkipPlan(M_both, M_global, τ):
 > - (b) (a) 在阈值 \(\tau\) 下的二值化结果，并用红框标出最大矩形 \(I_1\)。
 > - (c) skip\_global CKA 热图。
 > - (d) (c) 在阈值 \(\tau\) 下的二值化结果，并用红框标出 **剔除 \(I_1\) 已选位置后** 的最大矩形 \(I_2\)。
-> Caption：直观对应算法 1 的两阶段流程——先 skip\_both 选最长 \(I_1\)、再 skip\_global 剔除 \(I_1\) 选剩余最长 \(I_2\)。
+> Caption：直观对应算法 1 的两阶段流程——先在“帧内与全局同时可省略”的相似性图上选最长 \(I_1\)，再在“仅全局可折叠”的相似性图上剔除 \(I_1\) 后选剩余最长 \(I_2\)。
 
 **两个工作配置（用于实验）。** 不同阈值 \(\tau\) 给出不同的"压缩-精度"折衷，我们在表 2 中给出常用阈值下的候选区间，并把本文实验所用的两个配置列在最后两行：
 
 > **表 2**（占位）：阈值扫描与本文采用配置。
 >
-> | 阈值 \(\tau\) | \(I_1\) (skip\_both) | \(I_2\) (skip\_global) | 删除 frame 层 | 删除 global 层 |
+> | 阈值 \(\tau\) | \(I_1\)（第一阶段：帧内与全局子模块同时可省略） | \(I_2\)（第二阶段：仅全局子模块可折叠） | 删除 frame 层 | 删除 global 层 |
 > | :--- | :--- | :--- | ---: | ---: |
 > | 0.95 | TBD | TBD | TBD | TBD |
-> | 0.90 (**config\_90**) | [4, 10] (7 层) | [19, 22] (4 层) | 7 | 11 |
-> | 0.85 (**config\_85**, headline) | [4, 11] (8 层) | [18, 23] (6 层) | 8 | 14 |
+> | 0.90（压缩率中等的一档） | [4, 10] (7 层) | [19, 22] (4 层) | 7 | 11 |
+> | 0.85（压缩率较高的一档；摘要与 headline 所用） | [4, 11] (8 层) | [18, 23] (6 层) | 8 | 14 |
 > | 0.80 | TBD | TBD | TBD | TBD |
 >
-> 引用：[analysis/train/config_90_vggt.json](../analysis/train/config_90_vggt.json)、[analysis/train/config_85_vggt.json](../analysis/train/config_85_vggt.json)。
+> 上表两档在实现中对应仓库内的 JSON 区间文件（便于复现）：[中等压缩率档](../analysis/train/config_90_vggt.json)、[较高压缩率档](../analysis/train/config_85_vggt.json)。
 
 ### 3.5 GT-Free LoRA 自蒸馏较准
 
@@ -234,7 +228,7 @@ function BuildSkipPlan(M_both, M_global, τ):
 其中：
 
 - \(\mathcal{L}_{\text{MSE}}, \mathcal{L}_{\cos}, \mathcal{L}_{\text{CKA}}\) 都在 **student / teacher 在同一对齐位置的 hidden state** 上计算，分别对应均方误差、余弦相似（取 \(1 - \cos\)）、Linear CKA（取 \(1 - \text{CKA}\)）；
-- \(\mathcal{L}_{\text{camera}}, \mathcal{L}_{\text{depth}}\) 复用 VGGT 训练框架中的相机与深度损失（见 [training/loss.py](../training/loss.py) 的 `compute_camera_loss` / `compute_depth_loss`），但 **target 不再是 GT 而是 teacher 的 \(\hat y^T\)**；这一替换是 GT-free 设定的关键。
+- \(\mathcal{L}_{\text{camera}}, \mathcal{L}_{\text{depth}}\) 复用 VGGT 训练框架中的相机与深度损失（见 [analysis/loss.py](../analysis/loss.py) 的 `compute_camera_loss` / `compute_depth_loss`），但 **target 不再是 GT 而是 teacher 的 \(\hat y^T\)**；这一替换是 GT-free 设定的关键。
 
 #### 3.5.4 设计要点与亮点
 
@@ -248,7 +242,7 @@ function BuildSkipPlan(M_both, M_global, τ):
 ```mermaid
 flowchart LR
   A[VGGT teacher] --> B[Stage1 全场景 cache]
-  B --> C[Stage2 CKA Heatmap skip_both 与 skip_global]
+  B --> C[Stage2 CKA 双设定热图]
   C --> D[Sec 3.4 区间发现 I1 加 I2]
   D --> E[Sec 3.5 删层 加 LoRA 注入 student]
   A -.-> F[Teacher hidden 加 prediction]
@@ -283,7 +277,7 @@ flowchart LR
 - **优化器**：AdamW，`lr=3e-5`、`weight_decay=0.05`、`min_lr=1e-8`、`warmup_ratio=0.05`、`grad_clip_max_norm=1.0`；
 - **训练规模**：`epochs=50`，`max_scenes=50`（仅 ScanNet `scans_dev50`）；
 - **LoRA**：`rank=8`、`alpha=16`、`dropout=0`；
-- **损失权重**（与 [analysis/train/config_85_vggt.json](../analysis/train/config_85_vggt.json) / [analysis/train/config_90_vggt.json](../analysis/train/config_90_vggt.json) 一致）：\(w_{\text{align}} = w_{\text{mse}} = w_{\cos} = w_{\text{cka}} = w_{\text{pred}} = w_{\text{camera}} = w_{\text{depth}} = 1.0\)；
+- **损失权重**（与表 2 两档默认实验 JSON 中设定一致，见 [较高压缩率档](../analysis/train/config_85_vggt.json)、[中等压缩率档](../analysis/train/config_90_vggt.json)）：\(w_{\text{align}} = w_{\text{mse}} = w_{\cos} = w_{\text{cka}} = w_{\text{pred}} = w_{\text{camera}} = w_{\text{depth}} = 1.0\)；
 - **target source**：`teacher` ⇒ GT-free；
 - **数值精度**：bfloat16 混合精度 + activation checkpointing。
 
@@ -304,53 +298,53 @@ flowchart LR
 每张主表都列出以下行：
 
 - **VGGT**：原始预训练模型，全 24 层 aggregator；
-- **VGGT skip-only(85)** / **VGGT skip-only(90)**：按 config\_85 / config\_90 删层但 **不做任何调整**——用以衡量"删层造成的最大可能精度下降"，对应 [analysis_outputs/evaluation/summary_comparison.md](../analysis_outputs/evaluation/summary_comparison.md) 中 `Ours_*` 行（无 `ckpt` 后缀）所代表的 lower bound；
+- **VGGT skip-only（较高压缩率档）** / **VGGT skip-only（中等压缩率档）**：与表 2 中两档层段选取一致地删层但 **不做任何较准**——用以衡量"删层造成的最大可能精度下降"，对应评测脚本中仅应用删层、不加载 LoRA 权重的 lower bound；
 - **FastVGGT** [2]：token merging（强 token 侧加速基线）；
-- **Ours-90(vggt) / Ours-85(vggt)**：以原 VGGT 为 backbone，删层 + LoRA 较准；
-- **Ours-90(fastvggt) / Ours-85(fastvggt)**：以 FastVGGT 为 backbone 叠加我们的删层 + LoRA ⇒ 同时享受 token merging 与 layer reduction，验证 **正交可组合性**。
+- **本文较准（中档，VGGT）/ 本文较准（高档，VGGT）**：以原始 VGGT 为骨干，在表 2 对应层段上删子模块并做 LoRA 自蒸馏较准；
+- **本文较准（中档，FastVGGT）/ 本文较准（高档，FastVGGT）**：在 FastVGGT 骨干上叠加相同删层与较准 ⇒ 同时享受 token merging 与深度侧删层，验证 **正交可组合性**。
 
 ### 4.3 主结果
 
-> 每张主表的 caption 都附带一句"**Ours-85 相比 VGGT 推理时间下降 TBD%、峰值显存下降 TBD%，精度 comparable 或更优**"。
+> 每张主表的 caption 都附带一句"**在压缩率较高一档下，本文较准模型相对原始 VGGT：推理时间下降 TBD%、峰值显存下降 TBD%，精度与原始模型相当或更优**"。
 
 **表 4**：ScanNet (`scans_test50`, `input_frame=50`) 主表。
 
 | Method | Chamfer ↓ | ATE ↓ | ARE ↓ | RPE-rot ↓ | RPE-trans ↓ | depth\_abs\_rel ↓ | depth\_δ1 ↑ | time(ms) ↓ | peak mem(GB) ↓ |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | VGGT | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| VGGT skip-only(90) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| VGGT skip-only(85) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| VGGT 仅删层（中档） | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| VGGT 仅删层（高档） | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 | FastVGGT | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-90 (vggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-90 (fastvggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-85 (vggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-85 (fastvggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（中档，VGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（中档，FastVGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（高档，VGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（高档，FastVGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 **表 5**：7Scenes 主表。
 
 | Method | acc ↓ | comp ↓ | nc ↑ | acc\_med ↓ | comp\_med ↓ | nc\_med ↑ | time(ms) ↓ | peak mem(GB) ↓ |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | VGGT | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| VGGT skip-only(90) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| VGGT skip-only(85) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| VGGT 仅删层（中档） | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| VGGT 仅删层（高档） | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 | FastVGGT | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-90 (vggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-90 (fastvggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-85 (vggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-85 (fastvggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（中档，VGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（中档，FastVGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（高档，VGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（高档，FastVGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 **表 6**：NRGBD 主表（行结构同表 5）。
 
 | Method | acc ↓ | comp ↓ | nc ↑ | acc\_med ↓ | comp\_med ↓ | nc\_med ↑ | time(ms) ↓ | peak mem(GB) ↓ |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | VGGT | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| VGGT skip-only(90) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| VGGT skip-only(85) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| VGGT 仅删层（中档） | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| VGGT 仅删层（高档） | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 | FastVGGT | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-90 (vggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-90 (fastvggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-85 (vggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| **Ours-85 (fastvggt)** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（中档，VGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（中档，FastVGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（高档，VGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| **本文较准（高档，FastVGGT）** | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
 
 ### 4.4 消融
 
@@ -389,13 +383,13 @@ flowchart LR
 
 ### 4.5 推理效率与显存
 
-> **图 6**（占位）：`input_frame ∈ {30, 50, 100, 200, 500}` 下，各方法的 (a) 推理时间、(b) 峰值显存折线图；x 轴为 `input_frame`，y 轴对数刻度。曲线包括 VGGT、FastVGGT、Ours-90(vggt)、Ours-90(fastvggt)、Ours-85(vggt)、Ours-85(fastvggt)。
+> **图 6**（占位）：`input_frame ∈ {30, 50, 100, 200, 500}` 下，各方法的 (a) 推理时间、(b) 峰值显存折线图；x 轴为 `input_frame`，y 轴对数刻度。曲线包括 VGGT、FastVGGT、以及表 4 所列本文较准的中档与高档两行（VGGT 与 FastVGGT 骨干各一）。
 
 文字结论：
 
 - 长序列下 layer-skip 的 **绝对** 时间 / 显存收益随 `input_frame` 增长而扩大；
 - 与 FastVGGT 组合时收益叠加，证明本文方法与 token 级加速 **正交**；
-- config\_85 比 config\_90 在效率上更激进、精度上略低 ⇒ 给出"压缩-精度"折衷的两个工作点。
+- 较高压缩率档位比较激进的一档在效率上收益更大、精度上略低于压缩率中等的一档 ⇒ 给出"压缩-精度"折衷的两个工作点。
 
 ### 4.6 可训参数与部署期参数对比
 
@@ -412,7 +406,7 @@ flowchart LR
 
 ## 5. 讨论与局限
 
-- **效率 / 精度 Pareto 前沿**：本文给出 (config\_85, config\_90) 两个工作点；阈值 \(\tau\) 连续扫描可生成完整 Pareto 前沿（留作工程化补充）。
+- **效率 / 精度 Pareto 前沿**：本文给出压缩率较高与中等两档工作点；阈值 \(\tau\) 连续扫描可生成完整 Pareto 前沿（留作工程化补充）。
 - **阈值选择**：当前 \(\tau\) 由阈值扫描手工确定，未来可由验证集 ATE 早停自动化。
 - **backbone 通用性**：本文仅在 VGGT-1B 验证，更大或更小 backbone（如 \(\pi^3\)）有待评测。
 - **GT-free 的边界**：理论上可扩展到任意无标注多视图集合；本文受时间限制只验证了 ScanNet 50 场景，更大规模 calibration 是否带来增益未充分探索。
@@ -422,7 +416,7 @@ flowchart LR
 
 ## 6. 结论
 
-本文针对视觉几何基础模型 VGGT，给出了一条贯穿"度量 → 区间发现 → GT-free 较准"的层级压缩管线。在度量层面，我们以"删层后任务退化"为真值，证明 **CKA 是更可靠的层间冗余指标**，并发现 **VGGT 的层间冗余是模型内禀属性**（跨数据集 pattern 一致、frame / global 异质冗余）；在消除层面，我们提出 **阈值 + 最大面积矩形** 的两阶段冗余区间发现算法，以及 **GT-free LoRA 自蒸馏较准**——以原 VGGT 为 teacher，仅用 50 个 ScanNet 场景、50 epoch、仅 LoRA 可训、且 **完全不使用任何 GT 标签**——即可让 student 达到与 teacher comparable 的精度。以 config\_85 为例，**推理时间下降 TBD%、峰值显存下降 TBD%、零额外推理参数**，并在 ScanNet / 7Scenes / NRGBD 上保持与原 VGGT comparable 甚至部分更优。本方法与 token 级加速（FastVGGT 等）**正交可组合**，为 3D 几何基础模型的轻量化部署提供了一个互补的"深度方向"切入点。
+本文针对视觉几何基础模型 VGGT，给出了一条贯穿"度量 → 区间发现 → GT-free 较准"的层级压缩管线。在度量层面，我们以"删层后任务退化"为真值，证明 **CKA 是更可靠的层间冗余指标**，并发现 **VGGT 的层间冗余是模型内禀属性**（跨数据集分布模式一致、frame / global 异质冗余）；在消除层面，我们提出 **阈值 + 最大面积矩形** 的两阶段冗余区间发现算法，以及 **GT-free LoRA 自蒸馏较准**——以原 VGGT 为 teacher，仅用 50 个 ScanNet 场景、50 epoch、仅 LoRA 可训、且 **完全不使用任何 GT 标签**——即可让 student 在几何指标上与 teacher **相当**。在 **压缩率较高的一档** 下，**推理时间下降 TBD%、峰值显存下降 TBD%、零额外推理参数**，并在 ScanNet / 7Scenes / NRGBD 上保持与原 VGGT **相当**、部分指标 **更优**。本方法与 token 级加速（FastVGGT 等）**正交可组合**，为 3D 几何基础模型的轻量化部署提供了一个互补的"深度方向"切入点。
 
 ---
 

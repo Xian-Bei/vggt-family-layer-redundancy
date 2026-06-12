@@ -3,19 +3,32 @@
 Lives under ``analysis/eval`` so evaluation code stays outside the ``vggt`` package.
 """
 
+import os
 from collections import deque
-from PIL import Image
-import cv2
 import io
 import random
 import time
+from copy import deepcopy
+
+# Keep plotting imports headless-safe for servers without GUI.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("MPLBACKEND", "Agg")
+try:
+    # evo applies SETTINGS.plot_backend at import time; force a non-interactive backend.
+    from evo.tools.settings import SETTINGS as _EVO_SETTINGS  # type: ignore
+
+    _EVO_SETTINGS.plot_backend = "Agg"
+except Exception:
+    pass
+
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
-from copy import deepcopy
-import matplotlib.pyplot as plt
-import evo.tools.plot as plot
+
+from PIL import Image
+import cv2
 import evo.main_ape as main_ape
 import evo.main_rpe as main_rpe
+import evo.tools.plot as plot
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -27,11 +40,11 @@ import open3d as o3d  # for point cloud processing and Chamfer Distance computat
 from scipy.spatial.transform import Rotation
 from torchvision import transforms as TF
 
-from analysis.aggregator_compat import aggregator_supports_return_layers
+from analysis.amp_policy import amp_dtype_for_device, autocast_device_dtype
 
-
-from vggt.utils.geometry import unproject_depth_map_to_point_map
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from analysis.backbones.registry import get_backbone
+from analysis.backbones.vendor_inference.vggt_geometry import unproject_depth_map_to_point_map
+from analysis.backbones.vendor_inference.vggt_pose_enc import pose_encoding_to_extri_intri
 
 
 def _depth_or_conf_to_shw(arr: np.ndarray, name: str) -> np.ndarray:
@@ -335,7 +348,8 @@ def eval_trajectory(poses_est, poses_gt, frame_ids, align=False, plot_trajectory
 
                 # Update translation part of transformation matrix
                 transform[:3, 3] = translation
-                print(f"Fallback to simple translation transformation: {transform}")
+                # Avoid dumping the full 4x4 matrix on every scene during batch eval.
+                print("Fallback to simple translation transformation", flush=True)
             except Exception as e:
                 print(f"Error building translation transformation: {e}")
                 print("Will use identity matrix")
@@ -720,34 +734,15 @@ def compute_original_coords(
     return original_coords
 
 
-def _required_prediction_layers_for_sparse_heads(model, num_layers):
-    required = set()
-    if getattr(model, "camera_head", None) is not None and num_layers > 0:
-        required.add(num_layers - 1)
-    if getattr(model, "depth_head", None) is not None:
-        required.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
-    if getattr(model, "point_head", None) is not None:
-        required.update(int(i) for i in getattr(model.point_head, "intermediate_layer_idx", []))
-    return sorted(i for i in required if 0 <= i < num_layers)
-
-
-def _forward_vggt_sparse_heads(model, images_batched):
-    num_layers = len(model.aggregator.global_blocks)
-    required_layers = _required_prediction_layers_for_sparse_heads(model, num_layers)
-    selected_outputs, patch_start_idx = model.aggregator(images_batched, return_layers=set(required_layers))
-    sparse_layers = [None] * num_layers
-    for idx, tensor in zip(required_layers, selected_outputs):
-        sparse_layers[idx] = tensor
-    if getattr(model, "camera_head", None) is not None and sparse_layers[-1] is None:
-        raise RuntimeError("Sparse forward missing final layer required by camera head.")
-    return model.forward_from_aggregated_tokens(sparse_layers, patch_start_idx, images_batched)
+def _vggt_family_adapter_for_model(model):
+    idx = list(getattr(getattr(model, "depth_head", None), "intermediate_layer_idx", []) or [])
+    return get_backbone("fastvggt" if idx == [0, 1, 2, 3] else "vggt")
 
 
 @torch.no_grad()
 def infer_vggt_and_reconstruct(
     model: torch.nn.Module,
     vgg_input: torch.Tensor,
-    dtype: torch.dtype,
     depth_conf_thresh: float,
     image_paths: list = None,
 ) -> Tuple[
@@ -761,53 +756,41 @@ def infer_vggt_and_reconstruct(
     np.ndarray,
     float,
 ]:
-    torch.cuda.synchronize()
-    # Keep H2D (.cuda) and batching outside the inference timer / peak-VRAM window
-    # (matches 7andN eval: timing is model forward only).
-    vgg_input_cuda = vgg_input.cuda()
-    if vgg_input_cuda.dim() == 4:
-        images_batched = vgg_input_cuda.unsqueeze(0)
-    elif vgg_input_cuda.dim() == 5:
-        images_batched = vgg_input_cuda
-    else:
-        raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_input_cuda.shape)}")
-    if images_batched.is_cuda:
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats(images_batched.device.index)
+    dev = next(model.parameters()).device
+    amp_dtype = amp_dtype_for_device(dev)
+    ac_kw = autocast_device_dtype(dev)
+
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+        torch.cuda.reset_peak_memory_stats(dev.index)
+
     start = time.time()
-    # Keep input image tensors out of autocast: preserve explicit fp32 image pipeline
-    # and only autocast model forward for speed.
-    if hasattr(model, "forward_from_aggregated_tokens") and aggregator_supports_return_layers(
-        model.aggregator
-    ):
-        with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = _forward_vggt_sparse_heads(model, images_batched)
-    else:
-        # FastVGGT vendor: ``forward_from_aggregated_tokens`` opens its own
-        # ``autocast(enabled=False)`` block but does NOT cast the bf16 aggregator
-        # outputs back to fp32 before feeding them through ``camera_head.token_norm``,
-        # which trips ``LayerNorm`` (input bf16, weight fp32) — the exact "expected
-        # scalar type BFloat16 but found Float" error the training periodic eval was
-        # hitting. Stage the aggregator inside ``autocast(dtype)`` for speed, then
-        # explicitly upcast to fp32 before driving the heads outside autocast.
-        with torch.cuda.amp.autocast(dtype=dtype):
-            aggregated_tokens_list, patch_start_idx = model.aggregator(images_batched)
-        aggregated_tokens_list = [
-            t.float() if isinstance(t, torch.Tensor) else t for t in aggregated_tokens_list
-        ]
-        predictions = model.forward_from_aggregated_tokens(
+    with torch.autocast(**ac_kw):
+        vgg_staged = vgg_input.to(device=dev, non_blocking=(dev.type == "cuda"))
+        if vgg_staged.dim() == 4:
+            images_batched = vgg_staged.unsqueeze(0)
+        elif vgg_staged.dim() == 5:
+            images_batched = vgg_staged
+        else:
+            raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_staged.shape)}")
+        if amp_dtype != torch.float32:
+            images_batched = images_batched.to(dtype=amp_dtype)
+
+        aggregated_tokens_list, patch_start_idx = model.aggregator(images_batched)
+        predictions = _vggt_family_adapter_for_model(model).run_heads_from_aggregated_tokens(
+            model,
             aggregated_tokens_list,
             int(patch_start_idx),
             images_batched,
         )
-    torch.cuda.synchronize()
+
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
     end = time.time()
     inference_time_ms = (end - start) * 1000.0
     infer_peak_vram_gb = 0.0
-    if images_batched.is_cuda:
-        infer_peak_vram_gb = float(
-            torch.cuda.max_memory_allocated(images_batched.device.index)
-        ) / (1024.0**3)
+    if dev.type == "cuda":
+        infer_peak_vram_gb = float(torch.cuda.max_memory_allocated(dev.index)) / (1024.0**3)
 
     extrinsic, intrinsic = pose_encoding_to_extri_intri(
         predictions["pose_enc"], (vgg_input.shape[2], vgg_input.shape[3])

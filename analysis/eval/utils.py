@@ -60,6 +60,16 @@ def depthmap_to_absolute_camera_coordinates(
     return X_world, valid_mask
 
 
+def _sort_points_xyz(points: np.ndarray, normals: np.ndarray | None = None):
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    order = np.lexsort((pts[:, 2], pts[:, 1], pts[:, 0]))
+    sorted_pts = pts[order]
+    if normals is None:
+        return sorted_pts, None
+    n = np.asarray(normals, dtype=np.float64).reshape(-1, 3)
+    return sorted_pts, n[order]
+
+
 def completion_ratio(gt_points, rec_points, dist_th=0.05):
     gen_points_kd_tree = KDTree(rec_points)
     distances, _ = gen_points_kd_tree.query(gt_points)
@@ -68,8 +78,10 @@ def completion_ratio(gt_points, rec_points, dist_th=0.05):
 
 
 def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None):
+    gt_points, gt_normals = _sort_points_xyz(gt_points, gt_normals)
+    rec_points, rec_normals = _sort_points_xyz(rec_points, rec_normals)
     gt_points_kd_tree = KDTree(gt_points)
-    distances, idx = gt_points_kd_tree.query(rec_points, workers=-1)
+    distances, idx = gt_points_kd_tree.query(rec_points, workers=1)
     acc = np.mean(distances)
 
     acc_median = np.median(distances)
@@ -84,8 +96,10 @@ def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None):
 
 
 def completion(gt_points, rec_points, gt_normals=None, rec_normals=None):
+    gt_points, gt_normals = _sort_points_xyz(gt_points, gt_normals)
+    rec_points, rec_normals = _sort_points_xyz(rec_points, rec_normals)
     gt_points_kd_tree = KDTree(rec_points)
-    distances, idx = gt_points_kd_tree.query(gt_points, workers=-1)
+    distances, idx = gt_points_kd_tree.query(gt_points, workers=1)
     comp = np.mean(distances)
     comp_median = np.median(distances)
 

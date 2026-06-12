@@ -184,12 +184,15 @@ def pairwise_similarity_matrices(
     metric_seconds: Optional[Dict[str, float]] = None,
     compute_pwcca: bool = False,
     device: Optional[Union[str, torch.device]] = None,
+    *,
+    progress: bool = False,
+    progress_desc: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Pairwise cosine / linear CKA / optional PWCCA / neg-MSE between layer token tensors.
 
-    If ``device`` is set (e.g. ``cuda``), tensors are moved to that device once; results
-    are returned on **CPU** float64.
+    If ``device`` is set (e.g. ``cuda``), layer tensors are moved to that device once for
+    all pairs; metric matrices are returned on **CPU** float64.
 
     PWCCA dominates cost on large ``N``; it is **off by default** (``compute_pwcca=False``).
     When disabled, the returned dict has **no** ``pwcca`` key.
@@ -217,29 +220,50 @@ def pairwise_similarity_matrices(
         if metric_seconds is not None:
             metric_seconds[name] = metric_seconds.get(name, 0.0) + (time.perf_counter() - t0)
 
-    for i in range(num_layers):
-        for j in range(i, num_layers):
-            t0 = time.perf_counter()
-            cos_v = sample_cosine_similarity(layer_tokens[i], layer_tokens[j])
-            _acc("cosine", t0)
+    pairs_total = num_layers * (num_layers + 1) // 2
+    pbar = None
+    if progress and pairs_total > 0:
+        import sys
 
-            t0 = time.perf_counter()
-            cka_v = linear_cka(layer_tokens[i], layer_tokens[j])
-            _acc("cka", t0)
+        from tqdm import tqdm
 
-            if compute_pwcca and pwcca_m is not None:
+        pbar = tqdm(
+            total=pairs_total,
+            desc=progress_desc or "pairwise similarity",
+            unit="pair",
+            leave=False,
+            dynamic_ncols=True,
+            file=sys.stderr,
+        )
+    try:
+        for i in range(num_layers):
+            for j in range(i, num_layers):
                 t0 = time.perf_counter()
-                pw_v = pwcca_similarity(layer_tokens[i], layer_tokens[j])
-                _acc("pwcca", t0)
-                pwcca_m[i, j] = pwcca_m[j, i] = pw_v
+                cos_v = sample_cosine_similarity(layer_tokens[i], layer_tokens[j])
+                _acc("cosine", t0)
 
-            t0 = time.perf_counter()
-            nm_v = neg_mean_squared_error(layer_tokens[i], layer_tokens[j])
-            _acc("neg_mse", t0)
+                t0 = time.perf_counter()
+                cka_v = linear_cka(layer_tokens[i], layer_tokens[j])
+                _acc("cka", t0)
 
-            cos[i, j] = cos[j, i] = cos_v
-            cka[i, j] = cka[j, i] = cka_v
-            neg_mse[i, j] = neg_mse[j, i] = nm_v
+                if compute_pwcca and pwcca_m is not None:
+                    t0 = time.perf_counter()
+                    pw_v = pwcca_similarity(layer_tokens[i], layer_tokens[j])
+                    _acc("pwcca", t0)
+                    pwcca_m[i, j] = pwcca_m[j, i] = pw_v
+
+                t0 = time.perf_counter()
+                nm_v = neg_mean_squared_error(layer_tokens[i], layer_tokens[j])
+                _acc("neg_mse", t0)
+
+                cos[i, j] = cos[j, i] = cos_v
+                cka[i, j] = cka[j, i] = cka_v
+                neg_mse[i, j] = neg_mse[j, i] = nm_v
+                if pbar is not None:
+                    pbar.update(1)
+    finally:
+        if pbar is not None:
+            pbar.close()
 
     out: Dict[str, torch.Tensor] = {
         "cosine": cos.cpu(),

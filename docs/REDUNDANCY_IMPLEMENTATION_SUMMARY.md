@@ -140,7 +140,7 @@ skip-range 分析当前是我们讨论后的实现：
 
 | 变量 | 默认值 | 说明 |
 | ------ | -------- | ------ |
-| `MAX_TOKENS_PER_LAYER` | `0` | 兼容性保留参数；当前主线已不再单独写 flattened layer cache。 |
+| `MAX_TOKENS` | `4096` | `run_cache_redundancy.sh`：相似度计算时每层 token 子采样（0=全量）。 |
 | `MAX_CONCAT_TOKENS` | `0` | Stage2 相似性前不二次下采样。 |
 | `PAIR_MAX_SPAN` | `1` | 默认启用主逻辑 `sim(frame_i, global_i)`。 |
 | `SKIP_RANGE_MAX_SPAN` | `6` | 最多连续跳过 6 个 global block。 |
