@@ -193,3 +193,9 @@ nouse/
 analysis_outputs_v3/
 *backup*/
 tests/
+.agents/
+.codex/
+.cursor/
+.gradio/
+.vscode/
+.cursorignore
