@@ -37,7 +37,14 @@ except ImportError as exc:  # pragma: no cover - import guard for optional demo 
 
 from analysis.backbones.bootstrap import apply_pythonpath
 from analysis.backbones.registry import get_backbone
-from .redundancy.metrics import upper_triangle_unpack_for_heatmap
+from .redundancy.metrics import upper_triangle_pack, upper_triangle_unpack_for_heatmap
+from analysis.prune_plan.build_prune_plan_v3 import load_similarity
+from analysis.redundancy.similarity_v3 import (
+    DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS,
+    REDUNDANCY_GRAPH_REGIONS,
+    regions_for_aggregation,
+)
+from analysis.triangular_heatmap import configure_triangle_axes, imshow_upper_triangle, triangle_xy
 from analysis.eval.scannet_eval import SceneData, load_scene_images
 from .redundancy.cache_layout import count_scene_replay_layers_disk, load_scene_metadata, scene_cache_dir
 from .redundancy.visualize_pair_attention import (
@@ -46,10 +53,10 @@ from .redundancy.visualize_pair_attention import (
     _overlay_patch_map,
     _reconstruct_qk,
 )
-from .vis import build_eval_tab, build_heatmaps_tab, build_lora_tab
+from .vis import build_cka_heatmaps_tab, build_eval_tab, build_heatmaps_tab, build_lora_tab, build_summary_tab
 # from .vis import build_pair_tab  # Pair Attention tab disabled
 
-DEFAULT_LORA_ROOT = Path("analysis_outputs/lora_skip")
+DEFAULT_LORA_ROOT = Path("analysis_outputs_v3")
 
 
 def _repo_root() -> Path:
@@ -97,7 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--lora-dir",
         type=Path,
         default=DEFAULT_LORA_ROOT,
-        help="Directory containing LoRA experiment subfolders (each subfolder is one run).",
+        help="v3 output root containing LoRA train plots: <model>/scannet_dev50/train/<plan>/.",
     )
     p.add_argument(
         "--analysis-dir",
@@ -168,7 +175,7 @@ SIMILARITY_METRICS: List[Tuple[str, str]] = [
 
 SKIP_MAIN_METRICS: List[Tuple[str, str]] = [
     ("are", "ARE"),
-    ("ate", "ATE"),
+    ("ape", "APE"),
     ("rpe_rot", "RPE_rot"),
     ("rpe_trans", "RPE_trans"),
 ]
@@ -176,8 +183,16 @@ SKIP_MAIN_METRICS: List[Tuple[str, str]] = [
 SKIP_DEPTH_METRICS: List[Tuple[str, str]] = [
     ("depth_abs_rel", "Depth abs rel"),
     ("depth_delta1", "Depth delta1"),
-    ("chamfer_distance", "Chamfer"),
 ]
+
+SKIP_POINT_METRICS: List[Tuple[str, str]] = [
+    ("acc", "Accuracy"),
+    ("comp", "Completeness"),
+    ("chamfer_distance", "Chamfer"),
+    ("nc", "Normal consistency"),
+]
+
+SKIP_HIGHER_IS_BETTER = {"depth_delta1", "nc"}
 
 
 class PairAttentionController:
@@ -296,11 +311,13 @@ class PairAttentionController:
     def _resolve_dataset_dir(self, root: Path, dataset: str) -> Path:
         p = Path(root)
         if self.v3_mode:
+            from analysis.view_v3_loader import redundancy_dir_has_graphs
+
             cand = p / dataset / "cache"
             if (cand / "cache_manifest_v3.json").exists():
                 return cand
             ds_root = p / dataset
-            if (ds_root / "redundancy" / "redundancy_graph_v3.npz").is_file():
+            if redundancy_dir_has_graphs(ds_root / "redundancy"):
                 return ds_root
         cand = p / dataset
         if (cand / "manifest.json").exists() or (cand / "per_scene").exists() or cand.exists():
@@ -364,7 +381,7 @@ class PairAttentionController:
 
     def switch_dataset(self, dataset: str) -> None:
         new_ds = str(dataset).strip().lower()
-        if new_ds == STAGE2_MIN_DATASET:
+        if _is_stage2_virtual_dataset(new_ds):
             self.dataset = new_ds
             self.stage2_render_cache = {}
             self.similarity_reports = {}
@@ -414,7 +431,7 @@ class PairAttentionController:
         return sorted(self.scene_items.keys())
 
     def stage2_scene_ids(self) -> List[str]:
-        if self.dataset == STAGE2_MIN_DATASET:
+        if _is_stage2_virtual_dataset(self.dataset):
             return ["mean"]
         all_ids = set(self.similarity_reports.keys()) | set(self.skip_reports.keys())
         scene_ids: List[str] = []
@@ -439,7 +456,7 @@ class PairAttentionController:
             reports = self._discover_similarity_reports_in_dir(sim_dir)
         return reports.get(sid)
 
-    def has_cross_dataset_min_similarity(self) -> bool:
+    def has_cross_dataset_similarity(self) -> bool:
         return any(
             self.get_similarity_report_for_dataset(ds, "mean") is not None
             for ds in getattr(self, "stage2_real_datasets", [])
@@ -779,7 +796,7 @@ class PairAttentionController:
             except Exception:
                 return 0
 
-        if self.dataset == STAGE2_MIN_DATASET:
+        if _is_stage2_virtual_dataset(self.dataset):
             for ds in getattr(self, "stage2_real_datasets", []):
                 rep = self.get_similarity_report_for_dataset(ds, "mean")
                 if rep is not None:
@@ -1042,13 +1059,29 @@ def _gallery_update(items: List[np.ndarray]):
 
 
 STAGE2_METRIC_ROW_POSE = "pose"
-STAGE2_METRIC_ROW_POINT = "point"
+STAGE2_METRIC_ROW_DEPTH = "depth"
+STAGE2_METRIC_ROW_POINT = "point cloud"
 STAGE2_TOKEN_ROW_SPECIAL = "special"
+STAGE2_TOKEN_ROW_CAMERA = "camera"
 STAGE2_TOKEN_ROW_PATCH = "patch"
 STAGE2_TOKEN_ROW_ALL = "all"
-# v3 redundancy + heatmaps: only all-token similarity (special/patch rows stay in layout but hidden).
-STAGE2_TOKEN_ROWS_ENABLED = [STAGE2_TOKEN_ROW_ALL]
+STAGE2_TOKEN_ROW_MEAN = "mean"
+STAGE2_TOKEN_ROW_MIN = "min"
+STAGE2_TOKEN_ROW_ORDER = [
+    STAGE2_TOKEN_ROW_SPECIAL,
+    STAGE2_TOKEN_ROW_CAMERA,
+    STAGE2_TOKEN_ROW_PATCH,
+    STAGE2_TOKEN_ROW_ALL,
+    STAGE2_TOKEN_ROW_MEAN,
+    STAGE2_TOKEN_ROW_MIN,
+]
 STAGE2_MIN_DATASET = "min"
+STAGE2_MEAN_DATASET = "mean"
+STAGE2_VIRTUAL_DATASETS = {STAGE2_MIN_DATASET, STAGE2_MEAN_DATASET}
+
+
+def _is_stage2_virtual_dataset(dataset: str) -> bool:
+    return str(dataset or "").strip().lower() in STAGE2_VIRTUAL_DATASETS
 
 
 def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
@@ -1066,11 +1099,12 @@ def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
         if not p.is_dir():
             continue
         name = str(p.name).strip()
-        if not name or name.startswith(".") or name == STAGE2_MIN_DATASET:
+        if not name or name.startswith(".") or _is_stage2_virtual_dataset(name):
             continue
         # Only include datasets with actual v3 redundancy outputs.
-        # Stage2 similarity reports are built from `redundancy_graph_v3.npz`.
-        if (p / "redundancy" / "redundancy_graph_v3.npz").is_file():
+        from analysis.view_v3_loader import redundancy_dir_has_graphs
+
+        if redundancy_dir_has_graphs(p / "redundancy"):
             tags.append(name)
     # Prefer ScanNet splits first for UX.
     prefer = ["scannet_dev50", "scannet_test50", "scannet", "7scenes", "nrgbd"]
@@ -1084,13 +1118,22 @@ def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
     return out
 
 
+def _discover_v3_dataset_tags_across_backbones(output_root: Path, backbones: Sequence[str]) -> List[str]:
+    tags: List[str] = []
+    for backbone in backbones:
+        for tag in _discover_v3_dataset_tags(Path(output_root) / str(backbone)):
+            if tag not in tags:
+                tags.append(tag)
+    return tags
+
+
 def _heatmaps_resolve_filters(
     controller: PairAttentionController,
     scene_id: Optional[str],
     value_mode: str,
     metric_rows: Optional[List[str]],
     token_rows: Optional[List[str]],
-) -> Tuple[str, List[str], List[str], List[str], bool, bool, bool]:
+) -> Tuple[str, List[str], List[str], List[str], List[str], bool, bool, bool]:
     """Coerce value mode and row filters from UI + current reports (per-dataset Stage1 eval for pct)."""
     scene_key = str(scene_id or "").strip()
     if scene_key == "":
@@ -1105,34 +1148,64 @@ def _heatmaps_resolve_filters(
         vm = "absolute"
     if vm not in choices_vm:
         vm = "absolute"
-    if controller.dataset == STAGE2_MIN_DATASET:
+    if _is_stage2_virtual_dataset(controller.dataset):
         has_skip = False
-        has_sim = controller.has_cross_dataset_min_similarity()
+        has_sim = controller.has_cross_dataset_similarity()
     else:
         has_skip = bool(scene_id) and controller.get_skip_report(scene_id) is not None
         has_sim = bool(scene_id) and controller.get_similarity_report(scene_id) is not None
 
+    token_choices: List[str] = []
+    if has_sim:
+        if _is_stage2_virtual_dataset(controller.dataset):
+            token_choices = [STAGE2_TOKEN_ROW_ALL]
+        else:
+            sim_report = controller.get_similarity_report(scene_key)
+            by_mode = (
+                _similarity_maps_with_token_aggregations(
+                    _extract_similarity_metric_maps_by_mode(sim_report.report)
+                )
+                if sim_report is not None
+                else {}
+            )
+            present = {
+                region
+                for mode_entry in by_mode.values()
+                for region in STAGE2_TOKEN_ROW_ORDER
+                if _similarity_region_has_data(mode_entry, region)
+            }
+            token_choices = [x for x in STAGE2_TOKEN_ROW_ORDER if x in present]
+        has_sim = bool(token_choices)
+
     if has_skip:
-        allowed_m = {STAGE2_METRIC_ROW_POSE, STAGE2_METRIC_ROW_POINT}
+        allowed_m = {
+            STAGE2_METRIC_ROW_POSE,
+            STAGE2_METRIC_ROW_DEPTH,
+            STAGE2_METRIC_ROW_POINT,
+        }
         if metric_rows is None:
-            m_val = [STAGE2_METRIC_ROW_POSE, STAGE2_METRIC_ROW_POINT]
+            m_val = [
+                STAGE2_METRIC_ROW_POSE,
+                STAGE2_METRIC_ROW_DEPTH,
+                STAGE2_METRIC_ROW_POINT,
+            ]
         else:
             m_val = [x for x in metric_rows if x in allowed_m]
     else:
         m_val = []
 
     if has_sim:
-        allowed_t = set(STAGE2_TOKEN_ROWS_ENABLED)
+        allowed_t = set(token_choices)
         if token_rows is None:
-            t_val = list(STAGE2_TOKEN_ROWS_ENABLED)
+            t_val = list(token_choices)
         else:
             t_val = [x for x in token_rows if x in allowed_t]
             if not t_val:
-                t_val = list(STAGE2_TOKEN_ROWS_ENABLED)
+                t_val = list(token_choices)
     else:
         t_val = []
 
-    return vm, m_val, t_val, choices_vm, has_skip, has_sim, pct_ok
+    return vm, m_val, t_val, choices_vm, token_choices, has_skip, has_sim, pct_ok
 
 
 def _heatmaps_gr_controls_from_resolved(
@@ -1142,6 +1215,7 @@ def _heatmaps_gr_controls_from_resolved(
     sim_gamma: float,
     sim_cutoff: float,
     _choices_vm: List[str],
+    token_choices: List[str],
     has_skip: bool,
     has_sim: bool,
     pct_ok: bool,
@@ -1153,11 +1227,11 @@ def _heatmaps_gr_controls_from_resolved(
         cls_vm.append("hm-value-mode-pct-locked")
     metric_update: Dict[str, Any] = {"interactive": has_skip}
     token_update: Dict[str, Any] = {
-        "interactive": False,
-        "choices": list(STAGE2_TOKEN_ROWS_ENABLED),
+        "interactive": has_sim,
+        "choices": list(token_choices),
     }
     sim_gamma_update: Dict[str, Any] = {"interactive": has_sim}
-    sim_cutoff_update: Dict[str, Any] = {"interactive": has_sim}
+    sim_cutoff_update: Dict[str, Any] = {"interactive": has_sim or has_skip}
     if write_values:
         metric_update["value"] = m_val
         token_update["value"] = list(t_val) if has_sim else []
@@ -1173,14 +1247,79 @@ def _heatmaps_gr_controls_from_resolved(
     )
 
 
-def _discover_lora_experiments(root: Path) -> List[str]:
-    if not root.exists():
-        return []
-    exps: List[str] = []
-    for entry in sorted(root.iterdir(), key=lambda p: p.name):
-        if entry.is_dir():
-            exps.append(entry.name)
-    return exps
+_LORA_METRIC_ORDER = (
+    "ape",
+    "are",
+    "rpe_trans",
+    "rpe_rot",
+    "depth_abs_rel",
+    "depth_delta1",
+    "acc",
+    "comp",
+    "cd",
+    "nc",
+    "chamfer_distance",
+)
+
+
+def _discover_lora_runs(root: Path) -> Dict[str, List[str]]:
+    """Return plan -> models for v3 LoRA train runs with saved eval plots."""
+    root = Path(root)
+    runs: Dict[str, List[str]] = {}
+    if not root.is_dir():
+        return runs
+    for model_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name):
+        train_root = model_dir / "scannet_dev50" / "train"
+        if not train_root.is_dir():
+            continue
+        for plan_dir in sorted((p for p in train_root.iterdir() if p.is_dir()), key=lambda p: p.name):
+            if any(plan_dir.glob("eval_plot_*.png")):
+                runs.setdefault(plan_dir.name, []).append(model_dir.name)
+    return {plan: sorted(set(models)) for plan, models in sorted(runs.items())}
+
+
+def _lora_metric_sort_key(metric: str) -> Tuple[int, str]:
+    try:
+        return (_LORA_METRIC_ORDER.index(metric), metric)
+    except ValueError:
+        return (len(_LORA_METRIC_ORDER), metric)
+
+
+def _lora_dataset_gallery_items(run_dir: Path, dataset_tag: str) -> List[Tuple[str, str]]:
+    prefix = f"eval_plot_{dataset_tag}_"
+    items: List[Tuple[str, str]] = []
+    for path in sorted(run_dir.glob(f"{prefix}*.png")):
+        metric = path.stem[len(prefix):]
+        items.append((str(path.resolve()), metric))
+    return sorted(items, key=lambda item: _lora_metric_sort_key(item[1]))
+
+
+def _lora_plot_rows(root: Path, plan_name: str, model_name: str) -> Dict[str, List[Tuple[str, str]]]:
+    root = Path(root)
+    run_dir = root / str(model_name) / "scannet_dev50" / "train" / str(plan_name)
+    training: List[Tuple[str, str]] = []
+    for filename, label in (
+        ("train_curves.png", "train_curves"),
+        ("train_loss_weighted_components.png", "train_loss_weighted_components"),
+    ):
+        path = run_dir / filename
+        if path.is_file():
+            training.append((str(path.resolve()), label))
+    if not run_dir.is_dir():
+        return {
+            "scans_dev50": [],
+            "scans_test50": [],
+            "7scenes_test": [],
+            "nrgbd": [],
+            "training": training,
+        }
+    return {
+        "scans_dev50": _lora_dataset_gallery_items(run_dir, "scannet_dev50"),
+        "scans_test50": _lora_dataset_gallery_items(run_dir, "scannet_test50"),
+        "7scenes_test": _lora_dataset_gallery_items(run_dir, "7scenes_test"),
+        "nrgbd": _lora_dataset_gallery_items(run_dir, "nrgbd"),
+        "training": training,
+    }
 
 
 def _load_image_if_exists(path: Path) -> Optional[np.ndarray]:
@@ -1199,71 +1338,13 @@ def _load_image_if_exists(path: Path) -> Optional[np.ndarray]:
     return np.asarray(arr, dtype=np.uint8)
 
 
-def _first_existing(paths: Sequence[Path]) -> Path:
-    for p in paths:
-        if p.exists():
-            return p
-    return paths[0]
-
-
-def _lora_expected_plot_paths(exp_dir: Path) -> Dict[str, Path]:
-    """Paths for LoRA tab images.
-
-    Training now saves ``eval_plot_{group}_{metric}.png`` (see ``_plot_metric_group`` in
-    ``train_lora_skip_baseline.py``): ``scannet`` bundles dev/test ScanNet curves; ``7andn``
-    bundles 7-scenes / RGB-D style metrics. Legacy unprefixed filenames are still tried.
-    """
-    return {
-        # ScanNet group (row 1–2 in the LoRA tab)
-        "eval_plot_are": _first_existing(
-            [exp_dir / "eval_plot_scannet_are.png", exp_dir / "eval_plot_are.png"]
-        ),
-        "eval_plot_ape": _first_existing(
-            [
-                exp_dir / "eval_plot_scannet_ape.png",
-                exp_dir / "eval_plot_scannet_ate.png",
-                exp_dir / "eval_plot_ape.png",
-                exp_dir / "eval_plot_ate.png",
-            ]
-        ),
-        "eval_plot_rpe_rot": _first_existing(
-            [exp_dir / "eval_plot_scannet_rpe_rot.png", exp_dir / "eval_plot_rpe_rot.png"]
-        ),
-        "eval_plot_rpe_trans": _first_existing(
-            [exp_dir / "eval_plot_scannet_rpe_trans.png", exp_dir / "eval_plot_rpe_trans.png"]
-        ),
-        "eval_plot_depth_abs_abs_rel": _first_existing(
-            [
-                exp_dir / "eval_plot_scannet_depth_abs_rel.png",
-                exp_dir / "eval_plot_depth_abs_abs_rel.png",
-                exp_dir / "eval_plot_depth_abs_rel.png",
-            ]
-        ),
-        "eval_plot_depth_abs_delta1": _first_existing(
-            [
-                exp_dir / "eval_plot_scannet_depth_delta1.png",
-                exp_dir / "eval_plot_depth_abs_delta1.png",
-                exp_dir / "eval_plot_depth_delta1.png",
-            ]
-        ),
-        "eval_plot_chamfer_distance": _first_existing(
-            [exp_dir / "eval_plot_scannet_chamfer_distance.png", exp_dir / "eval_plot_chamfer_distance.png"]
-        ),
-        # 7-scenes / NRGBD group (row 3)
-        "eval_plot_7andn_acc_med": exp_dir / "eval_plot_7andn_acc_med.png",
-        "eval_plot_7andn_comp_med": exp_dir / "eval_plot_7andn_comp_med.png",
-        "eval_plot_7andn_nc_med": exp_dir / "eval_plot_7andn_nc_med.png",
-        # Training curves (row 4)
-        "train_curves": exp_dir / "train_curves.png",
-        "train_loss_weighted_components": exp_dir / "train_loss_weighted_components.png",
-    }
-
-
 def _stage2_row_visibility_flags(
     mode_order: List[str],
     selected_modes: List[str],
     metric_rows: List[str],
     token_rows: List[str],
+    skip_modes: set[str],
+    similarity_regions_by_mode: Dict[str, set[str]],
 ) -> List[bool]:
     active_modes = {str(m) for m in selected_modes}
     metrics = {str(m) for m in metric_rows}
@@ -1271,24 +1352,31 @@ def _stage2_row_visibility_flags(
     out: List[bool] = []
     for mode in mode_order:
         on = mode in active_modes
-        out.append(on and STAGE2_METRIC_ROW_POSE in metrics)
-        out.append(on and STAGE2_TOKEN_ROW_SPECIAL in tokens)
-        out.append(on and STAGE2_METRIC_ROW_POINT in metrics)
-        out.append(on and STAGE2_TOKEN_ROW_PATCH in tokens)
-        sim_all_on = on and STAGE2_TOKEN_ROW_ALL in tokens
-        out.append(sim_all_on)
-        out.append(sim_all_on)
+        has_skip = mode in skip_modes
+        sim_regions = similarity_regions_by_mode.get(mode, set())
+        out.append(on and has_skip and STAGE2_METRIC_ROW_POSE in metrics)
+        out.append(on and has_skip and STAGE2_METRIC_ROW_DEPTH in metrics)
+        out.append(on and has_skip and STAGE2_METRIC_ROW_POINT in metrics)
+        out.append(on and STAGE2_TOKEN_ROW_SPECIAL in tokens and "special" in sim_regions)
+        out.append(on and STAGE2_TOKEN_ROW_CAMERA in tokens and "camera" in sim_regions)
+        out.append(on and STAGE2_TOKEN_ROW_PATCH in tokens and "patch" in sim_regions)
+        out.append(on and STAGE2_TOKEN_ROW_ALL in tokens and "all" in sim_regions)
+        out.append(on and STAGE2_TOKEN_ROW_MEAN in tokens and "mean" in sim_regions)
+        out.append(on and STAGE2_TOKEN_ROW_MIN in tokens and "min" in sim_regions)
     return out
 
 
-def _stage2_block_keys_for_mode(mode: str) -> Tuple[str, str, str, str, str, str]:
+def _stage2_block_keys_for_mode(mode: str) -> Tuple[str, str, str, str, str, str, str, str, str]:
     return (
         f"skip_{mode}_main",
-        f"sim_{mode}_special",
         f"skip_{mode}_depth",
+        f"skip_{mode}_point",
+        f"sim_{mode}_special",
+        f"sim_{mode}_camera",
         f"sim_{mode}_patch",
         f"sim_{mode}_all",
-        f"sim_{mode}_all_odd",
+        f"sim_{mode}_mean",
+        f"sim_{mode}_min",
     )
 
 
@@ -1297,6 +1385,8 @@ def _stage2_requested_block_keys(
     selected_modes: List[str],
     metric_rows: List[str],
     token_rows: List[str],
+    skip_modes: set[str],
+    similarity_regions_by_mode: Dict[str, set[str]],
 ) -> set[str]:
     active_modes = {str(m) for m in selected_modes}
     metrics = {str(m) for m in metric_rows}
@@ -1305,18 +1395,27 @@ def _stage2_requested_block_keys(
     for mode in mode_order:
         if mode not in active_modes:
             continue
-        skip_main, sim_special, skip_depth, sim_patch, sim_all, sim_all_odd = _stage2_block_keys_for_mode(mode)
-        if STAGE2_METRIC_ROW_POSE in metrics:
+        skip_main, skip_depth, skip_point, sim_special, sim_camera, sim_patch, sim_all, sim_mean, sim_min = _stage2_block_keys_for_mode(mode)
+        has_skip = mode in skip_modes
+        sim_regions = similarity_regions_by_mode.get(mode, set())
+        if has_skip and STAGE2_METRIC_ROW_POSE in metrics:
             requested.add(skip_main)
-        if STAGE2_TOKEN_ROW_SPECIAL in tokens:
-            requested.add(sim_special)
-        if STAGE2_METRIC_ROW_POINT in metrics:
+        if has_skip and STAGE2_METRIC_ROW_DEPTH in metrics:
             requested.add(skip_depth)
-        if STAGE2_TOKEN_ROW_PATCH in tokens:
+        if has_skip and STAGE2_METRIC_ROW_POINT in metrics:
+            requested.add(skip_point)
+        if STAGE2_TOKEN_ROW_SPECIAL in tokens and "special" in sim_regions:
+            requested.add(sim_special)
+        if STAGE2_TOKEN_ROW_CAMERA in tokens and "camera" in sim_regions:
+            requested.add(sim_camera)
+        if STAGE2_TOKEN_ROW_PATCH in tokens and "patch" in sim_regions:
             requested.add(sim_patch)
-        if STAGE2_TOKEN_ROW_ALL in tokens:
+        if STAGE2_TOKEN_ROW_ALL in tokens and "all" in sim_regions:
             requested.add(sim_all)
-            requested.add(sim_all_odd)
+        if STAGE2_TOKEN_ROW_MEAN in tokens and "mean" in sim_regions:
+            requested.add(sim_mean)
+        if STAGE2_TOKEN_ROW_MIN in tokens and "min" in sim_regions:
+            requested.add(sim_min)
     return requested
 
 
@@ -1438,6 +1537,7 @@ def _extract_similarity_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str,
                 continue
             patch_map = mode_payload.get("global_patch_similarity_upper_by_metric")
             special_map = mode_payload.get("global_special_similarity_upper_by_metric")
+            camera_map = mode_payload.get("global_camera_similarity_upper_by_metric")
             all_map = mode_payload.get("global_all_similarity_upper_by_metric")
             patch_clean = (
                 {
@@ -1457,6 +1557,15 @@ def _extract_similarity_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str,
                 if isinstance(special_map, dict)
                 else {}
             )
+            camera_clean = (
+                {
+                    str(k): packed
+                    for k, packed in ((k, _coerce_packed(v)) for k, v in camera_map.items())
+                    if packed is not None
+                }
+                if isinstance(camera_map, dict)
+                else {}
+            )
             all_clean = (
                 {
                     str(k): packed
@@ -1466,8 +1575,13 @@ def _extract_similarity_metric_maps_by_mode(report: Dict[str, Any]) -> Dict[str,
                 if isinstance(all_map, dict)
                 else {}
             )
-            if patch_clean or special_clean or all_clean:
-                out[str(mode)] = {"patch": patch_clean, "special": special_clean, "all": all_clean}
+            if patch_clean or special_clean or camera_clean or all_clean:
+                out[str(mode)] = {
+                    "patch": patch_clean,
+                    "special": special_clean,
+                    "camera": camera_clean,
+                    "all": all_clean,
+                }
 
     # Legacy fallback: single-mode top-level similarity maps.
     legacy_patch = report.get("global_patch_similarity_upper")
@@ -1590,13 +1704,40 @@ def _similarity_maps_for_skip_mode(
         return similarity_by_mode[skip_mode]
     if "default" in similarity_by_mode:
         return similarity_by_mode["default"]
-    return {"patch": {}, "special": {}, "all": {}}
+    return {"patch": {}, "special": {}, "camera": {}, "all": {}}
+
+
+def _similarity_region_has_data(
+    sim_entry: Dict[str, Dict[str, List[float]]],
+    region: str,
+) -> bool:
+    region_map = sim_entry.get(region)
+    if not isinstance(region_map, dict):
+        return False
+    return any(isinstance(packed, list) and len(packed) > 0 for packed in region_map.values())
+
+
+def _missing_similarity_region_note(
+    controller: PairAttentionController,
+    *,
+    scene_id: str,
+    mode: str,
+    region: str,
+) -> str:
+    label = "all-token" if region == "all" else f"{region}-token"
+    note = f"missing {label} similarity for mode={mode}"
+    if controller.v3_mode:
+        from analysis.redundancy.similarity_v3 import redundancy_graph_filename
+
+        note += f" ({controller.analysis_similarity_dir / redundancy_graph_filename(region)})"
+    return f"{scene_id}: {note}"
 
 
 def _packed_delta_to_pct(
     packed: List[float],
     baseline_value: float,
     *,
+    metric_key: str,
     clip_percent: float,
     eps: float = 1e-12,
 ) -> List[float]:
@@ -1609,28 +1750,10 @@ def _packed_delta_to_pct(
         if math.isnan(scalar):
             out.append(float("nan"))
             continue
-        pct = 100.0 * scalar / denom
+        degradation = -scalar if metric_key in SKIP_HIGHER_IS_BETTER else scalar
+        pct = 100.0 * degradation / denom
         out.append(float(max(pct, lower)))
     return out
-
-
-def _packed_drop_1based_odd_rows_reindex(packed: List[float], num_layers: int) -> Tuple[List[float], int]:
-    """Drop 1-based odd layer rows (0-based even i); reindex kept layers to 0..L'-1."""
-    grid = upper_triangle_unpack_for_heatmap(packed, num_layers, float("nan"))
-    kept = [i for i in range(num_layers) if i % 2 == 1]
-    if not kept:
-        return packed, num_layers
-    lp = len(kept)
-    sub: List[List[float]] = [[float("nan")] * lp for _ in range(lp)]
-    for ii, i_old in enumerate(kept):
-        for jj in range(ii, lp):
-            j_old = kept[jj]
-            sub[ii][jj] = grid[i_old][j_old]
-    out: List[float] = []
-    for ii in range(lp):
-        for jj in range(ii, lp):
-            out.append(float(sub[ii][jj]))
-    return out, lp
 
 
 def _heatmap_rgb_from_packed(
@@ -1642,11 +1765,11 @@ def _heatmap_rgb_from_packed(
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     tick_suffix: str = "",
-    drop_odd_rows: bool = False,
+    cmap: str = "viridis",
     markers: Optional[List[Tuple[int, int, str]]] = None,
+    label_fontsize: Optional[float] = None,
+    tick_fontsize: Optional[float] = None,
 ) -> np.ndarray:
-    if drop_odd_rows:
-        packed, num_layers = _packed_drop_1based_odd_rows_reindex(packed, num_layers)
     grid = upper_triangle_unpack_for_heatmap(packed, num_layers, fill_value)
     arr = np.asarray(grid, dtype=np.float64)
     finite_vals = arr[np.isfinite(arr)]
@@ -1654,19 +1777,31 @@ def _heatmap_rgb_from_packed(
         arr = np.ma.masked_invalid(arr)
 
     title_fs, label_fs, tick_fs = 18, 16, 14
+    if label_fontsize is not None:
+        label_fs = float(label_fontsize)
+    if tick_fontsize is not None:
+        tick_fs = float(tick_fontsize)
     fig, ax = plt.subplots(figsize=(9, 8))
-    imshow_kw: Dict[str, Any] = {"cmap": "viridis"}
+    imshow_kw: Dict[str, Any] = {"cmap": cmap}
     if vmin is not None:
         imshow_kw["vmin"] = vmin
     if vmax is not None:
         imshow_kw["vmax"] = vmax
-    im = ax.imshow(arr, **imshow_kw)
-    ax.set_title(title, fontsize=title_fs, fontweight="bold", pad=12)
-    ax.set_xlabel("layer j", fontsize=label_fs, fontweight="bold")
-    ax.set_ylabel("layer i", fontsize=label_fs, fontweight="bold")
-    ax.tick_params(axis="both", which="major", labelsize=tick_fs, width=2.0, length=6)
-    for lb in ax.get_xticklabels() + ax.get_yticklabels():
-        lb.set_fontweight("bold")
+    im = imshow_upper_triangle(ax, arr, num_layers, **imshow_kw)
+    if str(title or "").strip():
+        ax.set_title(title, fontsize=title_fs, fontweight="bold", pad=12)
+    configure_triangle_axes(
+        ax,
+        num_layers,
+        index_name="layer",
+        label_fontsize=label_fs,
+        label_fontweight="bold",
+        tick_fontsize=tick_fs,
+        tick_width=2.0,
+        tick_length=6,
+        bold_tick_labels=True,
+        use_major_locator=True,
+    )
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.ax.tick_params(labelsize=tick_fs, width=2.0, length=6)
     for lb in cbar.ax.get_yticklabels():
@@ -1680,7 +1815,8 @@ def _heatmap_rgb_from_packed(
         }
         for (mi, mj, tag) in markers:
             kw = style_map.get(str(tag), style_map["0"])
-            ax.scatter([int(mj)], [int(mi)], **kw)
+            x, y = triangle_xy(mi, mj)
+            ax.scatter([x], [y], **kw)
     data_min = float(vmin) if vmin is not None else (float(finite_vals.min()) if finite_vals.size else None)
     data_max = float(vmax) if vmax is not None else (float(finite_vals.max()) if finite_vals.size else None)
     if data_min is not None and data_max is not None:
@@ -1764,6 +1900,63 @@ def _packed_elementwise_min(packs: Sequence[List[float]]) -> List[float]:
     return out
 
 
+def _packed_elementwise_mean(packs: Sequence[List[float]]) -> List[float]:
+    if not packs:
+        return []
+    length = max(len(p) for p in packs)
+    out: List[float] = []
+    for idx in range(length):
+        vals: List[float] = []
+        for packed in packs:
+            if idx >= len(packed):
+                continue
+            scalar = float(packed[idx])
+            if math.isnan(scalar):
+                continue
+            vals.append(scalar)
+        out.append(float(sum(vals) / len(vals)) if vals else float("nan"))
+    return out
+
+
+def _similarity_maps_with_token_aggregations(
+    similarity_by_mode: Dict[str, Dict[str, Dict[str, List[float]]]],
+) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
+    """Add token-region mean/min maps using the shared aggregation exclusions."""
+    out: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
+    for mode, raw_entry in similarity_by_mode.items():
+        entry = {str(region): dict(metric_map) for region, metric_map in raw_entry.items()}
+        available_regions = [
+            region
+            for region in REDUNDANCY_GRAPH_REGIONS
+            if _similarity_region_has_data(entry, region)
+        ]
+        aggregate_regions = regions_for_aggregation(
+            available_regions,
+            exclude_token_regions=DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS,
+        )
+        metric_keys = {
+            metric_key
+            for region in aggregate_regions
+            for metric_key in entry.get(region, {}).keys()
+        }
+        mean_map: Dict[str, List[float]] = {}
+        min_map: Dict[str, List[float]] = {}
+        for metric_key in metric_keys:
+            packs = [
+                entry[region][metric_key]
+                for region in aggregate_regions
+                if metric_key in entry.get(region, {})
+            ]
+            if packs:
+                mean_map[metric_key] = _packed_elementwise_mean(packs)
+                min_map[metric_key] = _packed_elementwise_min(packs)
+        if mean_map:
+            entry[STAGE2_TOKEN_ROW_MEAN] = mean_map
+            entry[STAGE2_TOKEN_ROW_MIN] = min_map
+        out[str(mode)] = entry
+    return out
+
+
 def _similarity_packed_cutoff_01(
     packed: List[float],
     sim_cutoff: float,
@@ -1781,20 +1974,39 @@ def _similarity_packed_cutoff_01(
     return out
 
 
+def _signed_packed_cutoff(
+    packed: List[float],
+    cutoff_value: float,
+) -> List[float]:
+    """Zero values close to zero while preserving significant values of either sign."""
+    cutoff = float(np.clip(cutoff_value, 0.0, 1.0))
+    if cutoff <= 0.0:
+        return packed
+    out: List[float] = []
+    for value in packed:
+        scalar = float(value)
+        if math.isnan(scalar):
+            out.append(float("nan"))
+            continue
+        out.append(0.0 if abs(scalar) < cutoff else scalar)
+    return out
+
+
 def _similarity_metric_entries(similarity_upper: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Metrics present in this report (subset of :data:`SIMILARITY_METRICS`)."""
     available = {str(k) for k in similarity_upper.keys()}
     return [(k, label) for k, label in SIMILARITY_METRICS if k in available]
 
 
-def _build_cross_dataset_min_similarity_all(
+def _build_cross_dataset_similarity_all(
     controller: PairAttentionController,
     mode_order: List[str],
     *,
     sim_gamma: float,
     sim_cutoff: float,
+    aggregate: str,
 ) -> Dict[str, Dict[str, List[float]]]:
-    """Per skip mode: all-token similarity packed vectors = element-wise min over real datasets (scene mean)."""
+    """Per skip mode: all-token similarity packed vectors aggregated over real datasets (scene mean)."""
     per_dataset_maps: List[Dict[str, Dict[str, Dict[str, List[float]]]]] = []
     for ds in getattr(controller, "stage2_real_datasets", []):
         report = controller.get_similarity_report_for_dataset(ds, "mean")
@@ -1804,6 +2016,8 @@ def _build_cross_dataset_min_similarity_all(
 
     if not per_dataset_maps:
         return {}
+    agg_key = str(aggregate or STAGE2_MIN_DATASET).strip().lower()
+    reducer = _packed_elementwise_mean if agg_key == STAGE2_MEAN_DATASET else _packed_elementwise_min
 
     out: Dict[str, Dict[str, List[float]]] = {}
     for mode in mode_order:
@@ -1823,8 +2037,25 @@ def _build_cross_dataset_min_similarity_all(
                         processed = _similarity_packed_cutoff_01(processed, sim_cutoff)
                 metric_packs.setdefault(str(metric_key), []).append(processed)
         if metric_packs:
-            out[mode] = {k: _packed_elementwise_min(v) for k, v in metric_packs.items()}
+            out[mode] = {k: reducer(v) for k, v in metric_packs.items()}
     return out
+
+
+def _build_cross_dataset_min_similarity_all(
+    controller: PairAttentionController,
+    mode_order: List[str],
+    *,
+    sim_gamma: float,
+    sim_cutoff: float,
+) -> Dict[str, Dict[str, List[float]]]:
+    """Backward-compatible wrapper for the virtual ``min`` dataset."""
+    return _build_cross_dataset_similarity_all(
+        controller,
+        mode_order,
+        sim_gamma=sim_gamma,
+        sim_cutoff=sim_cutoff,
+        aggregate=STAGE2_MIN_DATASET,
+    )
 
 
 def _metric_entries_for_similarity_maps(
@@ -1847,7 +2078,6 @@ def _render_similarity_gallery(
     sim_gamma: float,
     sim_cutoff: float,
     metric_entries: Optional[List[Tuple[str, str]]] = None,
-    drop_odd_rows: bool = False,
     prune_overlay: bool = False,
     prune_metric_key: str = "cka",
     prune_n: int = 2,
@@ -1861,7 +2091,7 @@ def _render_similarity_gallery(
 
     overlay_markers: Optional[List[Tuple[int, int, str]]] = None
     prune_key = str(prune_metric_key or "").strip().lower()
-    if prune_overlay and not drop_odd_rows and prune_key in {"cka", "cosine"}:
+    if prune_overlay and prune_key in {"cka", "cosine"}:
         packed_for_prune = _coerce_packed(similarity_upper.get(prune_key))
         if packed_for_prune is not None:
             processed = list(packed_for_prune)
@@ -1881,7 +2111,7 @@ def _render_similarity_gallery(
                     v = grid[i][j]
                     if v == v:
                         sim_mat[i, j] = float(v)
-            from analysis.redundancy.triangle_prune import greedy_dense_triangles
+            from analysis.prune_plan.triangle_prune import greedy_dense_triangles
 
             picks, _ = greedy_dense_triangles(
                 sim_mat,
@@ -1909,11 +2139,150 @@ def _render_similarity_gallery(
                 f"{tag}·{metric_label}",
                 vmin=vmin,
                 vmax=vmax,
-                drop_odd_rows=drop_odd_rows,
                 markers=markers,
             )
         )
     return images
+
+
+_CKA_TOKEN_REGION_ORDER: Tuple[str, ...] = ("camera", "special", "all", "patch", "mean", "min")
+
+
+def _discover_cka_token_regions(
+    controller: PairAttentionController,
+    datasets: Sequence[str],
+    models: Sequence[str],
+) -> List[str]:
+    seen: set[str] = set()
+    discovered: List[str] = []
+
+    for dataset in datasets:
+        for backbone in models:
+            report_entry = controller.get_similarity_report_for_dataset(
+                str(dataset),
+                "mean",
+                backbone=str(backbone),
+            )
+            if report_entry is None:
+                continue
+            similarity_by_mode = _extract_similarity_metric_maps_by_mode(report_entry.report)
+            for mode_maps in similarity_by_mode.values():
+                if not isinstance(mode_maps, dict):
+                    continue
+                for region_name, region_map in mode_maps.items():
+                    key = str(region_name or "").strip().lower()
+                    if not key or key in seen:
+                        continue
+                    if not isinstance(region_map, dict):
+                        continue
+                    if _coerce_packed(region_map.get("cka")) is None:
+                        continue
+                    seen.add(key)
+                    discovered.append(key)
+
+    def _sort_key(name: str) -> Tuple[int, str]:
+        try:
+            return (_CKA_TOKEN_REGION_ORDER.index(name), name)
+        except ValueError:
+            return (len(_CKA_TOKEN_REGION_ORDER), name)
+
+    discovered = sorted(discovered, key=_sort_key)
+    if discovered:
+        for agg in ("mean", "min"):
+            if agg not in discovered:
+                discovered.append(agg)
+        discovered = sorted(discovered, key=_sort_key)
+    return discovered
+
+
+def _normalize_cka_exclude_token_regions(values: Sequence[str] | None) -> Tuple[str, ...]:
+    if not values:
+        return ()
+    return tuple(
+        sorted(
+            {
+                str(value).strip().lower()
+                for value in values
+                if str(value).strip().lower() in REDUNDANCY_GRAPH_REGIONS
+            }
+        )
+    )
+
+
+def _cka_detail_from_provenance(provenance: Dict[str, object]) -> str:
+    dataset_sel = str(provenance.get("dataset_selector", "") or "")
+    token_sel = str(provenance.get("token_region_selector", "") or "")
+    datasets = provenance.get("datasets", [])
+    excluded = provenance.get("excluded_token_regions", [])
+    regions_by_dataset = provenance.get("token_regions_by_dataset", {})
+    used_regions = sorted(
+        {
+            str(region)
+            for region_list in regions_by_dataset.values()
+            if isinstance(region_list, list)
+            for region in region_list
+        }
+    )
+    parts = [f"dataset={dataset_sel}", f"token={token_sel}"]
+    if used_regions:
+        parts.append(f"regions={','.join(used_regions)}")
+    if excluded:
+        parts.append(f"exclude={','.join(str(region) for region in excluded)}")
+    if isinstance(datasets, list) and datasets:
+        parts.append(f"datasets={','.join(str(dataset) for dataset in datasets)}")
+    return " | ".join(parts)
+
+
+def _render_cka_heatmap_from_packed(
+    packed: List[float],
+    *,
+    num_layers: int,
+    sim_cutoff: float,
+) -> np.ndarray:
+    cutoff = float(np.clip(float(sim_cutoff), 0.0, 1.0))
+    if cutoff > 0.0:
+        packed = _similarity_packed_cutoff_01(packed, cutoff)
+    return _heatmap_rgb_from_packed(
+        packed,
+        num_layers,
+        "",
+        vmin=0.0,
+        vmax=1.0,
+        label_fontsize=22,
+        tick_fontsize=20,
+    )
+
+
+def _render_cka_heatmap_for_backbone(
+    *,
+    backbone: str,
+    dataset: str,
+    token_region: str,
+    sim_cutoff: float,
+    exclude_token_regions: Sequence[str] = (),
+) -> Tuple[Optional[np.ndarray], str]:
+    region_key = str(token_region or "").strip().lower()
+    exclude_regions = _normalize_cka_exclude_token_regions(exclude_token_regions)
+    try:
+        unit_ids, sim, provenance = load_similarity(
+            experiment=str(backbone),
+            dataset=str(dataset),
+            token_region=region_key,
+            metric="cka",
+            exclude_token_regions=exclude_regions,
+        )
+    except FileNotFoundError as exc:
+        return None, str(exc)
+    except (KeyError, ValueError) as exc:
+        return None, str(exc)
+
+    packed = upper_triangle_pack(torch.from_numpy(sim))
+    image = _render_cka_heatmap_from_packed(
+        packed,
+        num_layers=len(unit_ids),
+        sim_cutoff=sim_cutoff,
+    )
+    return image, _cka_detail_from_provenance(provenance)
 
 
 def _render_skip_gallery(
@@ -1922,22 +2291,34 @@ def _render_skip_gallery(
     metrics: List[Tuple[str, str]],
     *,
     value_mode: str,
+    sim_cutoff: float = 0.0,
 ) -> List[np.ndarray]:
     images: List[np.ndarray] = []
     for metric_key, metric_label in metrics:
         packed = skip_metric_map.get(metric_key)
         if packed is None:
             continue
+        degradation_packed = (
+            [-float(value) for value in packed]
+            if value_mode == "absolute" and metric_key in SKIP_HIGHER_IS_BETTER
+            else packed
+        )
+        if sim_cutoff > 0.0:
+            degradation_packed = _signed_packed_cutoff(
+                degradation_packed,
+                sim_cutoff,
+            )
         if value_mode == "pct":
-            title = f"{metric_label} %"
+            title = f"{metric_label} degradation %"
         else:
-            title = metric_label
+            title = f"{metric_label} degradation Δ"
         images.append(
             _heatmap_rgb_from_packed(
-                packed,
+                degradation_packed,
                 num_layers,
                 title,
                 tick_suffix="%" if value_mode == "pct" else "",
+                cmap="viridis_r",
             )
         )
     return images
@@ -2101,6 +2482,7 @@ def _build_stage2_skip_maps(
                 pct_metric_map[metric_key] = _packed_delta_to_pct(
                     packed,
                     baseline,
+                    metric_key=metric_key,
                     clip_percent=pct_clip_percent,
                 )
             if pct_metric_map:
@@ -2127,6 +2509,7 @@ def _build_stage2_skip_maps(
             pct_metric_map[metric_key] = _packed_delta_to_pct(
                 packed,
                 float(baseline_row[metric_key]),
+                metric_key=metric_key,
                 clip_percent=pct_clip_percent,
             )
         if pct_metric_map:
@@ -2195,7 +2578,7 @@ def _stage2_prune_status_text(
             v = grid[i][j]
             if v == v:
                 sim_mat[i, j] = float(v)
-    from analysis.redundancy.triangle_prune import greedy_dense_triangles
+    from analysis.prune_plan.triangle_prune import greedy_dense_triangles
 
     picks, _ = greedy_dense_triangles(
         sim_mat,
@@ -2230,8 +2613,9 @@ def _prepare_stage2_render(
     prune_metric_key: str = "cka",
     prune_n: int = 2,
 ) -> Tuple[Dict[str, List[np.ndarray]], str, str]:
-    min_view = controller.dataset == STAGE2_MIN_DATASET
-    if min_view:
+    virtual_dataset = str(controller.dataset).strip().lower() if _is_stage2_virtual_dataset(controller.dataset) else ""
+    virtual_view = bool(virtual_dataset)
+    if virtual_view:
         scene_id = "mean"
 
     clip_key = int(round(float(np.clip(pct_clip_percent, 0.0, 100.0))))
@@ -2245,7 +2629,7 @@ def _prepare_stage2_render(
         prune_n=prune_n_i,
         sim_cutoff=sim_cutoff,
     )
-    cache_key = (scene_id, value_mode, clip_key, gamma_key, cutoff_key, min_view, *prune_sig)
+    cache_key = (scene_id, value_mode, clip_key, gamma_key, cutoff_key, virtual_dataset, *prune_sig)
     cached = controller.stage2_render_cache.get(cache_key)
     if cached is not None:
         galleries = dict(cached[0])
@@ -2265,48 +2649,54 @@ def _prepare_stage2_render(
 
     num_layers = int(controller.resolve_stage2_num_layers(scene_id))
     if num_layers <= 0:
-        label = "dataset=min (mean)" if min_view else scene_id
+        label = f"dataset={virtual_dataset} (mean)" if virtual_view else scene_id
         raise gr.Error(f"No similarity report with num_layers found for {label!r}.")
 
-    min_all_by_mode: Dict[str, Dict[str, List[float]]] = {}
-    if min_view:
-        if not controller.has_cross_dataset_min_similarity():
+    virtual_all_by_mode: Dict[str, Dict[str, List[float]]] = {}
+    if virtual_view:
+        if not controller.has_cross_dataset_similarity():
             ds_list = list(getattr(controller, "stage2_real_datasets", []))
             raise gr.Error(
-                "Dataset min needs full_report_similarity.json (mean) under each of "
+                f"Dataset {virtual_dataset} needs full_report_similarity.json (mean) under each of "
                 f"{', '.join(ds_list) if ds_list else '<no datasets discovered>'}."
             )
-        min_all_by_mode = _build_cross_dataset_min_similarity_all(
+        virtual_all_by_mode = _build_cross_dataset_similarity_all(
             controller,
             mode_order,
             sim_gamma=sim_gamma,
             sim_cutoff=sim_cutoff,
+            aggregate=virtual_dataset,
         )
         similarity_report = None
         similarity_by_mode = {}
         skip_by_mode: Dict[str, Dict[str, List[float]]] = {}
+        op_label = "element-wise mean" if virtual_dataset == STAGE2_MEAN_DATASET else "element-wise min"
         skip_source = (
-            "min view: element-wise min of all-token similarity (mean) over "
+            f"{virtual_dataset} view: {op_label} of all-token similarity (mean) over "
             + ", ".join(list(getattr(controller, "stage2_real_datasets", [])))
         )
     else:
         similarity_report = controller.get_similarity_report(scene_id)
         similarity_by_mode = {}
         if similarity_report is not None:
-            similarity_by_mode = _extract_similarity_metric_maps_by_mode(similarity_report.report)
+            similarity_by_mode = _similarity_maps_with_token_aggregations(
+                _extract_similarity_metric_maps_by_mode(similarity_report.report)
+            )
         skip_by_mode, skip_source = _build_stage2_skip_maps(controller, scene_id, value_mode, float(clip_key))
 
+    missing_similarity_notes: List[str] = []
     for mode in mode_order:
-        skip_main, sim_special, skip_depth, sim_patch, sim_all, sim_all_odd = _stage2_block_keys_for_mode(mode)
-        if not min_view and skip_main in target_blocks and skip_main not in galleries:
+        skip_main, skip_depth, skip_point, sim_special, sim_camera, sim_patch, sim_all, sim_mean, sim_min = _stage2_block_keys_for_mode(mode)
+        if not virtual_view and skip_main in target_blocks and skip_main not in galleries:
             galleries[skip_main] = _render_skip_gallery(
                 skip_by_mode.get(mode, {}),
                 num_layers,
                 SKIP_MAIN_METRICS,
                 value_mode=value_mode,
+                sim_cutoff=sim_cutoff,
             )
-        if min_view:
-            all_maps = min_all_by_mode.get(mode, {})
+        if virtual_view:
+            all_maps = virtual_all_by_mode.get(mode, {})
             if not all_maps:
                 continue
             sim_entry = {"all": all_maps, "special": {}, "patch": {}}
@@ -2318,7 +2708,16 @@ def _prepare_stage2_render(
             sim_entry.get("all", {}),
             report_metrics=report_metrics,
         )
-        if not min_view and sim_special in target_blocks and sim_special not in galleries:
+        if not virtual_view and sim_special in target_blocks and sim_special not in galleries:
+            if not _similarity_region_has_data(sim_entry, "special"):
+                missing_similarity_notes.append(
+                    _missing_similarity_region_note(
+                        controller,
+                        scene_id=scene_id,
+                        mode=mode,
+                        region="special",
+                    )
+                )
             galleries[sim_special] = _render_similarity_gallery(
                 sim_entry.get("special", {}),
                 num_layers,
@@ -2326,14 +2725,49 @@ def _prepare_stage2_render(
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
             )
-        if not min_view and skip_depth in target_blocks and skip_depth not in galleries:
+        if not virtual_view and sim_camera in target_blocks and sim_camera not in galleries:
+            if not _similarity_region_has_data(sim_entry, "camera"):
+                missing_similarity_notes.append(
+                    _missing_similarity_region_note(
+                        controller,
+                        scene_id=scene_id,
+                        mode=mode,
+                        region="camera",
+                    )
+                )
+            galleries[sim_camera] = _render_similarity_gallery(
+                sim_entry.get("camera", {}),
+                num_layers,
+                role_short="C",
+                sim_gamma=sim_gamma,
+                sim_cutoff=sim_cutoff,
+            )
+        if not virtual_view and skip_depth in target_blocks and skip_depth not in galleries:
             galleries[skip_depth] = _render_skip_gallery(
                 skip_by_mode.get(mode, {}),
                 num_layers,
                 SKIP_DEPTH_METRICS,
                 value_mode=value_mode,
+                sim_cutoff=sim_cutoff,
             )
-        if not min_view and sim_patch in target_blocks and sim_patch not in galleries:
+        if not virtual_view and skip_point in target_blocks and skip_point not in galleries:
+            galleries[skip_point] = _render_skip_gallery(
+                skip_by_mode.get(mode, {}),
+                num_layers,
+                SKIP_POINT_METRICS,
+                value_mode=value_mode,
+                sim_cutoff=sim_cutoff,
+            )
+        if not virtual_view and sim_patch in target_blocks and sim_patch not in galleries:
+            if not _similarity_region_has_data(sim_entry, "patch"):
+                missing_similarity_notes.append(
+                    _missing_similarity_region_note(
+                        controller,
+                        scene_id=scene_id,
+                        mode=mode,
+                        region="patch",
+                    )
+                )
             galleries[sim_patch] = _render_similarity_gallery(
                 sim_entry.get("patch", {}),
                 num_layers,
@@ -2343,6 +2777,15 @@ def _prepare_stage2_render(
             )
         if sim_all in target_blocks and (sim_all not in galleries or bool(prune_overlay)):
             sim_all_maps = sim_entry.get("all", {})
+            if not _similarity_region_has_data(sim_entry, "all"):
+                missing_similarity_notes.append(
+                    _missing_similarity_region_note(
+                        controller,
+                        scene_id=scene_id,
+                        mode=mode,
+                        region="all",
+                    )
+                )
             galleries[sim_all] = _render_similarity_gallery(
                 sim_all_maps,
                 num_layers,
@@ -2364,22 +2807,27 @@ def _prepare_stage2_render(
                     prune_n=prune_n_i,
                     prune_overlay=bool(prune_overlay),
                 )
-        if sim_all_odd in target_blocks and sim_all_odd not in galleries:
-            galleries[sim_all_odd] = _render_similarity_gallery(
-                sim_entry.get("all", {}),
+        if not virtual_view and sim_mean in target_blocks and sim_mean not in galleries:
+            galleries[sim_mean] = _render_similarity_gallery(
+                sim_entry.get("mean", {}),
                 num_layers,
-                role_short="A",
+                role_short="μ",
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
-                metric_entries=metric_entries,
-                drop_odd_rows=True,
             )
-
+        if not virtual_view and sim_min in target_blocks and sim_min not in galleries:
+            galleries[sim_min] = _render_similarity_gallery(
+                sim_entry.get("min", {}),
+                num_layers,
+                role_short="m",
+                sim_gamma=sim_gamma,
+                sim_cutoff=sim_cutoff,
+            )
     rendered = len(galleries)
     total = len(all_blocks)
-    if min_view:
+    if virtual_view:
         info = (
-            f"dataset=min | scene=mean | rendered={rendered}/{total} blocks | {skip_source} | "
+            f"dataset={virtual_dataset} | scene=mean | rendered={rendered}/{total} blocks | {skip_source} | "
             f"pct_clip={clip_key}%"
         )
     else:
@@ -2390,16 +2838,32 @@ def _prepare_stage2_render(
         info += f" | sim_cutoff={cutoff_key / 1000.0:.3f}"
     if bool(prune_overlay):
         info += f" | prune_metric={prune_metric} n={prune_n_i}"
+    if missing_similarity_notes:
+        unique_notes = list(dict.fromkeys(missing_similarity_notes))
+        info += " | " + " ; ".join(unique_notes[:4])
+        if len(unique_notes) > 4:
+            info += f" ; +{len(unique_notes) - 4} more missing similarity rows"
     controller.stage2_render_cache[cache_key] = (galleries, info, prune_status)
     return galleries, info, prune_status
 
 
 def _stage2_modes_for_controller(controller: PairAttentionController) -> List[str]:
-    if controller.dataset == STAGE2_MIN_DATASET:
+    if _is_stage2_virtual_dataset(controller.dataset):
         modes = controller.union_stage2_modes(getattr(controller, "stage2_real_datasets", []))
         if modes:
             return modes
     return _discover_stage2_modes(controller.similarity_reports, controller.skip_reports)
+
+
+def _preferred_stage2_scene(
+    controller: PairAttentionController,
+    scene_ids: Sequence[str],
+) -> Optional[str]:
+    """Prefer a concrete scene with skip data so the Δ controls are useful immediately."""
+    for scene_id in scene_ids:
+        if scene_id != "mean" and controller.get_skip_report(scene_id) is not None:
+            return str(scene_id)
+    return str(scene_ids[0]) if scene_ids else None
 
 
 def _build_ui(controller: PairAttentionController) -> gr.Blocks:
@@ -2409,7 +2873,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     # This prevents "only-cache" datasets (e.g. scannet_test50) from showing up
     # and from participating in "min" computations.
     controller.stage2_real_datasets = list(stage2_real)  # type: ignore[attr-defined]
-    dataset_choices = [STAGE2_MIN_DATASET, *stage2_real]
+    dataset_choices = [STAGE2_MIN_DATASET, STAGE2_MEAN_DATASET, *stage2_real]
     if controller.dataset not in dataset_choices:
         if stage2_real:
             controller.switch_dataset(stage2_real[0])
@@ -2428,10 +2892,22 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     # initial_frame_a = 0
     # initial_frame_b = min(1, len(frame_labels) - 1) if frame_labels else 0
     stage2_modes_all = controller.union_stage2_modes(stage2_real)
-    n_stage2_galleries = 6 * len(stage2_modes_all)
+    n_stage2_galleries = 9 * len(stage2_modes_all)
+    cka_models = list(controller.v3_backbones) if controller.v3_mode else []
+    cka_datasets = (
+        _discover_v3_dataset_tags_across_backbones(controller.v3_output_root, cka_models)
+        if cka_models
+        else list(stage2_real)
+    )
+    cka_token_regions = (
+        _discover_cka_token_regions(controller, cka_datasets, cka_models)
+        if cka_models and cka_datasets
+        else []
+    )
     lora_root = controller.lora_root
     stage2_last_render_key: Dict[str, Any] = {"cache_key": None}
     dataset_switch_output_len: Dict[str, int] = {"count": 0}
+    cka_render_cache: Dict[Tuple[Any, ...], Optional[np.ndarray]] = {}
 
     def _empty_stage2_visual_updates() -> Tuple[Any, ...]:
         gal = tuple(gr.update(value=[]) for _ in range(n_stage2_galleries))
@@ -2484,11 +2960,11 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             prune_n=prune_n_i,
             sim_cutoff=sim_cutoff,
         )
-        if controller.dataset == STAGE2_MIN_DATASET:
+        if _is_stage2_virtual_dataset(controller.dataset):
             scene_id = "mean"
         if not scene_id:
             stage2_last_render_key["cache_key"] = None
-            vm, m_val, t_val, choices_vm, has_skip, has_sim, pct_ok = _heatmaps_resolve_filters(
+            vm, m_val, t_val, choices_vm, token_choices, has_skip, has_sim, pct_ok = _heatmaps_resolve_filters(
                 controller,
                 None,
                 str(value_mode or "absolute"),
@@ -2502,6 +2978,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 sim_gamma,
                 sim_cutoff,
                 choices_vm,
+                token_choices,
                 has_skip,
                 has_sim,
                 pct_ok,
@@ -2511,7 +2988,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 return _stage2_noop_updates()
             return (*_empty_stage2_visual_updates(), *ctrl)
 
-        vm, m_val, t_val, choices_vm, has_skip, has_sim, pct_ok = _heatmaps_resolve_filters(
+        vm, m_val, t_val, choices_vm, token_choices, has_skip, has_sim, pct_ok = _heatmaps_resolve_filters(
             controller,
             scene_id,
             str(value_mode or "absolute"),
@@ -2520,12 +2997,44 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         )
         current_modes = _stage2_modes_for_controller(controller)
         selected_modes = list(current_modes)
+        if _is_stage2_virtual_dataset(controller.dataset):
+            skip_modes: set[str] = set()
+            similarity_regions_by_mode = {mode: {"all"} for mode in current_modes}
+        else:
+            skip_report = controller.get_skip_report(str(scene_id))
+            skip_modes = set(
+                _extract_skip_metric_maps_by_mode(skip_report.report).keys()
+                if skip_report is not None
+                else []
+            )
+            similarity_report = controller.get_similarity_report(str(scene_id))
+            similarity_by_mode = (
+                _similarity_maps_with_token_aggregations(
+                    _extract_similarity_metric_maps_by_mode(similarity_report.report)
+                )
+                if similarity_report is not None
+                else {}
+            )
+            similarity_regions_by_mode: Dict[str, set[str]] = {}
+            default_regions = {
+                region
+                for region in STAGE2_TOKEN_ROW_ORDER
+                if _similarity_region_has_data(similarity_by_mode.get("default", {}), region)
+            }
+            for mode in current_modes:
+                entry = similarity_by_mode.get(mode, {})
+                regions = {
+                    region
+                    for region in STAGE2_TOKEN_ROW_ORDER
+                    if _similarity_region_has_data(entry, region)
+                }
+                similarity_regions_by_mode[mode] = regions or set(default_regions)
 
         clip_key = int(round(float(np.clip(float(pct_clip_percent), 0.0, 100.0))))
         gamma_key = _sim_gamma_key(sim_gamma)
         cutoff_key = _sim_cutoff_key(sim_cutoff)
-        min_view = controller.dataset == STAGE2_MIN_DATASET
-        cache_key = (str(scene_id), vm, clip_key, gamma_key, cutoff_key, min_view, *prune_sig)
+        virtual_dataset = str(controller.dataset).strip().lower() if _is_stage2_virtual_dataset(controller.dataset) else ""
+        cache_key = (str(scene_id), vm, clip_key, gamma_key, cutoff_key, virtual_dataset, *prune_sig)
         prune_sig_changed = stage2_last_render_key.get("prune_sig") != prune_sig
         force_updates = (
             force_gallery_refresh
@@ -2534,7 +3043,14 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         )
         cached_before = controller.stage2_render_cache.get(cache_key)
         before_keys = set(cached_before[0].keys()) if cached_before is not None else set()
-        requested_blocks = _stage2_requested_block_keys(stage2_modes_all, selected_modes, m_val, t_val)
+        requested_blocks = _stage2_requested_block_keys(
+            stage2_modes_all,
+            selected_modes,
+            m_val,
+            t_val,
+            skip_modes,
+            similarity_regions_by_mode,
+        )
         galleries, details, prune_status_text = _prepare_stage2_render(
             controller,
             scene_id,
@@ -2569,6 +3085,8 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             selected_modes,
             m_val,
             t_val,
+            skip_modes,
+            similarity_regions_by_mode,
         )
         vis_updates = [gr.update(visible=bool(v)) for v in vis_flags]
         vm_changed = vm != str(value_mode or "absolute")
@@ -2587,6 +3105,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             sim_gamma,
                 sim_cutoff,
             choices_vm,
+            token_choices,
             has_skip,
             has_sim,
             pct_ok,
@@ -2725,13 +3244,13 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         ds_key = str(dataset).strip().lower()
         if ds_key != controller.dataset:
             controller.switch_dataset(dataset)
-        min_view = controller.dataset == STAGE2_MIN_DATASET
-        if min_view:
+        virtual_view = _is_stage2_virtual_dataset(controller.dataset)
+        if virtual_view:
             stage2_scene_ids_new = ["mean"]
             initial_stage2_scene_new = "mean"
         else:
             stage2_scene_ids_new = controller.stage2_scene_ids()
-            initial_stage2_scene_new = stage2_scene_ids_new[0] if stage2_scene_ids_new else None
+            initial_stage2_scene_new = _preferred_stage2_scene(controller, stage2_scene_ids_new)
         tup_hm = _stage2_visual_bundle(
             initial_stage2_scene_new,
             str(cur_value_mode or "absolute"),
@@ -2757,7 +3276,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             gr.update(
                 choices=stage2_scene_ids_new,
                 value=initial_stage2_scene_new,
-                interactive=not min_view,
+                interactive=not virtual_view,
             ),
             *hm_main,
             hm_prune_status,
@@ -2796,6 +3315,84 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             request_seq=request_seq,
             force_gallery_refresh=False,
         )
+
+    def _refresh_cka_heatmaps(
+        token_region: str,
+        sim_cutoff_value: float,
+        exclude_token_regions: List[str] | None,
+    ) -> Tuple[Any, ...]:
+        region = str(token_region or "").strip().lower()
+        if region not in set(cka_token_regions):
+            region = cka_token_regions[0] if cka_token_regions else "special"
+        exclude_regions = _normalize_cka_exclude_token_regions(exclude_token_regions)
+        try:
+            sim_cutoff = float(sim_cutoff_value)
+        except (TypeError, ValueError):
+            sim_cutoff = 0.0
+        if not math.isfinite(sim_cutoff):
+            sim_cutoff = 0.0
+        sim_cutoff = float(np.clip(sim_cutoff, 0.0, 1.0))
+        cutoff_key = _sim_cutoff_key(sim_cutoff)
+
+        images: List[Any] = []
+        notes: List[str] = []
+        rendered = 0
+        dataset_total = len(cka_datasets) * len(cka_models)
+        row_mean_total = len(cka_models)
+        display_total = dataset_total + row_mean_total
+        for backbone in cka_models:
+            for dataset in cka_datasets:
+                cache_key = (str(dataset), str(backbone), region, cutoff_key, exclude_regions)
+                if cache_key in cka_render_cache:
+                    image = cka_render_cache[cache_key]
+                    detail = "cached" if image is not None else "missing"
+                else:
+                    image, detail = _render_cka_heatmap_for_backbone(
+                        dataset=str(dataset),
+                        backbone=str(backbone),
+                        token_region=region,
+                        sim_cutoff=sim_cutoff,
+                        exclude_token_regions=exclude_regions,
+                    )
+                    cka_render_cache[cache_key] = image
+                if image is not None:
+                    rendered += 1
+                elif len(notes) < 6:
+                    notes.append(f"{dataset}/{backbone}: {detail}")
+                images.append(image)
+
+            row_mean_cache_key = ("mean", str(backbone), region, cutoff_key, exclude_regions)
+            if row_mean_cache_key in cka_render_cache:
+                row_mean_image = cka_render_cache[row_mean_cache_key]
+                row_mean_detail = "cached" if row_mean_image is not None else "missing"
+            else:
+                row_mean_image, row_mean_detail = _render_cka_heatmap_for_backbone(
+                    dataset="mean",
+                    backbone=str(backbone),
+                    token_region=region,
+                    sim_cutoff=sim_cutoff,
+                    exclude_token_regions=exclude_regions,
+                )
+                cka_render_cache[row_mean_cache_key] = row_mean_image
+            if row_mean_image is not None:
+                rendered += 1
+            elif len(notes) < 6:
+                notes.append(f"mean/{backbone}: {row_mean_detail}")
+            images.append(row_mean_image)
+
+        region_label = region if region != "all" else "all-token"
+        exclude_label = ",".join(exclude_regions) if exclude_regions else "none"
+        info = (
+            f"scene=mean | token={region_label} | metric=CKA | "
+            f"exclude={exclude_label} | "
+            f"rendered={rendered}/{display_total} | cutoff={cutoff_key / 1000.0:.3f}"
+        )
+        if notes:
+            info += " | " + " ; ".join(notes)
+            missing_more = display_total - rendered - len(notes)
+            if missing_more > 0:
+                info += f" ; +{missing_more} more missing cells"
+        return tuple([*images, info])
 
     with gr.Blocks(
         title="Results Panel",
@@ -2865,6 +3462,69 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         .results-gallery .gallery-item {
             width: 100% !important;
         }
+        .lora-eval-gallery.wrap,
+        .lora-training-gallery.wrap {
+            min-height: 0 !important;
+            height: auto !important;
+            overflow: visible !important;
+        }
+        .lora-eval-gallery .grid-wrap,
+        .lora-eval-gallery [class*="grid"],
+        .lora-training-gallery .grid-wrap,
+        .lora-training-gallery [class*="grid"] {
+            min-height: 0 !important;
+            height: auto !important;
+            max-height: none !important;
+            overflow: visible !important;
+            align-content: start !important;
+        }
+        .lora-eval-gallery .thumbnail-item,
+        .lora-eval-gallery .thumbnail-small,
+        .lora-eval-gallery button.thumbnail-item,
+        .lora-eval-gallery button,
+        .lora-training-gallery .thumbnail-item,
+        .lora-training-gallery .thumbnail-small,
+        .lora-training-gallery button.thumbnail-item,
+        .lora-training-gallery button {
+            height: auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            aspect-ratio: auto !important;
+        }
+        .lora-eval-gallery .thumbnail-item > div,
+        .lora-eval-gallery .thumbnail-small > div,
+        .lora-eval-gallery button > div,
+        .lora-eval-gallery [class*="image"],
+        .lora-eval-gallery [class*="preview"],
+        .lora-training-gallery .thumbnail-item > div,
+        .lora-training-gallery .thumbnail-small > div,
+        .lora-training-gallery button > div,
+        .lora-training-gallery [class*="image"],
+        .lora-training-gallery [class*="preview"] {
+            height: auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            aspect-ratio: auto !important;
+        }
+        .lora-eval-gallery .thumbnail-item img,
+        .lora-eval-gallery img,
+        .lora-training-gallery .thumbnail-item img,
+        .lora-training-gallery img {
+            display: block !important;
+            height: auto !important;
+            max-height: none !important;
+            vertical-align: bottom !important;
+        }
+        .lora-eval-gallery [class*="caption"],
+        .lora-eval-gallery figcaption,
+        .lora-eval-gallery .caption-label,
+        .lora-training-gallery [class*="caption"],
+        .lora-training-gallery figcaption,
+        .lora-training-gallery .caption-label {
+            min-height: 0 !important;
+            margin-top: 2px !important;
+            padding-top: 0 !important;
+        }
         .stage2-right {
             gap: 8px !important;
         }
@@ -2894,6 +3554,75 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             max-height: none !important;
             vertical-align: bottom !important;
         }
+        .cka-heatmap-matrix {
+            gap: 8px !important;
+            min-width: 0 !important;
+            overflow-x: hidden !important;
+        }
+        .cka-grid-row,
+        .cka-grid-header {
+            align-items: center !important;
+            flex-wrap: nowrap !important;
+            width: 100% !important;
+            min-width: 0 !important;
+        }
+        .cka-grid-row > *,
+        .cka-grid-header > * {
+            min-width: 0 !important;
+        }
+        .cka-grid-cell,
+        .cka-grid-dataset-label {
+            flex: 1 1 0 !important;
+        }
+        .cka-grid-corner,
+        .cka-grid-model-label {
+            flex: 0 0 96px !important;
+            width: 96px !important;
+        }
+        .cka-grid-model-label {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            text-align: center !important;
+        }
+        .cka-grid-model-label .prose,
+        .cka-grid-model-label p {
+            margin: 0 !important;
+            width: 100% !important;
+            text-align: center !important;
+            font-size: 1.35rem !important;
+            line-height: 1.25 !important;
+        }
+        .cka-grid-dataset-label {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            text-align: center !important;
+        }
+        .cka-grid-dataset-label .prose,
+        .cka-grid-dataset-label p {
+            margin: 0 !important;
+            width: 100% !important;
+            text-align: center !important;
+            font-size: clamp(0.8rem, 1.1vw, 1.1rem) !important;
+            line-height: 1.25 !important;
+            overflow-wrap: anywhere !important;
+        }
+        .cka-heatmap-image {
+            width: 100% !important;
+            min-width: 0 !important;
+        }
+        .cka-heatmap-image img,
+        .cka-heatmap-image [class*="image"] img {
+            display: block !important;
+            height: auto !important;
+            max-height: none !important;
+        }
+        .cka-heatmap-image .label-wrap,
+        .cka-heatmap-image > label,
+        .cka-heatmap-image .image-label {
+            display: none !important;
+        }
         /* Pct radio option: keep visible but non-clickable when Stage1 eval is missing (structure varies by Gradio version). */
         .hm-value-mode-pct-locked .wrap label:last-of-type,
         .hm-value-mode-pct-locked label:last-of-type {
@@ -2901,48 +3630,164 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             pointer-events: none !important;
             cursor: not-allowed !important;
         }
+        .summary-panel {
+            width: 100%;
+        }
+        .summary-table-wrap {
+            width: 100%;
+            overflow: auto;
+            max-height: 78vh;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            background: #ffffff;
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+        }
+        .summary-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            font-size: 14.5px;
+            line-height: 1.45;
+        }
+        .summary-table thead th {
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+            color: #0f172a;
+            font-weight: 600;
+            text-align: left;
+            padding: 10px 12px;
+            border-bottom: 2px solid #cbd5e1;
+            white-space: nowrap;
+        }
+        .summary-table tbody td {
+            padding: 8px 12px;
+            border-bottom: 1px solid #eef2f7;
+            color: #1e293b;
+            vertical-align: middle;
+        }
+        .summary-table tbody tr:nth-child(even) td {
+            background: #fafbfd;
+        }
+        .summary-table tbody tr:hover td {
+            background: #f1f5f9;
+        }
+        .summary-col-dataset {
+            font-weight: 600;
+            color: #0f172a;
+            white-space: nowrap;
+            text-align: center;
+            vertical-align: middle !important;
+        }
+        .summary-col-backbone {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 14px;
+            white-space: nowrap;
+            text-align: center;
+            vertical-align: middle !important;
+        }
+        .summary-col-mode {
+            white-space: nowrap;
+            font-weight: 600;
+        }
+        .summary-mode-upper {
+            color: #0369a1;
+        }
+        .summary-mode-plan {
+            color: #7c3aed;
+        }
+        .summary-na {
+            color: #94a3b8;
+        }
+        .summary-pct {
+            display: inline-block;
+            margin-left: 6px;
+            padding: 1px 6px;
+            border-radius: 999px;
+            font-size: 12.5px;
+            font-weight: 600;
+            background: #f1f5f9;
+            color: #475569;
+        }
+        .summary-pct-up {
+            background: #fef2f2;
+            color: #b91c1c;
+        }
+        .summary-pct-down {
+            background: #ecfdf5;
+            color: #047857;
+        }
+        .summary-empty {
+            padding: 24px;
+            color: #64748b;
+            font-size: 15.5px;
+        }
         """,
     ) as demo:
-        build_lora_tab(
-            blocks=demo,
-            lora_root=Path(lora_root),
-            discover_lora_experiments=_discover_lora_experiments,
-            lora_expected_plot_paths=_lora_expected_plot_paths,
-        )
+        from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT
 
-        # pair_ui = build_pair_tab(
-        #     controller=controller,
-        #     dataset_choices=dataset_choices,
-        #     scene_ids=scene_ids,
-        #     initial_scene=initial_scene,
-        #     num_layers=num_layers,
-        #     num_frames=num_frames,
-        #     frame_labels=frame_labels,
-        #     initial_frame_a=initial_frame_a,
-        #     initial_frame_b=initial_frame_b,
-        #     num_heads=num_heads,
-        #     scene_changed_cb=_scene_changed,
-        #     refresh_outputs_cb=_refresh_outputs,
-        # )
+        with gr.Tabs(selected="eval_summary"):
+            build_cka_heatmaps_tab(
+                datasets=cka_datasets,
+                models=cka_models,
+                token_regions=cka_token_regions,
+                refresh_cka_heatmaps_cb=_refresh_cka_heatmaps,
+            )
 
-        stage2_scene_ids = controller.stage2_scene_ids()
-        initial_stage2_scene = stage2_scene_ids[0] if stage2_scene_ids else None
-        heatmaps_ui = build_heatmaps_tab(
-            controller=controller,
-            dataset_choices=dataset_choices,
-            backbone_choices=controller.v3_backbones if controller.v3_mode else [],
-            initial_backbone=controller.v3_backbone if controller.v3_mode else None,
-            stage2_modes=stage2_modes_all,
-            stage2_scene_ids=stage2_scene_ids,
-            initial_stage2_scene=initial_stage2_scene,
-            stage2_metric_row_pose=STAGE2_METRIC_ROW_POSE,
-            stage2_metric_row_point=STAGE2_METRIC_ROW_POINT,
-            stage2_token_row_special=STAGE2_TOKEN_ROW_SPECIAL,
-            stage2_token_row_patch=STAGE2_TOKEN_ROW_PATCH,
-            stage2_token_row_all=STAGE2_TOKEN_ROW_ALL,
-            heatmaps_resolve_filters_cb=_heatmaps_resolve_filters,
-            refresh_stage2_full_cb=_refresh_stage2_full,
-        )
+            # pair_ui = build_pair_tab(
+            #     controller=controller,
+            #     dataset_choices=dataset_choices,
+            #     scene_ids=scene_ids,
+            #     initial_scene=initial_scene,
+            #     num_layers=num_layers,
+            #     num_frames=num_frames,
+            #     frame_labels=frame_labels,
+            #     initial_frame_a=initial_frame_a,
+            #     initial_frame_b=initial_frame_b,
+            #     num_heads=num_heads,
+            #     scene_changed_cb=_scene_changed,
+            #     refresh_outputs_cb=_refresh_outputs,
+            # )
+
+            stage2_scene_ids = controller.stage2_scene_ids()
+            initial_stage2_scene = _preferred_stage2_scene(controller, stage2_scene_ids)
+            heatmaps_ui = build_heatmaps_tab(
+                controller=controller,
+                dataset_choices=dataset_choices,
+                backbone_choices=controller.v3_backbones if controller.v3_mode else [],
+                initial_backbone=controller.v3_backbone if controller.v3_mode else None,
+                stage2_modes=stage2_modes_all,
+                stage2_scene_ids=stage2_scene_ids,
+                initial_stage2_scene=initial_stage2_scene,
+                stage2_metric_row_pose=STAGE2_METRIC_ROW_POSE,
+                stage2_metric_row_depth=STAGE2_METRIC_ROW_DEPTH,
+                stage2_metric_row_point=STAGE2_METRIC_ROW_POINT,
+                stage2_token_row_special=STAGE2_TOKEN_ROW_SPECIAL,
+                stage2_token_row_camera=STAGE2_TOKEN_ROW_CAMERA,
+                stage2_token_row_patch=STAGE2_TOKEN_ROW_PATCH,
+                stage2_token_row_all=STAGE2_TOKEN_ROW_ALL,
+                stage2_token_row_mean=STAGE2_TOKEN_ROW_MEAN,
+                stage2_token_row_min=STAGE2_TOKEN_ROW_MIN,
+                heatmaps_resolve_filters_cb=_heatmaps_resolve_filters,
+                refresh_stage2_full_cb=_refresh_stage2_full,
+            )
+
+            build_summary_tab(blocks=demo, output_root=OUTPUT_ROOT_DEFAULT, tab_id="eval_summary")
+
+            build_lora_tab(
+                blocks=demo,
+                lora_root=Path(lora_root),
+                discover_lora_runs=_discover_lora_runs,
+                lora_plot_rows=_lora_plot_rows,
+            )
+
+            build_eval_tab(
+                blocks=demo,
+                controller=controller,
+                eval_viser_controller_cls=EvalViserController,
+                load_image_if_exists=_load_image_if_exists,
+            )
 
         dataset_switch_outputs: List[Any] = [
             heatmaps_ui["stage2_dataset_dd"],
@@ -3034,13 +3879,15 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 raise gr.Error("No Stage2 mode available to save prune plan.")
 
             rep = controller.get_similarity_report(str(scene_id))
-            if controller.dataset == STAGE2_MIN_DATASET:
-                # Build min similarity maps as displayed (already includes gamma/cutoff in builder).
-                maps_by_mode = _build_cross_dataset_min_similarity_all(
+            if _is_stage2_virtual_dataset(controller.dataset):
+                virtual_dataset = str(controller.dataset).strip().lower()
+                # Build virtual-dataset similarity maps as displayed (already includes gamma/cutoff in builder).
+                maps_by_mode = _build_cross_dataset_similarity_all(
                     controller,
                     [mode],
                     sim_gamma=float(sim_gamma),
                     sim_cutoff=cutoff,
+                    aggregate=virtual_dataset,
                 )
                 all_map = maps_by_mode.get(mode, {})
                 packed = _coerce_packed(all_map.get(metric))
@@ -3075,7 +3922,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         sim_mat[i, j] = float(v)
 
             from analysis.prune_plan import UnitLoraSpec, UnitPrunePlan, default_prune_plan_root
-            from analysis.redundancy.triangle_prune import build_triangle_prune_actions
+            from analysis.prune_plan.triangle_prune import build_triangle_prune_actions
 
             actions, extra, picks = build_triangle_prune_actions(
                 sim_mat,
@@ -3151,13 +3998,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             inputs=heatmaps_ui["stage2_inputs"],
             outputs=[heatmaps_ui["stage2_prune_status"]],
             show_progress="minimal",
-        )
-
-        build_eval_tab(
-            blocks=demo,
-            controller=controller,
-            eval_viser_controller_cls=EvalViserController,
-            load_image_if_exists=_load_image_if_exists,
         )
 
     return demo

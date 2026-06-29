@@ -1,8 +1,49 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 import gradio as gr
+
+_BACKBONE_ORDER: Tuple[str, ...] = (
+    "vggt",
+    "pi3",
+    "vggt_omega",
+)
+
+_DATASET_ORDER: Tuple[str, ...] = (
+    "min",
+    "mean",
+    "scannet_dev50",
+    "scans_dev50",
+    "scannet_test50",
+    "scans_test50",
+    "7scenes_test",
+    "7scenes",
+    "7scenes_train",
+    "nrgbd",
+    "nuscenes_val",
+    "waymo_validation",
+    "nuscenes_train",
+    "waymo_training",
+)
+
+
+def _backbone_sort_key(name: str) -> Tuple[int, str]:
+    key = str(name or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if key == "vggtomega":
+        key = "vggt_omega"
+    try:
+        return (_BACKBONE_ORDER.index(key), key)
+    except ValueError:
+        return (len(_BACKBONE_ORDER), key)
+
+
+def _dataset_sort_key(name: str) -> Tuple[int, str]:
+    key = str(name or "").strip()
+    try:
+        return (_DATASET_ORDER.index(key), key)
+    except ValueError:
+        return (len(_DATASET_ORDER), key)
 
 
 def build_heatmaps_tab(
@@ -15,46 +56,61 @@ def build_heatmaps_tab(
     stage2_scene_ids: List[str],
     initial_stage2_scene: str | None,
     stage2_metric_row_pose: str,
+    stage2_metric_row_depth: str,
     stage2_metric_row_point: str,
     stage2_token_row_special: str,
+    stage2_token_row_camera: str,
     stage2_token_row_patch: str,
     stage2_token_row_all: str,
+    stage2_token_row_mean: str,
+    stage2_token_row_min: str,
     heatmaps_resolve_filters_cb: Any,
     refresh_stage2_full_cb: Any,
 ) -> Dict[str, Any]:
+    sorted_backbone_choices = sorted([str(x) for x in backbone_choices], key=_backbone_sort_key)
+    sorted_dataset_choices = sorted([str(x) for x in dataset_choices], key=_dataset_sort_key)
+
     with gr.Tab("Heatmaps") as tab_stage2:
         gr.Markdown("## Heatmaps")
         gr.Markdown(
-            "Choose `mean` or a scene. Per skip mode: pose skip Δ -> depth Δ -> **all-token** similarity "
-            "(v3 redundancy; special/patch token rows are disabled). "
+            "Choose `mean` or a scene. Per skip mode: pose/depth/point-cloud degradation plus the token-similarity "
+            "regions actually present in the saved redundancy graphs. "
             "Dataset **`min`**: virtual cross-dataset view (element-wise min of each dataset's `mean` "
             "all-token similarity; Scene locked to `mean`). "
-            "A second row repeats the same metrics but drops 1-based odd layer rows and reindexes "
-            "the remaining layers contiguously (e.g. 0–47 → 0–23). "
+            "Dataset **`mean`**: virtual cross-dataset view (element-wise mean of each dataset's `mean` "
+            "all-token similarity; Scene locked to `mean`). "
             "Use the **left filters** for skip row groups. "
-            "Skip value/pct applies only to skip rows."
+            "Skip value/pct applies only to skip rows; darker means worse degradation."
         )
         with gr.Row():
             with gr.Column(scale=1):
                 stage2_backbone_dd = None
-                if backbone_choices:
+                if sorted_backbone_choices:
                     stage2_backbone_dd = gr.Dropdown(
                         label="Backbone",
-                        choices=list(backbone_choices),
-                        value=initial_backbone if initial_backbone in backbone_choices else backbone_choices[0],
+                        choices=sorted_backbone_choices,
+                        value=(
+                            initial_backbone
+                            if initial_backbone in sorted_backbone_choices
+                            else sorted_backbone_choices[0]
+                        ),
                     )
                 stage2_dataset_dd = gr.Dropdown(
                     label="Dataset",
-                    choices=list(dataset_choices),
+                    choices=sorted_dataset_choices,
                     value=controller.dataset,
                 )
                 stage2_scene_dd = gr.Dropdown(label="Scene", choices=stage2_scene_ids, value=initial_stage2_scene)
-                _hm_vm, _hm_m, _hm_t, _, _hm_hs, _hm_hi, _hm_po = heatmaps_resolve_filters_cb(
+                _hm_vm, _hm_m, _hm_t, _, _hm_tc, _hm_hs, _hm_hi, _hm_po = heatmaps_resolve_filters_cb(
                     controller, initial_stage2_scene, "absolute", None, None
                 )
                 stage2_metric_rows_filter = gr.CheckboxGroup(
                     label="Skip Δ rows",
-                    choices=[stage2_metric_row_pose, stage2_metric_row_point],
+                    choices=[
+                        stage2_metric_row_pose,
+                        stage2_metric_row_depth,
+                        stage2_metric_row_point,
+                    ],
                     value=_hm_m,
                     interactive=_hm_hs,
                 )
@@ -74,9 +130,9 @@ def build_heatmaps_tab(
                 )
                 stage2_token_rows_filter = gr.CheckboxGroup(
                     label="Token similarity rows",
-                    choices=[stage2_token_row_all],
-                    value=[stage2_token_row_all] if _hm_hi else [],
-                    interactive=False,
+                    choices=_hm_tc,
+                    value=_hm_t,
+                    interactive=_hm_hi,
                 )
                 stage2_sim_gamma_slider = gr.Slider(
                     label="gamma (1 disables)",
@@ -92,7 +148,7 @@ def build_heatmaps_tab(
                     maximum=1.0,
                     value=0.0,
                     step=0.01,
-                    interactive=_hm_hi,
+                    interactive=_hm_hi or _hm_hs,
                 )
                 gr.Markdown("### Prune plan (dense triangles)")
                 stage2_prune_show = gr.Checkbox(
@@ -131,13 +187,16 @@ def build_heatmaps_tab(
                 stage2_mode_galleries: List[gr.Gallery] = []
                 stage2_row_body_cols: List[gr.Column] = []
                 for mode in stage2_modes:
-                    for label, n_columns, odd_row in (
-                        (f"{mode}: pose", 4, False),
-                        (f"{mode}: sim · special", 4, False),
-                        (f"{mode}: depth", 3, False),
-                        (f"{mode}: sim · patch", 4, False),
-                        (f"{mode}: sim · all tokens", 4, False),
-                        (f"{mode}: sim · all tokens (drop odd rows, reindexed)", 4, True),
+                    for label, n_columns in (
+                        (f"{mode}: pose", 4),
+                        (f"{mode}: depth", 2),
+                        (f"{mode}: point cloud", 4),
+                        (f"{mode}: sim · special", 4),
+                        (f"{mode}: sim · camera", 4),
+                        (f"{mode}: sim · patch", 4),
+                        (f"{mode}: sim · all tokens", 4),
+                        (f"{mode}: sim · token mean", 4),
+                        (f"{mode}: sim · token min", 4),
                     ):
                         gallery_classes = ["results-gallery", "stage2-heatmap-gallery"]
                         with gr.Row(elem_classes=["stage2-gallery-row"], equal_height=False):

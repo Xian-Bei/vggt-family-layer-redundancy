@@ -8,7 +8,7 @@ cp analysis/backbones/adapters/backbone_adapter_template.py analysis/backbones/a
 
 然后把 `NewBackboneAdapter` 改名为 `<Name>Adapter`，把 `name = "new_backbone"` 改成公共 backbone 名，并在 `analysis/backbones/registry.py` 的 `_load_defaults()` 中导入和 `register()`。
 
-模板不会被默认导入，也不会影响现有 `vggt`、`fastvggt`、`vggt_omega`、`pi3`。
+模板不会被默认导入，也不会影响现有 `vggt`、`vggt_omega`、`pi3`。
 
 ## 公共路径只认识的东西
 

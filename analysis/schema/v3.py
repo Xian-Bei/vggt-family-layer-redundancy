@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence
 
 SCHEMA_VERSION = "v3"
-OUTPUT_ROOT_DEFAULT = Path("analysis_outputs_v3")
+OUTPUT_ROOT_DEFAULT = Path(os.environ.get("OUTPUT_ROOT", "analysis_outputs_v3"))
 
 LayerUnitKind = Literal["frame", "global"]
 
@@ -169,6 +170,9 @@ class EvalRecordV3:
 
 
 SEVENSCENES_SPLITS = ("train", "test")
+NUSCENES_SPLITS = ("train", "val")
+WAYMO_SPLITS = ("training", "validation")
+WAYMO_SPLIT_ALIASES = {"train": "training", "val": "validation"}
 
 
 def dataset_output_tag(dataset: str, split: str | None = None) -> str:
@@ -180,17 +184,47 @@ def dataset_output_tag(dataset: str, split: str | None = None) -> str:
         if split_norm not in SEVENSCENES_SPLITS:
             raise ValueError(f"Invalid 7scenes split: {split!r} (expected train or test)")
         return f"7scenes_{split_norm}"
+    if dataset == "nuscenes":
+        if not split:
+            raise ValueError("nuscenes requires split='train' or 'val'")
+        split_norm = str(split).strip().lower()
+        if split_norm not in NUSCENES_SPLITS:
+            raise ValueError(f"Invalid nuscenes split: {split!r} (expected train or val)")
+        return f"nuscenes_{split_norm}"
+    if dataset == "waymo":
+        if not split:
+            raise ValueError("waymo requires split='training' or 'validation'")
+        split_norm = WAYMO_SPLIT_ALIASES.get(str(split).strip().lower(), str(split).strip().lower())
+        if split_norm not in WAYMO_SPLITS:
+            raise ValueError(f"Invalid waymo split: {split!r} (expected training or validation)")
+        return f"waymo_{split_norm}"
     return dataset
 
 
-def parse_7scenes_plugin_args(dataset_tag: str) -> tuple[str, str | None]:
-    """Return ``(plugin_name, split)`` for tags like ``7scenes_test``."""
+def parse_dataset_plugin_args(dataset_tag: str) -> tuple[str, str | None]:
+    """Return ``(dataset_name, split)`` for tags like ``7scenes_test`` or ``nuscenes_val``."""
     if dataset_tag.startswith("7scenes_"):
         split = dataset_tag[len("7scenes_") :]
         if split not in SEVENSCENES_SPLITS:
             raise ValueError(f"Invalid 7scenes split in tag: {dataset_tag!r}")
         return "7scenes", split
+    if dataset_tag.startswith("nuscenes_"):
+        split = dataset_tag[len("nuscenes_") :]
+        if split not in NUSCENES_SPLITS:
+            raise ValueError(f"Invalid nuscenes split in tag: {dataset_tag!r}")
+        return "nuscenes", split
+    if dataset_tag.startswith("waymo_"):
+        split = dataset_tag[len("waymo_") :]
+        split = WAYMO_SPLIT_ALIASES.get(split, split)
+        if split not in WAYMO_SPLITS:
+            raise ValueError(f"Invalid waymo split in tag: {dataset_tag!r}")
+        return "waymo", split
     return dataset_tag, None
+
+
+def parse_7scenes_plugin_args(dataset_tag: str) -> tuple[str, str | None]:
+    """Backward-compatible alias for older training code."""
+    return parse_dataset_plugin_args(dataset_tag)
 
 
 def stage_dir(experiment: str, dataset: str, stage: str) -> Path:

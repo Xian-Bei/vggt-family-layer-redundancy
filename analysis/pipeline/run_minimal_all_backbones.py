@@ -63,8 +63,10 @@ def run_backbone(
 
     # --- Stage 1+2: cache + redundancy (single forward per scene) ---
     st1 = StageTiming(stage="cache_redundancy")
-    red_npz = REPO_ROOT / "analysis_outputs_v3" / exp / "scannet" / "redundancy" / "redundancy_graph_v3.npz"
-    if skip_cache and skip_redundancy and (cache_dir / "cache_manifest_v3.json").is_file() and red_npz.is_file():
+    red_npz = REPO_ROOT / "analysis_outputs_v3" / exp / "scannet" / "redundancy" / "redundancy_graph_all.npz"
+    legacy_npz = red_npz.parent / "redundancy_graph_v3.npz"
+    has_red = red_npz.is_file() or legacy_npz.is_file()
+    if skip_cache and skip_redundancy and (cache_dir / "cache_manifest_v3.json").is_file() and has_red:
         st1.add("cache_redundancy_v3", 0.0, status="skipped", detail="reuse existing cache+redundancy")
     else:
         with timed_step(st1, "cache_redundancy_v3"):

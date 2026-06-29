@@ -11,10 +11,27 @@ from torch.utils.checkpoint import checkpoint
 
 from analysis.backbones.cache_replay.base import CacheReplayEngine
 from analysis.backbones.cache_replay.common import ReplayResult, is_skipped, split_concat
-from analysis.backbones.contracts import PredictionLossWeights
+from analysis.backbones.contracts import PredictionLossWeights, TrainingHyperparams
 from analysis.backbones.registry import get_backbone
-from analysis.schema.v3 import PruneAction
+from analysis.schema.v3 import PruneAction, parse_dataset_plugin_args
 from analysis.train.model import count_unique_params
+
+
+def pi3_official_dataset_name(dataset_name: str) -> str:
+    """Map LaRe dataset tags to the names Pi3 official loss uses for dataset gates."""
+    name = str(dataset_name or "").strip()
+    if name:
+        name, _split = parse_dataset_plugin_args(name)
+    key = name.lower()
+    if key in {"scannet", "scannet_dev50", "scannet_test50"}:
+        return "ScanNet"
+    if key in {"scannetpp", "scannet++", "scannet_plus_plus"}:
+        return "Scannetpp"
+    if key == "taskonomy":
+        return "Taskonomy"
+    if key == "hypersim":
+        return "Hypersim"
+    return name
 
 
 def _decoder_index(unit_id: str) -> int:
@@ -44,6 +61,31 @@ def _resolve_pi3_image_hw(
     if t.dim() != 5:
         raise ValueError(f"Expected dummy_images [B,N,3,H,W], got {tuple(t.shape)}")
     return int(t.shape[-2]), int(t.shape[-1])
+
+
+def _canonicalize_pi3_replay_seed(
+    seed_tensor: torch.Tensor,
+    *,
+    model: nn.Module,
+    h: int,
+    w: int,
+) -> torch.Tensor:
+    if seed_tensor.dim() != 4:
+        raise RuntimeError(f"Expected Pi3 seed tokens [B,S,P,C], got {tuple(seed_tensor.shape)}")
+    patch_tokens = (int(h) // int(model.patch_size)) * (int(w) // int(model.patch_size))
+    frame_tokens = int(patch_tokens) + int(model.patch_start_idx)
+    if frame_tokens <= 0:
+        raise RuntimeError(f"Invalid Pi3 frame token count: {frame_tokens}")
+    b, s, p, c = (int(x) for x in seed_tensor.shape)
+    if p == frame_tokens:
+        return seed_tensor
+    if s == 1 and p % frame_tokens == 0:
+        n = p // frame_tokens
+        return seed_tensor.reshape(b, n, frame_tokens, c).contiguous()
+    raise RuntimeError(
+        "Cannot reshape Pi3 replay seed to [B,N,P,C]: "
+        f"seed={tuple(seed_tensor.shape)} frame_tokens={frame_tokens} image_hw={(int(h), int(w))}"
+    )
 
 
 def _alignment_concat_layers(
@@ -142,9 +184,9 @@ def _replay_pi3_cache_first(
         else:
             raise ValueError(f"seed_kind must be frame, global, or none, got {seed_kind!r}")
         use_frame_seed = kind == "frame"
-    bsz, seq_len, p, c = (int(x) for x in seed_tensor.shape)
-
     H, W = _resolve_pi3_image_hw(dummy_images, image_hw)
+    seed_tensor = _canonicalize_pi3_replay_seed(seed_tensor, model=model, h=H, w=W)
+    bsz, seq_len, p, c = (int(x) for x in seed_tensor.shape)
     B, N = bsz, seq_len
     pos = _build_pi3_pos(model, B=B, N=N, H=H, W=W, device=device)
 
@@ -230,9 +272,10 @@ def _replay_pi3_cache_first(
 
         points = torch.einsum("bnij, bnhwj -> bnhwi", camera_poses, homogenize_points(local_points))[..., :3]
     pred = {
-        "global_points": points,
+        "points": points,
         "local_points": local_points,
         "camera_poses": camera_poses,
+        "global_points": None,
     }
     return ReplayResult(concat_by_layer=concat_out, pred=pred)
 
@@ -242,6 +285,7 @@ def build_target_batch_from_teacher_pi3(
     *,
     images_batched: torch.Tensor,
     device: torch.device,
+    dataset_name: str = "",
 ) -> Dict[str, torch.Tensor]:
     if "points" not in teacher_pred or "camera_poses" not in teacher_pred:
         raise RuntimeError("Pi3 teacher target mode requires cached keys: points and camera_poses")
@@ -266,7 +310,8 @@ def build_target_batch_from_teacher_pi3(
         # Cache replay uses a lightweight dummy image tensor; loss only needs shape-matched placeholders.
         imgs = torch.zeros((B, N, 3, H, W), device=device, dtype=torch.float32)
     gt_raw: List[Dict[str, torch.Tensor | str | List[str]]] = []
-    dataset_names = ["ScanNet"] * B
+    pi3_dataset_name = pi3_official_dataset_name(dataset_name)
+    dataset_names = [pi3_dataset_name] * B
     for i in range(B):
         views: List[Dict[str, Any]] = []
         for j in range(N):
@@ -282,7 +327,7 @@ def build_target_batch_from_teacher_pi3(
         gt_raw.append({"views": views})
     # Flatten into list-of-views (B is effectively always 1 in analysis pipeline).
     views0 = gt_raw[0]["views"]  # type: ignore[index]
-    return {"gt_raw": views0, "images": imgs}
+    return {"gt_raw": views0, "images": imgs, "pi3_dataset_names": dataset_names}
 
 
 def prediction_points_conf(
@@ -290,19 +335,15 @@ def prediction_points_conf(
     target_batch: Dict[str, torch.Tensor],
     *,
     w_pred: float,
-    w_camera: float,
-    w_depth: float,
-    camera_loss_type: str,
-    depth_valid_range: float,
-    depth_gradient_loss_fn: str,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    del w_camera, camera_loss_type, depth_valid_range, depth_gradient_loss_fn, w_depth
+    del w_pred
     from analysis.backbones.cache_replay.pi3_official.loss import Pi3Loss
 
     gt_raw = target_batch.get("gt_raw")
     if not isinstance(gt_raw, list) or not gt_raw:
         raise RuntimeError("Pi3 target_batch must contain non-empty list gt_raw")
-    # Official loss expects pred keys: local_points, global_points, camera_poses (and optional conf).
+    # Official loss expects local_points and camera_poses. global_points is optional
+    # and disabled for the official default Pi3 configuration.
     device = next(iter(student_pred.values())).device
     student_pred_fp32: Dict[str, torch.Tensor] = {
         k: (v.float() if torch.is_tensor(v) and torch.is_floating_point(v) else v)
@@ -321,11 +362,16 @@ def prediction_points_conf(
         total_loss, details = loss_fn(student_pred_fp32, gt_raw_fp32)
     logs: Dict[str, float] = {f"pi3_{k}": float(v.detach().item()) if torch.is_tensor(v) else float(v) for k, v in details.items()}
     logs["loss_pi3_total"] = float(total_loss.detach().item())
-    return float(w_pred) * total_loss, logs
+    return total_loss, logs
 
 
 class Pi3CacheReplayEngine(CacheReplayEngine):
     backbone_name = "pi3"
+
+    def __init__(self) -> None:
+        self._lr_scheduler: Optional[torch.optim.lr_scheduler.OneCycleLR] = None
+        self._lr_scheduler_key: Optional[Tuple[int, int, float]] = None
+        self._lr_scheduler_steps = 0
 
     @staticmethod
     def layers_to_keep_in_cpu_cache(
@@ -351,6 +397,15 @@ class Pi3CacheReplayEngine(CacheReplayEngine):
         if not isinstance(pred, dict):
             raise SystemExit("Invalid cache row: missing dict key 'pred'.")
         get_backbone(self.backbone_name).validate_cached_prediction(pred)
+
+    def training_config(self) -> TrainingHyperparams:
+        return get_backbone(self.backbone_name).training_config()
+
+    def normalize_alignment_term(self, term: torch.Tensor) -> torch.Tensor:
+        if term.dim() != 4:
+            return term
+        b, s, p, c = (int(x) for x in term.shape)
+        return term.reshape(b, 1, s * p, c)
 
     def build_train_model(
         self,
@@ -426,38 +481,112 @@ class Pi3CacheReplayEngine(CacheReplayEngine):
         *,
         images_batched: torch.Tensor,
         device: torch.device,
+        dataset_name: str = "",
     ) -> Dict[str, torch.Tensor]:
         return get_backbone(self.backbone_name).build_target_batch_from_teacher(
             teacher_pred,
             images_batched=images_batched,
             device=device,
+            dataset_name=dataset_name,
         )
+
+    def build_optimizer(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        args: Any,
+    ) -> torch.optim.Optimizer:
+        del args
+        cfg = self.training_config()
+        return get_backbone(self.backbone_name).build_training_optimizer(trainable, config=cfg)
 
     def prediction_loss(
         self,
         student_pred: Dict[str, torch.Tensor],
         target_batch: Dict[str, torch.Tensor],
         *,
-        w_pred: float,
-        w_camera: float,
-        w_depth: float,
-        camera_loss_type: str,
-        depth_valid_range: float,
-        depth_gradient_loss_fn: str,
+        args: Any,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        del args
+        cfg = self.training_config()
         weights = PredictionLossWeights(
-            w_pred=float(w_pred),
-            w_camera=float(w_camera),
-            w_depth=float(w_depth),
-            camera_loss_type=str(camera_loss_type),
-            depth_valid_range=float(depth_valid_range),
-            depth_gradient_loss_fn=str(depth_gradient_loss_fn),
+            w_pred=float(cfg.w_pred),
         )
         return get_backbone(self.backbone_name).prediction_loss(
             student_pred,
             target_batch,
             weights=weights,
         )
+
+    def regularization_loss(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        args: Any,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del args
+        cfg = self.training_config()
+        loss_reg = torch.zeros((), device=device)
+        if float(cfg.w_reg) > 0:
+            for p in trainable:
+                loss_reg = loss_reg + p.float().pow(2).mean()
+        return loss_reg
+
+    def update_optimizer_schedule(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        args: Any,
+        global_step: int,
+        total_steps: int,
+    ) -> float:
+        del args
+        cfg = self.training_config()
+        total = max(int(total_steps), 1)
+        key = (id(optimizer), total, float(cfg.lr))
+        if self._lr_scheduler is None or self._lr_scheduler_key != key:
+            self._lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=float(cfg.lr),
+                total_steps=total,
+                pct_start=0.0,
+                anneal_strategy="cos",
+                div_factor=1000.0,
+                final_div_factor=100.0,
+            )
+            self._lr_scheduler_key = key
+            self._lr_scheduler_steps = 0
+
+        # The shared trainer asks for the LR before optimizer.step(), while Pi3
+        # official calls scheduler.step() after optimizer.step(). Advance here
+        # only for optimizer steps already completed by previous iterations.
+        completed_steps = max(0, min(int(global_step), total))
+        while self._lr_scheduler_steps < completed_steps:
+            self._lr_scheduler.step()
+            self._lr_scheduler_steps += 1
+
+        return float(optimizer.param_groups[0]["lr"])
+
+    def clip_gradients(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        optimizer: torch.optim.Optimizer,
+        scaler: Any,
+        args: Any,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del args
+        cfg = self.training_config()
+        grad_norm = torch.tensor(0.0, device=device)
+        if float(cfg.grad_clip_max_norm) > 0:
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable,
+                max_norm=float(cfg.grad_clip_max_norm),
+            )
+        return grad_norm
 
     def trainable_param_module(self, model: nn.Module) -> nn.Module:
         return model.decoder

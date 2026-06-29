@@ -1,10 +1,10 @@
-"""Shared VGGT-family adapter logic (repo vggt or FastVGGT vendor)."""
+"""VGGT backbone adapter logic."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,9 +19,9 @@ from analysis.backbones.contracts import (
     BackboneAdapter,
     BackboneCapabilities,
     CacheForwardResult,
-    EvalSceneContext,
     PredictionLossWeights,
     PredictionBundle,
+    TrainingHyperparams,
 )
 
 
@@ -41,8 +41,38 @@ def import_vggt_class():
     return VGGT
 
 
+def vggt_family_training_config() -> TrainingHyperparams:
+    return TrainingHyperparams(
+        optimizer_cls=torch.optim.AdamW,
+        lr=5e-5,
+        weight_decay=0.05,
+        min_lr=1e-8,
+        warmup_ratio=0.05,
+        grad_clip_max_norm=1.0,
+        w_align=1.0,
+        w_align_mse=1.0,
+        w_align_cos=1.0,
+        w_align_cka=0.0,
+        w_pred=1.0,
+        w_reg=0.0,
+    )
+
+
+def build_vggt_family_training_optimizer(
+    trainable: Sequence[nn.Parameter],
+    *,
+    config: Optional[TrainingHyperparams] = None,
+) -> torch.optim.Optimizer:
+    cfg = config or vggt_family_training_config()
+    return cfg.optimizer_cls(
+        trainable,
+        lr=float(cfg.lr),
+        weight_decay=float(cfg.weight_decay),
+    )
+
+
 class VGGTFamilyAdapterMixin(BackboneAdapter):
-    """Mixin for VGGT / FastVGGT backends with frame_blocks + global_blocks."""
+    """Shared implementation for VGGT's frame/global alternating blocks."""
 
     name: str = "vggt"
 
@@ -54,6 +84,47 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
             supports_lora=True,
             supports_eval=True,
         )
+
+    def training_config(self) -> TrainingHyperparams:
+        return vggt_family_training_config()
+
+    def build_training_optimizer(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        config: Optional[TrainingHyperparams] = None,
+    ) -> torch.optim.Optimizer:
+        return build_vggt_family_training_optimizer(trainable, config=config or self.training_config())
+
+    def load_eval_images(self, image_paths: Sequence[Path | str]) -> torch.Tensor:
+        from vggt.utils.load_fn import load_and_preprocess_images
+
+        return load_and_preprocess_images([str(p) for p in image_paths], mode="crop")
+
+    def load_driving_depth_stack(
+        self,
+        depth_paths: Sequence[Path | str],
+        *,
+        output_hw: Tuple[int, int],
+    ) -> Tuple[Any, int]:
+        from analysis.datasets.driving_depth import load_driving_depth_stack_vggt
+
+        return load_driving_depth_stack_vggt(depth_paths, output_hw=output_hw)
+
+    def align_7andn_gt_depth(self, view: Any, *, output_hw: Tuple[int, int]) -> Any:
+        from analysis.eval.prediction_eval import _load_7andn_gt_depth_vggt
+
+        return _load_7andn_gt_depth_vggt(view, image_hw=output_hw)
+
+    def load_scannet_gt_depth(
+        self,
+        scene: Any,
+        *,
+        output_hw: Tuple[int, int],
+    ) -> Any:
+        from analysis.eval.prediction_eval import _load_gt_depth_for_scene
+
+        return _load_gt_depth_for_scene(scene, image_hw=output_hw)
 
     def load_pretrained(
         self,
@@ -194,7 +265,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         unit_ids: Optional[Set[str]] = None,
         layer_callback: Optional[Callable[[str, torch.Tensor], None]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-        """FastVGGT-style aggregators without ``return_layers``: hook frame/global blocks."""
+        """Capture VGGT frame/global blocks with forward hooks."""
         if images.dim() == 4:
             images = images.unsqueeze(0)
         catalog = {u.unit_id: u for u in self.layer_unit_catalog(model)}
@@ -229,6 +300,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         concat_list = self._concat_layers_from_unit_map(model, out)
         meta = {
             "patch_start_idx": int(patch_start_idx),
+            "camera_token_count": 1,
             "aggregated_concat": concat_list,
         }
         return out, meta
@@ -342,22 +414,6 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
 
         return build_vggt_family_dummy_images(seq_len=seq_len, h=h, w=w, device=device)
 
-    def eval_scene(
-        self,
-        model: nn.Module,
-        *,
-        dataset_name: str,
-        batch: Any,
-        ctx: EvalSceneContext,
-    ) -> Dict[str, float]:
-        from analysis.backbones import eval_impl
-
-        if dataset_name == "scannet":
-            return eval_impl.eval_scannet_points_adapter(self, model, batch, ctx.device, ctx.profile, ctx)
-        if dataset_name in ("7scenes", "nrgbd"):
-            return eval_impl.eval_7andn_points_adapter(self, model, batch, ctx.device, ctx.profile, ctx)
-        raise ValueError(f"Unsupported dataset for VGGT-family eval: {dataset_name}")
-
     def apply_checkpoint_structure(
         self,
         model: nn.Module,
@@ -388,6 +444,182 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
             model, aggregated_tokens_list, int(patch_start_idx), images
         )
         return self.prediction_bundle_from_raw(dict(preds) if isinstance(preds, dict) else {}, images)
+
+    def supports_incremental_skip_eval(self) -> bool:
+        return True
+
+    @staticmethod
+    def _run_incremental_skip_unit(
+        model: nn.Module,
+        tokens_bspc: torch.Tensor,
+        unit_idx: int,
+        *,
+        pos_frame: Optional[torch.Tensor],
+        pos_global: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run one public frame/global unit while preserving the aggregator layouts."""
+        from analysis.backbones.cache_replay.vggt_family import run_block_with_checkpoint
+
+        bsz, seq_len, num_tokens, channels = (int(x) for x in tokens_bspc.shape)
+        layer_idx, half = divmod(int(unit_idx), 2)
+        if half == 0:
+            frame_in = tokens_bspc.reshape(bsz * seq_len, num_tokens, channels)
+            frame_out = run_block_with_checkpoint(
+                model.aggregator.frame_blocks[layer_idx],
+                frame_in,
+                pos=pos_frame,
+                training=False,
+                use_checkpoint=False,
+                use_reentrant=False,
+            )
+            return frame_out.reshape(bsz, seq_len, num_tokens, channels)
+        global_in = tokens_bspc.reshape(bsz, seq_len * num_tokens, channels)
+        global_out = run_block_with_checkpoint(
+            model.aggregator.global_blocks[layer_idx],
+            global_in,
+            pos=pos_global,
+            training=False,
+            use_checkpoint=False,
+            use_reentrant=False,
+        )
+        return global_out.reshape(bsz, seq_len, num_tokens, channels)
+
+    def _predict_incremental_skip_span(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        *,
+        prefix_tokens: torch.Tensor,
+        prefix_layers: Dict[int, torch.Tensor],
+        start_unit: int,
+        end_unit: int,
+        total_units: int,
+        required_layers: Set[int],
+        pos_frame: Optional[torch.Tensor],
+        pos_global: Optional[torch.Tensor],
+    ) -> PredictionBundle:
+        tokens = prefix_tokens
+        selected = dict(prefix_layers)
+        frame_at_layer: Optional[torch.Tensor] = tokens if int(start_unit) % 2 == 1 else None
+        for unit_idx in range(int(start_unit), int(total_units)):
+            layer_idx, half = divmod(unit_idx, 2)
+            if unit_idx > int(end_unit):
+                tokens = self._run_incremental_skip_unit(
+                    model,
+                    tokens,
+                    unit_idx,
+                    pos_frame=pos_frame,
+                    pos_global=pos_global,
+                )
+            if half == 0:
+                frame_at_layer = tokens
+            else:
+                if frame_at_layer is None:
+                    raise RuntimeError(f"Missing frame state before global unit {unit_idx}")
+                if layer_idx in required_layers:
+                    selected[layer_idx] = torch.cat([frame_at_layer, tokens], dim=-1)
+                frame_at_layer = None
+
+        num_layers = int(total_units) // 2
+        missing = sorted(required_layers.difference(selected))
+        if missing:
+            raise RuntimeError(f"Incremental skip replay missed head layers: {missing}")
+        aggregated: List[Any] = [None] * num_layers
+        for layer_idx, tensor in selected.items():
+            aggregated[int(layer_idx)] = tensor
+        raw = self.run_heads_from_aggregated_tokens(
+            model,
+            aggregated,
+            int(model.aggregator.patch_start_idx),
+            images,
+        )
+        return self.prediction_bundle_from_raw(raw, images)
+
+    def iter_skip_span_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        spans: Sequence[Tuple[int, int]],
+    ) -> Iterable[Tuple[int, int, PredictionBundle]]:
+        """Stream exact VGGT span predictions while computing baseline prefixes once."""
+        from analysis.amp_policy import autocast_device_dtype
+        from analysis.backbones.cache_replay.vggt_family import build_pos
+
+        if images.dim() == 4:
+            images = images.unsqueeze(0)
+        if images.dim() != 5:
+            raise ValueError(f"Expected skip-eval images [B,S,3,H,W], got {tuple(images.shape)}")
+
+        unit_ids = [u.unit_id for u in self.layer_unit_catalog(model)]
+        total_units = len(unit_ids)
+        if total_units == 0 or total_units % 2 != 0:
+            raise RuntimeError(f"VGGT incremental replay requires paired units, got {total_units}")
+        aa_order = list(getattr(model.aggregator, "aa_order", ["frame", "global"]))
+        aa_block_size = int(getattr(model.aggregator, "aa_block_size", 1))
+        if aa_order != ["frame", "global"] or aa_block_size != 1:
+            raise RuntimeError(
+                "VGGT incremental skip replay currently requires "
+                f"aa_order=['frame','global'] and aa_block_size=1; got {aa_order}, {aa_block_size}"
+            )
+        requested: Dict[int, List[int]] = {}
+        for i_raw, j_raw in spans:
+            i, j = int(i_raw), int(j_raw)
+            if i < 0 or j < i or j >= total_units:
+                raise ValueError(f"Invalid skip span ({i},{j}) for {total_units} units")
+            requested.setdefault(i, []).append(j)
+        for ends in requested.values():
+            ends.sort()
+
+        device = images.device
+        ac_kw = autocast_device_dtype(device)
+        with torch.inference_mode(), torch.autocast(**ac_kw):
+            pos_frame, pos_global = build_pos(model, images)
+            prefix_tokens = self.build_initial_tokens(model, images)
+        if prefix_tokens is None:
+            raise RuntimeError("VGGT adaptor did not produce initial replay tokens")
+
+        required_layers = set(
+            int(x) for x in self.required_head_layers_for_cache(model, total_units // 2)
+        )
+        prefix_layers: Dict[int, torch.Tensor] = {}
+        baseline_frame: Optional[torch.Tensor] = None
+
+        for start_unit in range(total_units):
+            for end_unit in requested.get(start_unit, []):
+                with torch.inference_mode(), torch.autocast(**ac_kw):
+                    prediction = self._predict_incremental_skip_span(
+                        model,
+                        images,
+                        prefix_tokens=prefix_tokens,
+                        prefix_layers=prefix_layers,
+                        start_unit=start_unit,
+                        end_unit=end_unit,
+                        total_units=total_units,
+                        required_layers=required_layers,
+                        pos_frame=pos_frame,
+                        pos_global=pos_global,
+                    )
+                yield start_unit, end_unit, prediction
+
+            with torch.inference_mode(), torch.autocast(**ac_kw):
+                prefix_tokens = self._run_incremental_skip_unit(
+                    model,
+                    prefix_tokens,
+                    start_unit,
+                    pos_frame=pos_frame,
+                    pos_global=pos_global,
+                )
+                layer_idx, half = divmod(start_unit, 2)
+                if half == 0:
+                    baseline_frame = prefix_tokens
+                else:
+                    if baseline_frame is None:
+                        raise RuntimeError(f"Missing baseline frame state at layer {layer_idx}")
+                    if layer_idx in required_layers:
+                        prefix_layers[layer_idx] = torch.cat(
+                            [baseline_frame, prefix_tokens], dim=-1
+                        )
+                    baseline_frame = None
 
     def _prediction_bundle_from_preds(self, preds: Dict[str, Any], images: torch.Tensor) -> PredictionBundle:
         return self.prediction_bundle_from_raw(dict(preds) if isinstance(preds, dict) else {}, images)
@@ -449,6 +681,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         )
         meta = {
             "patch_start_idx": int(patch_start_idx),
+            "camera_token_count": 1,
             "aggregated_concat": concat_list,
         }
         pred = self._prediction_bundle_from_preds(preds, images)
@@ -495,6 +728,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         *,
         images_batched: torch.Tensor,
         device: torch.device,
+        dataset_name: str = "",
     ) -> Dict[str, torch.Tensor]:
         from analysis.backbones.cache_replay.vggt_family import build_target_batch_from_teacher
 
@@ -503,6 +737,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
             images_batched=images_batched,
             device=device,
             backbone_name=self.name,
+            dataset_name=dataset_name,
         )
 
     def prediction_loss(
@@ -518,11 +753,6 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
             student_pred,
             target_batch,  # type: ignore[arg-type]
             w_pred=float(weights.w_pred),
-            w_camera=float(weights.w_camera),
-            w_depth=float(weights.w_depth),
-            camera_loss_type=str(weights.camera_loss_type),
-            depth_valid_range=float(weights.depth_valid_range),
-            depth_gradient_loss_fn=str(weights.depth_gradient_loss_fn),
         )
 
     def replay_student_cache_first(

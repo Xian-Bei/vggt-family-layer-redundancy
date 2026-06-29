@@ -57,6 +57,8 @@ def required_cache_layers_for_training(plan: UnitPrunePlan, model: nn.Module) ->
     layers: set[int] = set()
     if str(seed_kind) != "none":
         layers.add(int(seed_layer))
+    # Preserve the post-LoRA unit outputs themselves for possible later reuse.
+    layers.update(int(layer) for layer in lora_layers)
 
     for spec in plan.lora.values():
         if spec.alignment_teacher_unit_index is None:
@@ -95,6 +97,13 @@ def required_cache_unit_ids(plan: UnitPrunePlan, model: nn.Module) -> Set[str]:
         required_units.add("layer_-1")
     else:
         required_units.add(unit_index_to_unit_id(2 * int(seed_layer) + (0 if str(seed_kind) == "frame" else 1)))
+
+    # In addition to the replay predecessor, retain every LoRA unit's own output.
+    for raw_index in plan.lora.keys():
+        lora_index = int(raw_index)
+        if lora_index < 0 or lora_index >= int(plan.num_units):
+            raise ValueError(f"lora unit index out of range: {lora_index}")
+        required_units.add(unit_index_to_unit_id(lora_index))
 
     start_layer = replay_start_layer(plan)
 

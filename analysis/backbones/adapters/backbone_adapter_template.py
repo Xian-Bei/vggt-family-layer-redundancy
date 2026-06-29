@@ -22,7 +22,6 @@ from analysis.backbones.contracts import (
     BackboneAdapter,
     BackboneCapabilities,
     CacheForwardResult,
-    EvalSceneContext,
     PredictionBundle,
     PredictionLossWeights,
 )
@@ -262,9 +261,10 @@ class NewBackboneAdapter(BackboneAdapter):
         *,
         images_batched: torch.Tensor,
         device: torch.device,
+        dataset_name: str = "",
     ) -> Dict[str, Any]:
         """Convert cached teacher prediction to the target batch for loss."""
-        del teacher_pred, images_batched, device
+        del teacher_pred, images_batched, device, dataset_name
         raise NotImplementedError("build backbone-specific prediction targets")
 
     def prediction_loss(
@@ -317,18 +317,6 @@ class NewBackboneAdapter(BackboneAdapter):
     def periodic_eval_skip_depth(self) -> bool:
         """Return True when eval should omit dense-depth metrics."""
         return False
-
-    def eval_scene(
-        self,
-        model: nn.Module,
-        *,
-        dataset_name: str,
-        batch: Any,
-        ctx: EvalSceneContext,
-    ) -> Dict[str, float]:
-        """Evaluate one scene and return unified metric names."""
-        del model, dataset_name, batch, ctx
-        raise NotImplementedError("run one-scene eval for this backbone")
 
     @staticmethod
     def _get_submodule(model: nn.Module, module_path: str) -> nn.Module:

@@ -36,7 +36,7 @@ Stage1 **不再** 主线写 `*_pred.pt`；GT 评测和可视化都直接基于�
 当前 Stage1 `eval_scannet.json` 中的主线 GT 指标包括：
 
 - pose / geometry：
-  `ate`、`are`、`rpe_rot`、`rpe_trans`、`chamfer_distance`
+  `ape`、`are`、`rpe_rot`、`rpe_trans`、`acc`、`comp`、`chamfer_distance`、`nc`
 - dense depth：
   `depth_abs_rel`、`depth_delta1`
 
@@ -125,7 +125,7 @@ skip-range 分析当前是我们讨论后的实现：
 
 其中当前主线
 
-`k ∈ {ate, are, rpe_rot, rpe_trans, chamfer_distance, depth_abs_rel, depth_delta1}`。
+`k ∈ {ape, are, rpe_rot, rpe_trans, acc, comp, chamfer_distance, nc, depth_abs_rel, depth_delta1}`。
 
 解释方式保持不变：
 

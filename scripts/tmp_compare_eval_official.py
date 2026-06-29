@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Sequence
 
 
 REPO = Path(__file__).resolve().parents[1]
-DEFAULT_BACKBONES = ("vggt", "fastvggt", "vggt_omega", "pi3")
+DEFAULT_BACKBONES = ("vggt", "vggt_omega", "pi3")
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
@@ -238,65 +238,6 @@ def _worker_run_official(backbone: str, scene_to_paths: Dict[str, List[str]], wa
             def fn():
                 with torch.no_grad(), torch.cuda.amp.autocast(dtype=amp_dtype):
                     _ = model(x)
-
-            mean_ms, _ = _bench(fn, warmup=warmup, runs=runs)
-            scene_ms[sid] = float(mean_ms)
-
-        return ModeRunResult(
-            mode="official_demo",
-            backbone=backbone,
-            module_file=module_file,
-            model_class=type(model).__name__,
-            device="cuda",
-            autocast_dtype=str(amp_dtype).split(".")[-1],
-            scene_ms=scene_ms,
-            input_shapes=input_shapes,
-        )
-
-    if backbone == "fastvggt":
-        sys.path.insert(0, str(REPO / "backbones" / "FastVGGT"))
-        from vggt.models.vggt import VGGT
-
-        def get_vgg_input_imgs_local(images: np.ndarray):
-            to_tensor = TF.ToTensor()
-            vgg_input_images = []
-            final_width = None
-            final_height = None
-            for image in images:
-                img = Image.fromarray(image, mode="RGB")
-                width, height = img.size
-                new_width = 518
-                new_height = round(height * (new_width / width) / 14) * 14
-                img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
-                img = to_tensor(img)
-                if new_height > 518:
-                    start_y = (new_height - 518) // 2
-                    img = img[:, start_y : start_y + 518, :]
-                    final_height = 518
-                else:
-                    final_height = new_height
-                final_width = new_width
-                vgg_input_images.append(img)
-            vgg_input_images = torch.stack(vgg_input_images)
-            patch_width = int(final_width // 14)
-            patch_height = int(final_height // 14)
-            return vgg_input_images, patch_width, patch_height
-
-        model = VGGT.from_pretrained("facebook/VGGT-1B").cuda().eval()
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        module_file = str(Path(sys.modules[type(model).__module__].__file__).resolve())
-        scene_ms: Dict[str, float] = {}
-        input_shapes: Dict[str, List[int]] = {}
-        for sid, paths in scene_to_paths.items():
-            imgs = [np.array(Image.open(p).convert("RGB")) for p in paths]
-            x, patch_w, patch_h = get_vgg_input_imgs_local(np.stack(imgs, axis=0))
-            model.update_patch_dimensions(int(patch_w), int(patch_h))
-            x = x.cuda()
-            input_shapes[sid] = list(x.shape)
-
-            def fn():
-                with torch.no_grad(), torch.cuda.amp.autocast(dtype=amp_dtype):
-                    _ = model(x.to(torch.bfloat16), image_paths=paths)
 
             mean_ms, _ = _bench(fn, warmup=warmup, runs=runs)
             scene_ms[sid] = float(mean_ms)

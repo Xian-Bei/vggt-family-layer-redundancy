@@ -17,15 +17,18 @@ from analysis.backbones.bootstrap import apply_pythonpath
 from analysis.backbones.contracts import EvalSceneContext
 from analysis.backbones.registry import get_backbone
 from analysis.datasets.batch_frames import count_eval_frames
-from analysis.datasets.registry import get_dataset
+from analysis.datasets.registry import dataset_names, get_dataset
 from analysis.eval.metrics_core import average_metrics
+from analysis.inference_compression.contracts import InferenceCompressionConfig
+from analysis.inference_compression.registry import get_inference_compression
 from analysis.prune_plan import (
     UnitPrunePlan,
     default_prune_plan_root,
-    resolve_named_prune_plan_path,
+    load_named_prune_plan,
     resolve_prune_plan_path,
 )
-from analysis.schema.v3 import EvalRecordV3, dataset_output_tag, stage_dir
+from analysis.training_plan import compose_training_unit_prune_plan
+from analysis.schema.v3 import EvalRecordV3, stage_dir
 from analysis.train.checkpoint_v3 import EvalMode, apply_eval_model_structure
 
 _EVAL_MODES = ("upper", "lower", "model")
@@ -33,45 +36,24 @@ _EVAL_MODES = ("upper", "lower", "model")
 
 def _eval_scene_count(
     ds_plugin,
-    dataset: str,
     data_root: Path,
     *,
     max_scenes: int,
     split: str | None,
 ) -> int | None:
     """Scene count for tqdm total without loading image batches."""
-    max_scenes_i = int(max_scenes)
-    if dataset == "scannet":
-        from analysis.eval.scannet_eval import discover_scannet_scenes
-
-        n = len(discover_scannet_scenes(data_root))
-    elif dataset in ("7scenes", "nrgbd"):
-        from analysis.datasets.plugins._7andn_common import count_7andn_scenes
-
-        n = count_7andn_scenes(
-            dataset=dataset,
-            data_root=data_root,
-            prof=ds_plugin.eval_profile(),
-            max_scenes=max_scenes_i,
-            split=split,
-        )
-    else:
-        return None
-    if max_scenes_i > 0:
-        n = min(n, max_scenes_i)
-    return n
+    return ds_plugin.count_scenes(data_root, max_scenes=int(max_scenes), split=split)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Unified eval (v3).")
     p.add_argument("--experiment", type=str, default="default")
-    p.add_argument("--dataset", type=str, required=True, choices=["scannet", "7scenes", "nrgbd"])
+    p.add_argument("--dataset", type=str, required=True, choices=dataset_names())
     p.add_argument(
         "--split",
         type=str,
         default=None,
-        choices=["train", "test"],
-        help="7scenes split (required when --dataset=7scenes).",
+        help="Optional dataset split, validated by the dataset adaptor.",
     )
     p.add_argument("--data-root", type=Path, required=True)
     p.add_argument("--backbone", type=str, default="vggt")
@@ -107,10 +89,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-backbone prune plans for lower/model modes (default: analysis/prune_plan).",
     )
     p.add_argument(
-        "--plan-name",
+        "--prune-plan-name",
+        dest="prune_plan_name",
         type=str,
         default="",
-        help="Plan name for lower/model modes (e.g. plan_t2_l1).",
+        help="Prune selector for lower/model modes (e.g. prune_span10).",
+    )
+    p.add_argument(
+        "--training-plan-root",
+        type=Path,
+        default=None,
+        help="Training plan root for model mode. Defaults to prune-plan-root.",
+    )
+    p.add_argument(
+        "--training-plan-name",
+        type=str,
+        default="",
+        help="Training plan name for model mode (e.g. training_lora_l1_r32).",
     )
     p.add_argument(
         "--export-vis-2d",
@@ -133,6 +128,20 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable tqdm progress bar; restore legacy per-line logging.",
     )
+    p.add_argument(
+        "--inference-compression",
+        choices=("none", "lora_merge", "fastvggt", "quantvggt"),
+        default="none",
+        help="Deployment-only compression applied after prune/checkpoint restoration.",
+    )
+    p.add_argument("--fastvggt-merge-start", type=int, default=0)
+    p.add_argument("--fastvggt-merge-ratio", type=float, default=0.9)
+    p.add_argument(
+        "--quantvggt-dtype",
+        choices=("w4a4", "w6a6", "w8a8"),
+        default="w4a4",
+    )
+    p.add_argument("--quantvggt-params-dir", type=Path, default=None)
     return p
 
 
@@ -159,10 +168,9 @@ def evaluate_model_v3(
     progress: bool = True,
 ) -> Path:
     """Shared evaluation entry used by stage-4 eval and training periodic eval."""
-    if dataset == "7scenes" and not split:
-        raise ValueError("7scenes requires split='train' or 'test'")
+    split = ds_plugin.validate_split(split)
     profile = ds_plugin.eval_profile()
-    tagged_dataset = output_dataset or dataset_output_tag(dataset, split)
+    tagged_dataset = output_dataset or ds_plugin.output_tag(split)
     out_dir = output_dir or stage_dir(experiment, tagged_dataset, f"eval/{model_name}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -175,14 +183,13 @@ def evaluate_model_v3(
         vis_save_root=out_dir,
         vis_max_points=int(vis_max_points),
         backbone_name=str(backbone),
-        dataset_name=str(dataset),
+        dataset_name=str(ds_plugin.name),
     )
 
     rows: List[Dict[str, float]] = []
     max_scenes_i = int(max_scenes)
     total_scenes = _eval_scene_count(
         ds_plugin,
-        str(dataset),
         data_root,
         max_scenes=max_scenes_i,
         split=split,
@@ -212,9 +219,9 @@ def evaluate_model_v3(
             pbar.set_postfix_str(sid, refresh=False)
         try:
             with torch.no_grad():
-                scene_metrics = adapter.eval_scene(
+                scene_metrics = ds_plugin.evaluate_scene(
+                    adapter,
                     model,
-                    dataset_name=str(dataset),
                     batch=batch,
                     ctx=ctx,
                 )
@@ -253,6 +260,12 @@ def evaluate_model_v3(
         },
         scenes={str(i): r for i, r in enumerate(rows)},
         average=avg,
+        extra={
+            "eval_mode": str(getattr(model, "_lare_eval_mode", "")),
+            "inference_compression": dict(
+                getattr(model, "_inference_compression", {"name": "none"})
+            )
+        },
     )
     record.save(out_dir / "eval_record_v3.json")
     done_msg = f"Wrote {out_dir / 'eval_record_v3.json'}"
@@ -265,24 +278,46 @@ def evaluate_model_v3(
 
 def main() -> None:
     args = _build_parser().parse_args()
-    if args.dataset == "7scenes" and not args.split:
-        raise SystemExit("--split is required when --dataset=7scenes")
     adapter = get_backbone(args.backbone)
     apply_pythonpath(adapter.name)
     ds_plugin = get_dataset(args.dataset)
+    split = ds_plugin.validate_split(args.split)
     device = torch.device(args.device)
     hf_model = str(args.hf_model or adapter.default_hf_model())
     eval_mode: EvalMode = args.eval_mode  # type: ignore[assignment]
-    model_name = str(args.model_name).strip() or str(eval_mode)
+    base_model_name = str(args.model_name).strip() or str(eval_mode)
+    compression_config = InferenceCompressionConfig(
+        name=str(args.inference_compression),
+        fastvggt_merge_start=int(args.fastvggt_merge_start),
+        fastvggt_merge_ratio=float(args.fastvggt_merge_ratio),
+        quantvggt_dtype=str(args.quantvggt_dtype),
+        quantvggt_params_dir=args.quantvggt_params_dir,
+    )
+    compression_adapter = None
+    model_name = base_model_name
+    if compression_config.name != "none":
+        compression_adapter = get_inference_compression(compression_config.name)
+        compression_adapter.validate_backbone(adapter.name)
+        compression_adapter.validate_config(compression_config)
+        model_name = f"{base_model_name}_{compression_adapter.output_tag(compression_config)}"
 
     model = adapter.load_pretrained(hf_model=hf_model, device=str(device))
 
     prune_plan: Optional[UnitPrunePlan] = None
     if eval_mode in ("lower", "model"):
         plan_root = args.prune_plan_root or default_prune_plan_root()
-        plan_name = str(args.plan_name or "").strip()
-        if plan_name:
-            prune_plan = UnitPrunePlan.load(resolve_named_prune_plan_path(plan_root, plan_name))
+        prune_plan_name = str(args.prune_plan_name or "").strip()
+        if prune_plan_name:
+            training_plan_name = str(args.training_plan_name or "").strip()
+            if eval_mode == "model" and training_plan_name:
+                prune_plan = compose_training_unit_prune_plan(
+                    prune_plan_root=plan_root,
+                    training_plan_root=args.training_plan_root or plan_root,
+                    prune_selector=prune_plan_name,
+                    training_plan=training_plan_name,
+                )
+            else:
+                prune_plan = load_named_prune_plan(plan_root, prune_plan_name)
         else:
             prune_plan = UnitPrunePlan.load(resolve_prune_plan_path(plan_root, adapter.name))
 
@@ -295,11 +330,21 @@ def main() -> None:
         map_location=device,
     )
 
+    if compression_adapter is not None:
+        model = compression_adapter.apply(
+            model,
+            backbone_name=adapter.name,
+            config=compression_config,
+        )
+    else:
+        model._inference_compression = {"name": "none"}
+    model._lare_eval_mode = str(eval_mode)
+
     model.eval()
     if args.no_progress:
         print(
             f"[eval_v3] mode={eval_mode} model_name={model_name} backbone={adapter.name} "
-            f"checkpoint={args.checkpoint}",
+            f"checkpoint={args.checkpoint} inference_compression={compression_config.name}",
             flush=True,
         )
     evaluate_model_v3(
@@ -319,7 +364,7 @@ def main() -> None:
         export_vis_2d=bool(args.export_vis_2d),
         export_vis_3d=bool(args.export_vis_3d),
         vis_max_points=int(args.vis_max_points),
-        split=args.split,
+        split=split,
         progress=not bool(args.no_progress),
     )
 

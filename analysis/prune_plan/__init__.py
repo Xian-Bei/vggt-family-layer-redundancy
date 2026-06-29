@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from analysis.schema.v3 import PruneAction
+
+_FULL_PLAN_NAME_RE = re.compile(r"^(plan_t\d+)_l\d+$")
+_PLAN_GROUP_RE = re.compile(r"^plan_t\d+$")
+_BUDGET_FULL_PLAN_NAME_RE = re.compile(r"^(plan_budget\d+)_l\d+$")
+_BUDGET_PLAN_RE = re.compile(r"^plan_budget\d+$")
+_BUDGET_FULL_SELECTOR_RE = re.compile(r"^plan_budget(?P<budget>\d+)_l(?P<lora>\d+)$")
+_BUDGET_GROUP_SELECTOR_RE = re.compile(r"^plan_budget(?P<budget>\d+)$")
+_SPAN_SELECTOR_RE = re.compile(r"^prune_span(?P<span>\d+)$")
+
+BUDGET_PLAN_BUNDLE_FILENAME = "plan_budget_all.json"
+BUDGET_PLAN_BUNDLE_SCHEMA_VERSION = "budget_plan_bundle_v1"
+PRUNE_PLAN_BUNDLE_FILENAME = "prune_plan_all.json"
+PRUNE_PLAN_BUNDLE_SCHEMA_VERSION = "span_prune_plan_bundle_v1"
 
 
 def _repo_root() -> Path:
@@ -30,6 +44,209 @@ def resolve_named_prune_plan_path(root: Path, plan_name: str) -> Path:
     if key.endswith(".json"):
         return Path(root) / key
     return Path(root) / f"{key}.json"
+
+
+def budget_plan_bundle_path(root: Path) -> Path:
+    return Path(root) / BUDGET_PLAN_BUNDLE_FILENAME
+
+
+def prune_plan_bundle_path(root: Path) -> Path:
+    return Path(root) / PRUNE_PLAN_BUNDLE_FILENAME
+
+
+def load_prune_plan_bundle(root: Path) -> Dict[str, Any]:
+    path = prune_plan_bundle_path(root)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing prune plan bundle: {path}")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"Invalid prune plan bundle: expected object at {path}")
+    schema = str(raw.get("schema_version", ""))
+    if schema != PRUNE_PLAN_BUNDLE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Invalid prune plan bundle schema at {path}: {schema!r} "
+            f"(expected {PRUNE_PLAN_BUNDLE_SCHEMA_VERSION!r})"
+        )
+    return raw
+
+
+def load_plan_bundle(root: Path) -> Dict[str, Any]:
+    path = budget_plan_bundle_path(root)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing budget plan bundle: {path}")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"Invalid budget plan bundle: expected object at {path}")
+    schema = str(raw.get("schema_version", ""))
+    if schema != BUDGET_PLAN_BUNDLE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Invalid budget plan bundle schema at {path}: {schema!r} "
+            f"(expected {BUDGET_PLAN_BUNDLE_SCHEMA_VERSION!r})"
+        )
+    return raw
+
+
+def _budget_group_number(group: str) -> int:
+    m = _BUDGET_GROUP_SELECTOR_RE.match(str(group or "").strip())
+    if not m:
+        raise ValueError(f"invalid budget plan group: {group!r}")
+    return int(m.group("budget"))
+
+
+def _budget_full_selector(name: str) -> Tuple[int, int]:
+    m = _BUDGET_FULL_SELECTOR_RE.match(str(name or "").strip())
+    if not m:
+        raise ValueError(f"invalid budget plan selector: {name!r}")
+    return int(m.group("budget")), int(m.group("lora"))
+
+
+def _bundle_budget_record(bundle: Dict[str, Any], budget: int) -> Dict[str, Any]:
+    budgets = bundle.get("budgets", {})
+    if not isinstance(budgets, dict):
+        raise ValueError("Invalid budget plan bundle: budgets must be an object")
+    raw = budgets.get(str(int(budget)))
+    if not isinstance(raw, dict):
+        raise FileNotFoundError(f"Budget selector plan_budget{int(budget)} is not present in bundle")
+    if not bool(raw.get("available", False)):
+        reason = str(raw.get("skip_reason", "") or "budget is unavailable")
+        raise FileNotFoundError(f"Budget selector plan_budget{int(budget)} is unavailable: {reason}")
+    return raw
+
+
+def _bundle_lora_prefixes(bundle: Dict[str, Any]) -> List[int]:
+    prefixes = [int(x) for x in list(bundle.get("lora_prefixes", []))]
+    if not prefixes:
+        raise FileNotFoundError("Budget plan bundle contains no LoRA prefixes")
+    return sorted(set(prefixes))
+
+
+def is_full_plan_name(name: str) -> bool:
+    key = str(name or "").strip()
+    return bool(
+        _FULL_PLAN_NAME_RE.match(key)
+        or _BUDGET_FULL_PLAN_NAME_RE.match(key)
+        or _SPAN_SELECTOR_RE.match(key)
+    )
+
+
+def is_plan_group_name(name: str) -> bool:
+    key = str(name or "").strip()
+    return bool(_PLAN_GROUP_RE.match(key) or _BUDGET_PLAN_RE.match(key) or _SPAN_SELECTOR_RE.match(key))
+
+
+def plan_group_from_name(name: str) -> str:
+    """Map a plan filename stem to its evaluation group."""
+    key = str(name or "").strip()
+    if not key:
+        raise ValueError("plan name must be non-empty")
+    m = _FULL_PLAN_NAME_RE.match(key)
+    if m:
+        return m.group(1)
+    m = _BUDGET_FULL_PLAN_NAME_RE.match(key)
+    if m:
+        return m.group(1)
+    if _SPAN_SELECTOR_RE.match(key):
+        return key
+    if _PLAN_GROUP_RE.match(key) or _BUDGET_PLAN_RE.match(key):
+        return key
+    return key
+
+
+def _lora_index_from_plan_stem(stem: str) -> int:
+    m = _FULL_PLAN_NAME_RE.match(str(stem)) or _BUDGET_FULL_PLAN_NAME_RE.match(str(stem))
+    if not m:
+        return 0
+    return int(str(stem).rsplit("_l", 1)[-1])
+
+
+def resolve_prune_plan_path_for_group(root: Path, plan_group: str) -> Path:
+    """Resolve a budget group to the bundle path after validating availability.
+
+    New budget selectors are virtual; callers that need an actual plan should use
+    ``load_group_canonical_prune_plan`` or ``canonical_plan_name_for_group``.
+    """
+    group = plan_group_from_name(plan_group)
+    if not is_plan_group_name(group):
+        raise ValueError(f"invalid plan group: {plan_group!r}")
+    root = Path(root)
+    if _SPAN_SELECTOR_RE.match(group):
+        bundle = load_prune_plan_bundle(root)
+        span = int(_SPAN_SELECTOR_RE.match(group).group("span"))  # type: ignore[union-attr]
+        spans = bundle.get("spans", {})
+        if not isinstance(spans, dict) or str(span) not in spans:
+            raise FileNotFoundError(f"No prune span {span} under {root}")
+        return prune_plan_bundle_path(root)
+    if _BUDGET_PLAN_RE.match(group):
+        bundle = load_plan_bundle(root)
+        _bundle_budget_record(bundle, _budget_group_number(group))
+        return budget_plan_bundle_path(root)
+    matches = sorted(
+        root.glob(f"{group}_l*.json"),
+        key=lambda p: (_lora_index_from_plan_stem(p.stem), p.name),
+    )
+    if not matches:
+        raise FileNotFoundError(f"No plan files for group {group!r} under {root}")
+    return matches[0]
+
+
+def list_plan_groups(root: Path) -> List[str]:
+    """List available prune-span groups from ``prune_plan_all.json``."""
+    root = Path(root)
+    if prune_plan_bundle_path(root).is_file():
+        bundle = load_prune_plan_bundle(root)
+        spans = bundle.get("spans", {})
+        if not isinstance(spans, dict):
+            return []
+        return [
+            f"prune_span{int(key)}"
+            for key, record in sorted(
+                spans.items(),
+                key=lambda item: int(item[0]) if str(item[0]).isdigit() else 10**9,
+            )
+            if isinstance(record, dict)
+        ]
+    if not budget_plan_bundle_path(root).is_file():
+        return []
+    bundle = load_plan_bundle(root)
+    budgets = bundle.get("budgets", {})
+    if not isinstance(budgets, dict):
+        return []
+    out: List[str] = []
+    for key, record in sorted(
+        budgets.items(),
+        key=lambda item: int(item[0]) if str(item[0]).isdigit() else 10**9,
+    ):
+        if isinstance(record, dict) and bool(record.get("available", False)):
+            out.append(f"plan_budget{int(key)}")
+    return out
+
+
+def list_full_plan_names(root: Path) -> List[str]:
+    """List all available virtual budget×LoRA plan selectors from the bundle."""
+    root = Path(root)
+    if not budget_plan_bundle_path(root).is_file():
+        return []
+    bundle = load_plan_bundle(root)
+    prefixes = _bundle_lora_prefixes(bundle)
+    out: List[str] = []
+    for group in list_plan_groups(root):
+        for lora_prefix in prefixes:
+            out.append(f"{group}_l{int(lora_prefix)}")
+    return out
+
+
+def canonical_plan_name_for_group(root: Path, plan_group: str) -> str:
+    """Return the canonical virtual selector for a prune/span group."""
+    group = plan_group_from_name(plan_group)
+    if _SPAN_SELECTOR_RE.match(group):
+        resolve_prune_plan_path_for_group(root, group)
+        return group
+    if not _BUDGET_PLAN_RE.match(group):
+        path = resolve_prune_plan_path_for_group(root, group)
+        return path.stem
+    bundle = load_plan_bundle(root)
+    _bundle_budget_record(bundle, _budget_group_number(group))
+    return f"{group}_l{_bundle_lora_prefixes(bundle)[0]}"
 
 
 def unit_index_to_kind_layer(index: int) -> Tuple[str, int]:
@@ -155,6 +372,190 @@ class UnitPrunePlan:
     def load(cls, path: Path) -> "UnitPrunePlan":
         raw = json.loads(path.read_text(encoding="utf-8"))
         return cls.from_dict(raw)
+
+
+def _unit_lora_spec_from_raw(raw: Dict[str, Any]) -> UnitLoraSpec:
+    ati = raw.get("alignment_teacher_unit_index")
+    return UnitLoraSpec(
+        rank=int(raw.get("rank", 32)),
+        alpha=float(raw.get("alpha", 64.0)),
+        dropout=float(raw.get("dropout", 0.0)),
+        target_submodules=tuple(raw.get("target_submodules", ("qkv", "proj"))),
+        alignment_teacher_unit_index=int(ati) if ati is not None else None,
+    )
+
+
+def _load_named_budget_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan:
+    budget, lora_prefix = _budget_full_selector(plan_name)
+    bundle = load_plan_bundle(root)
+    budget_record = _bundle_budget_record(bundle, budget)
+    if int(lora_prefix) not in _bundle_lora_prefixes(bundle):
+        raise FileNotFoundError(
+            f"Selector {plan_name!r} is unavailable: bundle has no lora prefix {lora_prefix}"
+        )
+    drop_count = int(budget_record.get("drop_count", 0))
+
+    base_extra = dict(bundle.get("extra", {})) if isinstance(bundle.get("extra", {}), dict) else {}
+    source_cache = str(bundle.get("source_cache", ""))
+    if drop_count == 0:
+        plan = UnitPrunePlan(
+            backbone=str(bundle.get("backbone", "")),
+            dataset=str(bundle.get("dataset", "")),
+            num_units=int(bundle.get("num_units", 0)),
+            drop=[],
+            drop_length=0,
+            lora={},
+            source_cache=source_cache,
+            extra={
+                **base_extra,
+                "schema_version": BUDGET_PLAN_BUNDLE_SCHEMA_VERSION,
+                "selector": str(plan_name),
+                "plan_group": f"plan_budget{budget}",
+                "pruning_budget_percent": int(budget),
+                "requested_drop_count": 0,
+                "lora_prefix": int(lora_prefix),
+                "selected_corner_similarity": 1.0,
+                "cache_unit_ids": [],
+                "cache_unit_indices": [],
+            },
+        )
+        plan.validate()
+        return plan
+
+    spans = bundle.get("spans", {})
+    if not isinstance(spans, dict):
+        raise ValueError("Invalid budget plan bundle: spans must be an object")
+    span_record = spans.get(str(drop_count))
+    if not isinstance(span_record, dict):
+        raise FileNotFoundError(
+            f"Budget selector plan_budget{budget} requires drop_count={drop_count}, "
+            "but that span is missing from bundle"
+        )
+    lora_by_prefix = span_record.get("lora", {})
+    if not isinstance(lora_by_prefix, dict):
+        raise ValueError(f"Invalid span record for drop_count={drop_count}: lora must be an object")
+    lora_record = lora_by_prefix.get(str(lora_prefix))
+    if not isinstance(lora_record, dict):
+        raise FileNotFoundError(
+            f"Selector {plan_name!r} is unavailable: bundle has no lora prefix {lora_prefix}"
+        )
+
+    lora_raw = lora_record.get("lora", {})
+    if not isinstance(lora_raw, dict):
+        raise ValueError(f"Invalid lora record for selector {plan_name!r}: lora must be an object")
+    lora = {
+        str(int(k)): _unit_lora_spec_from_raw(v)
+        for k, v in lora_raw.items()
+        if isinstance(v, dict)
+    }
+    drop = [int(x) for x in list(span_record.get("drop", []))]
+    cache_unit_ids = [str(x) for x in list(lora_record.get("cache_unit_ids", []))]
+    cache_unit_indices = [int(x) for x in list(lora_record.get("cache_unit_indices", []))]
+    triangles = [
+        {
+            "i": int(span_record.get("i", 0)),
+            "j": int(span_record.get("j", 0)),
+            "span": int(span_record.get("span", drop_count)),
+            "unit_i": str(span_record.get("unit_i", "")),
+            "unit_j": str(span_record.get("unit_j", "")),
+            "corner_similarity": float(span_record.get("corner_similarity", 1.0)),
+        }
+    ]
+    plan = UnitPrunePlan(
+        backbone=str(bundle.get("backbone", "")),
+        dataset=str(bundle.get("dataset", "")),
+        num_units=int(bundle.get("num_units", 0)),
+        drop=drop,
+        drop_length=len(drop),
+        lora=lora,
+        source_cache=source_cache,
+        extra={
+            **base_extra,
+            "schema_version": BUDGET_PLAN_BUNDLE_SCHEMA_VERSION,
+            "selector": str(plan_name),
+            "plan_group": f"plan_budget{budget}",
+            "pruning_budget_percent": int(budget),
+            "requested_drop_count": int(drop_count),
+            "lora_prefix": int(lora_prefix),
+            "selected_corner_similarity": float(span_record.get("corner_similarity", 1.0)),
+            "cache_unit_ids": cache_unit_ids,
+            "cache_unit_indices": cache_unit_indices,
+            "triangles": triangles,
+        },
+    )
+    plan.validate()
+    return plan
+
+
+def _load_named_span_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan:
+    m = _SPAN_SELECTOR_RE.match(str(plan_name or "").strip())
+    if not m:
+        raise ValueError(f"invalid prune span selector: {plan_name!r}")
+    span = int(m.group("span"))
+    bundle = load_prune_plan_bundle(root)
+    spans = bundle.get("spans", {})
+    if not isinstance(spans, dict):
+        raise ValueError("Invalid prune plan bundle: spans must be an object")
+    span_record = spans.get(str(span))
+    if not isinstance(span_record, dict):
+        raise FileNotFoundError(f"Prune span selector {plan_name!r} is not present in bundle")
+    base_extra = dict(bundle.get("extra", {})) if isinstance(bundle.get("extra", {}), dict) else {}
+    drop = [int(x) for x in list(span_record.get("drop", []))]
+    triangles = [
+        {
+            "i": int(span_record.get("i", 0)),
+            "j": int(span_record.get("j", 0)),
+            "span": int(span_record.get("span", span)),
+            "unit_i": str(span_record.get("unit_i", "")),
+            "unit_j": str(span_record.get("unit_j", "")),
+            "corner_similarity": float(span_record.get("corner_similarity", 1.0)),
+        }
+    ] if int(span) > 0 else []
+    plan = UnitPrunePlan(
+        backbone=str(bundle.get("backbone", "")),
+        dataset=str(bundle.get("dataset", "")),
+        num_units=int(bundle.get("num_units", 0)),
+        drop=drop,
+        drop_length=len(drop),
+        lora={},
+        source_cache=str(bundle.get("source_cache", "")),
+        extra={
+            **base_extra,
+            "schema_version": PRUNE_PLAN_BUNDLE_SCHEMA_VERSION,
+            "selector": str(plan_name),
+            "plan_group": str(plan_name),
+            "requested_drop_count": int(span),
+            "selected_corner_similarity": float(span_record.get("corner_similarity", 1.0)),
+            "triangles": triangles,
+        },
+    )
+    plan.validate()
+    return plan
+
+
+def load_named_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan:
+    """Load a virtual budget selector from ``plan_budget_all.json``.
+
+    Budget selectors may be either full names (``plan_budget20_l1``) or groups
+    (``plan_budget20``), in which case the smallest LoRA prefix is used.
+    """
+    key = str(plan_name or "").strip()
+    if not key:
+        raise ValueError("plan_name must be non-empty")
+    if _SPAN_SELECTOR_RE.match(key):
+        return _load_named_span_prune_plan(root, key)
+    if _BUDGET_PLAN_RE.match(key):
+        key = canonical_plan_name_for_group(root, key)
+    if _BUDGET_FULL_SELECTOR_RE.match(key):
+        return _load_named_budget_prune_plan(root, key)
+    path = resolve_named_prune_plan_path(root, key)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing prune plan: {path}")
+    return UnitPrunePlan.load(path)
+
+
+def load_group_canonical_prune_plan(root: Path, plan_group: str) -> UnitPrunePlan:
+    return load_named_prune_plan(root, canonical_plan_name_for_group(root, plan_group))
 
 
 def prune_actions_from_plan(plan: UnitPrunePlan) -> Tuple[List[PruneAction], List[PruneAction]]:

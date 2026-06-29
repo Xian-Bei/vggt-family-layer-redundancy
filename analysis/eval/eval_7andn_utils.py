@@ -217,11 +217,10 @@ def _uncollate_7andn_views(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _move_batch_to_device(batch: List[Dict[str, Any]], device: str) -> None:
-    """Mirror eval_7andN.py's per-batch device transfer (in place).
+    """Move per-view GT tensors to ``device`` for post-forward metric code (not inference).
 
-    ``img`` is left on CPU so :func:`_evaluate_one_scene_7andn` can ``torch.cat`` then
-    ``.to(device)`` once. Moving every view's ``img`` to CUDA *and* catting duplicated
-    ~400MB+ of pixels on GPU for long NRGBD clips and pushed the next scene over OOM.
+    ``img`` and ``depthmap`` stay on CPU: images are uploaded once for forward; depth maps
+    are read via :func:`_view_depthmap_to_hw` on CPU.
     """
     ignore_keys = {"depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng", "img"}
     for view in batch:
@@ -302,8 +301,7 @@ def _evaluate_one_scene_7andn(
     with torch.autocast(**ac_kw):
         agg_input = imgs_tensor if imgs_tensor.dim() == 5 else imgs_tensor.unsqueeze(0)
         aggregated_tokens_list, patch_start_idx = model.aggregator(agg_input)
-        idx = list(getattr(getattr(model, "depth_head", None), "intermediate_layer_idx", []) or [])
-        adapter = get_backbone("fastvggt" if idx == [0, 1, 2, 3] else "vggt")
+        adapter = get_backbone("vggt")
         preds = adapter.run_heads_from_aggregated_tokens(
             model,
             aggregated_tokens_list,
@@ -326,6 +324,9 @@ def _evaluate_one_scene_7andn(
     del imgs_tensor
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    if isinstance(batch, list):
+        _move_batch_to_device(batch, str(device))
 
     predictions = preds
     views = batch
@@ -581,27 +582,19 @@ def _evaluate_one_scene_7andn(
 
     pred_depth_stack = np.stack(pred_depth_crops, axis=0)
     gt_depth_stack = np.stack(gt_depth_crops, axis=0)
-    depth_nan = {
-        "depth_abs_rel": float("nan"),
-        "depth_delta1": float("nan"),
-        "depth_valid_pixels": float("nan"),
-    }
-    depth_stats: Dict[str, float] = dict(depth_nan)
-    try:
-        from .metrics import STREAMVGGT_DEPTH_MAX, evaluate_depth_metrics_streamvggt
+    from .metrics_core import compute_depth_metrics, require_depth_stack_shapes
+    from analysis.schema.v3 import DepthEvalProfile
 
-        if pred_depth_stack.shape != gt_depth_stack.shape:
-            raise ValueError(
-                f"pred/gt depth shape mismatch: {pred_depth_stack.shape} vs {gt_depth_stack.shape}"
-            )
-        depth_stats = evaluate_depth_metrics_streamvggt(
-            pred_depth_stack.astype(np.float32, copy=False),
-            gt_depth_stack.astype(np.float32, copy=False),
-            max_depth=float(STREAMVGGT_DEPTH_MAX),
-        )
-    except Exception as e:
-        if not quiet:
-            print(f"[warn] 7andn depth metrics skipped for {scene_id}: {e}", flush=True)
+    require_depth_stack_shapes(
+        pred_depth_stack,
+        gt_depth_stack,
+        context=f"7andn legacy eval {scene_id}",
+    )
+    depth_stats = compute_depth_metrics(
+        pred_depth_stack.astype(np.float32, copy=False),
+        gt_depth_stack.astype(np.float32, copy=False),
+        DepthEvalProfile(max_depth=10.0, conf_thresh=1.0, crop_mode="center224"),
+    )
 
     extr_np = extrinsics.detach().float().cpu().numpy()
     if extr_np.ndim == 4:
@@ -782,7 +775,6 @@ def evaluate_7andn_dataset(
                 disable=bool(quiet),
             ):
                 batch = default_collate(dataset[data_idx])
-                _move_batch_to_device(batch, device)
                 row = _evaluate_one_scene_7andn(
                     model=model,
                     batch=batch,

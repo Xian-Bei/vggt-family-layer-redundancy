@@ -1,23 +1,48 @@
-"""VGGT / FastVGGT cache-first replay training."""
+"""VGGT cache-first replay training."""
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fvcore.common.param_scheduler import (
+    CompositeParamScheduler,
+    ConstantParamScheduler,
+    CosineParamScheduler,
+    LinearParamScheduler,
+)
 from torch.utils.checkpoint import checkpoint
 
 from analysis.backbones.cache_replay.base import CacheReplayEngine
 from analysis.backbones.cache_replay.common import ReplayResult, is_skipped, split_concat
-from analysis.backbones.contracts import PredictionLossWeights
+from analysis.backbones.contracts import PredictionLossWeights, TrainingHyperparams
 from analysis.backbones.registry import get_backbone
 from analysis.schema.v3 import PruneAction
 from analysis.train.model import (
     count_unique_params,
 )
-FAST_DPT_FLAT_LAYERS = (4, 11, 17, 23)
+VGGT_OFFICIAL_CAMERA_WEIGHT = 5.0
+VGGT_OFFICIAL_DEPTH_WEIGHT = 1.0
+VGGT_OFFICIAL_CAMERA_LOSS_TYPE = "l1"
+VGGT_OFFICIAL_DEPTH_VALID_RANGE = 0.98
+VGGT_OFFICIAL_DEPTH_GRADIENT_LOSS_FN = "grad"
+
+
+def _build_vggt_official_lr_scheduler(cfg: TrainingHyperparams) -> CompositeParamScheduler:
+    return CompositeParamScheduler(
+        schedulers=[
+            LinearParamScheduler(float(cfg.min_lr), float(cfg.lr)),
+            CosineParamScheduler(float(cfg.lr), float(cfg.min_lr)),
+        ],
+        lengths=[float(cfg.warmup_ratio), 1.0 - float(cfg.warmup_ratio)],
+        interval_scaling=["rescaled", "rescaled"],
+    )
+
+
+def _build_vggt_official_weight_decay_scheduler(cfg: TrainingHyperparams) -> ConstantParamScheduler:
+    return ConstantParamScheduler(float(cfg.weight_decay))
 
 
 def _is_omega_model(model: nn.Module) -> bool:
@@ -62,11 +87,6 @@ def _decode_pose_to_extrinsics_intrinsics(
     if intrinsics is None:
         raise RuntimeError(f"{backbone_name} pose decode returned no intrinsics")
     return extrinsic, intrinsics
-
-
-def _is_fast_backend(m: nn.Module) -> bool:
-    idx = list(getattr(getattr(m, "depth_head", None), "intermediate_layer_idx", []) or [])
-    return idx == [0, 1, 2, 3]
 
 
 def build_pos(model: nn.Module, images: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -118,10 +138,7 @@ def required_head_layers(model: nn.Module, num_layers: int) -> List[int]:
     if model.camera_head is not None and num_layers > 0:
         keep.add(num_layers - 1)
     if model.depth_head is not None:
-        if _is_fast_backend(model):
-            keep.update(int(i) for i in FAST_DPT_FLAT_LAYERS)
-        else:
-            keep.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
+        keep.update(int(i) for i in getattr(model.depth_head, "intermediate_layer_idx", []))
     return sorted(i for i in keep if 0 <= i < num_layers)
 
 
@@ -248,24 +265,15 @@ def _replay_vggt_cache_first(
             if idx not in concat_out:
                 raise RuntimeError(f"Missing replay output at required layer {idx}")
             selected[idx] = concat_out[idx]
-    if _is_fast_backend(model):
-        compact = [selected[int(i)] for i in FAST_DPT_FLAT_LAYERS]
-        pred = get_backbone(backbone_name).run_heads_from_aggregated_tokens(
-            model,
-            compact,
-            int(model.aggregator.patch_start_idx),
-            dummy_images,
-        )
-    else:
-        agg_list: List[torch.Tensor] = [None] * num_layers  # type: ignore[list-item]
-        for idx, t in selected.items():
-            agg_list[idx] = t
-        pred = get_backbone(backbone_name).run_heads_from_aggregated_tokens(
-            model,
-            agg_list,
-            int(model.aggregator.patch_start_idx),
-            dummy_images,
-        )
+    agg_list: List[torch.Tensor] = [None] * num_layers  # type: ignore[list-item]
+    for idx, t in selected.items():
+        agg_list[idx] = t
+    pred = get_backbone(backbone_name).run_heads_from_aggregated_tokens(
+        model,
+        agg_list,
+        int(model.aggregator.patch_start_idx),
+        dummy_images,
+    )
     return ReplayResult(concat_by_layer=concat_out, pred=pred)
 
 
@@ -500,7 +508,9 @@ def build_target_batch_from_teacher(
     images_batched: torch.Tensor,
     device: torch.device,
     backbone_name: str = "vggt",
+    dataset_name: str = "",
 ) -> Dict[str, torch.Tensor]:
+    del dataset_name
     if "pose_enc" not in teacher_pred or "depth" not in teacher_pred:
         raise RuntimeError("teacher target mode requires teacher keys: pose_enc and depth")
     h = int(images_batched.shape[-2])
@@ -525,11 +535,6 @@ def prediction_official_camera_depth(
     target_batch: Dict[str, torch.Tensor],
     *,
     w_pred: float,
-    w_camera: float,
-    w_depth: float,
-    camera_loss_type: str,
-    depth_valid_range: float,
-    depth_gradient_loss_fn: str,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     from analysis.loss import compute_camera_loss, compute_depth_loss
 
@@ -545,25 +550,25 @@ def prediction_official_camera_depth(
         camera_loss_dict = compute_camera_loss(
             {"pose_enc_list": pred_for_camera["pose_enc_list"]},
             target_batch,
-            loss_type=camera_loss_type,
+            loss_type=VGGT_OFFICIAL_CAMERA_LOSS_TYPE,
         )
         l_camera = camera_loss_dict["loss_camera"]
-        total = total + float(w_camera) * l_camera
-        logs["loss_camera"] = float((wp * float(w_camera) * l_camera).detach().item())
+        total = total + VGGT_OFFICIAL_CAMERA_WEIGHT * l_camera
+        logs["loss_camera"] = float((wp * VGGT_OFFICIAL_CAMERA_WEIGHT * l_camera).detach().item())
 
     if "depth" in student_pred and "depth_conf" in student_pred:
         depth_loss_dict = compute_depth_loss(
             {"depth": student_pred["depth"], "depth_conf": student_pred["depth_conf"]},
             target_batch,
-            gradient_loss_fn=depth_gradient_loss_fn,
-            valid_range=depth_valid_range,
+            gradient_loss_fn=VGGT_OFFICIAL_DEPTH_GRADIENT_LOSS_FN,
+            valid_range=VGGT_OFFICIAL_DEPTH_VALID_RANGE,
         )
         l_conf = depth_loss_dict["loss_conf_depth"]
         l_reg = depth_loss_dict["loss_reg_depth"]
         l_grad = depth_loss_dict["loss_grad_depth"]
         l_depth = l_conf + l_reg + l_grad
-        total = total + float(w_depth) * l_depth
-        wd = float(w_depth)
+        total = total + VGGT_OFFICIAL_DEPTH_WEIGHT * l_depth
+        wd = VGGT_OFFICIAL_DEPTH_WEIGHT
         logs["loss_depth"] = float((wp * wd * l_depth).detach().item())
         logs["loss_depth_conf"] = float((wp * wd * l_conf).detach().item())
         logs["loss_depth_reg"] = float((wp * wd * l_reg).detach().item())
@@ -575,6 +580,12 @@ def prediction_official_camera_depth(
 class VGGTCacheReplayEngine(CacheReplayEngine):
     def __init__(self, backbone_name: str = "vggt") -> None:
         self.backbone_name = backbone_name.strip().lower()
+        self._lr_scheduler: Optional[CompositeParamScheduler] = None
+        self._weight_decay_scheduler: Optional[ConstantParamScheduler] = None
+        self._scheduler_key: Optional[Tuple[float, float, float, float]] = None
+
+    def training_config(self) -> TrainingHyperparams:
+        return get_backbone(self.backbone_name).training_config()
 
     def validate_cache_row(self, row: Dict[str, Any], *, num_layers: int) -> None:
         del num_layers
@@ -613,7 +624,7 @@ class VGGTCacheReplayEngine(CacheReplayEngine):
             skipped_modules_before.append(adapter.block_for_unit(m, f"frame_{int(idx)}"))
         for idx in skipped_global_idxs:
             skipped_modules_before.append(adapter.block_for_unit(m, f"global_{int(idx)}"))
-        pre_total = sum(p.numel() for p in m.aggregator.parameters())
+        pre_total = sum(p.numel() for p in self.parameter_accounting_parameters(m))
         removed = count_unique_params(skipped_modules_before) if prune else 0
         if prune:
             adapter.apply_prune_plan(m, list(drop_actions))
@@ -662,38 +673,108 @@ class VGGTCacheReplayEngine(CacheReplayEngine):
         *,
         images_batched: torch.Tensor,
         device: torch.device,
+        dataset_name: str = "",
     ) -> Dict[str, torch.Tensor]:
         return get_backbone(self.backbone_name).build_target_batch_from_teacher(
             teacher_pred,
             images_batched=images_batched,
             device=device,
+            dataset_name=dataset_name,
         )
+
+    def build_optimizer(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        args: Any,
+    ) -> torch.optim.Optimizer:
+        del args
+        cfg = self.training_config()
+        return get_backbone(self.backbone_name).build_training_optimizer(trainable, config=cfg)
 
     def prediction_loss(
         self,
         student_pred: Dict[str, torch.Tensor],
         target_batch: Dict[str, torch.Tensor],
         *,
-        w_pred: float,
-        w_camera: float,
-        w_depth: float,
-        camera_loss_type: str,
-        depth_valid_range: float,
-        depth_gradient_loss_fn: str,
+        args: Any,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        del args
+        cfg = self.training_config()
         weights = PredictionLossWeights(
-            w_pred=float(w_pred),
-            w_camera=float(w_camera),
-            w_depth=float(w_depth),
-            camera_loss_type=str(camera_loss_type),
-            depth_valid_range=float(depth_valid_range),
-            depth_gradient_loss_fn=str(depth_gradient_loss_fn),
+            w_pred=float(cfg.w_pred),
         )
         return get_backbone(self.backbone_name).prediction_loss(
             student_pred,
             target_batch,
             weights=weights,
         )
+
+    def regularization_loss(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        args: Any,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del args
+        cfg = self.training_config()
+        loss_reg = torch.zeros((), device=device)
+        if float(cfg.w_reg) > 0:
+            for p in trainable:
+                loss_reg = loss_reg + p.float().pow(2).mean()
+        return loss_reg
+
+    def update_optimizer_schedule(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        args: Any,
+        global_step: int,
+        total_steps: int,
+    ) -> float:
+        del args
+        cfg = self.training_config()
+        key = (
+            float(cfg.lr),
+            float(cfg.min_lr),
+            float(cfg.warmup_ratio),
+            float(cfg.weight_decay),
+        )
+        if self._lr_scheduler is None or self._weight_decay_scheduler is None or self._scheduler_key != key:
+            self._lr_scheduler = _build_vggt_official_lr_scheduler(cfg)
+            self._weight_decay_scheduler = _build_vggt_official_weight_decay_scheduler(cfg)
+            self._scheduler_key = key
+        where = float(global_step) / max(float(total_steps), 1.0)
+        where = max(0.0, min(1.0, where))
+        if where >= 1.0:
+            return float(optimizer.param_groups[0]["lr"])
+        lr_now = float(self._lr_scheduler(where))
+        weight_decay_now = float(self._weight_decay_scheduler(where))
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_now
+            pg["weight_decay"] = weight_decay_now
+        return lr_now
+
+    def clip_gradients(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        optimizer: torch.optim.Optimizer,
+        scaler: Any,
+        args: Any,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del args
+        cfg = self.training_config()
+        grad_norm = torch.tensor(0.0, device=device)
+        if float(cfg.grad_clip_max_norm) > 0:
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable,
+                max_norm=float(cfg.grad_clip_max_norm),
+            )
+        return grad_norm
 
     def supports_dataset_targets(self) -> bool:
         return True
@@ -703,3 +784,8 @@ class VGGTCacheReplayEngine(CacheReplayEngine):
 
     def trainable_param_module(self, model: nn.Module) -> nn.Module:
         return model.aggregator  # type: ignore[no-any-return]
+
+    def parameter_accounting_parameters(self, model: nn.Module) -> Iterable[nn.Parameter]:
+        """Count only prunable frame/global blocks, excluding patch embedding and tokens."""
+        yield from model.aggregator.frame_blocks.parameters()
+        yield from _global_blocks(model).parameters()

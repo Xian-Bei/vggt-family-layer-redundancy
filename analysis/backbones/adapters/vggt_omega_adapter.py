@@ -3,19 +3,23 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from analysis.backbones.adapters._vggt_base import (
+    build_vggt_family_training_optimizer,
+    vggt_family_training_config,
+)
 from analysis.backbones.contracts import (
     BackboneAdapter,
     BackboneCapabilities,
     CacheForwardResult,
-    EvalSceneContext,
     PredictionLossWeights,
     PredictionBundle,
+    TrainingHyperparams,
 )
 from analysis.backbones.registry import register
 from analysis.schema.v3 import LayerUnitSpec, PruneAction
@@ -55,6 +59,17 @@ class VGGTOmegaAdapter(BackboneAdapter):
             supports_lora=True,
             supports_eval=True,
         )
+
+    def training_config(self) -> TrainingHyperparams:
+        return vggt_family_training_config()
+
+    def build_training_optimizer(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        config: Optional[TrainingHyperparams] = None,
+    ) -> torch.optim.Optimizer:
+        return build_vggt_family_training_optimizer(trainable, config=config or self.training_config())
 
     def build_train_dummy_images(
         self,
@@ -223,6 +238,44 @@ class VGGTOmegaAdapter(BackboneAdapter):
         x2 = F.interpolate(x2, size=(th, tw), mode="bicubic", align_corners=False)
         return x2.reshape(int(x.shape[0]), int(x.shape[1]), int(x.shape[2]), th, tw)
 
+    def load_eval_images(self, image_paths: Sequence[Path | str]) -> torch.Tensor:
+        from analysis.datasets.driving_depth import load_raw_eval_images
+
+        raw = load_raw_eval_images(image_paths)
+        return self._prepare_images_like_omega(raw.unsqueeze(0)).squeeze(0)
+
+    def load_driving_depth_stack(
+        self,
+        depth_paths: Sequence[Path | str],
+        *,
+        output_hw: Tuple[int, int],
+    ) -> Tuple[Any, int]:
+        from analysis.datasets.driving_depth import load_driving_depth_stack_omega
+
+        return load_driving_depth_stack_omega(depth_paths, output_hw=output_hw)
+
+    def _ensure_eval_batch(self, images: torch.Tensor) -> torch.Tensor:
+        if images.dim() == 4:
+            images = images.unsqueeze(0)
+        if images.dim() != 5:
+            raise ValueError(f"Expected [B,S,3,H,W], got {tuple(images.shape)}")
+        return images
+
+    def load_scannet_gt_depth(
+        self,
+        scene: Any,
+        *,
+        output_hw: Tuple[int, int],
+    ) -> Any:
+        from analysis.eval.prediction_eval import _load_gt_depth_for_scene_omega
+
+        return _load_gt_depth_for_scene_omega(scene, image_hw=output_hw)
+
+    def align_7andn_gt_depth(self, view: Any, *, output_hw: Tuple[int, int]) -> Any:
+        from analysis.eval.prediction_eval import _load_7andn_gt_depth_omega
+
+        return _load_7andn_gt_depth_omega(view, image_hw=output_hw)
+
     def _omega_initial_tokens(self, model: nn.Module, images: torch.Tensor) -> torch.Tensor:
         agg = model.aggregator
         if images.dim() == 4:
@@ -267,9 +320,7 @@ class VGGTOmegaAdapter(BackboneAdapter):
         unit_ids: Optional[Set[str]] = None,
         layer_callback: Optional[Callable[[str, torch.Tensor], None]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-        if images.dim() == 4:
-            images = images.unsqueeze(0)
-        x = self._prepare_images_like_omega(images)
+        x = self._ensure_eval_batch(images)
         if x.device.type != "cuda":
             raise RuntimeError("vggt_omega forward requires CUDA device")
 
@@ -307,12 +358,10 @@ class VGGTOmegaAdapter(BackboneAdapter):
                 out[gid] = gt
                 if layer_callback is not None:
                     layer_callback(gid, gt)
-        return out, {"patch_start_idx": int(patch_start), "aggregated_concat": concat_list}
+        return out, {"patch_start_idx": int(patch_start), "camera_token_count": 1, "aggregated_concat": concat_list}
 
     def forward_predictions(self, model: nn.Module, images: torch.Tensor) -> PredictionBundle:
-        if images.dim() == 4:
-            images = images.unsqueeze(0)
-        x = self._prepare_images_like_omega(images)
+        x = self._ensure_eval_batch(images)
         if x.device.type != "cuda":
             raise RuntimeError("vggt_omega forward requires CUDA device")
 
@@ -322,6 +371,213 @@ class VGGTOmegaAdapter(BackboneAdapter):
 
     def _prediction_bundle_from_preds(self, preds: Dict[str, Any], x: torch.Tensor) -> PredictionBundle:
         return self.prediction_bundle_from_raw(dict(preds) if isinstance(preds, dict) else {}, x)
+
+    def supports_incremental_skip_eval(self) -> bool:
+        return True
+
+    @staticmethod
+    def _run_incremental_skip_unit(
+        model: nn.Module,
+        tokens_bspc: torch.Tensor,
+        unit_idx: int,
+        *,
+        frame_rope: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        from analysis.backbones.cache_replay.vggt_family import (
+            _run_omega_frame_block,
+            _run_omega_inter_frame_block,
+        )
+
+        bsz, seq_len, num_tokens, embed_dim = (int(x) for x in tokens_bspc.shape)
+        layer_idx, half = divmod(int(unit_idx), 2)
+        agg = model.aggregator
+        if half == 0:
+            frame_in = tokens_bspc.reshape(bsz * seq_len, num_tokens, embed_dim)
+            frame_out = _run_omega_frame_block(
+                agg.frame_blocks[layer_idx],
+                frame_in,
+                frame_rope,
+                training=False,
+                use_checkpoint=False,
+            )
+            return frame_out.reshape(bsz, seq_len, num_tokens, embed_dim)
+        return _run_omega_inter_frame_block(
+            agg,
+            layer_idx,
+            tokens_bspc,
+            bsz=bsz,
+            seq_len=seq_len,
+            num_tokens=num_tokens,
+            embed_dim=embed_dim,
+            block=agg.inter_frame_blocks[layer_idx],
+            training=False,
+            use_checkpoint=False,
+        )
+
+    def _forward_heads_from_incremental_layers(
+        self,
+        model: nn.Module,
+        selected: Dict[int, torch.Tensor],
+        *,
+        num_layers: int,
+        patch_start: int,
+        images: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        aggregated_tokens_list: List[Optional[torch.Tensor]] = [None] * int(num_layers)
+        for idx, tensor in selected.items():
+            if 0 <= int(idx) < int(num_layers):
+                aggregated_tokens_list[int(idx)] = tensor
+        final_tokens = aggregated_tokens_list[-1] if aggregated_tokens_list else None
+        preds: Dict[str, torch.Tensor] = {}
+        if isinstance(final_tokens, torch.Tensor):
+            preds["camera_and_register_tokens"] = final_tokens[:, :, : int(patch_start)].contiguous()
+        with torch.autocast(device_type=images.device.type, enabled=False):
+            if getattr(model, "camera_head", None) is not None:
+                preds["pose_enc"] = model.camera_head(
+                    aggregated_tokens_list,
+                    patch_token_start=int(patch_start),
+                )
+            if getattr(model, "dense_head", None) is not None:
+                depth_t, depth_conf_t = model.dense_head(
+                    aggregated_tokens_list,
+                    images=images,
+                    patch_token_start=int(patch_start),
+                )
+                preds["depth"] = depth_t
+                preds["depth_conf"] = depth_conf_t
+            if getattr(model, "text_alignment_head", None) is not None:
+                preds.update(
+                    model.text_alignment_head(
+                        aggregated_tokens_list,
+                        patch_token_start=int(patch_start),
+                    )
+                )
+        if not model.training:
+            preds["images"] = images
+        return preds
+
+    def _predict_incremental_skip_span(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        *,
+        prefix_tokens: torch.Tensor,
+        prefix_layers: Dict[int, torch.Tensor],
+        start_unit: int,
+        end_unit: int,
+        total_units: int,
+        required_layers: Set[int],
+        frame_rope: Tuple[torch.Tensor, torch.Tensor],
+    ) -> PredictionBundle:
+        tokens = prefix_tokens
+        selected = dict(prefix_layers)
+        frame_at_layer: Optional[torch.Tensor] = tokens if int(start_unit) % 2 == 1 else None
+        for unit_idx in range(int(start_unit), int(total_units)):
+            layer_idx, half = divmod(unit_idx, 2)
+            if unit_idx > int(end_unit):
+                tokens = self._run_incremental_skip_unit(
+                    model,
+                    tokens,
+                    unit_idx,
+                    frame_rope=frame_rope,
+                )
+            if half == 0:
+                frame_at_layer = tokens
+            else:
+                if frame_at_layer is None:
+                    raise RuntimeError(f"Missing Omega frame state before global unit {unit_idx}")
+                if layer_idx in required_layers:
+                    selected[layer_idx] = torch.cat([frame_at_layer, tokens], dim=-1)
+                frame_at_layer = None
+
+        missing = sorted(required_layers.difference(selected))
+        if missing:
+            raise RuntimeError(f"Omega incremental skip replay missed head layers: {missing}")
+        num_layers = int(total_units) // 2
+        raw = self._forward_heads_from_incremental_layers(
+            model,
+            selected,
+            num_layers=num_layers,
+            patch_start=int(model.aggregator.patch_token_start),
+            images=images,
+        )
+        return self.prediction_bundle_from_raw(raw, images)
+
+    def iter_skip_span_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        spans: Sequence[Tuple[int, int]],
+    ) -> Iterable[Tuple[int, int, PredictionBundle]]:
+        from analysis.amp_policy import autocast_device_dtype
+        from analysis.backbones.cache_replay.vggt_family import _build_omega_frame_rope
+
+        x = self._ensure_eval_batch(images)
+        if x.device.type != "cuda":
+            raise RuntimeError("vggt_omega incremental skip eval requires CUDA device")
+
+        unit_ids = [u.unit_id for u in self.layer_unit_catalog(model)]
+        total_units = len(unit_ids)
+        if total_units == 0 or total_units % 2 != 0:
+            raise RuntimeError(f"Omega incremental replay requires paired units, got {total_units}")
+        requested: Dict[int, List[int]] = {}
+        for i_raw, j_raw in spans:
+            i, j = int(i_raw), int(j_raw)
+            if i < 0 or j < i or j >= total_units:
+                raise ValueError(f"Invalid skip span ({i},{j}) for {total_units} units")
+            requested.setdefault(i, []).append(j)
+        for ends in requested.values():
+            ends.sort()
+
+        device = x.device
+        ac_kw = autocast_device_dtype(device)
+        with torch.inference_mode(), torch.autocast(**ac_kw):
+            frame_rope = _build_omega_frame_rope(model.aggregator, x, device)
+            prefix_tokens = self.build_initial_tokens(model, x)
+        if prefix_tokens is None:
+            raise RuntimeError("Omega adaptor did not produce initial replay tokens")
+
+        num_layers = int(total_units) // 2
+        required_layers = set(int(v) for v in self.required_head_layers_for_cache(model, num_layers))
+        if getattr(model, "text_alignment_head", None) is not None and num_layers > 0:
+            required_layers.add(num_layers - 1)
+        prefix_layers: Dict[int, torch.Tensor] = {}
+        baseline_frame: Optional[torch.Tensor] = None
+
+        for start_unit in range(total_units):
+            for end_unit in requested.get(start_unit, []):
+                with torch.inference_mode(), torch.autocast(**ac_kw):
+                    prediction = self._predict_incremental_skip_span(
+                        model,
+                        x,
+                        prefix_tokens=prefix_tokens,
+                        prefix_layers=prefix_layers,
+                        start_unit=start_unit,
+                        end_unit=end_unit,
+                        total_units=total_units,
+                        required_layers=required_layers,
+                        frame_rope=frame_rope,
+                    )
+                yield start_unit, end_unit, prediction
+
+            with torch.inference_mode(), torch.autocast(**ac_kw):
+                prefix_tokens = self._run_incremental_skip_unit(
+                    model,
+                    prefix_tokens,
+                    start_unit,
+                    frame_rope=frame_rope,
+                )
+                layer_idx, half = divmod(start_unit, 2)
+                if half == 0:
+                    baseline_frame = prefix_tokens
+                else:
+                    if baseline_frame is None:
+                        raise RuntimeError(f"Missing Omega baseline frame state at layer {layer_idx}")
+                    if layer_idx in required_layers:
+                        prefix_layers[layer_idx] = torch.cat(
+                            [baseline_frame, prefix_tokens], dim=-1
+                        )
+                    baseline_frame = None
 
     def prediction_bundle_from_raw(
         self,
@@ -337,9 +593,7 @@ class VGGTOmegaAdapter(BackboneAdapter):
         model: nn.Module,
         images: torch.Tensor,
     ) -> Optional[CacheForwardResult]:
-        if images.dim() == 4:
-            images = images.unsqueeze(0)
-        x = self._prepare_images_like_omega(images)
+        x = self._ensure_eval_batch(images)
         if x.device.type != "cuda":
             raise RuntimeError("vggt_omega forward requires CUDA device")
 
@@ -401,7 +655,11 @@ class VGGTOmegaAdapter(BackboneAdapter):
             preds["images"] = x
 
         pred = self._prediction_bundle_from_preds(preds, x)
-        meta = {"patch_start_idx": int(patch_start), "aggregated_concat": concat_list}
+        meta = {
+            "patch_start_idx": int(patch_start),
+            "camera_token_count": 1,
+            "aggregated_concat": concat_list,
+        }
         # Reuse first cached concat frame half as layer_-1 seed to avoid a second
         # patch-embed forward (which can spike GPU memory on large scenes).
         init_tokens = out.get("frame_0")
@@ -452,6 +710,7 @@ class VGGTOmegaAdapter(BackboneAdapter):
         *,
         images_batched: torch.Tensor,
         device: torch.device,
+        dataset_name: str = "",
     ) -> Dict[str, torch.Tensor]:
         from analysis.backbones.cache_replay.vggt_family import build_target_batch_from_teacher
 
@@ -460,6 +719,7 @@ class VGGTOmegaAdapter(BackboneAdapter):
             images_batched=images_batched,
             device=device,
             backbone_name=self.name,
+            dataset_name=dataset_name,
         )
 
     def prediction_loss(
@@ -475,11 +735,6 @@ class VGGTOmegaAdapter(BackboneAdapter):
             student_pred,
             target_batch,  # type: ignore[arg-type]
             w_pred=float(weights.w_pred),
-            w_camera=float(weights.w_camera),
-            w_depth=float(weights.w_depth),
-            camera_loss_type=str(weights.camera_loss_type),
-            depth_valid_range=float(weights.depth_valid_range),
-            depth_gradient_loss_fn=str(weights.depth_gradient_loss_fn),
         )
 
     def replay_student_cache_first(
@@ -497,22 +752,5 @@ class VGGTOmegaAdapter(BackboneAdapter):
         from analysis.backbones.cache_replay.vggt_family import VGGTCacheReplayEngine
 
         return VGGTCacheReplayEngine(backbone_name=self.name)
-
-    def eval_scene(
-        self,
-        model: nn.Module,
-        *,
-        dataset_name: str,
-        batch: Any,
-        ctx: EvalSceneContext,
-    ) -> Dict[str, float]:
-        from analysis.backbones import eval_impl
-
-        if dataset_name == "scannet":
-            return eval_impl.eval_scannet_points_adapter(self, model, batch, ctx.device, ctx.profile, ctx)
-        if dataset_name in ("7scenes", "nrgbd"):
-            return eval_impl.eval_7andn_points_adapter(self, model, batch, ctx.device, ctx.profile, ctx)
-        raise ValueError(f"Unsupported dataset for vggt_omega eval: {dataset_name}")
-
 
 register(VGGTOmegaAdapter())

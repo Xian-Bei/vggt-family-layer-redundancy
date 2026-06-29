@@ -3,39 +3,42 @@
 from __future__ import annotations
 
 import argparse
-import gc
+import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
 from analysis.backbones.bootstrap import apply_pythonpath
+from analysis.backbones.contracts import EvalSceneContext
 from analysis.backbones.registry import get_backbone
-from analysis.datasets.registry import get_dataset
-from analysis.eval.eval_v3 import evaluate_model_v3
+from analysis.datasets.registry import dataset_names, get_dataset
 from analysis.redundancy.metrics import upper_triangle_pack
-from analysis.schema.v3 import SCHEMA_VERSION, dataset_output_tag, stage_dir
-from analysis.schema.v3 import PruneAction
+from analysis.schema.v3 import SCHEMA_VERSION, stage_dir
 
 SKIP_EVAL_METRICS: Tuple[str, ...] = (
-    "ate",
+    "ape",
     "are",
     "rpe_rot",
     "rpe_trans",
     "depth_abs_rel",
     "depth_delta1",
+    "acc",
+    "comp",
     "chamfer_distance",
+    "nc",
 )
 
-# Maps eval_v3 / metrics_core keys -> heatmap keys in analysis.view.
+# Normalize legacy/evaluator metric keys to the public skip-eval names.
 _EVAL_TO_VIEW_KEY: Dict[str, str] = {
-    "ape": "ate",
+    "ate": "ape",
     "cd": "chamfer_distance",
 }
 
@@ -52,7 +55,7 @@ _LOWER_IS_WORSE = frozenset(
         "cd",
     }
 )
-_HIGHER_IS_WORSE = frozenset({"depth_delta1", "acc", "nc"})
+_HIGHER_IS_WORSE = frozenset({"depth_delta1", "nc"})
 
 
 def _timing_enabled(explicit: Optional[bool] = None) -> bool:
@@ -66,16 +69,20 @@ def _timing_log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _latency_log(msg: str) -> None:
+    """Always-on milestone log for long-running skip_gt_eval phases."""
+    print(msg, file=sys.stderr, flush=True)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Skip-range GT eval vs upper (v3).")
     p.add_argument("--experiment", type=str, default="default")
-    p.add_argument("--dataset", type=str, required=True, choices=["scannet", "7scenes", "nrgbd"])
+    p.add_argument("--dataset", type=str, required=True, choices=dataset_names())
     p.add_argument(
         "--split",
         type=str,
         default=None,
-        choices=["train", "test"],
-        help="7scenes split (required when --dataset=7scenes).",
+        help="Optional dataset split, validated by the dataset adaptor.",
     )
     p.add_argument("--data-root", type=Path, required=True)
     p.add_argument("--backbone", type=str, default="vggt")
@@ -109,6 +116,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Log per-step timings (also set SKIP_GT_EVAL_TIMING=1).",
     )
+    p.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Discard skip-eval JSONL checkpoints and recompute all scene/span results.",
+    )
     return p
 
 
@@ -124,19 +136,6 @@ def iter_unit_spans(n: int, *, max_span: int) -> Iterable[Tuple[int, int]]:
         j_max = n - 1 if cap <= 0 else min(n - 1, i + cap)
         for j in range(i, j_max + 1):
             yield i, j
-
-
-def _span_drop_label(unit_ids: Sequence[str], i: int, j: int) -> str:
-    if int(i) == int(j):
-        return str(unit_ids[i])
-    return f"{unit_ids[i]}..{unit_ids[j]}"
-
-
-def drop_actions_for_span(unit_ids: Sequence[str], i: int, j: int) -> List[PruneAction]:
-    actions: List[PruneAction] = []
-    for k in range(int(i), int(j) + 1):
-        actions.append(PruneAction(action="drop_unit", unit_id=str(unit_ids[k])))
-    return actions
 
 
 def normalize_metrics(raw: Dict[str, float]) -> Dict[str, float]:
@@ -174,17 +173,17 @@ def delta_vs_upper(upper: float, current: float) -> float:
     return float(current) - float(upper)
 
 
-def _upper_eval_path(experiment: str, tagged_dataset: str, backbone: str) -> Path:
-    return stage_dir(experiment, tagged_dataset, "eval") / f"upper_{backbone.strip().lower()}" / "eval_record_v3.json"
+def _upper_eval_path(experiment: str, tagged_dataset: str) -> Path:
+    return stage_dir(experiment, tagged_dataset, "eval") / "upper" / "eval_record_v3.json"
 
 
 def load_upper_eval_or_fail(
     *,
     experiment: str,
     tagged_dataset: str,
-    backbone: str,
+    require_depth: bool = False,
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
-    upper_path = _upper_eval_path(experiment, tagged_dataset, backbone)
+    upper_path = _upper_eval_path(experiment, tagged_dataset)
     if not upper_path.is_file():
         raise FileNotFoundError(
             "Missing upper eval record: "
@@ -210,97 +209,13 @@ def load_upper_eval_or_fail(
             if not sid:
                 continue
             scene_metrics[sid] = normalize_metrics(row)
-    return normalize_metrics(avg), scene_metrics
-
-
-def evaluate_span(
-    *,
-    adapter,
-    hf_model: str,
-    device: torch.device,
-    ds_plugin,
-    experiment: str,
-    dataset: str,
-    tagged_dataset: str,
-    data_root: Path,
-    backbone: str,
-    unit_ids: Sequence[str],
-    span_i: int,
-    span_j: int,
-    max_scenes: int,
-    max_frames: int,
-    split: str | None,
-    progress: bool,
-    timing: bool = False,
-) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
-    span_t0 = time.perf_counter()
-    t_load = time.perf_counter()
-    model = adapter.load_pretrained(hf_model=hf_model, device=str(device), eval_mode=True)
-    load_s = time.perf_counter() - t_load
-    try:
-        t_plan = time.perf_counter()
-        actions = drop_actions_for_span(unit_ids, span_i, span_j)
-        adapter.apply_prune_plan(model, actions)
-        model.eval()
-        plan_s = time.perf_counter() - t_plan
-
-        out_dir = (
-            stage_dir(experiment, tagged_dataset, "skip_eval")
-            / "runs"
-            / f"span_{span_i}_{span_j}"
+    avg_norm = normalize_metrics(avg)
+    if require_depth and not {"depth_abs_rel", "depth_delta1"}.issubset(avg_norm):
+        raise RuntimeError(
+            f"Upper eval {upper_path} predates sparse driving-depth evaluation. "
+            "Re-run run_eval.sh in upper mode before skip evaluation."
         )
-        t_eval = time.perf_counter()
-        evaluate_model_v3(
-            adapter=adapter,
-            model=model,
-            ds_plugin=ds_plugin,
-            experiment=experiment,
-            dataset=dataset,
-            data_root=data_root,
-            backbone=backbone,
-            model_name=f"skip_{span_i}_{span_j}",
-            device=device,
-            output_dir=out_dir,
-            skip_depth=adapter.periodic_eval_skip_depth(),
-            max_scenes=int(max_scenes),
-            max_frames=int(max_frames),
-            split=split,
-            output_dataset=tagged_dataset,
-            progress=progress,
-        )
-        eval_s = time.perf_counter() - t_eval
-        t_read = time.perf_counter()
-        rec_path = out_dir / "eval_record_v3.json"
-        payload = json.loads(rec_path.read_text(encoding="utf-8"))
-        read_s = time.perf_counter() - t_read
-        if timing:
-            _timing_log(
-                f"[timing] span=({span_i},{span_j}) fallback "
-                f"load={load_s:.3f}s plan={plan_s:.3f}s evaluate_model_v3={eval_s:.3f}s "
-                f"read_record={read_s:.3f}s total={time.perf_counter() - span_t0:.3f}s"
-            )
-    finally:
-        del model
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-    avg = normalize_metrics(dict(payload.get("average", {})))
-    scenes_payload = payload.get("scenes", {})
-    by_scene: Dict[str, Dict[str, float]] = {}
-    if isinstance(scenes_payload, dict):
-        rows = list(scenes_payload.values())
-    elif isinstance(scenes_payload, list):
-        rows = list(scenes_payload)
-    else:
-        rows = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        sid = str(row.get("scene_id", "")).strip()
-        if not sid:
-            continue
-        by_scene[sid] = normalize_metrics(row)
-    return avg, by_scene
+    return avg_norm, scene_metrics
 
 
 def build_packed_matrices(
@@ -410,12 +325,155 @@ def _safe_scene_filename(scene_id: str) -> str:
     return str(scene_id).replace("/", "__").replace("\\", "__")
 
 
-def _scene_staging_dir(out_root: Path) -> Path:
-    return out_root / "scene_staging"
+def _checkpoint_dir(out_root: Path) -> Path:
+    return out_root / "checkpoints"
 
 
-def _scene_staging_path(out_root: Path, scene_id: str) -> Path:
-    return _scene_staging_dir(out_root) / f"{_safe_scene_filename(scene_id)}.json"
+def _checkpoint_path(out_root: Path, scene_id: str) -> Path:
+    return _checkpoint_dir(out_root) / f"{_safe_scene_filename(scene_id)}.jsonl"
+
+
+def _manifest_path(out_root: Path) -> Path:
+    return out_root / "skip_eval_manifest_v3.json"
+
+
+def _manifest_fingerprint(config: Dict[str, Any]) -> str:
+    raw = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _prepare_checkpoint_manifest(
+    out_root: Path,
+    *,
+    config: Dict[str, Any],
+    resume: bool,
+) -> Dict[str, Any]:
+    manifest_path = _manifest_path(out_root)
+    checkpoint_dir = _checkpoint_dir(out_root)
+    derived = (
+        out_root / "skip_eval_report_v3.json",
+        out_root / "skip_eval_scenes_v3.json",
+        out_root / "skip_eval_v3.npz",
+        out_root / "skip_eval_summary_v3.json",
+    )
+    if not resume:
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir)
+        for path in (manifest_path, *derived):
+            if path.exists():
+                path.unlink()
+
+    fingerprint = _manifest_fingerprint(config)
+    if manifest_path.is_file():
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if str(existing.get("fingerprint", "")) != fingerprint:
+            raise RuntimeError(
+                f"Skip-eval checkpoint configuration mismatch at {manifest_path}. "
+                "Re-run with --no-resume to start a new checkpoint set."
+            )
+        return existing
+    if resume and checkpoint_dir.is_dir() and any(checkpoint_dir.glob("*.jsonl")):
+        raise RuntimeError(
+            f"Found skip-eval checkpoints without {manifest_path}. "
+            "Re-run with --no-resume to start a new checkpoint set."
+        )
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "skip_gt_eval_v3_manifest",
+        "fingerprint": fingerprint,
+        "config": config,
+    }
+    _atomic_write_json(manifest_path, payload)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    return payload
+
+
+def _load_scene_checkpoint(out_root: Path, scene_id: str) -> Dict[Tuple[int, int], Dict[str, float]]:
+    path = _checkpoint_path(out_root, scene_id)
+    if not path.is_file():
+        return {}
+    rows: Dict[Tuple[int, int], Dict[str, float]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError:
+                _latency_log(
+                    f"[skip_gt_eval][resume] ignore malformed checkpoint line {path}:{line_no}"
+                )
+                continue
+            if not isinstance(row, dict) or str(row.get("scene_id", "")) != str(scene_id):
+                continue
+            try:
+                span = (int(row["span_i"]), int(row["span_j"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            metrics = row.get("metrics", {})
+            if isinstance(metrics, dict):
+                rows[span] = normalize_metrics(metrics)
+    return rows
+
+
+def _append_scene_checkpoint(
+    out_root: Path,
+    *,
+    scene_id: str,
+    span: Tuple[int, int],
+    metrics: Dict[str, float],
+) -> None:
+    path = _checkpoint_path(out_root, scene_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "skip_gt_eval_v3_span",
+        "scene_id": str(scene_id),
+        "span_i": int(span[0]),
+        "span_j": int(span[1]),
+        "metrics": dict(metrics),
+    }
+    with path.open("a", encoding="utf-8", buffering=1) as f:
+        f.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
+def _load_all_checkpoint_rows(out_root: Path) -> List[Dict[str, Any]]:
+    checkpoint_dir = _checkpoint_dir(out_root)
+    if not checkpoint_dir.is_dir():
+        return []
+    rows: List[Dict[str, Any]] = []
+    for path in sorted(checkpoint_dir.glob("*.jsonl")):
+        scene_id = ""
+        span_raw: Dict[Tuple[int, int], Dict[str, float]] = {}
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("scene_id", "")).strip()
+                if not sid:
+                    continue
+                scene_id = sid
+                try:
+                    span = (int(item["span_i"]), int(item["span_j"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                metric_row = item.get("metrics", {})
+                if isinstance(metric_row, dict):
+                    span_raw[span] = normalize_metrics(metric_row)
+        if scene_id:
+            rows.append(
+                {
+                    "scene_id": scene_id,
+                    "upper_average": {},
+                    "span_raw_metrics": _serialize_span_raw(span_raw),
+                }
+            )
+    return rows
 
 
 def _scenes_json_path(out_root: Path) -> Path:
@@ -440,37 +498,6 @@ def _init_scenes_payload(*, backbone: str, dataset: str) -> Dict[str, Any]:
     }
 
 
-def _load_scenes_payload(path: Path) -> Dict[str, Any]:
-    if not path.is_file():
-        return _init_scenes_payload(backbone="", dataset="")
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Invalid scenes payload: {path}")
-    return payload
-
-
-def _upsert_scene_report(
-    out_root: Path,
-    scene_report: Dict[str, Any],
-    *,
-    backbone: str,
-    dataset: str,
-) -> None:
-    path = _scenes_json_path(out_root)
-    payload = _load_scenes_payload(path) if path.is_file() else _init_scenes_payload(backbone=backbone, dataset=dataset)
-    payload["schema_version"] = SCHEMA_VERSION
-    payload["kind"] = "skip_gt_eval_v3_scenes"
-    payload["backbone"] = backbone
-    payload["dataset"] = dataset
-    sid = str(scene_report.get("scene_id", "")).strip()
-    scenes = [row for row in payload.get("scenes", []) if str(row.get("scene_id", "")).strip() != sid]
-    scenes.append(scene_report)
-    scenes.sort(key=lambda row: str(row.get("scene_id", "")))
-    payload["scenes"] = scenes
-    payload["num_scenes"] = len(scenes)
-    _atomic_write_json(path, payload)
-
-
 def _span_raw_is_complete(span_raw: Dict[Tuple[int, int], Dict[str, float]], spans: Sequence[Tuple[int, int]]) -> bool:
     return all(span in span_raw for span in spans)
 
@@ -481,76 +508,6 @@ def _staging_row_is_complete(row: Dict[str, Any], spans: Sequence[Tuple[int, int
         return False
     span_raw = _deserialize_span_raw(row.get("span_raw_metrics", {}))
     return _span_raw_is_complete(span_raw, spans)
-
-
-def _save_scene_staging(
-    out_root: Path,
-    *,
-    scene_id: str,
-    upper_average: Dict[str, float],
-    span_raw: Dict[Tuple[int, int], Dict[str, float]],
-) -> None:
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "kind": "skip_gt_eval_v3_scene_staging",
-        "scene_id": str(scene_id),
-        "upper_average": dict(upper_average),
-        "span_raw_metrics": _serialize_span_raw(span_raw),
-    }
-    _atomic_write_json(_scene_staging_path(out_root, scene_id), payload)
-
-
-def _load_scene_staging(out_root: Path, scene_id: str) -> Optional[Dict[str, Any]]:
-    path = _scene_staging_path(out_root, scene_id)
-    if not path.is_file():
-        return None
-    row = json.loads(path.read_text(encoding="utf-8"))
-    return row if isinstance(row, dict) else None
-
-
-def _merge_span_into_scene_staging(
-    out_root: Path,
-    *,
-    scene_id: str,
-    upper_average: Dict[str, float],
-    span: Tuple[int, int],
-    metric_row: Dict[str, float],
-) -> None:
-    path = _scene_staging_path(out_root, scene_id)
-    if path.is_file():
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            payload = {}
-    else:
-        payload = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "skip_gt_eval_v3_scene_staging",
-            "scene_id": str(scene_id),
-            "upper_average": dict(upper_average),
-            "span_raw_metrics": {},
-        }
-    payload["upper_average"] = dict(upper_average)
-    raw_obj = payload.setdefault("span_raw_metrics", {})
-    if not isinstance(raw_obj, dict):
-        raw_obj = {}
-        payload["span_raw_metrics"] = raw_obj
-    raw_obj[_span_ij_key(*span)] = dict(metric_row)
-    _atomic_write_json(path, payload)
-
-
-def _load_all_scene_staging(out_root: Path) -> List[Dict[str, Any]]:
-    staging_dir = _scene_staging_dir(out_root)
-    if not staging_dir.is_dir():
-        return []
-    rows: List[Dict[str, Any]] = []
-    for path in sorted(staging_dir.glob("*.json")):
-        try:
-            row = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if isinstance(row, dict):
-            rows.append(row)
-    return rows
 
 
 def _build_scene_report_from_staging_row(
@@ -597,59 +554,20 @@ def _build_scene_report_from_staging_row(
     )
 
 
-def _persist_scene_result(
-    out_root: Path,
-    *,
-    scene_id: str,
-    upper_average: Dict[str, float],
-    span_raw: Dict[Tuple[int, int], Dict[str, float]],
-    spans: Sequence[Tuple[int, int]],
-    n_units: int,
-    unit_ids: Sequence[str],
-    metrics: Sequence[str],
-    backbone: str,
-    dataset: str,
-    max_span: int,
-    fusion_mode: str,
-) -> None:
-    _save_scene_staging(
-        out_root,
-        scene_id=scene_id,
-        upper_average=upper_average,
-        span_raw=span_raw,
-    )
-    staging_row = _load_scene_staging(out_root, scene_id)
-    if staging_row is None:
-        return
-    scene_report = _build_scene_report_from_staging_row(
-        staging_row,
-        spans=spans,
-        n_units=n_units,
-        unit_ids=unit_ids,
-        metrics=metrics,
-        backbone=backbone,
-        dataset=dataset,
-        max_span=max_span,
-        fusion_mode=fusion_mode,
-    )
-    if scene_report is None:
-        return
-    _upsert_scene_report(out_root, scene_report, backbone=backbone, dataset=dataset)
-    print(f"Wrote scene {scene_id} -> {_scenes_json_path(out_root)}", file=sys.stderr)
-
-
 def _average_span_metrics_from_staging(
     staging_rows: Sequence[Dict[str, Any]],
     spans: Sequence[Tuple[int, int]],
     metrics: Sequence[str],
 ) -> Dict[Tuple[int, int], Dict[str, float]]:
     span_metrics: Dict[Tuple[int, int], Dict[str, float]] = {}
+    decoded_rows = [
+        _deserialize_span_raw(row.get("span_raw_metrics", {})) for row in staging_rows
+    ]
     for span in spans:
         avg_row: Dict[str, float] = {}
         for m in metrics:
             vals: List[float] = []
-            for row in staging_rows:
-                span_raw = _deserialize_span_raw(row.get("span_raw_metrics", {}))
+            for span_raw in decoded_rows:
                 sm = span_raw.get(span, {})
                 if m in sm and np.isfinite(float(sm[m])):
                     vals.append(float(sm[m]))
@@ -668,6 +586,7 @@ def _finalize_skip_outputs_from_disk(
     unit_ids: Sequence[str],
     metrics: Sequence[str],
     upper_metrics: Dict[str, float],
+    upper_scene_metrics: Optional[Dict[str, Dict[str, float]]] = None,
     backbone: str,
     dataset: str,
     max_span: int,
@@ -675,9 +594,14 @@ def _finalize_skip_outputs_from_disk(
     elapsed_seconds: float,
     ensure_scene_reports: bool = False,
 ) -> Path:
-    staging_rows = _load_all_scene_staging(out_root)
+    staging_rows = _load_all_checkpoint_rows(out_root)
+    for row in staging_rows:
+        sid = str(row.get("scene_id", ""))
+        row["upper_average"] = dict((upper_scene_metrics or {}).get(sid, {}))
     complete_rows = [row for row in staging_rows if _staging_row_is_complete(row, spans)]
     if ensure_scene_reports:
+        scenes_payload = _init_scenes_payload(backbone=backbone, dataset=dataset)
+        scene_reports: List[Dict[str, Any]] = []
         for row in complete_rows:
             scene_report = _build_scene_report_from_staging_row(
                 row,
@@ -691,7 +615,11 @@ def _finalize_skip_outputs_from_disk(
                 fusion_mode=fusion_mode,
             )
             if scene_report is not None:
-                _upsert_scene_report(out_root, scene_report, backbone=backbone, dataset=dataset)
+                scene_reports.append(scene_report)
+        scene_reports.sort(key=lambda item: str(item.get("scene_id", "")))
+        scenes_payload["scenes"] = scene_reports
+        scenes_payload["num_scenes"] = len(scene_reports)
+        _atomic_write_json(_scenes_json_path(out_root), scenes_payload)
 
     scene_ids_for_mean = sorted(str(row.get("scene_id", "")).strip() for row in complete_rows if str(row.get("scene_id", "")).strip())
     span_metrics = _average_span_metrics_from_staging(complete_rows, spans, metrics)
@@ -747,7 +675,7 @@ def _finalize_skip_outputs_from_disk(
         "elapsed_seconds": elapsed_seconds,
         "report_path": str(report_path),
         "scenes_path": str(scenes_path),
-        "staging_dir": str(_scene_staging_dir(out_root)),
+        "checkpoint_dir": str(_checkpoint_dir(out_root)),
     }
     summary_path = out_root / "skip_eval_summary_v3.json"
     _atomic_write_json(summary_path, summary)
@@ -775,102 +703,215 @@ def run_skip_gt_eval(
     split: str | None = None,
     progress: bool = True,
     timing: Optional[bool] = None,
+    resume: bool = True,
 ) -> Path:
     timing_on = _timing_enabled(timing)
+    run_t0 = time.perf_counter()
     if timing_on:
         _timing_log(f"[timing] skip_gt_eval timing enabled dataset={dataset} backbone={backbone}")
-    if dataset == "7scenes" and not split:
-        raise ValueError("7scenes requires split='train' or 'test'")
-    tagged_dataset = str(output_dataset).strip() or dataset_output_tag(dataset, split)
+
+    t_phase = time.perf_counter()
     adapter = get_backbone(backbone)
     apply_pythonpath(adapter.name)
+    if not adapter.supports_incremental_skip_eval():
+        raise RuntimeError(
+            f"Backbone {adapter.name!r} does not yet implement the incremental skip-eval adaptor API"
+        )
     ds_plugin = get_dataset(dataset)
+    split = ds_plugin.validate_split(split)
+    tagged_dataset = str(output_dataset).strip() or ds_plugin.output_tag(split)
+    _latency_log(
+        f"[skip_gt_eval] start dataset={tagged_dataset} backbone={backbone} "
+        f"max_scenes={max_scenes} max_frames={max_frames} max_span={max_span}"
+    )
     torch_device = torch.device(device)
     hf = str(hf_model or adapter.default_hf_model())
+    _latency_log(f"[skip_gt_eval] init adapter+dataset {time.perf_counter() - t_phase:.2f}s")
 
     out_root = output_dir or stage_dir(experiment, tagged_dataset, "skip_eval")
     out_root.mkdir(parents=True, exist_ok=True)
 
-    t0 = time.perf_counter()
-    model_upper = adapter.load_pretrained(hf_model=hf, device=str(torch_device), eval_mode=True)
-    unit_ids = unit_ids_from_catalog(adapter, model_upper)
+    t_phase = time.perf_counter()
+    _latency_log("[skip_gt_eval] load_pretrained (single dataset model) ...")
+    model = adapter.load_pretrained(hf_model=hf, device=str(torch_device), eval_mode=True)
+    model.eval()
+    _latency_log(f"[skip_gt_eval] load_pretrained done {time.perf_counter() - t_phase:.2f}s")
+
+    t_phase = time.perf_counter()
+    unit_ids = unit_ids_from_catalog(adapter, model)
     n_units = len(unit_ids)
     if n_units < 1:
         raise RuntimeError(f"No units in catalog for backbone={backbone}")
+    _latency_log(f"[skip_gt_eval] unit catalog n_units={n_units} {time.perf_counter() - t_phase:.3f}s")
 
+    t_phase = time.perf_counter()
     spans = list(iter_unit_spans(n_units, max_span=int(max_span)))
     metrics_available = list(SKIP_EVAL_METRICS)
+    _latency_log(f"[skip_gt_eval] span enumeration n_spans={len(spans)} {time.perf_counter() - t_phase:.3f}s")
 
+    t_phase = time.perf_counter()
     upper_metrics, upper_scene_metrics = load_upper_eval_or_fail(
         experiment=experiment,
         tagged_dataset=tagged_dataset,
-        backbone=backbone,
+        require_depth=dataset in {"nuscenes", "waymo"} and not adapter.periodic_eval_skip_depth(),
     )
-    del model_upper
-    if torch_device.type == "cuda":
-        torch.cuda.empty_cache()
+    _latency_log(
+        f"[skip_gt_eval] load upper eval ({len(upper_scene_metrics)} scenes) "
+        f"{time.perf_counter() - t_phase:.2f}s"
+    )
 
     metrics = [m for m in metrics_available if m in upper_metrics]
     if not metrics:
         raise RuntimeError(f"No overlapping metrics between upper eval and skip_eval list: {upper_metrics}")
-
     total_spans = len(spans)
-    desc = f"skip_eval {adapter.name} ({tagged_dataset})"
-    span_iter: Iterable[Tuple[int, Tuple[int, int]]] = (
-        tqdm(
-            enumerate(spans),
-            total=total_spans,
-            desc=desc,
-            unit="span",
-            file=sys.stderr,
-            dynamic_ncols=True,
-        )
-        if progress
-        else enumerate(spans)
+    manifest_config: Dict[str, Any] = {
+        "backbone": str(adapter.name),
+        "dataset": str(tagged_dataset),
+        "source_dataset": str(dataset),
+        "data_root": str(Path(data_root).resolve()),
+        "split": split,
+        "hf_model": hf,
+        "max_scenes": int(max_scenes),
+        "max_frames": int(max_frames),
+        "max_span": int(max_span),
+        "mode": str(mode),
+        "metrics": list(metrics),
+        "unit_ids": list(unit_ids),
+        "spans": [[int(i), int(j)] for i, j in spans],
+        "skip_depth": bool(adapter.periodic_eval_skip_depth()),
+    }
+    _prepare_checkpoint_manifest(out_root, config=manifest_config, resume=bool(resume))
+    _latency_log(
+        f"[skip_gt_eval] entering scene-first loop: {total_spans} spans, "
+        f"{len(metrics)} metrics, resume={bool(resume)}, elapsed={time.perf_counter() - run_t0:.2f}s"
     )
-    for si, (i, j) in span_iter:
-        drop_label = _span_drop_label(unit_ids, i, j)
-        if progress and hasattr(span_iter, "set_postfix_str"):
-            span_iter.set_postfix_str(drop_label, refresh=False)
+    profile = ds_plugin.eval_profile()
+    eval_ctx = EvalSceneContext(
+        device=torch_device,
+        profile=profile,
+        skip_depth=bool(adapter.periodic_eval_skip_depth()),
+        export_vis_2d=False,
+        export_vis_3d=False,
+        vis_save_root=None,
+        vis_max_points=0,
+        backbone_name=str(adapter.name),
+        dataset_name=str(ds_plugin.name),
+    )
+    total_scenes = ds_plugin.count_scenes(
+        data_root, max_scenes=int(max_scenes), split=split
+    )
+    scene_source = ds_plugin.iter_scenes(
+        data_root,
+        max_scenes=int(max_scenes),
+        max_frames=int(max_frames),
+        split=split,
+    )
+    scene_iter = tqdm(
+        scene_source,
+        total=total_scenes,
+        desc=f"skip_eval {adapter.name} ({tagged_dataset})",
+        unit="scene",
+        file=sys.stderr,
+        dynamic_ncols=True,
+        position=0,
+        disable=not progress,
+    )
+    span_set = set(spans)
+    for scene_index, batch in enumerate(scene_iter):
+        sid = str(batch.scene_id)
+        completed = _load_scene_checkpoint(out_root, sid) if resume else {}
+        missing = [span for span in spans if span not in completed]
+        if not missing:
+            _latency_log(
+                f"[skip_gt_eval][resume] scene={sid} reused all {total_spans} spans"
+            )
+            continue
+        if progress:
+            scene_iter.set_postfix_str(f"{sid} missing={len(missing)}", refresh=False)
+        scene_t0 = time.perf_counter()
+        prepared = None
+        span_iter = None
         try:
-            _, by_scene_metrics = evaluate_span(
-                adapter=adapter,
-                hf_model=hf,
-                device=torch_device,
-                ds_plugin=ds_plugin,
-                experiment=experiment,
-                dataset=dataset,
-                tagged_dataset=tagged_dataset,
-                data_root=data_root,
-                backbone=backbone,
-                unit_ids=unit_ids,
-                span_i=i,
-                span_j=j,
-                max_scenes=int(max_scenes),
-                max_frames=int(max_frames),
-                split=split,
-                progress=False,
-                timing=timing_on,
+            prepared = ds_plugin.prepare_skip_eval_scene(adapter, batch, eval_ctx)
+            if not isinstance(prepared.images, torch.Tensor):
+                raise TypeError(
+                    f"Dataset adaptor {ds_plugin.name!r} returned non-tensor skip-eval images"
+                )
+            prepare_s = time.perf_counter() - scene_t0
+            yielded: Set[Tuple[int, int]] = set()
+            missing_set = set(missing)
+            replay_t0 = time.perf_counter()
+            prediction_iter = adapter.iter_skip_span_predictions(
+                model, prepared.images, missing
             )
-        except RuntimeError as e:
-            msg = f"[warn] span {i},{j} ({drop_label}) failed: {e}"
-            if progress:
-                tqdm.write(msg, file=sys.stderr)
-            else:
-                print(msg, file=sys.stderr, flush=True)
-            by_scene_metrics = {}
-        for sid, metric_row in by_scene_metrics.items():
-            scene_upper = normalize_metrics(dict(upper_scene_metrics.get(str(sid), {})))
-            _merge_span_into_scene_staging(
-                out_root,
-                scene_id=str(sid),
-                upper_average=scene_upper,
-                span=(int(i), int(j)),
-                metric_row=dict(metric_row),
+            span_iter = tqdm(
+                prediction_iter,
+                total=len(missing),
+                desc=f"  spans {sid}",
+                unit="span",
+                file=sys.stderr,
+                dynamic_ncols=True,
+                leave=False,
+                position=1,
+                disable=not progress,
             )
-        if torch_device.type == "cuda":
-            torch.cuda.empty_cache()
+            for i, j, prediction in span_iter:
+                span = (int(i), int(j))
+                if progress:
+                    span_iter.set_postfix_str(f"({span[0]},{span[1]})", refresh=False)
+                if span not in span_set or span not in missing_set:
+                    raise RuntimeError(f"Adaptor yielded unrequested skip span {span}")
+                if span in yielded:
+                    raise RuntimeError(f"Adaptor yielded duplicate skip span {span}")
+                yielded.add(span)
+                try:
+                    metric_row = normalize_metrics(
+                        ds_plugin.score_skip_eval_prediction(
+                            adapter, prediction, prepared, eval_ctx
+                        )
+                    )
+                    _append_scene_checkpoint(
+                        out_root,
+                        scene_id=sid,
+                        span=span,
+                        metrics=metric_row,
+                    )
+                except Exception as e:
+                    _latency_log(f"[warn] scene={sid} span={span} scoring failed: {e}")
+                finally:
+                    del prediction
+            span_iter.close()
+            if yielded != missing_set:
+                absent = sorted(missing_set.difference(yielded))
+                extra = sorted(yielded.difference(missing_set))
+                raise RuntimeError(
+                    f"Incremental adaptor span coverage mismatch: missing={absent[:8]} extra={extra[:8]}"
+                )
+            scene_s = time.perf_counter() - scene_t0
+            replay_s = time.perf_counter() - replay_t0
+            _latency_log(
+                f"[skip_gt_eval] scene {scene_index + 1}/{total_scenes or '?'} {sid} "
+                f"prepare={prepare_s:.2f}s replay+score={replay_s:.2f}s total={scene_s:.2f}s"
+            )
+            if timing_on:
+                _timing_log(
+                    f"[timing] scene={sid} prepare={prepare_s:.3f}s "
+                    f"replay_score={replay_s:.3f}s total={scene_s:.3f}s"
+                )
+        except Exception as e:
+            _latency_log(f"[warn] scene={sid} incremental skip eval failed: {e}")
+        finally:
+            if span_iter is not None:
+                span_iter.close()
+            if prepared is not None:
+                del prepared
+            if torch_device.type == "cuda":
+                torch.cuda.empty_cache()
 
+    del model
+    if torch_device.type == "cuda":
+        torch.cuda.empty_cache()
+    _latency_log(f"[skip_gt_eval] scene loop finished, finalizing ... elapsed={time.perf_counter() - run_t0:.1f}s")
     return _finalize_skip_outputs_from_disk(
         out_root=out_root,
         spans=spans,
@@ -878,11 +919,12 @@ def run_skip_gt_eval(
         unit_ids=unit_ids,
         metrics=metrics,
         upper_metrics=upper_metrics,
+        upper_scene_metrics=upper_scene_metrics,
         backbone=adapter.name,
         dataset=tagged_dataset,
         max_span=int(max_span),
         fusion_mode=str(mode),
-        elapsed_seconds=time.perf_counter() - t0,
+        elapsed_seconds=time.perf_counter() - run_t0,
         ensure_scene_reports=True,
     )
 
@@ -911,6 +953,7 @@ def main() -> None:
         split=args.split,
         progress=not bool(args.no_progress),
         timing=bool(args.timing) if args.timing else None,
+        resume=not bool(args.no_resume),
     )
 
 

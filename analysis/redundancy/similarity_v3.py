@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -13,10 +12,82 @@ import torch
 from analysis.redundancy.metrics import pairwise_similarity_matrices
 from analysis.schema.v3 import SCHEMA_VERSION, stage_dir
 
+REDUNDANCY_GRAPH_REGIONS = ("special", "camera", "patch", "all")
+DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS: Tuple[str, ...] = ()
+LEGACY_REDUNDANCY_GRAPH_V3 = "redundancy_graph_v3.npz"
+
+
+def parse_exclude_token_regions(spec: str) -> Tuple[str, ...]:
+    """Parse comma-separated token regions excluded from mean/min aggregation."""
+    raw = str(spec or "").strip()
+    if not raw:
+        return DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS
+    allowed = set(REDUNDANCY_GRAPH_REGIONS)
+    out: List[str] = []
+    for part in raw.split(","):
+        region = part.strip().lower()
+        if not region:
+            continue
+        if region not in allowed:
+            raise ValueError(
+                f"Unknown exclude token region {region!r}; allowed: {sorted(allowed)}"
+            )
+        if region not in out:
+            out.append(region)
+    return tuple(out)
+
+
+def regions_for_aggregation(
+    available_regions: Sequence[str],
+    *,
+    exclude_token_regions: Sequence[str],
+) -> List[str]:
+    """Drop excluded regions while preserving ``available_regions`` order."""
+    exclude = {
+        str(region).strip().lower()
+        for region in exclude_token_regions
+        if str(region).strip()
+    }
+    return [
+        region
+        for region in available_regions
+        if str(region).strip().lower() not in exclude
+    ]
+
+
+def redundancy_graph_filename(region: str) -> str:
+    return f"redundancy_graph_{region}.npz"
+
+
+def resolve_redundancy_graph_path(redundancy_dir: Path, region: str) -> Optional[Path]:
+    """Per-region redundancy npz; legacy ``redundancy_graph_v3.npz`` counts as ``all``."""
+    path = Path(redundancy_dir) / redundancy_graph_filename(region)
+    if path.is_file():
+        return path
+    legacy = Path(redundancy_dir) / LEGACY_REDUNDANCY_GRAPH_V3
+    if region == "all" and legacy.is_file():
+        return legacy
+    return None
+
+
+def list_redundancy_graph_regions(redundancy_dir: Path) -> List[str]:
+    red = Path(redundancy_dir)
+    if not red.is_dir():
+        return []
+    out: List[str] = []
+    for region in REDUNDANCY_GRAPH_REGIONS:
+        if resolve_redundancy_graph_path(red, region) is not None:
+            out.append(region)
+    return out
+
+
+def redundancy_dir_has_graphs(redundancy_dir: Path) -> bool:
+    return bool(list_redundancy_graph_regions(redundancy_dir))
+
 
 def parse_token_regions(spec: str) -> List[str]:
-    """Parse ``special,patch,all``. Empty spec defaults to ``all`` (backward compatible)."""
-    allowed = {"special", "patch", "all"}
+    """Parse ``special,camera,patch,all``. Empty spec defaults to ``all`` (backward compatible)."""
+    allowed = set(REDUNDANCY_GRAPH_REGIONS)
     regions = [r.strip().lower() for r in spec.split(",") if r.strip()]
     if not regions:
         return ["all"]
@@ -35,6 +106,7 @@ def flatten_unit_token_regions(
     *,
     patch_start_idx: int,
     regions: Sequence[str],
+    camera_token_count: int = 0,
 ) -> List[Tuple[str, torch.Tensor]]:
     """Split a unit activation into flat ``[N,C]`` tensors per requested region."""
     want = set(regions)
@@ -53,7 +125,10 @@ def flatten_unit_token_regions(
     t = t.float()
     _b, _s, p, c = (int(x) for x in t.shape)
     psi = max(0, min(int(patch_start_idx), p))
+    cam_n = max(0, min(int(camera_token_count), psi))
     out: List[Tuple[str, torch.Tensor]] = []
+    if "camera" in want and cam_n > 0:
+        out.append(("camera", t[:, :, :cam_n, :].reshape(-1, c).float()))
     if "special" in want and psi > 0:
         out.append(("special", t[:, :, :psi, :].reshape(-1, c).float()))
     if "patch" in want and psi < p:
@@ -99,15 +174,17 @@ def subsample_token_rows(t: torch.Tensor, max_tokens: int, seed: int) -> torch.T
     return t.index_select(0, idx)
 
 
-def unit_map_to_flat_layers(
+def unit_map_to_flat_layers_for_region(
     unit_map: Dict[str, torch.Tensor],
     unit_ids: Sequence[str],
     *,
+    region: str,
     patch_start_idx: int,
-    regions: Sequence[str],
+    camera_token_count: int = 0,
     max_tokens: int,
     seed: int,
 ) -> Tuple[List[torch.Tensor], List[str]]:
+    """Flatten one token region; ``scene_unit_ids`` are bare catalog ids (no region suffix)."""
     flat_layers: List[torch.Tensor] = []
     scene_unit_ids: List[str] = []
     for uid in unit_ids:
@@ -117,13 +194,42 @@ def unit_map_to_flat_layers(
         if not isinstance(t, torch.Tensor):
             raise TypeError(f"unit_map[{uid!r}] must be a torch.Tensor")
         for region_name, flat in flatten_unit_token_regions(
-            t, patch_start_idx=patch_start_idx, regions=regions
+            t,
+            patch_start_idx=patch_start_idx,
+            regions=[region],
+            camera_token_count=camera_token_count,
         ):
+            if region_name != region:
+                continue
             flat_layers.append(subsample_token_rows(flat, max_tokens, seed))
-            scene_unit_ids.append(
-                uid if region_name == "all" and len(regions) == 1 else f"{uid}_{region_name}"
-            )
+            scene_unit_ids.append(str(uid))
     return flat_layers, scene_unit_ids
+
+
+def unit_map_to_flat_layers_by_region(
+    unit_map: Dict[str, torch.Tensor],
+    unit_ids: Sequence[str],
+    *,
+    patch_start_idx: int,
+    camera_token_count: int = 0,
+    regions: Sequence[str],
+    max_tokens: int,
+    seed: int,
+) -> Dict[str, Tuple[List[torch.Tensor], List[str]]]:
+    out: Dict[str, Tuple[List[torch.Tensor], List[str]]] = {}
+    for region in regions:
+        flat_layers, scene_unit_ids = unit_map_to_flat_layers_for_region(
+            unit_map,
+            unit_ids,
+            region=str(region),
+            patch_start_idx=patch_start_idx,
+            camera_token_count=camera_token_count,
+            max_tokens=max_tokens,
+            seed=seed,
+        )
+        if flat_layers:
+            out[str(region)] = (flat_layers, scene_unit_ids)
+    return out
 
 
 def compute_scene_similarity(
@@ -152,11 +258,11 @@ def compute_scene_similarity(
 
 
 class RedundancyAccumulator:
-    """Cross-scene redundancy graph builder (mean + per-scene stacks)."""
+    """Cross-scene redundancy graph builder for one token region (mean + per-scene stacks)."""
 
-    def __init__(self, metric_names: Sequence[str], token_regions: Sequence[str]) -> None:
+    def __init__(self, metric_names: Sequence[str], token_region: str) -> None:
         self.metric_names = list(metric_names)
-        self.token_regions = list(token_regions)
+        self.token_region = str(token_region)
         self.accum: Dict[str, List[np.ndarray]] = {m: [] for m in self.metric_names}
         self.scene_stack: Dict[str, List[np.ndarray]] = {m: [] for m in self.metric_names}
         self.scene_ids_processed: List[str] = []
@@ -176,7 +282,7 @@ class RedundancyAccumulator:
         elif list(scene_unit_ids) != self.graph_unit_ids:
             raise ValueError(
                 f"Scene {scene_id!r} unit layout {scene_unit_ids} != prior {self.graph_unit_ids}; "
-                "check token_regions and cache consistency across scenes."
+                f"check token region {self.token_region!r} and cache consistency across scenes."
             )
         self.scene_ids_processed.append(str(scene_id))
         for m, arr in sims.items():
@@ -193,7 +299,7 @@ class RedundancyAccumulator:
         out: Dict[str, np.ndarray] = {
             "unit_ids": np.array(unit_ids, dtype=object),
             "schema_version": np.array([SCHEMA_VERSION]),
-            "token_regions": np.array([",".join(self.token_regions)]),
+            "token_region": np.array([self.token_region]),
             "scene_ids": np.array(self.scene_ids_processed, dtype=object),
         }
         for m, mats in self.accum.items():
@@ -209,39 +315,24 @@ def write_redundancy_outputs(
     *,
     experiment: str,
     dataset: str,
-    backbone: str,
     unit_ids: Sequence[str],
-    accumulator: RedundancyAccumulator,
-    max_span: int,
-    max_tokens: int,
-    metric_device: Optional[str],
-    source_cache: str,
+    accumulators: Dict[str, RedundancyAccumulator],
+    token_regions: Sequence[str],
     timing_total_s: float,
-) -> Path:
+) -> List[Path]:
     red_dir = stage_dir(experiment, dataset, "redundancy")
     red_dir.mkdir(parents=True, exist_ok=True)
-    out_npz = accumulator.finalize_npz(fallback_unit_ids=unit_ids)
-    out_npz_path = red_dir / "redundancy_graph_v3.npz"
-    np.savez(out_npz_path, **out_npz)
-    summary = {
-        "schema_version": SCHEMA_VERSION,
-        "dataset": dataset,
-        "backbone": backbone,
-        "unit_ids": list(unit_ids),
-        "metrics": accumulator.metric_names,
-        "num_scenes": len(accumulator.scene_ids_processed),
-        "scene_ids": accumulator.scene_ids_processed,
-        "max_span": int(max_span),
-        "max_tokens": int(max_tokens),
-        "token_regions": accumulator.token_regions,
-        "metric_device": metric_device or "cpu",
-        "timing_seconds": {
-            "total": float(timing_total_s),
-            "source_cache": source_cache,
-        },
-    }
-    (red_dir / "redundancy_summary_v3.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
-    )
-    print(f"Wrote {out_npz_path} ({timing_total_s:.1f}s)", file=sys.stderr)
-    return out_npz_path
+    written: List[Path] = []
+    for region in token_regions:
+        acc = accumulators.get(str(region))
+        if acc is None or not acc.scene_ids_processed:
+            continue
+        out_npz = acc.finalize_npz(fallback_unit_ids=unit_ids)
+        out_npz_path = red_dir / redundancy_graph_filename(str(region))
+        np.savez(out_npz_path, **out_npz)
+        written.append(out_npz_path)
+        print(f"Wrote {out_npz_path} ({timing_total_s:.1f}s)", file=sys.stderr)
+
+    if not written:
+        raise RuntimeError("No redundancy graphs were written (no scenes accumulated).")
+    return written

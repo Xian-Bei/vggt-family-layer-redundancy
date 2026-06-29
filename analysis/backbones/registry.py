@@ -32,11 +32,9 @@ def _load_defaults() -> None:
     if _REGISTRY:
         return
     from .adapters.vggt_adapter import VGGTAdapter
-    from .adapters.fastvggt_adapter import FastVGGTAdapter
     from .adapters.pi3_adapter import Pi3Adapter
     from .adapters.vggt_omega_adapter import VGGTOmegaAdapter
 
     register(VGGTAdapter())
-    register(FastVGGTAdapter())
     register(Pi3Adapter())
     register(VGGTOmegaAdapter())

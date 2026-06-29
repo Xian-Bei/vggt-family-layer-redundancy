@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import torch
-
+from analysis.prune_plan import (
+    is_plan_group_name,
+    load_prune_plan_bundle,
+    plan_group_from_name,
+    prune_plan_bundle_path,
+)
 from analysis.schema.v3 import EvalRecordV3, OUTPUT_ROOT_DEFAULT, UNIFIED_METRIC_KEYS
 
 AGG_PARAMS_KEY = "agg_params"
@@ -27,7 +32,7 @@ METRIC_HEADERS: Dict[str, str] = {
     "nc": "NC ↑",
     "inference_time_ms": "Time (ms) ↓",
     "infer_peak_vram_gb": "VRAM (GB) ↓",
-    AGG_PARAMS_KEY: "Agg params ↓",
+    AGG_PARAMS_KEY: "Block params ↓",
 }
 
 _DATASET_ORDER = (
@@ -36,6 +41,10 @@ _DATASET_ORDER = (
     "7scenes_test",
     "7scenes_train",
     "nrgbd",
+    "nuscenes_val",
+    "waymo_validation",
+    "nuscenes_train",
+    "waymo_training",
 )
 
 
@@ -44,6 +53,31 @@ def _dataset_sort_key(name: str) -> Tuple[int, str]:
         return (_DATASET_ORDER.index(name), name)
     except ValueError:
         return (len(_DATASET_ORDER), name)
+
+
+_PLAN_GROUP_SORT_RE = re.compile(r"^(?:prune_span(\d+)|plan_budget(\d+)|plan_t(\d+))$")
+_PRUNE_SPAN_RE = re.compile(r"^prune_span(\d+)$")
+
+
+def _lower_label_sort_key(label: str) -> Tuple[int, int, str]:
+    if label == "lower":
+        return (1, -1, label)
+    m = _PLAN_GROUP_SORT_RE.match(label)
+    if m:
+        return (0, int(next(g for g in m.groups() if g is not None)), label)
+    return (2, 0, label)
+
+
+def _label_base(label: str) -> str:
+    base = str(label or "").split("+", 1)[0]
+    if base.startswith("model/"):
+        base = base.split("/", 1)[1]
+    return base
+
+
+def _span_from_label(label: str) -> Optional[int]:
+    m = _PRUNE_SPAN_RE.match(_label_base(label))
+    return int(m.group(1)) if m else None
 
 
 def _format_param_count(n: int) -> str:
@@ -71,95 +105,85 @@ def _fmt_value(key: str, value: float) -> str:
     return f"{value:.4f}"
 
 
-def _pct_change(upper: float, lower: float) -> Optional[float]:
-    if not (math.isfinite(upper) and math.isfinite(lower)):
-        return None
-    if upper == 0.0:
-        return None
-    return (lower - upper) / upper * 100.0
-
-
-def _fmt_pct(pct: float) -> str:
-    sign = "+" if pct > 0 else ""
-    return f"({sign}{pct:.1f}%)"
-
-
-def _fmt_lower_cell(key: str, upper: float, lower: float) -> str:
-    base = _fmt_value(key, lower)
-    pct = _pct_change(upper, lower)
-    if pct is None:
-        return base
-    return f"{base} {_fmt_pct(pct)}"
-
-
-def _compute_aggregator_param_counts(
-    backbone: str,
+def _read_aggregator_param_counts_from_bundle(
     prune_plan_root: Path,
-    plan_name: str = "",
-) -> Tuple[int, int]:
-    """Mirror train_lora_skip_baseline: count aggregator/decoder stack params (excludes heads)."""
-    from analysis.backbones.bootstrap import apply_pythonpath
-    from analysis.backbones.cache_replay import get_cache_replay_engine
-    from analysis.backbones.registry import get_backbone
-    from analysis.prune_plan import (
-        UnitPrunePlan,
-        drop_intervals_from_plan,
-        prune_actions_from_plan,
-        resolve_named_prune_plan_path,
-        resolve_prune_plan_path,
-    )
-    from analysis.train.model import build_skipped_layer_indices
+    labels: List[str],
+) -> Tuple[Optional[int], Dict[str, int]]:
+    """Read span parameter counts stored by the prune-plan builder."""
+    prune_plan_root = Path(prune_plan_root)
+    if not prune_plan_bundle_path(prune_plan_root).is_file():
+        print(
+            f"[warn] Missing prune plan bundle for parameter accounting: "
+            f"{prune_plan_bundle_path(prune_plan_root)}",
+            flush=True,
+        )
+        return None, {}
 
-    apply_pythonpath(backbone)
-    adapter = get_backbone(backbone)
-    engine = get_cache_replay_engine(backbone)
-    device = torch.device("cpu")
-    hf_model = adapter.default_hf_model()
+    try:
+        bundle = load_prune_plan_bundle(prune_plan_root)
+    except Exception as exc:
+        print(f"[warn] Could not load prune plan bundle for parameter accounting: {exc}", flush=True)
+        return None, {}
 
-    plan_name = str(plan_name or "").strip()
-    if plan_name:
-        plan_path = resolve_named_prune_plan_path(prune_plan_root, plan_name)
-    else:
-        plan_path = resolve_prune_plan_path(prune_plan_root, backbone)
-    if not plan_path.is_file():
-        raise FileNotFoundError(f"Missing prune plan for {backbone}: {plan_path}")
+    param_accounting = bundle.get("param_accounting", {})
+    if not isinstance(param_accounting, dict) or not bool(param_accounting.get("available", False)):
+        reason = ""
+        if isinstance(param_accounting, dict):
+            reason = str(param_accounting.get("skip_reason", "") or "")
+        print(
+            "[warn] Prune plan bundle has no available param_accounting; "
+            f"Block params will be omitted{': ' + reason if reason else ''}.",
+            flush=True,
+        )
+        return None, {}
 
-    plan = UnitPrunePlan.load(plan_path)
-    drop_actions, lora_actions = prune_actions_from_plan(plan)
-    frame_int, global_int, _, _ = drop_intervals_from_plan(plan)
-    skipped_frame = build_skipped_layer_indices(frame_int)
-    skipped_global = build_skipped_layer_indices(global_int)
+    try:
+        upper = int(param_accounting["total_params"])
+    except Exception:
+        print("[warn] Invalid prune plan param_accounting.total_params; Block params omitted.", flush=True)
+        return None, {}
 
-    _, _, upper_count, _ = engine.build_train_model(
-        hf_model=hf_model,
-        device=device,
-        drop_actions=[],
-        lora_actions=[],
-        frame_skip_intervals=[],
-        global_skip_intervals=[],
-        skipped_frame_idxs=[],
-        skipped_global_idxs=[],
-        prune=False,
-        inject_lora=False,
-    )
+    spans = bundle.get("spans", {})
+    if not isinstance(spans, dict):
+        print("[warn] Invalid prune plan bundle: spans is not an object; Block params omitted.", flush=True)
+        return upper, {}
 
-    model_lower, _, _, _removed = engine.build_train_model(
-        hf_model=hf_model,
-        device=device,
-        drop_actions=drop_actions,
-        lora_actions=lora_actions,
-        frame_skip_intervals=frame_int,
-        global_skip_intervals=global_int,
-        skipped_frame_idxs=skipped_frame,
-        skipped_global_idxs=skipped_global,
-        prune=True,
-        inject_lora=False,
-    )
-    lower_count = sum(p.numel() for p in engine.trainable_param_module(model_lower).parameters())
-    return int(upper_count), int(lower_count)
+    lower_by_label: Dict[str, int] = {}
+    for label in labels:
+        span = _span_from_label(label)
+        if span is None:
+            continue
+        raw = spans.get(str(int(span)))
+        if not isinstance(raw, dict):
+            print(f"[warn] Missing span {span} in prune plan bundle for label {label!r}.", flush=True)
+            continue
+        value: Any = raw.get("aggregator_params")
+        if value is None:
+            print(
+                f"[warn] Span {span} has no aggregator_params in prune plan bundle "
+                f"for label {label!r}.",
+                flush=True,
+            )
+            continue
+        try:
+            lower_by_label[label] = int(value)
+        except Exception:
+            print(
+                f"[warn] Invalid aggregator_params={value!r} for span {span} "
+                f"and label {label!r}.",
+                flush=True,
+            )
+    return upper, lower_by_label
 
 
-def _mode_candidate_score(mode: str, rel_run_dir: Path) -> int:
+def _normalize_lower_label(label: str) -> str:
+    key = str(label or "").strip()
+    if not key or key == "lower":
+        return key
+    return plan_group_from_name(key)
+
+
+def _mode_candidate_score(mode: str, rel_run_dir: Path, raw_lower_label: str = "") -> int:
     parts = rel_run_dir.parts
     if not parts:
         return 0
@@ -167,12 +191,14 @@ def _mode_candidate_score(mode: str, rel_run_dir: Path) -> int:
     # Prefer canonical layout: eval/lower/... or eval/upper/...
     if parts[0] == mode:
         score += 100
-    # Prefer nested plan runs (e.g. lower/plan_t1_l1) over flat legacy runs.
+    # Prefer nested plan runs (e.g. lower/plan_t1) over flat legacy runs.
     if len(parts) > 1:
         score += 10
     # Legacy fallback: lower_vggt / upper_vggt.
     if parts[0].startswith(f"{mode}_"):
         score += 20
+    if mode == "lower" and is_plan_group_name(raw_lower_label):
+        score += 50
     return score
 
 
@@ -187,6 +213,42 @@ def _lower_label_from_rel_run_dir(rel_run_dir: Path) -> str:
     if parts[0].startswith("lower_"):
         return parts[0]
     return parts[0]
+
+
+def _compression_tag(rec: EvalRecordV3) -> str:
+    raw = rec.extra.get("inference_compression", {}) if isinstance(rec.extra, dict) else {}
+    if not isinstance(raw, dict):
+        return ""
+    name = str(raw.get("name", "none")).strip().lower()
+    if name in ("", "none"):
+        return ""
+    if name == "fastvggt":
+        ratio = f"{float(raw.get('merge_ratio', 0.9)):g}".replace(".", "p")
+        return f"fastvggt_m{int(raw.get('merge_start', 0))}_r{ratio}"
+    if name == "quantvggt":
+        return f"quantvggt_{str(raw.get('dtype', 'w4a4')).lower()}"
+    return name
+
+
+def _record_label(rec: EvalRecordV3, rel_run_dir: Path) -> tuple[str, str, str]:
+    extra = rec.extra if isinstance(rec.extra, dict) else {}
+    mode = str(extra.get("eval_mode", "")).strip().lower()
+    if mode not in ("upper", "lower", "model"):
+        mode = str(rec.model_name).strip().lower().split("_", 1)[0]
+    if mode not in ("upper", "lower", "model"):
+        mode = rel_run_dir.parts[0].split("_", 1)[0].lower() if rel_run_dir.parts else "upper"
+
+    raw_plan = ""
+    if mode in ("lower", "model"):
+        raw_plan = rel_run_dir.parts[1] if len(rel_run_dir.parts) >= 2 else mode
+        if mode == "lower":
+            base = _normalize_lower_label(raw_plan)
+        else:
+            base = f"model/{raw_plan}"
+    else:
+        base = "upper"
+    compression = _compression_tag(rec)
+    return mode, f"{base}+{compression}" if compression else base, raw_plan
 
 
 def _collect_by_dataset(root: Path) -> Dict[str, Dict[str, EvalRecordV3]]:
@@ -204,19 +266,115 @@ def _collect_by_dataset(root: Path) -> Dict[str, Dict[str, EvalRecordV3]]:
         for rec_path in eval_root.rglob("eval_record_v3.json"):
             run_dir = rec_path.parent
             rec = EvalRecordV3.load(rec_path)
-            mode = str(rec.model_name).strip().lower()
             rel_run_dir = run_dir.relative_to(eval_root)
-            if mode not in ("upper", "lower"):
-                mode = run_dir.name.split("_", 1)[0].lower()
-            label = mode
-            if mode == "lower":
-                label = _lower_label_from_rel_run_dir(rel_run_dir)
-            score = _mode_candidate_score(mode, rel_run_dir)
+            mode, label, raw_plan = _record_label(rec, rel_run_dir)
+            score = _mode_candidate_score(mode, rel_run_dir, raw_plan)
             best = picked_scores.setdefault(ds_name, {}).get(label, -1)
             if score >= best:
                 picked_scores[ds_name][label] = score
                 grouped.setdefault(ds_name, {})[label] = rec
     return grouped
+
+
+def _filter_to_current_prune_spans(
+    grouped: Dict[str, Dict[str, EvalRecordV3]],
+    prune_plan_root: Path,
+) -> Dict[str, Dict[str, EvalRecordV3]]:
+    """Drop stale legacy plan labels when a split prune-span bundle exists."""
+    try:
+        from analysis.prune_plan import list_plan_groups, prune_plan_bundle_path
+
+        if not prune_plan_bundle_path(prune_plan_root).is_file():
+            return grouped
+        valid_spans = set(list_plan_groups(prune_plan_root))
+    except Exception:
+        return grouped
+    if not valid_spans:
+        return grouped
+
+    filtered: Dict[str, Dict[str, EvalRecordV3]] = {}
+    for ds_name, modes in grouped.items():
+        keep: Dict[str, EvalRecordV3] = {}
+        for label, rec in modes.items():
+            base = _label_base(label)
+            if label == "upper" or label.startswith("upper+") or base in valid_spans:
+                keep[label] = rec
+        if keep:
+            filtered[ds_name] = keep
+    return filtered
+
+
+def _plot_metric_curves_by_span(
+    root: Path,
+    grouped: Dict[str, Dict[str, EvalRecordV3]],
+) -> List[Path]:
+    """For each dataset, plot all eval metrics from upper/span0 to max prune span."""
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as exc:
+        print(f"[warn] Could not import matplotlib for summary metric curves: {exc}", flush=True)
+        return []
+
+    written: List[Path] = []
+    metric_grid: List[List[Optional[str]]] = [
+        ["ape", "are", "rpe_trans", "rpe_rot"],
+        ["acc", "comp", "cd", "nc"],
+        ["depth_abs_rel", "depth_delta1", "inference_time_ms", "infer_peak_vram_gb"],
+    ]
+    n_rows = 3
+    n_cols = 4
+
+    for ds_name in sorted(grouped.keys(), key=_dataset_sort_key):
+        modes = grouped[ds_name]
+        upper_rec = modes.get("upper")
+        if upper_rec is None:
+            continue
+        span_items = sorted(
+            (
+                (span, label, rec)
+                for label, rec in modes.items()
+                if not str(label).split("+", 1)[0].startswith("model/")
+                if (span := _span_from_label(label)) is not None
+            ),
+            key=lambda item: item[0],
+        )
+        if not span_items:
+            continue
+
+        xs = [0] + [int(span) for span, _label, _rec in span_items]
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.0 * n_cols, 3.25 * n_rows), squeeze=False)
+        for row_idx, row in enumerate(metric_grid):
+            for col_idx, key in enumerate(row):
+                ax = axes[row_idx][col_idx]
+                if key is None:
+                    ax.axis("off")
+                    continue
+                ys = [float(upper_rec.average.get(key, float("nan")))]
+                ys.extend(float(rec.average.get(key, float("nan"))) for _span, _label, rec in span_items)
+                has_data = any(math.isfinite(v) for v in ys)
+                if not has_data:
+                    ax.axis("off")
+                    continue
+                ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4)
+                ax.set_title(METRIC_HEADERS.get(key, key), fontsize=11, fontweight="bold")
+                ax.set_xlabel("Dropped units / prune span")
+                ax.grid(True, alpha=0.25)
+                ax.set_xlim(left=0)
+                ax.set_xticks(xs)
+        fig.suptitle(
+            f"{root.name} / {ds_name}: metrics from upper(span0) to max prune span",
+            fontsize=14,
+            fontweight="bold",
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+        safe_ds = str(ds_name).replace("/", "_").replace(" ", "_")
+        out_dir = root / ds_name / "eval" / "lower"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{safe_ds}_metrics_by_span.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        written.append(out_path)
+    return written
 
 
 def _table_separator(n_cols: int) -> str:
@@ -236,10 +394,10 @@ def build_summary_markdown(
 
     lines = [
         f"# Evaluation summary — `{experiment}`\n\n",
-        "Comparison of **upper** (full model) vs **pruned plan runs**. "
-        "Plan-row values show percent change relative to upper in parentheses. "
+        "Comparison of **upper** (full model), pruned plans, trained models, and deployment-compressed variants on disk. "
         "Column arrows indicate the preferred direction (↓ lower is better, ↑ higher is better). "
-        "**Agg params** counts the aggregator stack (decoder for Pi3), excluding heads, "
+        "**Block params** counts prunable transformer blocks (Pi3 decoder or VGGT frame/global blocks), "
+        "excluding embeddings and heads, "
         "matching the `[params]` log in `train_lora_skip_baseline.py`.\n\n",
         "| " + " | ".join(headers) + " |\n",
         _table_separator(n_cols),
@@ -248,22 +406,22 @@ def build_summary_markdown(
     for ds_name in sorted(grouped.keys(), key=_dataset_sort_key):
         modes = grouped[ds_name]
         upper_rec = modes.get("upper")
-        lower_labels = sorted([k for k in modes.keys() if k != "upper"])
+        lower_labels = sorted(
+            [k for k in modes.keys() if k != "upper"],
+            key=_lower_label_sort_key,
+        )
         for mode_label in ["upper"] + lower_labels:
             rec = modes.get(mode_label)
             if rec is None:
                 continue
-            is_lower = mode_label != "upper"
+            is_baseline = mode_label == "upper"
+            uses_upper_topology = is_baseline or mode_label.startswith("upper+")
             row = [ds_name, mode_label]
             for key in UNIFIED_METRIC_KEYS:
                 val = float(rec.average.get(key, float("nan")))
-                if is_lower and upper_rec is not None:
-                    upper_val = float(upper_rec.average.get(key, float("nan")))
-                    row.append(_fmt_lower_cell(key, upper_val, val))
-                else:
-                    row.append(_fmt_value(key, val))
+                row.append(_fmt_value(key, val))
             if upper_agg_params is not None:
-                if not is_lower:
+                if uses_upper_topology:
                     row.append(_fmt_value(AGG_PARAMS_KEY, float(upper_agg_params)))
                 else:
                     lower_params = None
@@ -272,7 +430,7 @@ def build_summary_markdown(
                     if lower_params is None:
                         row.append("—")
                     else:
-                        row.append(_fmt_lower_cell(AGG_PARAMS_KEY, float(upper_agg_params), float(lower_params)))
+                        row.append(_fmt_value(AGG_PARAMS_KEY, float(lower_params)))
             else:
                 row.append("—")
             lines.append("| " + " | ".join(row) + " |\n")
@@ -295,46 +453,34 @@ def main() -> None:
     p.add_argument(
         "--skip-param-count",
         action="store_true",
-        help="Skip loading models to count aggregator parameters.",
-    )
-    p.add_argument(
-        "--plan-name",
-        type=str,
-        default="",
-        help="Optional prune plan name (e.g. plan_t1_l1) for aggregator param counting.",
+        help="Skip reading stored aggregator block parameter counts from prune_plan_all.json.",
     )
     args = p.parse_args()
 
     root = OUTPUT_ROOT_DEFAULT / args.experiment
     grouped = _collect_by_dataset(root)
+    grouped = _filter_to_current_prune_spans(grouped, Path(args.prune_plan_root))
 
     upper_agg_params: Optional[int] = None
     lower_agg_params_by_label: Dict[str, int] = {}
     if not args.skip_param_count:
-        labels = sorted({k for ds in grouped.values() for k in ds.keys() if k != "upper"})
-        if args.plan_name:
-            labels = [str(args.plan_name).strip()]
-        for label in labels:
-            plan_name_for_count = "" if label == "lower" else label
-            try:
-                upper_i, lower_i = _compute_aggregator_param_counts(
-                    args.experiment,
-                    args.prune_plan_root,
-                    plan_name_for_count,
-                )
-                if upper_agg_params is None:
-                    upper_agg_params = upper_i
-                lower_agg_params_by_label[label] = lower_i
-                print(
-                    f"[params] {args.experiment}/{label}: upper={_format_param_count(upper_i)} "
-                    f"lower={_format_param_count(lower_i)}",
-                    flush=True,
-                )
-            except Exception as exc:
-                print(
-                    f"[warn] Could not compute aggregator params for {args.experiment}/{label}: {exc}",
-                    flush=True,
-                )
+        labels = sorted(
+            {
+                k for ds in grouped.values() for k in ds.keys()
+                if k != "upper" and not k.startswith("upper+")
+            },
+            key=_lower_label_sort_key,
+        )
+        upper_agg_params, lower_agg_params_by_label = _read_aggregator_param_counts_from_bundle(
+            args.prune_plan_root,
+            labels,
+        )
+        if upper_agg_params is not None:
+            print(
+                f"[params] {args.experiment}: upper={_format_param_count(upper_agg_params)} "
+                f"loaded lower counts for {len(lower_agg_params_by_label)} labels from prune_plan_all.json",
+                flush=True,
+            )
 
     content = build_summary_markdown(
         args.experiment,
@@ -347,6 +493,8 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content, encoding="utf-8")
     print(f"Wrote {out}")
+    for plot_path in _plot_metric_curves_by_span(root, grouped):
+        print(f"Wrote {plot_path}", flush=True)
 
 
 if __name__ == "__main__":

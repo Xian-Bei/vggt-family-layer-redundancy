@@ -228,7 +228,7 @@ def _render_panel(
     axes[0, 0].set_title("A as q: max over B patches")
     axes[0, 1].imshow(overlay_b_tgt)
     axes[0, 1].set_title("B as k: max over A queries")
-    im0 = axes[0, 2].imshow(score_ab, cmap="viridis")
+    im0 = axes[0, 2].imshow(score_ab, cmap="viridis", origin="lower")
     axes[0, 2].set_title("A -> B patch scores")
     fig.colorbar(im0, ax=axes[0, 2], fraction=0.046, pad=0.04)
 
@@ -236,7 +236,7 @@ def _render_panel(
     axes[1, 0].set_title("B as q: max over A patches")
     axes[1, 1].imshow(overlay_a_tgt)
     axes[1, 1].set_title("A as k: max over B queries")
-    im1 = axes[1, 2].imshow(score_ba, cmap="viridis")
+    im1 = axes[1, 2].imshow(score_ba, cmap="viridis", origin="lower")
     axes[1, 2].set_title("B -> A patch scores")
     fig.colorbar(im1, ax=axes[1, 2], fraction=0.046, pad=0.04)
 

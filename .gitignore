@@ -149,8 +149,24 @@ skyseg.onnx
 *.egg-info
 
 
-data
-analysis_outputs
+# Keep dataset payloads out of Git while allowing setup scripts/docs at data/ root.
+data/*
+!data/*.py
+!data/*.sh
+!data/*.md
+!data/*.txt
+# Explicit dataset directories (all contents ignored; redundant with data/* but documents intent)
+data/7scenes/
+data/neural_rgbd_data/
+data/nuscenes/
+data/quantvggt/
+data/scans_dev50/
+data/scans_test50/
+data/waymo/
+data/waymo_raw/
+data/__pycache__/
+analysis_outputs/
+analysis_outputs_v3/
 .gradio/
 examples/
 nouse/
@@ -190,7 +206,6 @@ nouse/
 **/ckpt/
 **/ckpts/
 **/weights/
-analysis_outputs_v3/
 *backup*/
 tests/
 .agents/
@@ -199,3 +214,4 @@ tests/
 .gradio/
 .vscode/
 .cursorignore
+backbones/training_reference/

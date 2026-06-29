@@ -164,8 +164,8 @@ def build_eval_tab(
     except Exception:
         eval_ctrl = None
 
-    with gr.Tab("Eval Visualization") as tab_eval:
-        gr.Markdown("## Eval visualization (2D + 3D)")
+    with gr.Tab("Eval Results") as tab_eval:
+        gr.Markdown("## Eval Results (2D + 3D)")
         gr.Markdown(
             "2D: per-scene `plot.png` when present. 3D: Viser point cloud + trajectory "
             "(requires `vis/pred/viser_points.npz`). "

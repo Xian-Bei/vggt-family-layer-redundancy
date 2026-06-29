@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install pinned backbone repositories for LaRe.
+"""Install pinned backbone and inference-compression repositories for LaRe.
 
 Examples:
   python backbones/install_backbone.py vggt pi3
@@ -186,7 +186,7 @@ def build_optional_extensions(name: str, *, cuda_arch_list: str | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("backbones", nargs="*", help="Backbone names or 'all'.")
+    parser.add_argument("backbones", nargs="*", help="Vendored component names or 'all'.")
     parser.add_argument("--force", action="store_true", help="Replace existing checkout directories.")
     parser.add_argument("--download-ckpt", action="store_true", help="Download local checkpoints when required.")
     parser.add_argument(

@@ -10,9 +10,11 @@ from analysis.backbones.contracts import TrainFromCacheArgs
 from analysis.backbones.registry import get_backbone
 from analysis.prune_plan import (
     default_prune_plan_root,
+    prune_plan_bundle_path,
     resolve_named_prune_plan_path,
     resolve_prune_plan_path,
 )
+from analysis.training_plan import compose_training_unit_prune_plan, training_plan_path
 from analysis.schema.v3 import stage_dir
 
 
@@ -30,17 +32,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Directory with prune plans (legacy default: analysis/prune_plan).",
     )
     p.add_argument(
-        "--plan-name",
+        "--prune-plan-name",
+        dest="prune_plan_name",
         type=str,
         default="",
-        help="Required plan name for multi-plan layout (e.g. plan_t2_l1).",
+        help="Required prune selector (e.g. prune_span10).",
+    )
+    p.add_argument(
+        "--training-plan-root",
+        type=Path,
+        default=None,
+        help="Directory with training plan bundles (default: prune-plan-root).",
+    )
+    p.add_argument(
+        "--training-plan-name",
+        type=str,
+        default="",
+        help="Required training plan name (e.g. training_lora_l1_r32).",
     )
     p.add_argument("--data-root", type=Path, default=None)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--max-scenes", type=int, default=0)
     p.add_argument("--max-steps", type=int, default=0)
     p.add_argument("--max-align-tokens", type=int, default=4096)
-    p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--eval-epoch", type=int, default=0, help="0 disables periodic eval during training.")
     p.add_argument("--eval-max-scenes", type=int, default=0, help="0 means full periodic eval split.")
@@ -99,6 +113,36 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Enable periodic eval on nrgbd.",
     )
+    p.add_argument(
+        "--eval-nuscenes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable periodic eval on nuscenes.",
+    )
+    p.add_argument(
+        "--eval-nuscenes-split",
+        type=str,
+        default="val",
+        choices=("train", "val"),
+        help="nuScenes split for periodic eval (output tag: nuscenes_<split>).",
+    )
+    p.add_argument(
+        "--eval-waymo",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable periodic eval on waymo.",
+    )
+    p.add_argument(
+        "--eval-waymo-split",
+        type=str,
+        default="validation",
+        choices=("training", "validation", "train", "val"),
+        help="Waymo split for periodic eval (output tag: waymo_<split>).",
+    )
+    p.add_argument("--root-7scenes", type=Path, default=Path("data/7scenes"))
+    p.add_argument("--root-nrgbd", type=Path, default=Path("data/neural_rgbd_data"))
+    p.add_argument("--root-nuscenes", type=Path, default=Path("data/nuscenes"))
+    p.add_argument("--root-waymo", type=Path, default=Path("data/waymo"))
     p.add_argument("--dtype", type=str, default="bfloat16", choices=("float32", "bfloat16", "float16"))
     return p
 
@@ -109,18 +153,37 @@ def main() -> None:
     apply_pythonpath(adapter.name)
 
     cache_dir = stage_dir(args.experiment, args.dataset, "cache")
-    if not str(args.plan_name).strip():
-        raise SystemExit("--plan-name is required")
+    if not str(args.prune_plan_name).strip():
+        raise SystemExit("--prune-plan-name is required")
     plan_root = args.prune_plan_root or (Path("analysis_outputs_v3") / adapter.name)
-    prune_path = resolve_named_prune_plan_path(plan_root, str(args.plan_name))
-    if not prune_path.is_file():
+    prune_plan_name = str(args.prune_plan_name).strip()
+    training_root = args.training_plan_root or plan_root
+    training_plan_name = str(args.training_plan_name or "").strip()
+    if not training_plan_name:
+        raise SystemExit("--training-plan-name is required")
+    try:
+        compose_training_unit_prune_plan(
+            prune_plan_root=plan_root,
+            training_plan_root=training_root,
+            prune_selector=prune_plan_name,
+            training_plan=training_plan_name,
+        )
+        prune_path = (
+            prune_plan_bundle_path(plan_root)
+            if prune_plan_name.startswith("prune_span")
+            else resolve_named_prune_plan_path(plan_root, prune_plan_name)
+        )
+    except FileNotFoundError:
         # Backward-compatible fallback if caller still passes legacy root/name-by-backbone.
         legacy = resolve_prune_plan_path(plan_root, adapter.name)
-        if legacy.is_file() and str(args.plan_name).strip().lower() in ("legacy", adapter.name):
+        if legacy.is_file() and prune_plan_name.lower() in ("legacy", adapter.name):
             prune_path = legacy
         else:
-            raise SystemExit(f"Missing prune plan: {prune_path}")
-    out_dir = args.output_dir or (stage_dir(args.experiment, args.dataset, str(args.plan_name)) / "train")
+            raise SystemExit(
+                f"Missing prune/training plan selector: prune={prune_plan_name} under {plan_root}, "
+                f"training={training_plan_path(training_root, training_plan_name)}"
+            )
+    out_dir = args.output_dir or (stage_dir(args.experiment, args.dataset, prune_plan_name) / "train")
     out_dir.mkdir(parents=True, exist_ok=True)
     hf_model = str(args.hf_model or adapter.default_hf_model())
 
@@ -136,7 +199,6 @@ def main() -> None:
         epochs=int(args.epochs),
         max_scenes=int(args.max_scenes),
         max_steps=int(args.max_steps),
-        lr=float(args.lr),
         data_root=args.data_root,
         max_align_tokens=int(args.max_align_tokens),
         eval_epoch=int(args.eval_epoch),
@@ -150,7 +212,17 @@ def main() -> None:
         eval_7scenes=bool(args.eval_7scenes),
         eval_7scenes_split=str(args.eval_7scenes_split),
         eval_nrgbd=bool(args.eval_nrgbd),
-        plan_name=str(args.plan_name),
+        eval_nuscenes=bool(args.eval_nuscenes),
+        eval_nuscenes_split=str(args.eval_nuscenes_split),
+        eval_waymo=bool(args.eval_waymo),
+        eval_waymo_split=str(args.eval_waymo_split),
+        root_7scenes=Path(args.root_7scenes),
+        root_nrgbd=Path(args.root_nrgbd),
+        root_nuscenes=Path(args.root_nuscenes),
+        root_waymo=Path(args.root_waymo),
+        prune_plan_name=prune_plan_name,
+        training_plan_root=Path(training_root),
+        training_plan_name=training_plan_name,
     )
     print(
         f"[train_prune_lora_v3] backbone={adapter.name} prune_plan={prune_path} -> adapter.train_from_cache",

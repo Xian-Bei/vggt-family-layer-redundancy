@@ -255,6 +255,29 @@ def load_gt_pointcloud(scene_id, gt_ply_dir):
     return points, colors
 
 
+def _ensure_trajectory_plot_axis_limits(ax, min_span_m: float = 5.0) -> None:
+    """Expand 2D axis limits so equal-aspect trajectory plots stay readable.
+
+    evo enables ``plot_xyz_realistic`` by default, which calls ``set_aspect("equal")``.
+    When a trajectory is nearly 1D (e.g. straight along z), one axis span can be ~0 and
+    the saved figure becomes extremely narrow or flat.
+    """
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    xmid = (x0 + x1) / 2.0
+    ymid = (y0 + y1) / 2.0
+    half_min = float(min_span_m) / 2.0
+    plot_radius = max(
+        abs(x0 - xmid),
+        abs(x1 - xmid),
+        abs(y0 - ymid),
+        abs(y1 - ymid),
+        half_min,
+    )
+    ax.set_xlim(xmid - plot_radius, xmid + plot_radius)
+    ax.set_ylim(ymid - plot_radius, ymid + plot_radius)
+
+
 def eval_trajectory(poses_est, poses_gt, frame_ids, align=False, plot_trajectory: bool = True):
     # NOTE: `poses_est`/`poses_gt` are expected to be camera-from-world (w2c) SE(3) matrices.
     # For physical consistency with point clouds in world coordinates, build trajectories from camera centers:
@@ -432,6 +455,8 @@ def eval_trajectory(poses_est, poses_gt, frame_ids, align=False, plot_trajectory
             )
 
         ax.legend()
+        _ensure_trajectory_plot_axis_limits(ax)
+        plot.set_aspect_equal(ax)
 
         # Save image to memory buffer
         buffer = io.BytesIO()
@@ -735,8 +760,8 @@ def compute_original_coords(
 
 
 def _vggt_family_adapter_for_model(model):
-    idx = list(getattr(getattr(model, "depth_head", None), "intermediate_layer_idx", []) or [])
-    return get_backbone("fastvggt" if idx == [0, 1, 2, 3] else "vggt")
+    del model
+    return get_backbone("vggt")
 
 
 @torch.no_grad()
@@ -760,22 +785,22 @@ def infer_vggt_and_reconstruct(
     amp_dtype = amp_dtype_for_device(dev)
     ac_kw = autocast_device_dtype(dev)
 
+    vgg_staged = vgg_input.to(device=dev, non_blocking=(dev.type == "cuda"))
+    if vgg_staged.dim() == 4:
+        images_batched = vgg_staged.unsqueeze(0)
+    elif vgg_staged.dim() == 5:
+        images_batched = vgg_staged
+    else:
+        raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_staged.shape)}")
+    if amp_dtype != torch.float32:
+        images_batched = images_batched.to(dtype=amp_dtype)
+
     if dev.type == "cuda":
         torch.cuda.synchronize(dev)
         torch.cuda.reset_peak_memory_stats(dev.index)
 
     start = time.time()
     with torch.autocast(**ac_kw):
-        vgg_staged = vgg_input.to(device=dev, non_blocking=(dev.type == "cuda"))
-        if vgg_staged.dim() == 4:
-            images_batched = vgg_staged.unsqueeze(0)
-        elif vgg_staged.dim() == 5:
-            images_batched = vgg_staged
-        else:
-            raise ValueError(f"Expected [S,3,H,W] or [B,S,3,H,W], got {tuple(vgg_staged.shape)}")
-        if amp_dtype != torch.float32:
-            images_batched = images_batched.to(dtype=amp_dtype)
-
         aggregated_tokens_list, patch_start_idx = model.aggregator(images_batched)
         predictions = _vggt_family_adapter_for_model(model).run_heads_from_aggregated_tokens(
             model,

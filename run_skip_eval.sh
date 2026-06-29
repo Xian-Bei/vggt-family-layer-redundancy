@@ -8,21 +8,27 @@ export PYTHONUNBUFFERED=1
 
 BACKBONES="${BACKBONES:-vggt}"
 
-SPLIT_7SCENES="${SPLIT_7SCENES:-test}"
-
 SKIP_GT_EVAL_SCANNET_DEV50="${SKIP_GT_EVAL_SCANNET_DEV50:-0}"
 SKIP_GT_EVAL_SCANNET_TEST50="${SKIP_GT_EVAL_SCANNET_TEST50:-0}"
-SKIP_GT_EVAL_7SCENES="${SKIP_GT_EVAL_7SCENES:-0}"
+SKIP_GT_EVAL_7SCENES_TEST="${SKIP_GT_EVAL_7SCENES_TEST:-0}"
+SKIP_GT_EVAL_7SCENES_TRAIN="${SKIP_GT_EVAL_7SCENES_TRAIN:-0}"
 SKIP_GT_EVAL_NRGBD="${SKIP_GT_EVAL_NRGBD:-0}"
+SKIP_GT_EVAL_NUSCENES_TRAIN="${SKIP_GT_EVAL_NUSCENES_TRAIN:-0}"
+SKIP_GT_EVAL_NUSCENES_VAL="${SKIP_GT_EVAL_NUSCENES_VAL:-0}"
+SKIP_GT_EVAL_WAYMO_TRAINING="${SKIP_GT_EVAL_WAYMO_TRAINING:-0}"
+SKIP_GT_EVAL_WAYMO_VALIDATION="${SKIP_GT_EVAL_WAYMO_VALIDATION:-0}"
 
 ROOT_SCANNET_DEV50="${ROOT_SCANNET_DEV50:-data/scans_dev50}"
 ROOT_SCANNET_TEST50="${ROOT_SCANNET_TEST50:-data/scans_test50}"
 ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
 ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
+ROOT_NUSCENES="${ROOT_NUSCENES:-data/nuscenes}"
+ROOT_WAYMO="${ROOT_WAYMO:-data/waymo}"
 
 MAX_SCENES="${MAX_SCENES:-0}"
 SKIP_GT_EVAL_MAX_SPAN="${SKIP_GT_EVAL_MAX_SPAN:-8}"
 SKIP_GT_EVAL_TIMING="${SKIP_GT_EVAL_TIMING:-0}"
+SKIP_GT_EVAL_RESUME="${SKIP_GT_EVAL_RESUME:-1}"
 
 DEVICE="${DEVICE:-cuda}"
 CONDA_ENV="${CONDA_ENV:-vggt}"
@@ -36,19 +42,12 @@ truthy() {
   [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
 }
 
-validate_split_7scenes() {
-  if [[ "${SPLIT_7SCENES}" != "train" && "${SPLIT_7SCENES}" != "test" ]]; then
-    echo "error: SPLIT_7SCENES must be train or test, got: ${SPLIT_7SCENES}" >&2
-    exit 1
-  fi
-}
-validate_split_7scenes
-
 run_skip_eval_dataset() {
   local dataset="$1"
   local data_root="$2"
   local backbone="$3"
   local output_dataset="${4:-${dataset}}"
+  local split="${5:-}"
 
   set_backend_pythonpath "${backbone}"
 
@@ -69,11 +68,14 @@ run_skip_eval_dataset() {
   if truthy "${SKIP_GT_EVAL_TIMING}"; then
     extra+=(--timing)
   fi
-  if [[ "${dataset}" == "7scenes" ]]; then
-    extra+=(--split "${SPLIT_7SCENES}")
+  if ! truthy "${SKIP_GT_EVAL_RESUME}"; then
+    extra+=(--no-resume)
+  fi
+  if [[ -n "${split}" ]]; then
+    extra+=(--split "${split}")
   fi
 
-  echo "== skip_gt_eval dataset=${output_dataset} backbone=${backbone} max_span=${SKIP_GT_EVAL_MAX_SPAN} =="
+  echo "== skip_gt_eval dataset=${output_dataset} backbone=${backbone} max_span=${SKIP_GT_EVAL_MAX_SPAN} resume=${SKIP_GT_EVAL_RESUME} =="
   conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.redundancy.skip_gt_eval_v3 \
     "${extra[@]}"
 }
@@ -87,11 +89,26 @@ run_datasets_for_backbone() {
   if truthy "${SKIP_GT_EVAL_SCANNET_TEST50}"; then
     run_skip_eval_dataset "scannet" "${ROOT_SCANNET_TEST50}" "${backbone}" "scannet_test50"
   fi
-  if truthy "${SKIP_GT_EVAL_7SCENES}"; then
-    run_skip_eval_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "7scenes_${SPLIT_7SCENES}"
+  if truthy "${SKIP_GT_EVAL_7SCENES_TEST}"; then
+    run_skip_eval_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "7scenes_test" "test"
+  fi
+  if truthy "${SKIP_GT_EVAL_7SCENES_TRAIN}"; then
+    run_skip_eval_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "7scenes_train" "train"
   fi
   if truthy "${SKIP_GT_EVAL_NRGBD}"; then
     run_skip_eval_dataset "nrgbd" "${ROOT_NRGBD}" "${backbone}" "nrgbd"
+  fi
+  if truthy "${SKIP_GT_EVAL_NUSCENES_VAL}"; then
+    run_skip_eval_dataset "nuscenes" "${ROOT_NUSCENES}" "${backbone}" "nuscenes_val" "val"
+  fi
+  if truthy "${SKIP_GT_EVAL_NUSCENES_TRAIN}"; then
+    run_skip_eval_dataset "nuscenes" "${ROOT_NUSCENES}" "${backbone}" "nuscenes_train" "train"
+  fi
+  if truthy "${SKIP_GT_EVAL_WAYMO_VALIDATION}"; then
+    run_skip_eval_dataset "waymo" "${ROOT_WAYMO}" "${backbone}" "waymo_validation" "validation"
+  fi
+  if truthy "${SKIP_GT_EVAL_WAYMO_TRAINING}"; then
+    run_skip_eval_dataset "waymo" "${ROOT_WAYMO}" "${backbone}" "waymo_training" "training"
   fi
 }
 

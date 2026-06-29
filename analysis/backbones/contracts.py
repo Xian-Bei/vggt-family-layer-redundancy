@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -50,11 +50,22 @@ class CacheForwardResult:
 @dataclass
 class PredictionLossWeights:
     w_pred: float = 1.0
-    w_camera: float = 1.0
-    w_depth: float = 1.0
-    camera_loss_type: str = "l1"
-    depth_valid_range: float = 0.98
-    depth_gradient_loss_fn: str = "grad"
+
+
+@dataclass(frozen=True)
+class TrainingHyperparams:
+    optimizer_cls: Any = torch.optim.AdamW
+    lr: float = 5e-5
+    weight_decay: float = 0.05
+    min_lr: float = 1e-8
+    warmup_ratio: float = 0.05
+    grad_clip_max_norm: float = 1.0
+    w_align: float = 1.0
+    w_align_mse: float = 1.0
+    w_align_cos: float = 1.0
+    w_align_cka: float = 0.0
+    w_pred: float = 1.0
+    w_reg: float = 0.0
 
 
 @dataclass
@@ -70,7 +81,6 @@ class TrainFromCacheArgs:
     epochs: int = 1
     max_scenes: int = 0
     max_steps: int = 0
-    lr: float = 5e-5
     data_root: Optional[Path] = None
     max_align_tokens: int = 4096
     eval_epoch: int = 0
@@ -84,7 +94,17 @@ class TrainFromCacheArgs:
     eval_7scenes: bool = True
     eval_7scenes_split: str = "test"
     eval_nrgbd: bool = True
-    plan_name: str = ""
+    eval_nuscenes: bool = False
+    eval_nuscenes_split: str = "val"
+    eval_waymo: bool = False
+    eval_waymo_split: str = "validation"
+    root_7scenes: Path = Path("data/7scenes")
+    root_nrgbd: Path = Path("data/neural_rgbd_data")
+    root_nuscenes: Path = Path("data/nuscenes")
+    root_waymo: Path = Path("data/waymo")
+    prune_plan_name: str = ""
+    training_plan_root: Path = Path("")
+    training_plan_name: str = ""
 
 
 @dataclass
@@ -138,6 +158,22 @@ class BackboneAdapter(ABC):
     def forward_predictions(self, model: nn.Module, images: torch.Tensor) -> PredictionBundle:
         ...
 
+    def supports_incremental_skip_eval(self) -> bool:
+        """Whether this adaptor implements scene-local incremental skip replay."""
+        return False
+
+    def iter_skip_span_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        spans: Sequence[Tuple[int, int]],
+    ) -> Iterable[Tuple[int, int, PredictionBundle]]:
+        """Yield one normalized prediction for every requested closed unit span."""
+        del model, images, spans
+        raise NotImplementedError(
+            f"Backbone {self.name!r} does not implement incremental skip evaluation"
+        )
+
     @abstractmethod
     def apply_prune_plan(self, model: nn.Module, actions: Sequence[PruneAction]) -> nn.Module:
         ...
@@ -149,8 +185,49 @@ class BackboneAdapter(ABC):
     def default_hf_model(self) -> str:
         return "facebook/VGGT-1B"
 
+    def training_config(self) -> TrainingHyperparams:
+        raise NotImplementedError(f"{self.name} does not define training hyperparameters")
+
+    def build_training_optimizer(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        config: Optional[TrainingHyperparams] = None,
+    ) -> torch.optim.Optimizer:
+        del trainable, config
+        raise NotImplementedError(f"{self.name} does not define a training optimizer")
+
     def pythonpath_entries(self, repo_root: Path) -> List[Path]:
         return [repo_root]
+
+    def load_eval_images(self, image_paths: Sequence[Path | str]) -> torch.Tensor:
+        """Load and preprocess eval/cache images -> ``[S, 3, H, W]`` in ``[0, 1]``."""
+        raise NotImplementedError(f"{self.name} does not implement load_eval_images")
+
+    def load_driving_depth_stack(
+        self,
+        depth_paths: Sequence[Path | str],
+        *,
+        output_hw: Tuple[int, int],
+    ) -> Tuple[Any, int]:
+        """Rasterize sparse driving-depth GT to match model RGB preprocessing."""
+        raise NotImplementedError(f"{self.name} does not implement load_driving_depth_stack")
+
+    def load_scannet_gt_depth(
+        self,
+        scene: Any,
+        *,
+        output_hw: Tuple[int, int],
+    ) -> Any:
+        """Load ScanNet dense GT depth aligned to ``load_eval_images`` output size."""
+        from analysis.eval.prediction_eval import _load_gt_depth_for_scene
+
+        return _load_gt_depth_for_scene(scene, image_hw=output_hw)
+
+    def align_7andn_gt_depth(self, view: Any, *, output_hw: Tuple[int, int]) -> Any:
+        from analysis.eval.prediction_eval import _load_7andn_gt_depth_vggt
+
+        return _load_7andn_gt_depth_vggt(view, image_hw=output_hw)
 
     def block_for_unit(self, model: nn.Module, unit_id: str) -> nn.Module:
         """Return the concrete module for a public unit id."""
@@ -297,8 +374,9 @@ class BackboneAdapter(ABC):
         *,
         images_batched: torch.Tensor,
         device: torch.device,
+        dataset_name: str = "",
     ) -> Dict[str, Any]:
-        del teacher_pred, images_batched, device
+        del teacher_pred, images_batched, device, dataset_name
         raise NotImplementedError(f"{self.name} does not implement teacher-target conversion")
 
     def prediction_loss(
@@ -337,16 +415,6 @@ class BackboneAdapter(ABC):
 
     def periodic_eval_skip_depth(self) -> bool:
         return False
-
-    def eval_scene(
-        self,
-        model: nn.Module,
-        *,
-        dataset_name: str,
-        batch: Any,
-        ctx: EvalSceneContext,
-    ) -> Dict[str, float]:
-        raise NotImplementedError(f"{self.name} does not implement eval_scene for {dataset_name}")
 
     def apply_checkpoint_structure(
         self,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,9 +13,9 @@ from analysis.backbones.contracts import (
     BackboneAdapter,
     BackboneCapabilities,
     CacheForwardResult,
-    EvalSceneContext,
     PredictionLossWeights,
     PredictionBundle,
+    TrainingHyperparams,
 )
 from analysis.backbones.registry import register
 from analysis.schema.v3 import LayerUnitSpec, PruneAction
@@ -45,6 +45,44 @@ class _Pi3SkipBlock(nn.Module):
         return x
 
 
+def pi3_official_training_config() -> TrainingHyperparams:
+    """Pi3 official training defaults adapted to cache-replay LoRA training.
+
+    The official code uses AdamW(lr=5e-5, wd=5e-2), grad clip 1.0, bf16
+    autocast, and OneCycleLR with pct_start=0.0. Pi3 prediction loss is the
+    official Pi3Loss, whose camera term is already weighted by 0.1 internally.
+    """
+
+    return TrainingHyperparams(
+        optimizer_cls=torch.optim.AdamW,
+        lr=5e-5,
+        weight_decay=5e-2,
+        min_lr=5e-10,
+        warmup_ratio=0.0,
+        grad_clip_max_norm=1.0,
+        w_align=1.0,
+        w_align_mse=1.0,
+        w_align_cos=1.0,
+        w_align_cka=0.0,
+        w_pred=1.0,
+        w_reg=0.0,
+    )
+
+
+def build_pi3_official_training_optimizer(
+    trainable: Sequence[nn.Parameter],
+    *,
+    config: Optional[TrainingHyperparams] = None,
+) -> torch.optim.Optimizer:
+    cfg = config or pi3_official_training_config()
+    return cfg.optimizer_cls(
+        trainable,
+        lr=float(cfg.lr),
+        weight_decay=float(cfg.weight_decay),
+        betas=(0.9, 0.95),
+    )
+
+
 class Pi3Adapter(BackboneAdapter):
     name = "pi3"
 
@@ -60,12 +98,43 @@ class Pi3Adapter(BackboneAdapter):
     def default_hf_model(self) -> str:
         return "yyfz233/Pi3"
 
+    def training_config(self) -> TrainingHyperparams:
+        return pi3_official_training_config()
+
+    def build_training_optimizer(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        config: Optional[TrainingHyperparams] = None,
+    ) -> torch.optim.Optimizer:
+        return build_pi3_official_training_optimizer(trainable, config=config or self.training_config())
+
     def pythonpath_entries(self, repo_root: Path) -> List[Path]:
         return [
             repo_root / "analysis" / "backbones" / "vendor_extensions" / "pi3_curope",
             repo_root / "backbones" / "Pi3",
             repo_root,
         ]
+
+    def load_eval_images(self, image_paths: Sequence[Path | str]) -> torch.Tensor:
+        from vggt.utils.load_fn import load_and_preprocess_images
+
+        return load_and_preprocess_images([str(p) for p in image_paths], mode="crop")
+
+    def load_driving_depth_stack(
+        self,
+        depth_paths: Sequence[Path | str],
+        *,
+        output_hw: Tuple[int, int],
+    ) -> Tuple[Any, int]:
+        from analysis.datasets.driving_depth import load_driving_depth_stack_vggt
+
+        return load_driving_depth_stack_vggt(depth_paths, output_hw=output_hw)
+
+    def align_7andn_gt_depth(self, view: Any, *, output_hw: Tuple[int, int]) -> Any:
+        from analysis.eval.prediction_eval import _load_7andn_gt_depth_vggt
+
+        return _load_7andn_gt_depth_vggt(view, image_hw=output_hw)
 
     def load_pretrained(
         self,
@@ -178,6 +247,47 @@ class Pi3Adapter(BackboneAdapter):
             )
         raise ValueError(f"Unsupported unit operation {operation!r}")
 
+    def _normalize_decoder_capture(
+        self,
+        unit_id: str,
+        tensor: torch.Tensor,
+        *,
+        bsz: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Return decoder block activations as [B, N, tokens_per_frame, C]."""
+        kind, _ = unit_id.split("_", 1)
+        if tensor.dim() == 4:
+            if int(tensor.shape[0]) == bsz and int(tensor.shape[1]) == seq_len:
+                return tensor.contiguous()
+            if int(tensor.shape[0]) == 1 and int(tensor.shape[1]) == bsz * seq_len:
+                return tensor.reshape(bsz, seq_len, int(tensor.shape[2]), int(tensor.shape[3])).contiguous()
+            if int(tensor.shape[0]) == 1 and int(tensor.shape[1]) == bsz and int(tensor.shape[2]) % seq_len == 0:
+                tokens_per_frame = int(tensor.shape[2]) // seq_len
+                return tensor.reshape(bsz, seq_len, tokens_per_frame, int(tensor.shape[3])).contiguous()
+            raise ValueError(f"Unexpected Pi3 {unit_id} activation shape {tuple(tensor.shape)}")
+        if tensor.dim() != 3:
+            raise ValueError(f"Unexpected Pi3 {unit_id} activation shape {tuple(tensor.shape)}")
+
+        if kind == "frame":
+            if int(tensor.shape[0]) != bsz * seq_len:
+                raise ValueError(
+                    f"Unexpected Pi3 frame activation batch for {unit_id}: "
+                    f"{tuple(tensor.shape)} with B={bsz}, N={seq_len}"
+                )
+            return tensor.reshape(bsz, seq_len, int(tensor.shape[1]), int(tensor.shape[2])).contiguous()
+
+        if kind == "global":
+            if int(tensor.shape[0]) != bsz or int(tensor.shape[1]) % seq_len != 0:
+                raise ValueError(
+                    f"Unexpected Pi3 global activation layout for {unit_id}: "
+                    f"{tuple(tensor.shape)} with B={bsz}, N={seq_len}"
+                )
+            tokens_per_frame = int(tensor.shape[1]) // seq_len
+            return tensor.reshape(bsz, seq_len, tokens_per_frame, int(tensor.shape[2])).contiguous()
+
+        raise KeyError(unit_id)
+
     def extract_layer_units(
         self,
         model: nn.Module,
@@ -194,14 +304,16 @@ class Pi3Adapter(BackboneAdapter):
         def _make_hook(uid: str):
             def hook(_mod, _inp, out):
                 t = out[0] if isinstance(out, tuple) else out
-                if t.dim() == 3:
-                    t = t.unsqueeze(0)
-                captures[uid] = t.detach()
+                t = self._normalize_decoder_capture(uid, t, bsz=bsz, seq_len=seq_len).detach()
+                captures[uid] = t
                 if layer_callback is not None:
-                    layer_callback(uid, t.detach())
+                    layer_callback(uid, t)
 
             return hook
 
+        if images.dim() == 4:
+            images = images.unsqueeze(0)
+        bsz, seq_len = int(images.shape[0]), int(images.shape[1])
         for uid in want:
             if uid not in catalog:
                 continue
@@ -209,8 +321,6 @@ class Pi3Adapter(BackboneAdapter):
             if idx < len(model.decoder):
                 handles.append(model.decoder[idx].register_forward_hook(_make_hook(uid)))
 
-        if images.dim() == 4:
-            images = images.unsqueeze(0)
         device = self._forward_device(model, images)
         restore_encoder_cpu = self._prepare_full_forward(model, device)
         images = images.to(device=device, dtype=torch.float32)
@@ -225,7 +335,10 @@ class Pi3Adapter(BackboneAdapter):
         for h in handles:
             h.remove()
 
-        return captures, {"patch_start_idx": int(getattr(model, "patch_start_idx", 0))}
+        return captures, {
+            "patch_start_idx": int(getattr(model, "patch_start_idx", 0)),
+            "camera_token_count": 0,
+        }
 
     def forward_predictions(self, model: nn.Module, images: torch.Tensor) -> PredictionBundle:
         if images.dim() == 4:
@@ -241,6 +354,237 @@ class Pi3Adapter(BackboneAdapter):
         finally:
             self._restore_full_forward(model, restore_encoder_cpu)
         return self.prediction_bundle_from_raw(dict(out), images)
+
+    def supports_incremental_skip_eval(self) -> bool:
+        return True
+
+    @staticmethod
+    def _run_incremental_skip_unit(
+        model: nn.Module,
+        tokens_bspc: torch.Tensor,
+        unit_idx: int,
+        *,
+        pos_bnpc: torch.Tensor,
+    ) -> torch.Tensor:
+        from analysis.backbones.cache_replay.pi3 import _run_pi3_block
+
+        bsz, seq_len, num_tokens, channels = (int(x) for x in tokens_bspc.shape)
+        idx = int(unit_idx)
+        if idx < 0 or idx >= len(model.decoder):
+            raise IndexError(f"Pi3 decoder unit index out of range: {idx}")
+        if idx % 2 == 0:
+            hidden = tokens_bspc.reshape(bsz * seq_len, num_tokens, channels)
+            pos = pos_bnpc.reshape(bsz * seq_len, num_tokens, -1)
+            out = _run_pi3_block(
+                model.decoder[idx],
+                hidden,
+                pos,
+                training=False,
+                use_checkpoint=False,
+            )
+            return out.reshape(bsz, seq_len, num_tokens, channels)
+        hidden = tokens_bspc.reshape(bsz, seq_len * num_tokens, channels)
+        pos = pos_bnpc.reshape(bsz, seq_len * num_tokens, -1)
+        out = _run_pi3_block(
+            model.decoder[idx],
+            hidden,
+            pos,
+            training=False,
+            use_checkpoint=False,
+        )
+        return out.reshape(bsz, seq_len, num_tokens, channels)
+
+    @staticmethod
+    def _pi3_head_unit_indices(model: nn.Module) -> Tuple[int, int]:
+        dec_depth = int(len(model.decoder))
+        if dec_depth < 2:
+            raise RuntimeError(f"Pi3 skip eval needs at least two decoder blocks, got {dec_depth}")
+        return dec_depth - 2, dec_depth - 1
+
+    def _forward_pi3_heads_from_decoder_outputs(
+        self,
+        model: nn.Module,
+        *,
+        head_outputs: Dict[int, torch.Tensor],
+        pos_bnpc: torch.Tensor,
+        image_hw: Tuple[int, int],
+    ) -> Dict[str, torch.Tensor]:
+        from analysis.backbones.cache_replay.pi3 import _set_pi3_head_checkpoint
+        from analysis.backbones.cache_replay.pi3_official.geometry import homogenize_points
+
+        penultimate_idx, last_idx = self._pi3_head_unit_indices(model)
+        missing = [idx for idx in (penultimate_idx, last_idx) if idx not in head_outputs]
+        if missing:
+            raise RuntimeError(f"Pi3 incremental skip replay missed head units: {missing}")
+        penultimate = head_outputs[penultimate_idx]
+        final = head_outputs[last_idx]
+        if penultimate.shape != final.shape:
+            raise RuntimeError(
+                "Pi3 head decoder outputs have inconsistent shapes: "
+                f"{tuple(penultimate.shape)} vs {tuple(final.shape)}"
+            )
+        bsz, seq_len, num_tokens, _channels = (int(x) for x in penultimate.shape)
+        h, w = int(image_hw[0]), int(image_hw[1])
+        patch_h, patch_w = h // int(model.patch_size), w // int(model.patch_size)
+        patch_start = int(model.patch_start_idx)
+        head_in = torch.cat(
+            [
+                penultimate.reshape(bsz * seq_len, num_tokens, -1),
+                final.reshape(bsz * seq_len, num_tokens, -1),
+            ],
+            dim=-1,
+        )
+        pos_bn = pos_bnpc.reshape(bsz * seq_len, num_tokens, -1)
+        _set_pi3_head_checkpoint(model, False)
+
+        point_hidden = model.point_decoder(head_in, xpos=pos_bn)
+        conf_hidden = model.conf_decoder(head_in, xpos=pos_bn)
+        camera_hidden = model.camera_decoder(head_in, xpos=pos_bn)
+
+        with torch.autocast(device_type=head_in.device.type, enabled=False):
+            point_hidden = point_hidden.float()
+            ret = model.point_head([point_hidden[:, patch_start:]], (h, w)).reshape(
+                bsz, seq_len, h, w, -1
+            )
+            xy, z = ret.split([2, 1], dim=-1)
+            z = torch.exp(z)
+            local_points = torch.cat([xy * z, z], dim=-1)
+
+            conf_hidden = conf_hidden.float()
+            conf = model.conf_head([conf_hidden[:, patch_start:]], (h, w)).reshape(
+                bsz, seq_len, h, w, -1
+            )
+
+            camera_hidden = camera_hidden.float()
+            camera_poses = model.camera_head(
+                camera_hidden[:, patch_start:],
+                patch_h,
+                patch_w,
+            ).reshape(bsz, seq_len, 4, 4)
+
+            points = torch.einsum(
+                "bnij, bnhwj -> bnhwi",
+                camera_poses,
+                homogenize_points(local_points),
+            )[..., :3]
+
+        return {
+            "points": points,
+            "local_points": local_points,
+            "conf": conf,
+            "camera_poses": camera_poses,
+        }
+
+    def _predict_incremental_skip_span(
+        self,
+        model: nn.Module,
+        *,
+        prefix_tokens: torch.Tensor,
+        prefix_head_outputs: Dict[int, torch.Tensor],
+        start_unit: int,
+        end_unit: int,
+        total_units: int,
+        pos_bnpc: torch.Tensor,
+        image_hw: Tuple[int, int],
+    ) -> PredictionBundle:
+        tokens = prefix_tokens
+        head_outputs = dict(prefix_head_outputs)
+        head_unit_set = set(self._pi3_head_unit_indices(model))
+        for unit_idx in range(int(start_unit), int(total_units)):
+            if unit_idx > int(end_unit):
+                tokens = self._run_incremental_skip_unit(
+                    model,
+                    tokens,
+                    unit_idx,
+                    pos_bnpc=pos_bnpc,
+                )
+            if unit_idx in head_unit_set:
+                head_outputs[unit_idx] = tokens
+        raw = self._forward_pi3_heads_from_decoder_outputs(
+            model,
+            head_outputs=head_outputs,
+            pos_bnpc=pos_bnpc,
+            image_hw=image_hw,
+        )
+        return self.prediction_bundle_from_raw(raw, prefix_tokens)
+
+    def iter_skip_span_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        spans: Sequence[Tuple[int, int]],
+    ) -> Iterable[Tuple[int, int, PredictionBundle]]:
+        from analysis.amp_policy import autocast_device_dtype
+        from analysis.backbones.cache_replay.pi3 import _build_pi3_pos
+
+        if images.dim() == 4:
+            images = images.unsqueeze(0)
+        if images.dim() != 5:
+            raise ValueError(f"Expected skip-eval images [B,S,3,H,W], got {tuple(images.shape)}")
+        device = self._forward_device(model, images)
+        restore_encoder_cpu = self._prepare_full_forward(model, device)
+        x = images.to(device=device, dtype=torch.float32)
+
+        unit_ids = [u.unit_id for u in self.layer_unit_catalog(model)]
+        total_units = len(unit_ids)
+        if total_units != len(model.decoder):
+            raise RuntimeError(
+                f"Pi3 unit catalog/decoder mismatch: units={total_units} decoder={len(model.decoder)}"
+            )
+        requested: Dict[int, List[int]] = {}
+        for i_raw, j_raw in spans:
+            i, j = int(i_raw), int(j_raw)
+            if i < 0 or j < i or j >= total_units:
+                raise ValueError(f"Invalid skip span ({i},{j}) for {total_units} units")
+            requested.setdefault(i, []).append(j)
+        for ends in requested.values():
+            ends.sort()
+
+        bsz, seq_len, _channels, height, width = (int(v) for v in x.shape)
+        ac_kw = autocast_device_dtype(device)
+        try:
+            with torch.inference_mode(), torch.autocast(**ac_kw):
+                prefix_tokens = self.build_initial_tokens(model, x)
+                pos = _build_pi3_pos(
+                    model,
+                    B=bsz,
+                    N=seq_len,
+                    H=height,
+                    W=width,
+                    device=device,
+                )
+            if prefix_tokens is None:
+                raise RuntimeError("Pi3 adaptor did not produce initial replay tokens")
+            pos_bnpc = pos.reshape(bsz, seq_len, int(prefix_tokens.shape[2]), -1)
+            prefix_head_outputs: Dict[int, torch.Tensor] = {}
+            head_unit_set = set(self._pi3_head_unit_indices(model))
+
+            for start_unit in range(total_units):
+                for end_unit in requested.get(start_unit, []):
+                    with torch.inference_mode(), torch.autocast(**ac_kw):
+                        prediction = self._predict_incremental_skip_span(
+                            model,
+                            prefix_tokens=prefix_tokens,
+                            prefix_head_outputs=prefix_head_outputs,
+                            start_unit=start_unit,
+                            end_unit=end_unit,
+                            total_units=total_units,
+                            pos_bnpc=pos_bnpc,
+                            image_hw=(height, width),
+                        )
+                    yield start_unit, end_unit, prediction
+
+                with torch.inference_mode(), torch.autocast(**ac_kw):
+                    prefix_tokens = self._run_incremental_skip_unit(
+                        model,
+                        prefix_tokens,
+                        start_unit,
+                        pos_bnpc=pos_bnpc,
+                    )
+                    if start_unit in head_unit_set:
+                        prefix_head_outputs[start_unit] = prefix_tokens
+        finally:
+            self._restore_full_forward(model, restore_encoder_cpu)
 
     def prediction_bundle_from_raw(
         self,
@@ -291,19 +635,20 @@ class Pi3Adapter(BackboneAdapter):
         def _make_hook(uid: str):
             def hook(_mod, _inp, out):
                 t = out[0] if isinstance(out, tuple) else out
-                if t.dim() == 3:
-                    t = t.unsqueeze(0)
-                captures[uid] = t.detach()
+                captures[uid] = self._normalize_decoder_capture(
+                    uid, t, bsz=bsz, seq_len=seq_len
+                ).detach()
 
             return hook
 
+        if images.dim() == 4:
+            images = images.unsqueeze(0)
+        bsz, seq_len = int(images.shape[0]), int(images.shape[1])
         for uid in want:
             idx = self._decoder_index(uid)
             if idx < len(model.decoder):
                 handles.append(model.decoder[idx].register_forward_hook(_make_hook(uid)))
 
-        if images.dim() == 4:
-            images = images.unsqueeze(0)
         device = self._forward_device(model, images)
         restore_encoder_cpu = self._prepare_full_forward(model, device)
         images = images.to(device=device, dtype=torch.float32)
@@ -320,7 +665,10 @@ class Pi3Adapter(BackboneAdapter):
 
         pred = self.prediction_bundle_from_raw(dict(out), images)
         init_tokens = self.build_initial_tokens(model, images)
-        meta = {"patch_start_idx": int(getattr(model, "patch_start_idx", 0))}
+        meta = {
+            "patch_start_idx": int(getattr(model, "patch_start_idx", 0)),
+            "camera_token_count": 0,
+        }
         return CacheForwardResult(unit_map=captures, meta=meta, pred=pred, initial_tokens=init_tokens)
 
     def apply_prune_plan(self, model: nn.Module, actions: Sequence[PruneAction]) -> nn.Module:
@@ -389,22 +737,6 @@ class Pi3Adapter(BackboneAdapter):
     def periodic_eval_skip_depth(self) -> bool:
         return True
 
-    def eval_scene(
-        self,
-        model: nn.Module,
-        *,
-        dataset_name: str,
-        batch: Any,
-        ctx: EvalSceneContext,
-    ) -> Dict[str, float]:
-        from analysis.backbones import eval_impl
-
-        if dataset_name == "scannet":
-            return eval_impl.eval_scannet_points_adapter(self, model, batch, ctx.device, ctx.profile, ctx)
-        if dataset_name in ("7scenes", "nrgbd"):
-            return eval_impl.eval_7andn_points_adapter(self, model, batch, ctx.device, ctx.profile, ctx)
-        raise ValueError(f"Unsupported dataset for Pi3 eval: {dataset_name}")
-
     def validate_cached_prediction(self, pred: Dict[str, Any]) -> None:
         required = ("points", "camera_poses")
         missing = [k for k in required if k not in pred]
@@ -417,6 +749,7 @@ class Pi3Adapter(BackboneAdapter):
         *,
         images_batched: torch.Tensor,
         device: torch.device,
+        dataset_name: str = "",
     ) -> Dict[str, torch.Tensor]:
         from analysis.backbones.cache_replay.pi3 import build_target_batch_from_teacher_pi3
 
@@ -424,6 +757,7 @@ class Pi3Adapter(BackboneAdapter):
             teacher_pred,
             images_batched=images_batched,
             device=device,
+            dataset_name=dataset_name,
         )
 
     def prediction_loss(
@@ -439,11 +773,6 @@ class Pi3Adapter(BackboneAdapter):
             student_pred,
             target_batch,  # type: ignore[arg-type]
             w_pred=float(weights.w_pred),
-            w_camera=float(weights.w_camera),
-            w_depth=float(weights.w_depth),
-            camera_loss_type=str(weights.camera_loss_type),
-            depth_valid_range=float(weights.depth_valid_range),
-            depth_gradient_loss_fn=str(weights.depth_gradient_loss_fn),
         )
 
     def replay_student_cache_first(

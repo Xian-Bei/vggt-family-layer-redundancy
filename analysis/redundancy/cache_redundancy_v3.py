@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
 from tqdm import tqdm
@@ -17,29 +18,34 @@ from analysis.amp_policy import amp_dtype_for_device
 from analysis.backbones.bootstrap import apply_pythonpath
 from analysis.backbones.registry import get_backbone
 from analysis.datasets.image_batch import prepare_cache_batch
-from analysis.datasets.registry import get_dataset
+from analysis.datasets.registry import dataset_names, get_dataset
 from analysis.redundancy.similarity_v3 import (
     RedundancyAccumulator,
     compute_scene_similarity,
     metric_device,
     parse_token_regions,
     should_compute_scene_redundancy,
-    unit_map_to_flat_layers,
+    unit_map_to_flat_layers_by_region,
     write_redundancy_outputs,
 )
-from analysis.schema.v3 import SCHEMA_VERSION, CacheManifestV3, dataset_output_tag, stage_dir
+from analysis.schema.v3 import SCHEMA_VERSION, CacheManifestV3, stage_dir
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Cache + redundancy (v3, single forward per scene).")
     p.add_argument("--experiment", type=str, default="default")
-    p.add_argument("--dataset", type=str, required=True, choices=["scannet", "7scenes", "nrgbd"])
+    p.add_argument("--dataset", type=str, required=True, choices=dataset_names())
+    p.add_argument(
+        "--output-dataset",
+        type=str,
+        default="",
+        help="Optional output dataset tag override (e.g. scannet_dev50/scannet_test50).",
+    )
     p.add_argument(
         "--split",
         type=str,
         default=None,
-        choices=["train", "test"],
-        help="7scenes split (required when --dataset=7scenes).",
+        help="Optional dataset split, validated by the dataset adaptor.",
     )
     p.add_argument("--data-root", type=Path, required=True)
     p.add_argument("--backbone", type=str, default="vggt")
@@ -67,10 +73,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "(reads {backbone}.json under this directory).",
     )
     p.add_argument(
-        "--plan-name",
+        "--prune-plan-name",
+        dest="prune_plan_name",
         type=str,
         default="",
-        help="Optional named prune plan (e.g., plan_t1_l1). If set, resolve <prune-plan-root>/<plan-name>.json.",
+        help="Optional prune selector list (e.g., 'prune_span5 prune_span10') from prune_plan_all.json.",
+    )
+    p.add_argument(
+        "--training-plan-root",
+        type=Path,
+        default=None,
+        help="Directory with training plan bundles. Defaults to --prune-plan-root.",
+    )
+    p.add_argument(
+        "--training-plan-name",
+        type=str,
+        default="",
+        help="Optional training plan name. If omitted, use all training_*.json bundles.",
     )
     return p
 
@@ -79,16 +98,15 @@ def _scene_out(cache_root: Path, scene_id: str) -> Path:
     return cache_root / scene_id
 
 
-def _resolve_prune_plan_paths(prune_plan_root: Path, backbone: str, plan_name: str) -> List[Path]:
-    from analysis.prune_plan import resolve_named_prune_plan_path, resolve_prune_plan_path
+def _resolve_prune_plan_refs(prune_plan_root: Path, backbone: str, plan_name: str) -> List[Union[Path, str]]:
+    from analysis.prune_plan import list_plan_groups, resolve_prune_plan_path
 
     root = Path(prune_plan_root)
     key = str(plan_name or "").strip()
     if key:
-        return [resolve_named_prune_plan_path(root, key)]
+        return [part for part in re.split(r"[\s,]+", key) if part]
 
-    # New layout: per-backbone multi-plan files (plan_t*_l*.json).
-    named = sorted(root.glob("plan_t*_l*.json"))
+    named = list_plan_groups(root)
     if named:
         return named
 
@@ -104,6 +122,11 @@ def _cache_unit_ids_from_plan_extra(plan: Any, unit_ids_all: List[str]) -> Optio
     if not isinstance(ids, list):
         return None
     parsed = {str(x) for x in ids}
+    # Upgrade older plan metadata in memory: always retain each LoRA unit's own
+    # output even if its serialized cache list only contains the replay seed.
+    from analysis.prune_plan import unit_index_to_unit_id
+
+    parsed.update(unit_index_to_unit_id(int(index)) for index in plan.lora.keys())
     known = set(unit_ids_all) | {"layer_-1"}
     bad = sorted(parsed - known)
     if bad:
@@ -223,18 +246,19 @@ def run_cache_redundancy(
     progress: bool = True,
     prune_plan_root: Optional[Path] = None,
     plan_name: str = "",
+    training_plan_root: Optional[Path] = None,
+    training_plan_name: str = "",
     skip_redundancy: bool = False,
     split: str | None = None,
+    output_dataset: str = "",
 ) -> Path:
     if skip_redundancy and not save_cache:
         raise ValueError("--skip-redundancy requires --save-cache (otherwise there is no output stage).")
-    if dataset == "7scenes" and not split:
-        raise ValueError("7scenes requires split='train' or 'test'")
-
-    output_dataset = dataset_output_tag(dataset, split)
     adapter = get_backbone(backbone)
     apply_pythonpath(adapter.name)
     ds_plugin = get_dataset(dataset)
+    split = ds_plugin.validate_split(split)
+    output_dataset = str(output_dataset).strip() or ds_plugin.output_tag(split)
     torch_device = torch.device(device)
     amp_dt = amp_dtype_for_device(torch_device)
     hf = str(hf_model or adapter.default_hf_model())
@@ -267,33 +291,64 @@ def run_cache_redundancy(
             UnitPrunePlan,
             required_cache_unit_ids,
         )
+        from analysis.training_plan import (
+            compose_training_unit_prune_plan,
+            list_training_plan_names,
+        )
 
-        plan_paths = _resolve_prune_plan_paths(Path(prune_plan_root), adapter.name, plan_name)
-        missing = [str(p) for p in plan_paths if not p.is_file()]
+        plan_refs = _resolve_prune_plan_refs(Path(prune_plan_root), adapter.name, plan_name)
+        missing = [str(p) for p in plan_refs if isinstance(p, Path) and not p.is_file()]
         if missing:
             raise FileNotFoundError(f"Missing prune plan for minimal cache save: {', '.join(missing)}")
+        training_root = Path(training_plan_root) if training_plan_root is not None else Path(prune_plan_root)
+        requested_training = [x for x in str(training_plan_name or "").replace(",", " ").split() if x.strip()]
+        training_names = requested_training or list_training_plan_names(training_root)
+        if not training_names and any(not isinstance(p, Path) for p in plan_refs):
+            raise FileNotFoundError(
+                f"No training plan bundles found under {training_root}; "
+                "cache minimal mode requires both prune and training plans."
+            )
         unit_ids_filter = set()
         explicit_cache_units_used = 0
-        for plan_path in plan_paths:
-            plan = UnitPrunePlan.load(plan_path)
-            explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
-            if explicit_ids is not None:
-                unit_ids_filter.update(explicit_ids)
-                explicit_cache_units_used += 1
+        plan_labels: List[str] = []
+        for plan_ref in plan_refs:
+            if isinstance(plan_ref, Path):
+                plan = UnitPrunePlan.load(plan_ref)
+                plan_labels.append(str(plan_ref.resolve()))
+                explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
+                if explicit_ids is not None:
+                    unit_ids_filter.update(explicit_ids)
+                    explicit_cache_units_used += 1
+                else:
+                    unit_ids_filter.update(required_cache_unit_ids(plan, model))
             else:
-                unit_ids_filter.update(required_cache_unit_ids(plan, model))
+                for train_name in training_names:
+                    plan = compose_training_unit_prune_plan(
+                        prune_plan_root=Path(prune_plan_root),
+                        training_plan_root=training_root,
+                        prune_selector=str(plan_ref),
+                        training_plan=str(train_name),
+                    )
+                    plan_labels.append(f"{plan_ref}+{train_name}")
+                    explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
+                    if explicit_ids is not None:
+                        unit_ids_filter.update(explicit_ids)
+                        explicit_cache_units_used += 1
+                    else:
+                        unit_ids_filter.update(required_cache_unit_ids(plan, model))
 
         cache_save_policy = {
-            "mode": "prune_plan_minimal_union" if len(plan_paths) > 1 else "prune_plan_minimal",
+            "mode": "prune_plan_minimal_union" if len(plan_refs) > 1 else "prune_plan_minimal",
             "prune_plan_root": str(Path(prune_plan_root).resolve()),
-            "prune_plan_files": [str(p.resolve()) for p in plan_paths],
+            "training_plan_root": str(training_root.resolve()),
+            "prune_plan_selectors": plan_labels,
             "units_saved": len(unit_ids_filter),
             "units_total": len(unit_ids),
             "explicit_cache_unit_ids_plans": int(explicit_cache_units_used),
         }
         print(
             f"[cache+redundancy] minimal cache save: {len(unit_ids_filter)}/{len(unit_ids)} units "
-            f"from {len(plan_paths)} plan(s)",
+            f"from {len(plan_refs)} plan(s)",
             file=sys.stderr,
         )
 
@@ -316,7 +371,9 @@ def run_cache_redundancy(
         extra=manifest_extra,
     )
 
-    accumulator = RedundancyAccumulator(metric_names, regions) if compute_redundancy else None
+    accumulators = (
+        {r: RedundancyAccumulator(metric_names, r) for r in regions} if compute_redundancy else None
+    )
     scene_rows: List[Dict[str, Any]] = []
     sum_infer_s = 0.0
     sum_disk_s = 0.0
@@ -338,14 +395,16 @@ def run_cache_redundancy(
     scene_iter = tqdm(scene_list, desc=iter_label, unit="scene", file=sys.stderr) if progress else scene_list
     for batch in scene_iter:
         scene_id = batch.scene_id
-        prepared = prepare_cache_batch(batch.images, max_frames=0, meta=batch.meta)
-        images = prepared.images
+        prepared = prepare_cache_batch(batch.images, max_frames=0, meta=batch.meta, backbone_adapter=adapter)
         frame_ids = list(prepared.frame_ids)
         image_paths = list(prepared.image_paths)
 
         if progress and hasattr(scene_iter, "set_postfix_str"):
             scene_iter.set_postfix_str(f"{scene_id} | forward", refresh=True)
 
+        images = prepared.images.to(torch_device, non_blocking=False)
+        if torch_device.type == "cuda":
+            torch.cuda.synchronize(torch_device)
         t_infer0 = time.perf_counter()
         fwd = adapter.forward_cache_batch(model, images, torch_device)
         infer_s = time.perf_counter() - t_infer0
@@ -353,23 +412,27 @@ def run_cache_redundancy(
         unit_map, meta, pred = fwd.unit_map, fwd.meta, fwd.pred
         fwd_initial_tokens = getattr(fwd, "initial_tokens", None)
         patch_start_idx = int(meta.get("patch_start_idx", 0))
+        camera_token_count = int(meta.get("camera_token_count", 0))
 
         if compute_redundancy:
-            assert accumulator is not None
-            flat_layers, scene_unit_ids = unit_map_to_flat_layers(
+            assert accumulators is not None
+            by_region = unit_map_to_flat_layers_by_region(
                 unit_map,
                 unit_ids,
                 patch_start_idx=patch_start_idx,
+                camera_token_count=camera_token_count,
                 regions=regions,
                 max_tokens=int(max_tokens),
                 seed=int(seed),
             )
-            if len(flat_layers) >= 2:
+            for region, (flat_layers, scene_unit_ids) in by_region.items():
+                if len(flat_layers) < 2:
+                    continue
                 n_pairs = len(flat_layers) * (len(flat_layers) + 1) // 2
                 if progress and hasattr(scene_iter, "set_postfix_str"):
                     tok_s = "all" if max_tokens <= 0 else str(max_tokens)
                     scene_iter.set_postfix_str(
-                        f"{scene_id} | sim 0/{n_pairs} ({tok_s} tok, {metric_dev or 'cpu'})",
+                        f"{scene_id} | sim {region} 0/{n_pairs} ({tok_s} tok, {metric_dev or 'cpu'})",
                         refresh=True,
                     )
                 sims = compute_scene_similarity(
@@ -377,10 +440,10 @@ def run_cache_redundancy(
                     metric_names=metric_names,
                     metric_device=metric_dev,
                     progress=progress,
-                    progress_desc=f"similarity {scene_id}",
+                    progress_desc=f"similarity {scene_id} [{region}]",
                 )
-                accumulator.add_scene(scene_id, flat_layers, scene_unit_ids, sims)
-            del flat_layers
+                accumulators[region].add_scene(scene_id, flat_layers, scene_unit_ids, sims)
+            del by_region
 
         if save_cache:
             t_disk0 = time.perf_counter()
@@ -416,20 +479,16 @@ def run_cache_redundancy(
     total_s = time.perf_counter() - t_run0
     out_path: Path
     if compute_redundancy:
-        assert accumulator is not None
-        source_cache = str(cache_root) if save_cache else "(memory-only)"
-        out_path = write_redundancy_outputs(
+        assert accumulators is not None
+        out_paths = write_redundancy_outputs(
             experiment=experiment,
             dataset=output_dataset,
-            backbone=adapter.name,
             unit_ids=unit_ids,
-            accumulator=accumulator,
-            max_span=int(max_span),
-            max_tokens=int(max_tokens),
-            metric_device=metric_dev,
-            source_cache=source_cache,
+            accumulators=accumulators,
+            token_regions=regions,
             timing_total_s=total_s,
         )
+        out_path = out_paths[0]
     else:
         out_path = cache_root
 
@@ -473,9 +532,12 @@ def main() -> None:
         similarity_threshold=float(args.similarity_threshold),
         progress=True,
         prune_plan_root=args.prune_plan_root,
-        plan_name=str(args.plan_name),
+        plan_name=str(args.prune_plan_name),
+        training_plan_root=args.training_plan_root,
+        training_plan_name=str(args.training_plan_name),
         skip_redundancy=bool(args.skip_redundancy),
         split=args.split,
+        output_dataset=str(args.output_dataset),
     )
 
 

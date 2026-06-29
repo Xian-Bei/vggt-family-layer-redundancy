@@ -192,6 +192,17 @@ def _preprocess_depth_like_vggt(depth: np.ndarray, *, target_width: int = 518, m
     return depth.astype(np.float32, copy=False)
 
 
+def _preprocess_depth_like_omega(depth: np.ndarray, *, output_hw: Tuple[int, int]) -> np.ndarray:
+    """Align dense ScanNet depth to the same geometry as vggt_omega RGB preprocessing."""
+    from analysis.datasets.driving_depth import _aspect_crop_dims
+
+    if depth.ndim != 2:
+        raise ValueError(f"Expected 2D depth map, got shape {depth.shape}")
+    crop_top, crop_left, crop_h, crop_w = _aspect_crop_dims(depth.shape[0], depth.shape[1])
+    depth = depth[crop_top : crop_top + crop_h, crop_left : crop_left + crop_w]
+    return _resize_depth_nearest(depth, (int(output_hw[0]), int(output_hw[1])))
+
+
 def _read_scannet_depth_png(path: Path) -> np.ndarray:
     arr = np.asarray(Image.open(path))
     if arr.ndim == 3:
@@ -228,6 +239,60 @@ def _find_gt_depth_path(scene_dir: Path, stem: str) -> Optional[Path]:
     return None
 
 
+def _7andn_depth_path_from_color(color_path: Path) -> Path:
+    name = color_path.name
+    if ".color." not in name:
+        raise ValueError(f"Unexpected 7Scenes/NRGBD color path: {color_path}")
+    return color_path.parent / name.replace(".color.", ".depth.proj.")
+
+
+def _read_7andn_depth_meters(path: Path) -> np.ndarray:
+    import cv2
+
+    depthmap = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if depthmap is None:
+        raise FileNotFoundError(f"Could not read 7andn depth: {path}")
+    depthmap = np.asarray(depthmap)
+    if depthmap.ndim == 3:
+        depthmap = depthmap[..., 0]
+    depthmap[depthmap == 65535] = 0
+    depth = np.nan_to_num(depthmap.astype(np.float32), nan=0.0) / 1000.0
+    depth[(depth > 10.0) | (depth < 1e-3)] = 0.0
+    return depth
+
+
+def _load_7andn_gt_depth_vggt(view: Dict[str, Any], image_hw: Tuple[int, int]) -> np.ndarray:
+    color_path = Path(str(view["instance"]))
+    depth_path = _7andn_depth_path_from_color(color_path)
+    depth = _read_7andn_depth_meters(depth_path)
+    import cv2
+
+    rgb = cv2.imread(str(color_path))
+    if rgb is None:
+        raise FileNotFoundError(f"Could not read 7andn color image: {color_path}")
+    rgb_h, rgb_w = int(rgb.shape[0]), int(rgb.shape[1])
+    if depth.shape != (rgb_h, rgb_w):
+        depth = _resize_depth_nearest(depth, (rgb_h, rgb_w))
+    depth = _preprocess_depth_like_vggt(depth, target_width=int(image_hw[1]), mode="crop")
+    return _match_depth_hw(depth, image_hw)
+
+
+def _load_7andn_gt_depth_omega(view: Dict[str, Any], image_hw: Tuple[int, int]) -> np.ndarray:
+    color_path = Path(str(view["instance"]))
+    depth_path = _7andn_depth_path_from_color(color_path)
+    depth = _read_7andn_depth_meters(depth_path)
+    import cv2
+
+    rgb = cv2.imread(str(color_path))
+    if rgb is None:
+        raise FileNotFoundError(f"Could not read 7andn color image: {color_path}")
+    rgb_h, rgb_w = int(rgb.shape[0]), int(rgb.shape[1])
+    if depth.shape != (rgb_h, rgb_w):
+        depth = _resize_depth_nearest(depth, (rgb_h, rgb_w))
+    depth = _preprocess_depth_like_omega(depth, output_hw=image_hw)
+    return _match_depth_hw(depth, image_hw)
+
+
 def _load_gt_depth_for_scene(scene: SceneData, image_hw: Tuple[int, int]) -> Optional[np.ndarray]:
     """Load ScanNet GT depth and align it to the same crop-mode preprocessing as RGB input."""
     depth_maps: List[np.ndarray] = []
@@ -245,6 +310,35 @@ def _load_gt_depth_for_scene(scene: SceneData, image_hw: Tuple[int, int]) -> Opt
         if depth.shape != (rgb_h, rgb_w):
             depth = _resize_depth_nearest(depth, (rgb_h, rgb_w))
         depth = _preprocess_depth_like_vggt(depth, target_width=int(image_hw[1]), mode="crop")
+        depth = _match_depth_hw(depth, image_hw)
+        depth_maps.append(depth)
+        shapes.add(tuple(depth.shape))
+    if not depth_maps:
+        raise RuntimeError(f"No GT depth maps loaded for {scene.scene_id}")
+    if len(shapes) > 1:
+        target_h = max(h for h, _ in shapes)
+        target_w = max(w for _, w in shapes)
+        depth_maps = [_match_depth_hw(d, (target_h, target_w)) for d in depth_maps]
+    return np.stack(depth_maps, axis=0).astype(np.float32, copy=False)
+
+
+def _load_gt_depth_for_scene_omega(scene: SceneData, image_hw: Tuple[int, int]) -> Optional[np.ndarray]:
+    """Load ScanNet GT depth aligned to vggt_omega balanced preprocessing."""
+    depth_maps: List[np.ndarray] = []
+    shapes: set[Tuple[int, int]] = set()
+    for image_path in scene.image_paths:
+        depth_path = _find_gt_depth_path(scene.scene_dir, image_path.stem)
+        if depth_path is None:
+            raise RuntimeError(
+                f"Missing GT depth for frame {image_path.stem} in {scene.scene_id}. "
+                "Expected depth/*.png or frame-XXXXXX.depth(.proj).png."
+            )
+        depth = _read_scannet_depth_png(depth_path)
+        with Image.open(image_path) as image:
+            rgb_w, rgb_h = image.size
+        if depth.shape != (rgb_h, rgb_w):
+            depth = _resize_depth_nearest(depth, (rgb_h, rgb_w))
+        depth = _preprocess_depth_like_omega(depth, output_hw=image_hw)
         depth = _match_depth_hw(depth, image_hw)
         depth_maps.append(depth)
         shapes.add(tuple(depth.shape))

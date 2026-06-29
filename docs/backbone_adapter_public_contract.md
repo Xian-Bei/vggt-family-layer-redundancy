@@ -1,6 +1,6 @@
 # Backbone Adaptor 公共契约
 
-本文档定义目标形态：公共流程不再按 `vggt`、`fastvggt`、`vggt_omega`、`pi3` 分支，而是只调用每个 backbone adaptor 暴露的接口。新增 backbone 时，只需要实现这些接口，并注册到 `analysis/backbones/registry.py`。
+本文档定义目标形态：公共流程不再按 `vggt`、`vggt_omega`、`pi3` 分支，而是只调用每个 backbone adaptor 暴露的接口。新增 backbone 时，只需要实现这些接口，并注册到 `analysis/backbones/registry.py`。FastVGGT 与 QuantVGGT 属于推理时压缩，使用 `analysis/inference_compression` 下的独立 adaptor contract。
 
 可复制的代码骨架见 `analysis/backbones/adapters/backbone_adapter_template.py`，逐项填充说明见 `docs/backbone_adapter_template.md`。
 
@@ -219,7 +219,7 @@ def bundle_from_pose_depth(
 ) -> PredictionBundle
 ```
 
-VGGT、FastVGGT、VGGT-Omega 只需要把 raw dict 交给这个 helper。Pi3 adaptor 自己把 `points/local_points/conf/camera_poses` 填入 `PredictionBundle`，`depth=None`。
+VGGT、VGGT-Omega 只需要把 raw dict 交给这个 helper。Pi3 adaptor 自己把 `points/local_points/conf/camera_poses` 填入 `PredictionBundle`，`depth=None`。
 
 ### 5. 剪枝和 LoRA
 

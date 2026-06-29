@@ -9,6 +9,20 @@ import numpy as np
 from analysis.schema.v3 import DepthEvalProfile, GeometryEvalProfile, UNIFIED_METRIC_KEYS
 
 
+def require_depth_stack_shapes(
+    pred_depth: np.ndarray,
+    gt_depth: np.ndarray,
+    *,
+    context: str,
+) -> None:
+    pred = np.asarray(pred_depth)
+    gt = np.asarray(gt_depth)
+    if tuple(pred.shape) != tuple(gt.shape):
+        raise ValueError(
+            f"{context}: prediction/GT depth shape mismatch {tuple(pred.shape)} vs {tuple(gt.shape)}"
+        )
+
+
 def compute_depth_metrics(
     pred_depth: np.ndarray,
     gt_depth: np.ndarray,
@@ -22,14 +36,17 @@ def compute_depth_metrics(
     if profile.crop_mode == "center224":
         pred = _center_crop_224(pred)
         gt = _center_crop_224(gt)
-    if pred.shape != gt.shape:
-        raise ValueError(f"Depth shape mismatch: {pred.shape} vs {gt.shape}")
+    require_depth_stack_shapes(pred, gt, context="compute_depth_metrics")
 
     pred_t = torch.from_numpy(pred.reshape(-1, pred.shape[-1]) if pred.ndim == 3 else pred)
     gt_t = torch.from_numpy(gt.reshape(-1, gt.shape[-1]) if gt.ndim == 3 else gt)
     mask = (gt_t > 0) & (gt_t < float(profile.max_depth)) & torch.isfinite(pred_t)
     if int(mask.sum()) <= 0:
-        return {"depth_abs_rel": float("nan"), "depth_delta1": float("nan")}
+        return {
+            "depth_abs_rel": float("nan"),
+            "depth_delta1": float("nan"),
+            "depth_valid_pixels": 0.0,
+        }
     pred_v = pred_t[mask]
     gt_v = gt_t[mask]
     s = torch.nanmean(gt_v) / torch.clamp(torch.nanmean(pred_v), min=1e-8)
@@ -43,7 +60,11 @@ def compute_depth_metrics(
     abs_rel = torch.mean(torch.abs(pred_v - gt_v) / gt_v).item()
     ratio = torch.maximum(pred_v / gt_v, gt_v / pred_v.clamp(min=1e-5))
     delta1 = torch.mean((ratio < 1.25).float()).item()
-    return {"depth_abs_rel": float(abs_rel), "depth_delta1": float(delta1)}
+    return {
+        "depth_abs_rel": float(abs_rel),
+        "depth_delta1": float(delta1),
+        "depth_valid_pixels": float(mask.sum().item()),
+    }
 
 
 def compute_pose_metrics(
@@ -213,8 +234,10 @@ def average_metrics(rows: list[Dict[str, float]]) -> Dict[str, float]:
 
 
 def _center_crop_224(arr: np.ndarray) -> np.ndarray:
+    if arr.ndim == 3:
+        return np.stack([_center_crop_224(arr[i]) for i in range(int(arr.shape[0]))], axis=0)
     if arr.ndim != 2:
-        raise ValueError(f"Expected HxW, got {arr.shape}")
+        raise ValueError(f"Expected HxW or SxHxW, got {arr.shape}")
     h, w = arr.shape
     cx, cy = w // 2, h // 2
     return arr[cy - 112 : cy + 112, cx - 112 : cx + 112]

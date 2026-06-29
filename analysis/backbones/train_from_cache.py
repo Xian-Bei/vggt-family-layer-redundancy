@@ -29,8 +29,8 @@ def launch_cache_replay_training(backbone: str, args: TrainFromCacheArgs) -> Non
         str(args.output_dir),
         "--prune-plan-file",
         str(args.prune_plan_path),
-        "--plan-name",
-        str(getattr(args, "plan_name", "")),
+        "--prune-plan-name",
+        str(args.prune_plan_name),
         "--device",
         str(args.device),
         "--dtype",
@@ -41,8 +41,6 @@ def launch_cache_replay_training(backbone: str, args: TrainFromCacheArgs) -> Non
         str(int(args.max_scenes)),
         "--max-steps",
         str(int(args.max_steps)),
-        "--lr",
-        str(float(args.lr)),
         "--save-every-epoch",
         str(int(args.save_every_epoch)),
         "--eval-epoch",
@@ -52,6 +50,12 @@ def launch_cache_replay_training(backbone: str, args: TrainFromCacheArgs) -> Non
         "--max-eval-views",
         str(int(args.max_eval_views)),
     ]
+    training_plan_root = str(getattr(args, "training_plan_root", "") or "")
+    training_plan_name = str(getattr(args, "training_plan_name", "") or "")
+    if training_plan_root:
+        train_argv.extend(["--training-plan-root", training_plan_root])
+    if training_plan_name:
+        train_argv.extend(["--training-plan-name", training_plan_name])
     if bool(args.eval_at_start):
         train_argv.append("--eval-at-start")
     else:
@@ -81,7 +85,19 @@ def launch_cache_replay_training(backbone: str, args: TrainFromCacheArgs) -> Non
         train_argv.append("--eval-nrgbd")
     else:
         train_argv.append("--no-eval-nrgbd")
-    if name == "pi3":
-        train_argv.append("--use-checkpoint")
+    if bool(args.eval_nuscenes):
+        train_argv.append("--eval-nuscenes")
+    else:
+        train_argv.append("--no-eval-nuscenes")
+    train_argv.extend(["--eval-nuscenes-split", str(args.eval_nuscenes_split)])
+    if bool(args.eval_waymo):
+        train_argv.append("--eval-waymo")
+    else:
+        train_argv.append("--no-eval-waymo")
+    train_argv.extend(["--eval-waymo-split", str(args.eval_waymo_split)])
+    train_argv.extend(["--root-7scenes", str(args.root_7scenes)])
+    train_argv.extend(["--root-nrgbd", str(args.root_nrgbd)])
+    train_argv.extend(["--root-nuscenes", str(args.root_nuscenes)])
+    train_argv.extend(["--root-waymo", str(args.root_waymo)])
     print("[train] launching cache replay:", " ".join(train_argv[2:]), flush=True)
     subprocess.run(train_argv, check=True)

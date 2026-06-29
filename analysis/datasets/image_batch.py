@@ -4,17 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import torch
 from torch.utils.data._utils.collate import default_collate
 
 from analysis.datasets.frame_selection import pick_frame_indices
 
+if TYPE_CHECKING:
+    from analysis.backbones.contracts import BackboneAdapter
+
 
 @dataclass
 class PreparedCacheBatch:
-    """Model input tensor plus per-frame ids/paths (already selected by dataset plugins)."""
+    """Model input tensor plus per-frame ids/paths (already selected by dataset adaptors)."""
 
     images: torch.Tensor
     frame_ids: List[str]
@@ -45,9 +48,28 @@ def prepare_cache_batch(
     *,
     max_frames: int = 0,
     meta: Optional[Dict[str, Any]] = None,
+    backbone_adapter: Optional["BackboneAdapter"] = None,
 ) -> PreparedCacheBatch:
-    """Convert plugin batch to model tensor; frame count is set in dataset plugins (``max_frames=0`` = no re-cap)."""
+    """Convert dataset batch to model tensor; frame count is set in dataset adaptors (``max_frames=0`` = no re-cap)."""
     meta = dict(meta or {})
+
+    if images is None:
+        paths_raw = meta.get("image_paths") or []
+        image_paths = [str(Path(str(p)).resolve()) for p in paths_raw]
+        if not image_paths:
+            raise ValueError("batch.images is None and meta.image_paths is empty")
+        if backbone_adapter is None:
+            raise ValueError("batch.images is None; pass backbone_adapter to prepare_cache_batch")
+        tensor = backbone_adapter.load_eval_images(image_paths)
+        if tensor.dim() == 4:
+            tensor = tensor.unsqueeze(0)
+        if tensor.dim() != 5:
+            raise ValueError(f"Backbone load_eval_images expected [S,3,H,W] or [1,S,3,H,W], got {tuple(tensor.shape)}")
+        fids_raw = meta.get("frame_ids") or []
+        frame_ids = [str(x) for x in fids_raw] if fids_raw else [Path(p).stem for p in image_paths]
+        if len(frame_ids) != len(image_paths):
+            frame_ids = [Path(p).stem for p in image_paths]
+        return PreparedCacheBatch(tensor, frame_ids, image_paths)
 
     if isinstance(images, list) and images and isinstance(images[0], dict):
         views: List[Any] = list(images)
@@ -56,15 +78,14 @@ def prepare_cache_batch(
             views = [views[i] for i in pick]
         frame_ids = [_frame_id_from_view(v) for v in views]
         image_paths = [_image_path_from_view(v) for v in views]
-        collated = default_collate(views)
-        if not isinstance(collated, dict) or "img" not in collated:
-            raise ValueError("7andn-style batch must collate to dict with key 'img'")
-        out = (collated["img"].float() + 1.0) / 2.0
-        if out.dim() == 4:
-            out = out.unsqueeze(0)
-        if out.dim() != 5:
-            raise ValueError(f"Collated 7andn img expected 4D/5D, got {tuple(out.shape)}")
-        return PreparedCacheBatch(out, frame_ids, image_paths)
+        if backbone_adapter is None:
+            raise ValueError("7andn-style batch requires backbone_adapter in prepare_cache_batch")
+        tensor = backbone_adapter.load_eval_images(image_paths)
+        if tensor.dim() == 4:
+            tensor = tensor.unsqueeze(0)
+        if tensor.dim() != 5:
+            raise ValueError(f"Backbone load_eval_images expected [S,3,H,W] or [1,S,3,H,W], got {tuple(tensor.shape)}")
+        return PreparedCacheBatch(tensor, frame_ids, image_paths)
 
     paths_raw = meta.get("image_paths") or []
     fids_raw = meta.get("frame_ids") or []

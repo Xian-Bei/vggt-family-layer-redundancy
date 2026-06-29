@@ -12,13 +12,25 @@
       }
     },
     "fastvggt": {
+      "component_type": "inference_compression",
       "path": "backbones/FastVGGT",
       "url": "https://github.com/mystorm16/FastVGGT.git",
       "commit": "6526e275a29572653a034762bb3c6c9ce280ff55",
       "default_weight": {
         "kind": "huggingface_model_id",
         "value": "facebook/VGGT-1B",
-        "note": "LaRe uses the VGGT checkpoint through the FastVGGT code path."
+        "note": "Deployment-only token merging applied to a restored VGGT model."
+      }
+    },
+    "quantvggt": {
+      "component_type": "inference_compression",
+      "path": "backbones/QuantVGGT",
+      "url": "git@github.com:wlfeng0509/QuantVGGT.git",
+      "commit": "e6e0ca8859fb5cbc7683eec6c9b4773a1a3360ed",
+      "default_weight": {
+        "kind": "huggingface_model_id",
+        "value": "wlfeng/QuantVGGT",
+        "note": "Calibration parameters are loaded explicitly by the QuantVGGT inference compression adapter."
       }
     },
     "pi3": {
