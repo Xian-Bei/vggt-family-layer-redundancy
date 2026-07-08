@@ -16,6 +16,8 @@ import argparse
 import io
 import json
 import math
+import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -38,11 +40,9 @@ except ImportError as exc:  # pragma: no cover - import guard for optional demo 
 from analysis.backbones.bootstrap import apply_pythonpath
 from analysis.backbones.registry import get_backbone
 from .redundancy.metrics import upper_triangle_pack, upper_triangle_unpack_for_heatmap
-from analysis.prune_plan.build_prune_plan_v3 import load_similarity
+from analysis.prune_plan.build_prune_plan_common import load_similarity
 from analysis.redundancy.similarity_v3 import (
-    DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS,
     REDUNDANCY_GRAPH_REGIONS,
-    regions_for_aggregation,
 )
 from analysis.triangular_heatmap import configure_triangle_axes, imshow_upper_triangle, triangle_xy
 from analysis.eval.scannet_eval import SceneData, load_scene_images
@@ -53,10 +53,10 @@ from .redundancy.visualize_pair_attention import (
     _overlay_patch_map,
     _reconstruct_qk,
 )
-from .vis import build_cka_heatmaps_tab, build_eval_tab, build_heatmaps_tab, build_lora_tab, build_summary_tab
+from .vis import build_cka_heatmaps_tab, build_eval_tab, build_heatmaps_tab, build_recovery_tab, build_summary_tab
 # from .vis import build_pair_tab  # Pair Attention tab disabled
 
-DEFAULT_LORA_ROOT = Path("analysis_outputs_v3")
+OUTPUT_ROOT_DEFAULT = Path(os.environ.get("OUTPUT_ROOT", "analysis_outputs_v3"))
 
 
 def _repo_root() -> Path:
@@ -95,44 +95,23 @@ def _gradio_allowed_paths(controller: PairAttentionController) -> List[str]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Interactive browser panel for pair attention.")
+    p = argparse.ArgumentParser(description="Interactive browser panel for v3 results.")
     # v3 datasets live under analysis_outputs_v3/<backbone>/<dataset_tag>/...
     # Keep this free-form so new tags like scannet_dev50/scannet_test50 work.
     p.add_argument("--dataset", type=str, default="scannet_dev50")
-    p.add_argument("--cache-dir", type=Path, default=Path("analysis_outputs/cache"))
     p.add_argument(
-        "--lora-dir",
+        "--output-root",
         type=Path,
-        default=DEFAULT_LORA_ROOT,
-        help="v3 output root containing LoRA train plots: <model>/scannet_dev50/train/<plan>/.",
+        default=OUTPUT_ROOT_DEFAULT,
+        help="v3 output root, usually analysis_outputs_v3 or $OUTPUT_ROOT.",
     )
-    p.add_argument(
-        "--analysis-dir",
-        type=Path,
-        default=None,
-        help="Legacy single analysis dir. If set, used for both similarity and skip reports.",
-    )
-    p.add_argument("--analysis-sim-dir", type=Path, default=Path("analysis_outputs/similarity"))
-    p.add_argument("--analysis-skip-dir", type=Path, default=Path("analysis_outputs/skip"))
-    p.add_argument("--data-root", type=Path, default=Path("data/scans_dev50/"))
     p.add_argument("--scannet-root", type=Path, default=Path("data/scans_dev50/"))
     p.add_argument("--scannet-test-root", type=Path, default=Path("data/scans_test50/"))
     p.add_argument("--root-7scenes", type=Path, default=Path("data/7scenes"))
     p.add_argument("--root-nrgbd", type=Path, default=Path("data/neural_rgbd_data"))
-    p.add_argument("--hf-model", type=str, default="", help="Optional HF model override; default reads manifest.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--server-name", type=str, default="127.0.0.1")
-    p.add_argument("--server-port", type=int, default=7861)
-    p.add_argument(
-        "--eval-root",
-        type=Path,
-        default=Path("analysis_outputs/evaluation"),
-        help=(
-            "Eval outputs directory. Either the shared bundle root ``analysis_outputs/evaluation`` "
-            "(suites: 7andn, scans_*) so the UI can pick model + infer_s, or a single run folder "
-            "like ``.../scans_test50_input_frame_50/Ours_vggt`` with per-scene subdirs."
-        ),
-    )
+    p.add_argument("--server-port", type=int, default=7866)
     p.add_argument("--viser-host", type=str, default="127.0.0.1", help="Host for embedded Viser server.")
     p.add_argument("--viser-port", type=int, default=8090, help="Port for embedded Viser server.")
     p.add_argument(
@@ -198,52 +177,39 @@ SKIP_HIGHER_IS_BETTER = {"depth_delta1", "nc"}
 class PairAttentionController:
     def __init__(
         self,
-        cache_dir: Path,
-        analysis_sim_dir: Path,
-        analysis_skip_dir: Path,
-        data_root: Path,
+        output_root: Path,
         dataset: str,
         data_roots_by_dataset: Dict[str, Path],
-        hf_model: str,
         device_arg: str,
         *,
-        lora_root: Path = DEFAULT_LORA_ROOT,
-        eval_root: Optional[Path] = None,
         viser_host: str = "127.0.0.1",
         viser_port: int = 8090,
         v3_backbone: str = "",
     ) -> None:
-        from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT
-        from analysis.view_v3_loader import discover_v3_backbones
+        from analysis.vis.view_v3_loader import discover_v3_backbones
 
-        self.v3_output_root = OUTPUT_ROOT_DEFAULT
-        self.v3_mode = self.v3_output_root.is_dir()
-        self.v3_backbones: List[str] = []
-        self.v3_backbone = ""
-        if self.v3_mode:
-            self.v3_backbones = discover_v3_backbones(self.v3_output_root)
-            preferred = str(v3_backbone).strip()
-            if preferred and preferred in self.v3_backbones:
-                self.v3_backbone = preferred
-            elif self.v3_backbones:
-                self.v3_backbone = self.v3_backbones[0]
-            else:
-                self.v3_backbone = preferred or "vggt"
-        self.lora_root = _resolve_path_cwd_then_repo(Path(lora_root))
-        self.eval_root = (
-            _resolve_path_cwd_then_repo(Path(eval_root)) if eval_root is not None else None
-        )
+        self.v3_output_root = _resolve_path_cwd_then_repo(Path(output_root))
+        self.v3_mode = True
+        self.v3_backbones = discover_v3_backbones(self.v3_output_root)
+        preferred = str(v3_backbone).strip()
+        if preferred and preferred in self.v3_backbones:
+            self.v3_backbone = preferred
+        elif self.v3_backbones:
+            self.v3_backbone = self.v3_backbones[0]
+        else:
+            self.v3_backbone = preferred or "vggt"
+        self.lora_root = self.v3_output_root
+        self.eval_root: Optional[Path] = None
         self.viser_host = str(viser_host)
         self.viser_port = int(viser_port)
-        self.cache_root = cache_dir
-        self.analysis_similarity_root = analysis_sim_dir
-        self.analysis_skip_root = analysis_skip_dir
-        self.data_root = data_root
+        self.cache_root = self.v3_backbone_root()
+        self.analysis_similarity_root = self.v3_backbone_root()
+        self.analysis_skip_root = self.v3_backbone_root()
+        self.data_root = Path(data_roots_by_dataset.get(str(dataset).strip().lower(), Path(".")))
         self.data_roots_by_dataset = dict(data_roots_by_dataset)
         self.device = torch.device(device_arg if torch.cuda.is_available() or device_arg == "cpu" else "cpu")
         self.dataset = str(dataset).strip().lower()
-        if self.v3_mode:
-            self._apply_v3_backbone_paths()
+        self._apply_v3_backbone_paths()
         self.cache_root_exists = self.cache_root.exists() and self.cache_root.is_dir()
 
         self.cache_dir = self._resolve_dataset_dir(self.cache_root, self.dataset)
@@ -254,18 +220,70 @@ class PairAttentionController:
         self.manifest, self.scene_items = self._load_manifest_and_scenes()
         self.cache_available = self._cache_available_on_disk()
 
-        self.hf_model = hf_model.strip() or str(self.manifest.get("hf_model", "")).strip()
+        self.hf_model = str(self.manifest.get("hf_model", "")).strip()
         # Model is required only for Pair Attention reconstruction; Stage2/LoRA/Eval tabs can work without it.
         self.pair_available = self.cache_available and bool(self.scene_items) and bool(self.hf_model)
 
         self.model: Optional[Any] = None
         self.scene_cache: Dict[str, SceneCache] = {}
         self.qk_cache: Dict[Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._v3_similarity_report_cache: Dict[Tuple[str, str], Dict[str, Stage2SceneReport]] = {}
+        self._v3_skip_report_cache: Dict[Tuple[str, str], Dict[str, Stage2SceneReport]] = {}
+        self._stage2_modes_cache: Dict[Tuple[str, str], List[str]] = {}
         self.stage1_eval_by_scene = self._load_stage1_eval_by_scene()
         self.similarity_reports = self._discover_similarity_reports()
         self.skip_reports = self._discover_skip_reports()
+        self._cache_current_v3_stage2_reports()
         self.stage2_render_cache: Dict[Tuple[str, str, int, int, int], Tuple[Dict[str, List[np.ndarray]], str]] = {}
         self.stage2_request_seq = 0
+
+    def _v3_cache_key(self, dataset: str, backbone: Optional[str] = None) -> Tuple[str, str]:
+        bb = str(backbone if backbone is not None else self.v3_backbone).strip()
+        ds = str(dataset).strip().lower()
+        return (bb, ds)
+
+    def _cache_current_v3_stage2_reports(self) -> None:
+        if _is_stage2_virtual_dataset(self.dataset):
+            return
+        key = self._v3_cache_key(self.dataset, self.v3_backbone)
+        self._v3_similarity_report_cache[key] = self.similarity_reports
+        self._v3_skip_report_cache[key] = self.skip_reports
+        self._stage2_modes_cache[key] = _discover_stage2_modes(
+            self.similarity_reports,
+            self.skip_reports,
+        )
+
+    def _v3_similarity_reports_for_dataset(
+        self,
+        dataset: str,
+        *,
+        backbone: Optional[str] = None,
+    ) -> Dict[str, Stage2SceneReport]:
+        key = self._v3_cache_key(dataset, backbone)
+        cached = self._v3_similarity_report_cache.get(key)
+        if cached is not None:
+            return cached
+        root = self.v3_output_root / key[0]
+        reports = self._discover_v3_similarity_reports(root / key[1] / "redundancy")
+        self._v3_similarity_report_cache[key] = reports
+        return reports
+
+    def _v3_skip_reports_for_dataset(
+        self,
+        dataset: str,
+        *,
+        backbone: Optional[str] = None,
+    ) -> Dict[str, Stage2SceneReport]:
+        key = self._v3_cache_key(dataset, backbone)
+        cached = self._v3_skip_report_cache.get(key)
+        if cached is not None:
+            return cached
+        root = self.v3_output_root / key[0]
+        reports = self._discover_v3_skip_reports(root / key[1] / "skip_eval")
+        if not reports:
+            reports = self._discover_skip_reports_in_dir(root / key[1] / "prune")
+        self._v3_skip_report_cache[key] = reports
+        return reports
 
     def v3_backbone_root(self) -> Path:
         return self.v3_output_root / self.v3_backbone
@@ -286,11 +304,10 @@ class PairAttentionController:
         self.stage1_eval_by_scene = self._load_stage1_eval_by_scene()
         self.similarity_reports = self._discover_similarity_reports()
         self.skip_reports = self._discover_skip_reports()
+        self._cache_current_v3_stage2_reports()
         self.stage2_request_seq += 1
 
     def switch_backbone(self, backbone: str) -> None:
-        if not self.v3_mode:
-            return
         bb = str(backbone).strip()
         if not bb or bb == self.v3_backbone:
             return
@@ -304,79 +321,50 @@ class PairAttentionController:
         return self.v3_backbone_root() / self.dataset / "cache" / "cache_manifest_v3.json"
 
     def _cache_available_on_disk(self) -> bool:
-        if self.v3_mode:
-            return self._v3_cache_manifest_path().is_file()
-        return bool(self.manifest)
+        return self._v3_cache_manifest_path().is_file()
 
     def _resolve_dataset_dir(self, root: Path, dataset: str) -> Path:
         p = Path(root)
-        if self.v3_mode:
-            from analysis.view_v3_loader import redundancy_dir_has_graphs
+        from analysis.vis.view_v3_loader import redundancy_dir_has_graphs
 
-            cand = p / dataset / "cache"
-            if (cand / "cache_manifest_v3.json").exists():
-                return cand
-            ds_root = p / dataset
-            if redundancy_dir_has_graphs(ds_root / "redundancy"):
-                return ds_root
-        cand = p / dataset
-        if (cand / "manifest.json").exists() or (cand / "per_scene").exists() or cand.exists():
-            return cand
+        cand = p / dataset / "cache"
         if (cand / "cache_manifest_v3.json").exists():
             return cand
+        ds_root = p / dataset
+        if redundancy_dir_has_graphs(ds_root / "redundancy"):
+            return ds_root
         return p
 
     def _load_manifest_and_scenes(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
-        if self.v3_mode:
-            from analysis.view_v3_loader import load_v3_bundle
+        from analysis.vis.view_v3_loader import load_v3_bundle
 
-            exp_root = self.v3_backbone_root()
-            bundle = load_v3_bundle(exp_root, self.dataset)
-            manifest_obj = bundle.get("manifest")
-            from analysis.view_v3_loader import scene_item_from_v3_row
+        exp_root = self.v3_backbone_root()
+        bundle = load_v3_bundle(exp_root, self.dataset)
+        manifest_obj = bundle.get("manifest")
+        from analysis.vis.view_v3_loader import scene_item_from_v3_row
 
-            if manifest_obj is None:
-                self.analysis_similarity_dir = exp_root / self.dataset / "redundancy"
-                self.analysis_skip_dir = exp_root / self.dataset / "prune"
-                return {}, {}
-
-            manifest: Dict[str, Any] = {
-                "schema_version": "v3",
-                "hf_model": manifest_obj.hf_model,
-                "backbone": manifest_obj.backbone,
-                "scenes": manifest_obj.scenes,
-                "layer_units": [asdict(u) for u in manifest_obj.layer_units],
-                "num_heads": int(manifest_obj.num_heads),
-            }
-            scene_items: Dict[str, Dict[str, Any]] = {}
-            for item in manifest_obj.scenes:
-                sid = str(item.get("scene_id", "")).strip()
-                if not sid:
-                    continue
-                scene_items[sid] = scene_item_from_v3_row(sid, item, self.cache_dir)
-            if self.eval_root is None:
-                self.eval_root = exp_root / self.dataset / "eval"
+        if manifest_obj is None:
             self.analysis_similarity_dir = exp_root / self.dataset / "redundancy"
             self.analysis_skip_dir = exp_root / self.dataset / "prune"
-            return manifest, scene_items
-
-        manifest_path = self.cache_dir / "manifest.json"
-        if not manifest_path.exists():
-            v3_path = self.cache_dir / "cache_manifest_v3.json"
-            if v3_path.exists():
-                raise SystemExit(
-                    f"Found v3 cache at {v3_path} but v3 layout is not active. "
-                    f"Ensure {self.v3_output_root} exists or pass --v3-backbone <name>."
-                )
             return {}, {}
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        manifest: Dict[str, Any] = {
+            "schema_version": "v3",
+            "hf_model": manifest_obj.hf_model,
+            "backbone": manifest_obj.backbone,
+            "scenes": manifest_obj.scenes,
+            "layer_units": [asdict(u) for u in manifest_obj.layer_units],
+            "num_heads": int(manifest_obj.num_heads),
+        }
         scene_items: Dict[str, Dict[str, Any]] = {}
-        for item in manifest.get("scenes", []):
-            scene_id = str(item.get("scene_id", "")).strip()
-            has_dir = str(item.get("dir", "")).strip() != ""
-            has_file = str(item.get("file", "")).strip() != ""
-            if scene_id and (has_dir or has_file):
-                scene_items[scene_id] = item
+        for item in manifest_obj.scenes:
+            sid = str(item.get("scene_id", "")).strip()
+            if not sid:
+                continue
+            scene_items[sid] = scene_item_from_v3_row(sid, item, self.cache_dir)
+        self.eval_root = exp_root / self.dataset / "eval"
+        self.analysis_similarity_dir = exp_root / self.dataset / "redundancy"
+        self.analysis_skip_dir = exp_root / self.dataset / "prune"
         return manifest, scene_items
 
     def switch_dataset(self, dataset: str) -> None:
@@ -389,29 +377,11 @@ class PairAttentionController:
             self.stage2_request_seq += 1
             return
         self.dataset = new_ds
-        if self.v3_mode:
-            self._apply_v3_backbone_paths()
+        self._apply_v3_backbone_paths()
         self.cache_dir = self._resolve_dataset_dir(self.cache_root, self.dataset)
-        if not self.v3_mode:
-            self.analysis_similarity_dir = self._resolve_dataset_dir(self.analysis_similarity_root, self.dataset)
-            self.analysis_skip_dir = self._resolve_dataset_dir(self.analysis_skip_root, self.dataset)
         self.data_root = self.data_roots_by_dataset.get(self.dataset, self.data_root)
 
-        if self.v3_mode:
-            self._reload_v3_artifacts()
-            return
-
-        self.manifest, self.scene_items = self._load_manifest_and_scenes()
-        self.cache_available = self._cache_available_on_disk()
-        self.hf_model = str(self.manifest.get("hf_model", "")).strip() or self.hf_model
-        self.pair_available = self.cache_available and bool(self.scene_items) and bool(self.hf_model)
-        self.scene_cache = {}
-        self.qk_cache = {}
-        self.stage2_render_cache = {}
-        self.stage1_eval_by_scene = self._load_stage1_eval_by_scene()
-        self.similarity_reports = self._discover_similarity_reports()
-        self.skip_reports = self._discover_skip_reports()
-        self.stage2_request_seq = 0
+        self._reload_v3_artifacts()
 
     def _get_model(self) -> Any:
         if not self.hf_model:
@@ -445,15 +415,7 @@ class PairAttentionController:
     ) -> Optional[Stage2SceneReport]:
         ds = str(dataset).strip().lower()
         sid = str(scene_id).strip()
-        if self.v3_mode:
-            root = self.v3_backbone_root()
-            if backbone is not None:
-                root = self.v3_output_root / str(backbone).strip()
-            sim_dir = root / ds / "redundancy"
-            reports = self._discover_v3_similarity_reports(sim_dir)
-        else:
-            sim_dir = self._resolve_dataset_dir(self.analysis_similarity_root, ds)
-            reports = self._discover_similarity_reports_in_dir(sim_dir)
+        reports = self._v3_similarity_reports_for_dataset(ds, backbone=backbone)
         return reports.get(sid)
 
     def has_cross_dataset_similarity(self) -> bool:
@@ -712,7 +674,7 @@ class PairAttentionController:
         return result
 
     def _discover_v3_similarity_reports(self, redundancy_dir: Path) -> Dict[str, Stage2SceneReport]:
-        from analysis.view_v3_loader import discover_v3_similarity_reports
+        from analysis.vis.view_v3_loader import discover_v3_similarity_reports
 
         raw = discover_v3_similarity_reports(redundancy_dir)
         return {
@@ -721,7 +683,7 @@ class PairAttentionController:
         }
 
     def _discover_v3_skip_reports(self, skip_eval_dir: Path) -> Dict[str, Stage2SceneReport]:
-        from analysis.view_v3_loader import discover_v3_skip_reports
+        from analysis.vis.view_v3_loader import discover_v3_skip_reports
 
         raw = discover_v3_skip_reports(skip_eval_dir)
         return {
@@ -730,53 +692,33 @@ class PairAttentionController:
         }
 
     def _discover_similarity_reports(self) -> Dict[str, Stage2SceneReport]:
-        if self.v3_mode:
-            reports = self._discover_v3_similarity_reports(Path(self.analysis_similarity_dir))
-            if reports:
-                return reports
-        return self._discover_similarity_reports_in_dir(self.analysis_similarity_dir)
+        return self._discover_v3_similarity_reports(Path(self.analysis_similarity_dir))
 
     def _discover_skip_reports(self) -> Dict[str, Stage2SceneReport]:
-        if self.v3_mode:
-            skip_v3_dir = self.v3_backbone_root() / self.dataset / "skip_eval"
-            reports = self._discover_v3_skip_reports(skip_v3_dir)
-            if reports:
-                return reports
+        skip_v3_dir = self.v3_backbone_root() / self.dataset / "skip_eval"
+        reports = self._discover_v3_skip_reports(skip_v3_dir)
+        if reports:
+            return reports
         return self._discover_skip_reports_in_dir(self.analysis_skip_dir)
 
     def stage2_modes_for_dataset(self, dataset: str, *, backbone: Optional[str] = None) -> List[str]:
         ds = str(dataset).strip().lower()
-        if self.v3_mode:
-            root = self.v3_backbone_root()
-            if backbone is not None:
-                root = self.v3_output_root / str(backbone).strip()
-            sim_dir = root / ds / "redundancy"
-            skip_dir = root / ds / "skip_eval"
-        else:
-            sim_dir = self._resolve_dataset_dir(self.analysis_similarity_root, ds)
-            skip_dir = self._resolve_dataset_dir(self.analysis_skip_root, ds)
-        if self.v3_mode:
-            similarity_reports = self._discover_v3_similarity_reports(sim_dir)
-            skip_reports = self._discover_v3_skip_reports(skip_dir)
-            if not skip_reports:
-                skip_reports = self._discover_skip_reports_in_dir(root / ds / "prune")
-        else:
-            similarity_reports = self._discover_similarity_reports_in_dir(sim_dir)
-            skip_reports = self._discover_skip_reports_in_dir(skip_dir)
-        return _discover_stage2_modes(similarity_reports, skip_reports)
+        key = self._v3_cache_key(ds, backbone)
+        cached_modes = self._stage2_modes_cache.get(key)
+        if cached_modes is not None:
+            return list(cached_modes)
+        similarity_reports = self._v3_similarity_reports_for_dataset(ds, backbone=backbone)
+        skip_reports = self._v3_skip_reports_for_dataset(ds, backbone=backbone)
+        modes = _discover_stage2_modes(similarity_reports, skip_reports)
+        self._stage2_modes_cache[key] = list(modes)
+        return modes
 
     def union_stage2_modes(self, dataset_choices: Sequence[str]) -> List[str]:
         modes: List[str] = []
-        if self.v3_mode:
-            backbones = self.v3_backbones or [self.v3_backbone]
-            for bb in backbones:
-                for ds in dataset_choices:
-                    for mode in self.stage2_modes_for_dataset(ds, backbone=bb):
-                        if mode not in modes:
-                            modes.append(mode)
-        else:
+        backbones = self.v3_backbones or [self.v3_backbone]
+        for bb in backbones:
             for ds in dataset_choices:
-                for mode in self.stage2_modes_for_dataset(ds):
+                for mode in self.stage2_modes_for_dataset(ds, backbone=bb):
                     if mode not in modes:
                         modes.append(mode)
         if not modes:
@@ -1102,7 +1044,7 @@ def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
         if not name or name.startswith(".") or _is_stage2_virtual_dataset(name):
             continue
         # Only include datasets with actual v3 redundancy outputs.
-        from analysis.view_v3_loader import redundancy_dir_has_graphs
+        from analysis.vis.view_v3_loader import redundancy_dir_has_graphs
 
         if redundancy_dir_has_graphs(p / "redundancy"):
             tags.append(name)
@@ -1262,20 +1204,69 @@ _LORA_METRIC_ORDER = (
 )
 
 
-def _discover_lora_runs(root: Path) -> Dict[str, List[str]]:
-    """Return plan -> models for v3 LoRA train runs with saved eval plots."""
+_LORA_DIRECT_TRAINING_PLAN = "direct"
+_RECOVERY_PLOT_GROUP = "all_prune_spans"
+_RECOVERY_VIEW = "strategy_comparison"
+_RECOVERY_SPAN_RE = re.compile(r"^prune_span(\d+)$")
+_RECOVERY_METRIC_GRID = (
+    ("ape", "are", "rpe_trans", "rpe_rot"),
+    ("acc", "comp", "cd", "nc"),
+    ("depth_abs_rel", "depth_delta1", "inference_time_ms", "infer_peak_vram_gb"),
+)
+_RECOVERY_METRIC_HEADERS = {
+    "ape": "APE ↓",
+    "are": "ARE (°) ↓",
+    "rpe_trans": "RPE trans ↓",
+    "rpe_rot": "RPE rot (°) ↓",
+    "depth_abs_rel": "AbsRel ↓",
+    "depth_delta1": "δ1 ↑",
+    "acc": "Acc ↓",
+    "comp": "Comp ↓",
+    "cd": "CD ↓",
+    "nc": "NC ↑",
+    "inference_time_ms": "Time (ms) ↓",
+    "infer_peak_vram_gb": "VRAM (GB) ↓",
+}
+
+
+def _has_lora_run_outputs(run_dir: Path) -> bool:
+    return (
+        any(run_dir.glob("eval_plot_*.png"))
+        or (run_dir / "train_curves.png").is_file()
+        or (run_dir / "train_loss_weighted_components.png").is_file()
+    )
+
+
+def _discover_lora_runs(root: Path) -> Dict[str, Dict[str, List[str]]]:
+    """Return backbone -> prune plan -> training plans for v3 LoRA train runs."""
     root = Path(root)
-    runs: Dict[str, List[str]] = {}
+    runs: Dict[str, Dict[str, List[str]]] = {}
     if not root.is_dir():
         return runs
     for model_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name):
-        train_root = model_dir / "scannet_dev50" / "train"
-        if not train_root.is_dir():
-            continue
-        for plan_dir in sorted((p for p in train_root.iterdir() if p.is_dir()), key=lambda p: p.name):
-            if any(plan_dir.glob("eval_plot_*.png")):
-                runs.setdefault(plan_dir.name, []).append(model_dir.name)
-    return {plan: sorted(set(models)) for plan, models in sorted(runs.items())}
+        train_roots = [model_dir / "train", model_dir / "scannet_dev50" / "train"]
+        for train_root in train_roots:
+            if not train_root.is_dir():
+                continue
+            for prune_plan_dir in sorted((p for p in train_root.iterdir() if p.is_dir()), key=lambda p: p.name):
+                if _has_lora_run_outputs(prune_plan_dir):
+                    runs.setdefault(model_dir.name, {}).setdefault(
+                        prune_plan_dir.name, []
+                    ).append(_LORA_DIRECT_TRAINING_PLAN)
+                for training_plan_dir in sorted(
+                    (p for p in prune_plan_dir.iterdir() if p.is_dir()), key=lambda p: p.name
+                ):
+                    if _has_lora_run_outputs(training_plan_dir):
+                        runs.setdefault(model_dir.name, {}).setdefault(
+                            prune_plan_dir.name, []
+                        ).append(training_plan_dir.name)
+    return {
+        backbone: {
+            prune_plan: sorted(set(training_plans))
+            for prune_plan, training_plans in sorted(prune_runs.items())
+        }
+        for backbone, prune_runs in sorted(runs.items())
+    }
 
 
 def _lora_metric_sort_key(metric: str) -> Tuple[int, str]:
@@ -1294,9 +1285,34 @@ def _lora_dataset_gallery_items(run_dir: Path, dataset_tag: str) -> List[Tuple[s
     return sorted(items, key=lambda item: _lora_metric_sort_key(item[1]))
 
 
-def _lora_plot_rows(root: Path, plan_name: str, model_name: str) -> Dict[str, List[Tuple[str, str]]]:
+def _lora_run_dir(root: Path, model_name: str, prune_plan_name: str, training_plan_name: str) -> Path:
+    training_plan_name = str(training_plan_name or "").strip()
+    candidates = [
+        root / str(model_name) / "train" / str(prune_plan_name),
+        root / str(model_name) / "scannet_dev50" / "train" / str(prune_plan_name),
+    ]
+    for prune_plan_dir in candidates:
+        run_dir = (
+            prune_plan_dir
+            if not training_plan_name or training_plan_name == _LORA_DIRECT_TRAINING_PLAN
+            else prune_plan_dir / training_plan_name
+        )
+        if run_dir.is_dir():
+            return run_dir
+    prune_plan_dir = candidates[0]
+    if not training_plan_name or training_plan_name == _LORA_DIRECT_TRAINING_PLAN:
+        return prune_plan_dir
+    return prune_plan_dir / training_plan_name
+
+
+def _lora_plot_rows(
+    root: Path,
+    prune_plan_name: str,
+    training_plan_name: str,
+    model_name: str,
+) -> Dict[str, List[Tuple[str, str]]]:
     root = Path(root)
-    run_dir = root / str(model_name) / "scannet_dev50" / "train" / str(plan_name)
+    run_dir = _lora_run_dir(root, model_name, prune_plan_name, training_plan_name)
     training: List[Tuple[str, str]] = []
     for filename, label in (
         ("train_curves.png", "train_curves"),
@@ -1311,6 +1327,8 @@ def _lora_plot_rows(root: Path, plan_name: str, model_name: str) -> Dict[str, Li
             "scans_test50": [],
             "7scenes_test": [],
             "nrgbd": [],
+            "nuscenes_val": [],
+            "waymo_validation": [],
             "training": training,
         }
     return {
@@ -1318,8 +1336,279 @@ def _lora_plot_rows(root: Path, plan_name: str, model_name: str) -> Dict[str, Li
         "scans_test50": _lora_dataset_gallery_items(run_dir, "scannet_test50"),
         "7scenes_test": _lora_dataset_gallery_items(run_dir, "7scenes_test"),
         "nrgbd": _lora_dataset_gallery_items(run_dir, "nrgbd"),
+        "nuscenes_val": _lora_dataset_gallery_items(run_dir, "nuscenes_val"),
+        "waymo_validation": _lora_dataset_gallery_items(run_dir, "waymo_validation"),
         "training": training,
     }
+
+
+def _has_recovery_plot_outputs(backbone_dir: Path) -> bool:
+    return any(backbone_dir.glob("*/eval/recover/*_recover_strategies_by_span.png"))
+
+
+def _discover_recovery_runs(root: Path) -> Dict[str, Dict[str, List[str]]]:
+    """Return backbone -> plot group -> recovery views for summary-generated recovery plots."""
+    root = Path(root)
+    runs: Dict[str, Dict[str, List[str]]] = {}
+    if not root.is_dir():
+        return runs
+    for model_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name):
+        if _has_recovery_plot_outputs(model_dir):
+            runs.setdefault(model_dir.name, {}).setdefault(_RECOVERY_PLOT_GROUP, []).append(
+                _RECOVERY_VIEW
+            )
+    return {
+        backbone: {
+            plot_group: sorted(set(recovery_views))
+            for plot_group, recovery_views in sorted(recovery_runs.items())
+        }
+        for backbone, recovery_runs in sorted(runs.items())
+    }
+
+
+def _recovery_dataset_gallery_item(
+    root: Path,
+    model_name: str,
+    dataset_tag: str,
+    label: str,
+) -> List[Tuple[str, str]]:
+    if str(dataset_tag) == "mean":
+        path = Path(root) / str(model_name) / "eval" / "recover" / "mean_recover_strategies_by_span.png"
+    else:
+        path = (
+            Path(root)
+            / str(model_name)
+            / str(dataset_tag)
+            / "eval"
+            / "recover"
+            / f"{dataset_tag}_recover_strategies_by_span.png"
+        )
+    if not path.is_file():
+        return []
+    return [(str(path.resolve()), label)]
+
+
+def _recovery_dataset_tags(root: Path, model_name: str) -> List[str]:
+    model_dir = Path(root) / str(model_name)
+    tags = set()
+    if not model_dir.is_dir():
+        return []
+    for path in model_dir.glob("*/eval/recover/*_recover_strategies_by_span.png"):
+        dataset_tag = path.parent.parent.parent.name
+        if path.name == f"{dataset_tag}_recover_strategies_by_span.png":
+            tags.add(dataset_tag)
+    order = (
+        "scannet_dev50",
+        "scannet_test50",
+        "7scenes_test",
+        "7scenes_train",
+        "nrgbd",
+        "nuscenes_val",
+        "nuscenes_train",
+        "waymo_validation",
+        "waymo_training",
+    )
+    return sorted(tags, key=lambda tag: (order.index(tag) if tag in order else len(order), tag))
+
+
+def _read_eval_average(path: Path) -> Dict[str, float]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    raw = payload.get("average", {})
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            v = float(value)
+        except Exception:
+            continue
+        if math.isfinite(v):
+            out[str(key)] = v
+    return out
+
+
+def _append_average_values(bucket: Dict[str, List[float]], values: Dict[str, float]) -> None:
+    for metric, value in values.items():
+        if math.isfinite(float(value)):
+            bucket.setdefault(metric, []).append(float(value))
+
+
+def _mean_metric_values(bucket: Dict[str, List[float]]) -> Dict[str, float]:
+    return {
+        metric: float(sum(values) / len(values))
+        for metric, values in bucket.items()
+        if values
+    }
+
+
+def _generate_mean_recovery_plot(root: Path, model_name: str) -> Optional[Path]:
+    root = Path(root)
+    model_dir = root / str(model_name)
+    dataset_tags = _recovery_dataset_tags(root, model_name)
+    if not dataset_tags:
+        return None
+
+    upper_bucket: Dict[str, List[float]] = {}
+    lower_buckets: Dict[int, Dict[str, List[float]]] = {}
+    recover_buckets: Dict[str, Dict[int, Dict[str, List[float]]]] = {}
+    all_spans = set()
+
+    for dataset_tag in dataset_tags:
+        eval_root = model_dir / dataset_tag / "eval"
+        _append_average_values(
+            upper_bucket,
+            _read_eval_average(eval_root / "upper" / "eval_record_v3.json"),
+        )
+
+        lower_root = eval_root / "lower"
+        if lower_root.is_dir():
+            for rec_path in sorted(lower_root.glob("prune_span*/eval_record_v3.json")):
+                m = _RECOVERY_SPAN_RE.match(rec_path.parent.name)
+                if not m:
+                    continue
+                span = int(m.group(1))
+                all_spans.add(span)
+                _append_average_values(
+                    lower_buckets.setdefault(span, {}),
+                    _read_eval_average(rec_path),
+                )
+
+        recover_root = eval_root / "recover"
+        if recover_root.is_dir():
+            for plan_dir in sorted((p for p in recover_root.iterdir() if p.is_dir()), key=lambda p: p.name):
+                for rec_path in sorted(plan_dir.glob("prune_span*/eval_record_v3.json")):
+                    m = _RECOVERY_SPAN_RE.match(rec_path.parent.name)
+                    if not m:
+                        continue
+                    span = int(m.group(1))
+                    all_spans.add(span)
+                    _append_average_values(
+                        recover_buckets.setdefault(plan_dir.name, {}).setdefault(span, {}),
+                        _read_eval_average(rec_path),
+                    )
+
+    if not all_spans:
+        return None
+
+    upper_mean = _mean_metric_values(upper_bucket)
+    lower_mean = {span: _mean_metric_values(bucket) for span, bucket in lower_buckets.items()}
+    recover_mean = {
+        plan: {span: _mean_metric_values(bucket) for span, bucket in by_span.items()}
+        for plan, by_span in recover_buckets.items()
+    }
+    spans = sorted(all_spans)
+
+    fig, axes = plt.subplots(3, 4, figsize=(20, 9.75), squeeze=False)
+    for row_idx, row in enumerate(_RECOVERY_METRIC_GRID):
+        for col_idx, metric in enumerate(row):
+            ax = axes[row_idx][col_idx]
+            upper_value = float(upper_mean.get(metric, float("nan")))
+            has_data = math.isfinite(upper_value)
+            if math.isfinite(upper_value):
+                ax.axhline(
+                    upper_value,
+                    linestyle="--",
+                    color="#333333",
+                    linewidth=1.4,
+                    alpha=0.75,
+                    label="upper",
+                )
+                ax.scatter([0], [upper_value], color="#333333", marker="*", s=70, zorder=4)
+
+            lower_xs: List[int] = []
+            lower_ys: List[float] = []
+            if math.isfinite(upper_value):
+                lower_xs.append(0)
+                lower_ys.append(upper_value)
+            for span in spans:
+                value = float(lower_mean.get(span, {}).get(metric, float("nan")))
+                if not math.isfinite(value):
+                    continue
+                lower_xs.append(span)
+                lower_ys.append(value)
+            if len(lower_ys) > (1 if math.isfinite(upper_value) else 0):
+                has_data = True
+                ax.plot(
+                    lower_xs,
+                    lower_ys,
+                    marker="s",
+                    linestyle=":",
+                    color="#666666",
+                    linewidth=1.9,
+                    markersize=4,
+                    label="lower",
+                )
+
+            for plan in sorted(recover_mean.keys()):
+                xs: List[int] = []
+                ys: List[float] = []
+                if math.isfinite(upper_value):
+                    xs.append(0)
+                    ys.append(upper_value)
+                for span in spans:
+                    value = float(recover_mean.get(plan, {}).get(span, {}).get(metric, float("nan")))
+                    if not math.isfinite(value):
+                        continue
+                    xs.append(span)
+                    ys.append(value)
+                if len(ys) <= (1 if math.isfinite(upper_value) else 0):
+                    continue
+                has_data = True
+                ax.plot(
+                    xs,
+                    ys,
+                    marker="o",
+                    linewidth=1.8,
+                    markersize=4,
+                    label=plan.removeprefix("recovery_"),
+                )
+
+            if not has_data:
+                ax.axis("off")
+                continue
+            ax.set_title(_RECOVERY_METRIC_HEADERS.get(metric, metric), fontsize=11, fontweight="bold")
+            ax.set_xlabel("Dropped units / prune span")
+            ax.grid(True, alpha=0.25)
+            ax.set_xlim(left=0)
+            ax.set_xticks([0] + spans)
+            ax.legend(loc="best", fontsize=8)
+
+    fig.suptitle(
+        f"{model_name} / mean: lower and recover strategies vs upper",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    out_dir = model_dir / "eval" / "recover"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "mean_recover_strategies_by_span.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def _recovery_plot_rows(
+    root: Path,
+    plot_group_name: str,
+    recovery_view_name: str,
+    model_name: str,
+) -> Dict[str, List[Tuple[str, str]]]:
+    _ = (plot_group_name, recovery_view_name)
+    rows: Dict[str, List[Tuple[str, str]]] = {}
+    mean_path = _generate_mean_recovery_plot(root, model_name)
+    if mean_path is not None and mean_path.is_file():
+        rows["mean"] = [(str(mean_path.resolve()), "mean lower + recovery")]
+    for dataset_tag in _recovery_dataset_tags(root, model_name):
+        rows[dataset_tag] = _recovery_dataset_gallery_item(
+            root,
+            model_name,
+            dataset_tag,
+            f"{dataset_tag.replace('_', ' ')} lower + recovery",
+        )
+    return rows
 
 
 def _load_image_if_exists(path: Path) -> Optional[np.ndarray]:
@@ -1726,10 +2015,9 @@ def _missing_similarity_region_note(
 ) -> str:
     label = "all-token" if region == "all" else f"{region}-token"
     note = f"missing {label} similarity for mode={mode}"
-    if controller.v3_mode:
-        from analysis.redundancy.similarity_v3 import redundancy_graph_filename
+    from analysis.redundancy.similarity_v3 import redundancy_graph_filename
 
-        note += f" ({controller.analysis_similarity_dir / redundancy_graph_filename(region)})"
+    note += f" ({controller.analysis_similarity_dir / redundancy_graph_filename(region)})"
     return f"{scene_id}: {note}"
 
 
@@ -1921,7 +2209,7 @@ def _packed_elementwise_mean(packs: Sequence[List[float]]) -> List[float]:
 def _similarity_maps_with_token_aggregations(
     similarity_by_mode: Dict[str, Dict[str, Dict[str, List[float]]]],
 ) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
-    """Add token-region mean/min maps using the shared aggregation exclusions."""
+    """Add token-region mean/min maps over every available token region."""
     out: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
     for mode, raw_entry in similarity_by_mode.items():
         entry = {str(region): dict(metric_map) for region, metric_map in raw_entry.items()}
@@ -1930,13 +2218,9 @@ def _similarity_maps_with_token_aggregations(
             for region in REDUNDANCY_GRAPH_REGIONS
             if _similarity_region_has_data(entry, region)
         ]
-        aggregate_regions = regions_for_aggregation(
-            available_regions,
-            exclude_token_regions=DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS,
-        )
         metric_keys = {
             metric_key
-            for region in aggregate_regions
+            for region in available_regions
             for metric_key in entry.get(region, {}).keys()
         }
         mean_map: Dict[str, List[float]] = {}
@@ -1944,7 +2228,7 @@ def _similarity_maps_with_token_aggregations(
         for metric_key in metric_keys:
             packs = [
                 entry[region][metric_key]
-                for region in aggregate_regions
+                for region in available_regions
                 if metric_key in entry.get(region, {})
             ]
             if packs:
@@ -2195,25 +2479,10 @@ def _discover_cka_token_regions(
     return discovered
 
 
-def _normalize_cka_exclude_token_regions(values: Sequence[str] | None) -> Tuple[str, ...]:
-    if not values:
-        return ()
-    return tuple(
-        sorted(
-            {
-                str(value).strip().lower()
-                for value in values
-                if str(value).strip().lower() in REDUNDANCY_GRAPH_REGIONS
-            }
-        )
-    )
-
-
 def _cka_detail_from_provenance(provenance: Dict[str, object]) -> str:
     dataset_sel = str(provenance.get("dataset_selector", "") or "")
     token_sel = str(provenance.get("token_region_selector", "") or "")
     datasets = provenance.get("datasets", [])
-    excluded = provenance.get("excluded_token_regions", [])
     regions_by_dataset = provenance.get("token_regions_by_dataset", {})
     used_regions = sorted(
         {
@@ -2226,8 +2495,6 @@ def _cka_detail_from_provenance(provenance: Dict[str, object]) -> str:
     parts = [f"dataset={dataset_sel}", f"token={token_sel}"]
     if used_regions:
         parts.append(f"regions={','.join(used_regions)}")
-    if excluded:
-        parts.append(f"exclude={','.join(str(region) for region in excluded)}")
     if isinstance(datasets, list) and datasets:
         parts.append(f"datasets={','.join(str(dataset) for dataset in datasets)}")
     return " | ".join(parts)
@@ -2259,17 +2526,14 @@ def _render_cka_heatmap_for_backbone(
     dataset: str,
     token_region: str,
     sim_cutoff: float,
-    exclude_token_regions: Sequence[str] = (),
 ) -> Tuple[Optional[np.ndarray], str]:
     region_key = str(token_region or "").strip().lower()
-    exclude_regions = _normalize_cka_exclude_token_regions(exclude_token_regions)
     try:
         unit_ids, sim, provenance = load_similarity(
             experiment=str(backbone),
             dataset=str(dataset),
             token_region=region_key,
             metric="cka",
-            exclude_token_regions=exclude_regions,
         )
     except FileNotFoundError as exc:
         return None, str(exc)
@@ -2868,7 +3132,7 @@ def _preferred_stage2_scene(
 
 def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     # Stage2 dataset tags come from v3 outputs on disk.
-    stage2_real = _discover_v3_dataset_tags(controller.v3_backbone_root()) if controller.v3_mode else []
+    stage2_real = _discover_v3_dataset_tags(controller.v3_backbone_root())
     # If no dataset tag has v3 redundancy for this backbone, keep empty.
     # This prevents "only-cache" datasets (e.g. scannet_test50) from showing up
     # and from participating in "min" computations.
@@ -2891,19 +3155,25 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     #     num_heads = 1
     # initial_frame_a = 0
     # initial_frame_b = min(1, len(frame_labels) - 1) if frame_labels else 0
-    stage2_modes_all = controller.union_stage2_modes(stage2_real)
+    stage2_modes_all = _discover_stage2_modes(controller.similarity_reports, controller.skip_reports)
+    for fallback_mode in ("mixed_units", "v3_units", "default"):
+        if fallback_mode not in stage2_modes_all:
+            stage2_modes_all.append(fallback_mode)
     n_stage2_galleries = 9 * len(stage2_modes_all)
-    cka_models = list(controller.v3_backbones) if controller.v3_mode else []
+    cka_models = list(controller.v3_backbones)
     cka_datasets = (
         _discover_v3_dataset_tags_across_backbones(controller.v3_output_root, cka_models)
         if cka_models
         else list(stage2_real)
     )
-    cka_token_regions = (
-        _discover_cka_token_regions(controller, cka_datasets, cka_models)
-        if cka_models and cka_datasets
-        else []
-    )
+    cka_token_regions = [
+        STAGE2_TOKEN_ROW_CAMERA,
+        STAGE2_TOKEN_ROW_SPECIAL,
+        STAGE2_TOKEN_ROW_ALL,
+        STAGE2_TOKEN_ROW_PATCH,
+        STAGE2_TOKEN_ROW_MEAN,
+        STAGE2_TOKEN_ROW_MIN,
+    ] if cka_models and cka_datasets else []
     lora_root = controller.lora_root
     stage2_last_render_key: Dict[str, Any] = {"cache_key": None}
     dataset_switch_output_len: Dict[str, int] = {"count": 0}
@@ -3239,7 +3509,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         prune_n: float,
     ):
         controller.stage2_request_seq += 1
-        if controller.v3_mode and backbone:
+        if backbone:
             controller.switch_backbone(backbone)
         ds_key = str(dataset).strip().lower()
         if ds_key != controller.dataset:
@@ -3283,8 +3553,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             hm_info,
             *hm_ctrl,
         ]
-        if controller.v3_mode:
-            updates.insert(1, gr.update(value=controller.v3_backbone))
+        updates.insert(1, gr.update(value=controller.v3_backbone))
         return tuple(updates)
 
     def _refresh_stage2_full(
@@ -3319,12 +3588,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     def _refresh_cka_heatmaps(
         token_region: str,
         sim_cutoff_value: float,
-        exclude_token_regions: List[str] | None,
     ) -> Tuple[Any, ...]:
         region = str(token_region or "").strip().lower()
         if region not in set(cka_token_regions):
             region = cka_token_regions[0] if cka_token_regions else "special"
-        exclude_regions = _normalize_cka_exclude_token_regions(exclude_token_regions)
         try:
             sim_cutoff = float(sim_cutoff_value)
         except (TypeError, ValueError):
@@ -3342,7 +3609,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         display_total = dataset_total + row_mean_total
         for backbone in cka_models:
             for dataset in cka_datasets:
-                cache_key = (str(dataset), str(backbone), region, cutoff_key, exclude_regions)
+                cache_key = (str(dataset), str(backbone), region, cutoff_key)
                 if cache_key in cka_render_cache:
                     image = cka_render_cache[cache_key]
                     detail = "cached" if image is not None else "missing"
@@ -3352,7 +3619,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         backbone=str(backbone),
                         token_region=region,
                         sim_cutoff=sim_cutoff,
-                        exclude_token_regions=exclude_regions,
                     )
                     cka_render_cache[cache_key] = image
                 if image is not None:
@@ -3361,7 +3627,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     notes.append(f"{dataset}/{backbone}: {detail}")
                 images.append(image)
 
-            row_mean_cache_key = ("mean", str(backbone), region, cutoff_key, exclude_regions)
+            row_mean_cache_key = ("mean", str(backbone), region, cutoff_key)
             if row_mean_cache_key in cka_render_cache:
                 row_mean_image = cka_render_cache[row_mean_cache_key]
                 row_mean_detail = "cached" if row_mean_image is not None else "missing"
@@ -3371,7 +3637,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     backbone=str(backbone),
                     token_region=region,
                     sim_cutoff=sim_cutoff,
-                    exclude_token_regions=exclude_regions,
                 )
                 cka_render_cache[row_mean_cache_key] = row_mean_image
             if row_mean_image is not None:
@@ -3381,10 +3646,8 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             images.append(row_mean_image)
 
         region_label = region if region != "all" else "all-token"
-        exclude_label = ",".join(exclude_regions) if exclude_regions else "none"
         info = (
             f"scene=mean | token={region_label} | metric=CKA | "
-            f"exclude={exclude_label} | "
             f"rendered={rendered}/{display_total} | cutoff={cutoff_key / 1000.0:.3f}"
         )
         if notes:
@@ -3462,12 +3725,15 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         .results-gallery .gallery-item {
             width: 100% !important;
         }
+        .recovery-eval-gallery.wrap,
         .lora-eval-gallery.wrap,
         .lora-training-gallery.wrap {
             min-height: 0 !important;
             height: auto !important;
             overflow: visible !important;
         }
+        .recovery-eval-gallery .grid-wrap,
+        .recovery-eval-gallery [class*="grid"],
         .lora-eval-gallery .grid-wrap,
         .lora-eval-gallery [class*="grid"],
         .lora-training-gallery .grid-wrap,
@@ -3478,6 +3744,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             overflow: visible !important;
             align-content: start !important;
         }
+        .recovery-eval-gallery .thumbnail-item,
+        .recovery-eval-gallery .thumbnail-small,
+        .recovery-eval-gallery button.thumbnail-item,
+        .recovery-eval-gallery button,
         .lora-eval-gallery .thumbnail-item,
         .lora-eval-gallery .thumbnail-small,
         .lora-eval-gallery button.thumbnail-item,
@@ -3491,6 +3761,11 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             max-height: none !important;
             aspect-ratio: auto !important;
         }
+        .recovery-eval-gallery .thumbnail-item > div,
+        .recovery-eval-gallery .thumbnail-small > div,
+        .recovery-eval-gallery button > div,
+        .recovery-eval-gallery [class*="image"],
+        .recovery-eval-gallery [class*="preview"],
         .lora-eval-gallery .thumbnail-item > div,
         .lora-eval-gallery .thumbnail-small > div,
         .lora-eval-gallery button > div,
@@ -3506,6 +3781,8 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             max-height: none !important;
             aspect-ratio: auto !important;
         }
+        .recovery-eval-gallery .thumbnail-item img,
+        .recovery-eval-gallery img,
         .lora-eval-gallery .thumbnail-item img,
         .lora-eval-gallery img,
         .lora-training-gallery .thumbnail-item img,
@@ -3515,6 +3792,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             max-height: none !important;
             vertical-align: bottom !important;
         }
+        .recovery-eval-gallery [class*="caption"],
+        .recovery-eval-gallery figcaption,
+        .recovery-eval-gallery .caption-label,
         .lora-eval-gallery [class*="caption"],
         .lora-eval-gallery figcaption,
         .lora-eval-gallery .caption-label,
@@ -3725,9 +4005,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         }
         """,
     ) as demo:
-        from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT
-
-        with gr.Tabs(selected="eval_summary"):
+        with gr.Tabs(selected="recovery_results"):
             build_cka_heatmaps_tab(
                 datasets=cka_datasets,
                 models=cka_models,
@@ -3755,8 +4033,8 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             heatmaps_ui = build_heatmaps_tab(
                 controller=controller,
                 dataset_choices=dataset_choices,
-                backbone_choices=controller.v3_backbones if controller.v3_mode else [],
-                initial_backbone=controller.v3_backbone if controller.v3_mode else None,
+                backbone_choices=controller.v3_backbones,
+                initial_backbone=controller.v3_backbone,
                 stage2_modes=stage2_modes_all,
                 stage2_scene_ids=stage2_scene_ids,
                 initial_stage2_scene=initial_stage2_scene,
@@ -3775,11 +4053,12 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
 
             build_summary_tab(blocks=demo, output_root=OUTPUT_ROOT_DEFAULT, tab_id="eval_summary")
 
-            build_lora_tab(
+            build_recovery_tab(
                 blocks=demo,
-                lora_root=Path(lora_root),
-                discover_lora_runs=_discover_lora_runs,
-                lora_plot_rows=_lora_plot_rows,
+                recovery_root=Path(lora_root),
+                discover_recovery_runs=_discover_recovery_runs,
+                recovery_plot_rows=_recovery_plot_rows,
+                tab_id="recovery_results",
             )
 
             build_eval_tab(
@@ -3965,9 +4244,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 drop=drop_sorted,
                 drop_length=len(drop_sorted),
                 lora=lora_specs,
-                source_cache=str(controller.v3_output_root / str(controller.v3_backbone) / str(controller.dataset) / "cache")
-                if controller.v3_mode
-                else "",
+                source_cache=str(controller.v3_output_root / str(controller.v3_backbone) / str(controller.dataset) / "cache"),
                 extra=extra,
             )
             out_root = default_prune_plan_root()
@@ -4005,28 +4282,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
 
 def main() -> None:
     args = _build_parser().parse_args()
-    if args.analysis_dir is not None:
-        analysis_sim_dir = args.analysis_dir
-        analysis_skip_dir = args.analysis_dir
-    else:
-        analysis_sim_dir = args.analysis_sim_dir
-        analysis_skip_dir = args.analysis_skip_dir
-    from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT
-    from analysis.view_v3_loader import discover_v3_backbones
-
-    cache_dir = args.cache_dir
-    eval_root = args.eval_root
     v3_backbone = str(args.v3_backbone).strip()
-    if OUTPUT_ROOT_DEFAULT.is_dir():
-        backbones = discover_v3_backbones(OUTPUT_ROOT_DEFAULT)
-        v3_backbone = v3_backbone or (backbones[0] if backbones else "vggt")
-        cache_dir = OUTPUT_ROOT_DEFAULT / v3_backbone
-        eval_root = cache_dir / args.dataset / "eval"
     controller = PairAttentionController(
-        cache_dir=cache_dir,
-        analysis_sim_dir=analysis_sim_dir,
-        analysis_skip_dir=analysis_skip_dir,
-        data_root=args.data_root,
+        output_root=args.output_root,
         dataset=args.dataset,
         data_roots_by_dataset={
             "scannet": args.scannet_root,
@@ -4035,10 +4293,7 @@ def main() -> None:
             "7scenes": args.root_7scenes,
             "nrgbd": args.root_nrgbd,
         },
-        hf_model=args.hf_model,
         device_arg=args.device,
-        lora_root=args.lora_dir,
-        eval_root=eval_root,
         viser_host=args.viser_host,
         viser_port=args.viser_port,
         v3_backbone=v3_backbone,

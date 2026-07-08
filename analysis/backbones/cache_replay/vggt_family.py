@@ -20,7 +20,7 @@ from analysis.backbones.cache_replay.common import ReplayResult, is_skipped, spl
 from analysis.backbones.contracts import PredictionLossWeights, TrainingHyperparams
 from analysis.backbones.registry import get_backbone
 from analysis.schema.v3 import PruneAction
-from analysis.train.model import (
+from analysis.recover.train.model import (
     count_unique_params,
 )
 VGGT_OFFICIAL_CAMERA_WEIGHT = 5.0
@@ -536,7 +536,7 @@ def prediction_official_camera_depth(
     *,
     w_pred: float,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    from analysis.loss import compute_camera_loss, compute_depth_loss
+    from analysis.backbones.adapters.vggt_loss import compute_camera_loss, compute_depth_loss
 
     device = next(iter(student_pred.values())).device
     total = torch.zeros((), device=device)

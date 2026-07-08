@@ -80,16 +80,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional prune selector list (e.g., 'prune_span5 prune_span10') from prune_plan_all.json.",
     )
     p.add_argument(
+        "--recovery-plan-root",
         "--training-plan-root",
+        dest="training_plan_root",
         type=Path,
         default=None,
-        help="Directory with training plan bundles. Defaults to --prune-plan-root.",
+        help="Directory with recovery plan bundles. Defaults to --prune-plan-root.",
     )
     p.add_argument(
+        "--recovery-plan-name",
         "--training-plan-name",
+        dest="training_plan_name",
         type=str,
         default="",
-        help="Optional training plan name. If omitted, use all training_*.json bundles.",
+        help="Optional recovery plan name. If omitted, use all recovery_*.json bundles.",
     )
     return p
 
@@ -291,7 +295,7 @@ def run_cache_redundancy(
             UnitPrunePlan,
             required_cache_unit_ids,
         )
-        from analysis.training_plan import (
+        from analysis.prune_plan.recovery_plan import (
             compose_training_unit_prune_plan,
             list_training_plan_names,
         )

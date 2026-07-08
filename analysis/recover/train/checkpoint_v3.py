@@ -1,4 +1,4 @@
-"""Restore pruned + LoRA structure from train checkpoint (backbone-agnostic)."""
+"""Restore pruned + LoRA structure from train-based recovery checkpoints."""
 
 from __future__ import annotations
 
@@ -52,6 +52,8 @@ def apply_eval_model_structure(
     if eval_mode == "upper":
         if has_ckpt:
             payload = load_train_checkpoint_payload(ckpt_path, map_location=map_location)
+            if payload.get("variant") == "training_free_recovery_delta" and "model_state_dict" not in payload:
+                raise ValueError("upper eval cannot load a compact recovery delta checkpoint")
             state = payload.get("model_state_dict", payload)
             model.load_state_dict(state, strict=False)
         return

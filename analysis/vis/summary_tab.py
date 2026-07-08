@@ -37,6 +37,18 @@ _DATASET_ORDER: Tuple[str, ...] = (
 _PCT_RE = re.compile(r"\s*\(\*\*(.+?)\*\*\)")
 _NUMBER_RE = re.compile(r"^[\s]*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
 _PLAN_MODE_RE = re.compile(r"^(?:prune_span(\d+)|plan_budget(\d+)|plan_t(\d+))(?:_.*)?$")
+_SPAN_IN_MODE_RE = re.compile(r"(?:^|/)prune_span(\d+)(?:$|/|_)")
+_RECOVERY_MODE_RE = re.compile(r"(?:^|/)prune_span\d+[_/](?P<plan>[^/+]+)")
+_MODE_KIND_ORDER: Tuple[str, ...] = (
+    "upper",
+    "lower",
+    "diag",
+    "ghost",
+    "rotate",
+    "lora",
+    "train",
+    "model",
+)
 
 
 def _backbone_sort_key(name: str) -> Tuple[int, str]:
@@ -66,6 +78,48 @@ def _mode_sort_key(name: str) -> Tuple[int, int, str]:
     if key.startswith("prune_span") or key.startswith("plan"):
         return (1, 10_000, key)
     return (2, 0, key)
+
+
+def _mode_kind_sort_key(kind: str) -> Tuple[int, str]:
+    key = str(kind or "").strip().lower()
+    try:
+        return (_MODE_KIND_ORDER.index(key), key)
+    except ValueError:
+        return (len(_MODE_KIND_ORDER), key)
+
+
+def _mode_kind_for_row(mode: str) -> str:
+    key = str(mode or "").strip()
+    low = key.lower()
+    if low == "upper":
+        return "upper"
+    recovery_match = _RECOVERY_MODE_RE.search(key)
+    if recovery_match:
+        plan = recovery_match.group("plan")
+        return plan.removeprefix("recovery_")
+    if low == "lower" or low.startswith("lower/") or low.startswith("prune_span") or low.startswith("plan_"):
+        return "lower"
+    if low == "model" or low.startswith("model/"):
+        return "model"
+    return "model"
+
+
+def _span_value_for_row(mode: str) -> str:
+    key = str(mode or "").strip()
+    match = _SPAN_IN_MODE_RE.search(key)
+    if match:
+        return str(int(match.group(1)))
+    if _mode_kind_for_row(key) == "upper":
+        return ""
+    return key
+
+
+def _span_sort_key(span: str) -> Tuple[int, int, str]:
+    key = str(span or "").strip()
+    try:
+        return (0, int(key), key)
+    except ValueError:
+        return (1, 0, key)
 
 
 def _metric_key_for_header(header: str) -> Optional[str]:
@@ -537,39 +591,40 @@ def _load_training_best_rows(
     if not root.is_dir():
         return rows
     for backbone_dir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: _backbone_sort_key(p.name)):
-        train_root = backbone_dir / "scannet_dev50" / "train"
-        if not train_root.is_dir():
-            continue
-        for run_dir in sorted((p for p in train_root.iterdir() if p.is_dir()), key=lambda p: _mode_sort_key(p.name)):
-            eval_path = run_dir / "eval_metrics_history.csv"
-            if not eval_path.is_file():
+        train_roots = [backbone_dir / "train", backbone_dir / "scannet_dev50" / "train"]
+        for train_root in train_roots:
+            if not train_root.is_dir():
                 continue
-            epochs = _load_training_epochs_from_csv(eval_path)
-            if not epochs:
-                continue
-            datasets = sorted(
-                {
-                    str(k)
-                    for item in epochs
-                    if isinstance(item, dict)
-                    for k, v in item.items()
-                    if k != "epoch" and isinstance(v, dict)
-                },
-                key=_dataset_sort_key,
-            )
-            for dataset in datasets:
-                rows.append(
-                    SummaryRow(
-                        dataset=dataset,
-                        backbone=backbone_dir.name,
-                        mode=run_dir.name,
-                        metrics=_best_training_metrics_for_dataset(
-                            epochs,
-                            dataset,
-                            metric_headers,
-                        ),
-                    )
+            for run_dir in sorted((p for p in train_root.iterdir() if p.is_dir()), key=lambda p: _mode_sort_key(p.name)):
+                eval_path = run_dir / "eval_metrics_history.csv"
+                if not eval_path.is_file():
+                    continue
+                epochs = _load_training_epochs_from_csv(eval_path)
+                if not epochs:
+                    continue
+                datasets = sorted(
+                    {
+                        str(k)
+                        for item in epochs
+                        if isinstance(item, dict)
+                        for k, v in item.items()
+                        if k != "epoch" and isinstance(v, dict)
+                    },
+                    key=_dataset_sort_key,
                 )
+                for dataset in datasets:
+                    rows.append(
+                        SummaryRow(
+                            dataset=dataset,
+                            backbone=backbone_dir.name,
+                            mode=run_dir.name,
+                            metrics=_best_training_metrics_for_dataset(
+                                epochs,
+                                dataset,
+                                metric_headers,
+                            ),
+                        )
+                    )
     return rows
 
 
@@ -580,45 +635,66 @@ def build_summary_tab(
     tab_id: str | None = None,
 ) -> Dict[str, Any]:
     output_root = Path(output_root)
-    header, all_rows, source_paths = _load_per_backbone_summaries(output_root)
-    metric_headers = header[3:] if len(header) > 3 else []
-    initial_rows = _add_mean_rows(all_rows, metric_headers)
+
+    def _load_rows_from_disk(training_loaded: bool) -> Tuple[List[str], List[str], List[SummaryRow], List[Path], int]:
+        fresh_header, fresh_rows, fresh_source_paths = _load_per_backbone_summaries(output_root)
+        fresh_metric_headers = fresh_header[3:] if len(fresh_header) > 3 else []
+        training_rows: List[SummaryRow] = []
+        if training_loaded:
+            training_rows = _load_training_best_rows(
+                output_root=output_root,
+                metric_headers=fresh_metric_headers,
+            )
+        rows = _add_mean_rows([*fresh_rows, *training_rows], fresh_metric_headers)
+        return fresh_header, fresh_metric_headers, rows, fresh_source_paths, len(training_rows)
+
+    header, metric_headers, initial_rows, _, _ = _load_rows_from_disk(False)
     backbone_choices = sorted({r.backbone for r in initial_rows}, key=_backbone_sort_key)
     dataset_choices = sorted({r.dataset for r in initial_rows}, key=_dataset_sort_key)
-    mode_choices = sorted({r.mode for r in initial_rows}, key=_mode_sort_key)
-    training_rows_cache: Optional[List[SummaryRow]] = None
+    span_choices = sorted(
+        {span for r in initial_rows for span in [_span_value_for_row(r.mode)] if span},
+        key=_span_sort_key,
+    )
+    mode_kind_choices = sorted({_mode_kind_for_row(r.mode) for r in initial_rows}, key=_mode_kind_sort_key)
 
-    def _rows_for_state(training_loaded: bool) -> List[SummaryRow]:
-        source_rows: List[SummaryRow]
-        if training_loaded and training_rows_cache is not None:
-            source_rows = [*all_rows, *training_rows_cache]
-        else:
-            source_rows = list(all_rows)
-        return _add_mean_rows(source_rows, metric_headers)
-
-    def _choices_for_rows(rows: Sequence[SummaryRow]) -> Tuple[List[str], List[str], List[str]]:
+    def _choices_for_rows(rows: Sequence[SummaryRow]) -> Tuple[List[str], List[str], List[str], List[str]]:
         return (
             sorted({r.backbone for r in rows}, key=_backbone_sort_key),
             sorted({r.dataset for r in rows}, key=_dataset_sort_key),
-            sorted({r.mode for r in rows}, key=_mode_sort_key),
+            sorted(
+                {span for r in rows for span in [_span_value_for_row(r.mode)] if span},
+                key=_span_sort_key,
+            ),
+            sorted({_mode_kind_for_row(r.mode) for r in rows}, key=_mode_kind_sort_key),
         )
+
+    def _valid_values(selected: Sequence[str], choices: Sequence[str]) -> List[str]:
+        selected_set = {str(x) for x in (selected or [])}
+        return [str(x) for x in choices if str(x) in selected_set]
 
     def _filter_rows(
         rows: Sequence[SummaryRow],
         selected_backbones: Sequence[str],
         selected_datasets: Sequence[str],
-        selected_modes: Sequence[str],
+        selected_spans: Sequence[str],
+        selected_mode_kinds: Sequence[str],
     ) -> List[SummaryRow]:
         bb_set = {str(x) for x in (selected_backbones or [])}
         ds_set = {str(x) for x in (selected_datasets or [])}
-        mode_set = {str(x) for x in (selected_modes or [])}
-        if not bb_set or not ds_set or not mode_set:
+        span_set = {str(x) for x in (selected_spans or [])}
+        mode_kind_set = {str(x) for x in (selected_mode_kinds or [])}
+        if not bb_set or not ds_set or not mode_kind_set:
             return []
-        filtered = [
-            r
-            for r in rows
-            if r.backbone in bb_set and r.dataset in ds_set and r.mode in mode_set
-        ]
+        filtered: List[SummaryRow] = []
+        for r in rows:
+            if r.backbone not in bb_set or r.dataset not in ds_set:
+                continue
+            mode_kind = _mode_kind_for_row(r.mode)
+            if mode_kind not in mode_kind_set:
+                continue
+            if mode_kind != "upper" and _span_value_for_row(r.mode) not in span_set:
+                continue
+            filtered.append(r)
         return sorted(
             filtered,
             key=lambda r: (
@@ -631,75 +707,92 @@ def build_summary_tab(
     def _refresh(
         selected_backbones: Sequence[str],
         selected_datasets: Sequence[str],
-        selected_modes: Sequence[str],
+        selected_spans: Sequence[str],
+        selected_mode_kinds: Sequence[str],
         training_loaded: bool,
         show_percentages: bool,
         show_absolute_changes: bool,
     ):
-        source_rows = _rows_for_state(bool(training_loaded))
-        cur_backbone_choices, cur_dataset_choices, cur_mode_choices = _choices_for_rows(source_rows)
-        rows = _filter_rows(source_rows, selected_backbones, selected_datasets, selected_modes)
+        fresh_header, fresh_metric_headers, source_rows, fresh_source_paths, training_count = _load_rows_from_disk(
+            bool(training_loaded)
+        )
+        cur_backbone_choices, cur_dataset_choices, cur_span_choices, cur_mode_kind_choices = _choices_for_rows(source_rows)
+        bb_values = _valid_values(selected_backbones, cur_backbone_choices)
+        ds_values = _valid_values(selected_datasets, cur_dataset_choices)
+        span_values = _valid_values(selected_spans, cur_span_choices)
+        mode_kind_values = _valid_values(selected_mode_kinds, cur_mode_kind_choices)
+        rows = _filter_rows(source_rows, bb_values, ds_values, span_values, mode_kind_values)
         table_html = _render_summary_html(
-            header,
+            fresh_header,
             rows,
-            metric_headers=metric_headers,
+            metric_headers=fresh_metric_headers,
             show_percentages=bool(show_percentages),
             show_absolute_changes=bool(show_absolute_changes),
             reference_rows=source_rows,
         )
         status = (
             f"{len(rows)} rows · "
-            f"{len(selected_backbones or [])}/{len(cur_backbone_choices)} backbones · "
-            f"{len(selected_datasets or [])}/{len(cur_dataset_choices)} datasets · "
-            f"{len(selected_modes or [])}/{len(cur_mode_choices)} modes"
+            f"{len(bb_values)}/{len(cur_backbone_choices)} backbones · "
+            f"{len(ds_values)}/{len(cur_dataset_choices)} datasets · "
+            f"{len(span_values)}/{len(cur_span_choices)} spans · "
+            f"{len(mode_kind_values)}/{len(cur_mode_kind_choices)} modes"
         )
         if training_loaded:
-            status += f" · training best rows={len(training_rows_cache or [])}"
-        if not source_paths:
+            status += f" · training best rows={training_count}"
+        if not fresh_source_paths:
             status = f"No per-backbone summary files found under: {output_root}"
-        return table_html, status
+        return (
+            gr.update(choices=cur_backbone_choices, value=bb_values),
+            gr.update(choices=cur_dataset_choices, value=ds_values),
+            gr.update(choices=cur_span_choices, value=span_values),
+            gr.update(choices=cur_mode_kind_choices, value=mode_kind_values),
+            table_html,
+            status,
+        )
 
     def _toggle_training_rows(
         training_loaded: bool,
         selected_backbones: Sequence[str],
         selected_datasets: Sequence[str],
-        selected_modes: Sequence[str],
+        selected_spans: Sequence[str],
+        selected_mode_kinds: Sequence[str],
         show_percentages: bool,
         show_absolute_changes: bool,
     ):
-        nonlocal training_rows_cache
         next_loaded = not bool(training_loaded)
-        if next_loaded and training_rows_cache is None:
-            training_rows_cache = _load_training_best_rows(
-                output_root=output_root,
-                metric_headers=metric_headers,
-            )
-        source_rows = _rows_for_state(next_loaded)
-        next_backbone_choices, next_dataset_choices, next_mode_choices = _choices_for_rows(source_rows)
+        fresh_header, fresh_metric_headers, source_rows, fresh_source_paths, training_count = _load_rows_from_disk(
+            next_loaded
+        )
+        next_backbone_choices, next_dataset_choices, next_span_choices, next_mode_kind_choices = _choices_for_rows(source_rows)
 
         bb_set = {str(x) for x in (selected_backbones or [])}
         ds_set = {str(x) for x in (selected_datasets or [])}
-        mode_set = {str(x) for x in (selected_modes or [])}
+        span_set = {str(x) for x in (selected_spans or [])}
+        mode_kind_set = {str(x) for x in (selected_mode_kinds or [])}
         if next_loaded:
             bb_values = sorted(bb_set | set(next_backbone_choices), key=_backbone_sort_key)
             ds_values = sorted(ds_set | set(next_dataset_choices), key=_dataset_sort_key)
-            mode_values = sorted(mode_set | set(next_mode_choices), key=_mode_sort_key)
+            span_values = sorted(span_set | set(next_span_choices), key=_span_sort_key)
+            mode_kind_values = sorted(mode_kind_set | set(next_mode_kind_choices), key=_mode_kind_sort_key)
         else:
             bb_values = [x for x in next_backbone_choices if x in bb_set]
             ds_values = [x for x in next_dataset_choices if x in ds_set]
-            mode_values = [x for x in next_mode_choices if x in mode_set]
+            span_values = [x for x in next_span_choices if x in span_set]
+            mode_kind_values = [x for x in next_mode_kind_choices if x in mode_kind_set]
             if not bb_values:
                 bb_values = list(next_backbone_choices)
             if not ds_values:
                 ds_values = list(next_dataset_choices)
-            if not mode_values:
-                mode_values = list(next_mode_choices)
+            if not span_values:
+                span_values = list(next_span_choices)
+            if not mode_kind_values:
+                mode_kind_values = list(next_mode_kind_choices)
 
-        rows = _filter_rows(source_rows, bb_values, ds_values, mode_values)
+        rows = _filter_rows(source_rows, bb_values, ds_values, span_values, mode_kind_values)
         table_html = _render_summary_html(
-            header,
+            fresh_header,
             rows,
-            metric_headers=metric_headers,
+            metric_headers=fresh_metric_headers,
             show_percentages=bool(show_percentages),
             show_absolute_changes=bool(show_absolute_changes),
             reference_rows=source_rows,
@@ -708,10 +801,13 @@ def build_summary_tab(
             f"{len(rows)} rows · "
             f"{len(bb_values)}/{len(next_backbone_choices)} backbones · "
             f"{len(ds_values)}/{len(next_dataset_choices)} datasets · "
-            f"{len(mode_values)}/{len(next_mode_choices)} modes"
+            f"{len(span_values)}/{len(next_span_choices)} spans · "
+            f"{len(mode_kind_values)}/{len(next_mode_kind_choices)} modes"
         )
         if next_loaded:
-            status += f" · training best rows={len(training_rows_cache or [])}"
+            status += f" · training best rows={training_count}"
+        if not fresh_source_paths:
+            status = f"No per-backbone summary files found under: {output_root}"
         return (
             next_loaded,
             gr.update(
@@ -721,16 +817,16 @@ def build_summary_tab(
             ),
             gr.update(choices=next_backbone_choices, value=bb_values),
             gr.update(choices=next_dataset_choices, value=ds_values),
-            gr.update(choices=next_mode_choices, value=mode_values),
+            gr.update(choices=next_span_choices, value=span_values),
+            gr.update(choices=next_mode_kind_choices, value=mode_kind_values),
             table_html,
             status,
         )
 
     with gr.Tab("Eval Summary", id=tab_id) as tab_summary:
-        source_label = f"{len(source_paths)} per-backbone summary file(s) under `{output_root}`"
         gr.Markdown(
             "## All-backbones evaluation summary\n"
-            f"Source: {source_label}"
+            f"Source: `{output_root}` (reloaded from disk on each refresh)"
         )
         training_loaded_state = gr.State(False)
         with gr.Row():
@@ -757,17 +853,28 @@ def build_summary_tab(
                     choices=dataset_choices,
                     value=dataset_choices,
                 )
-                summary_mode_cb = gr.CheckboxGroup(
-                    label="Plan / mode",
-                    choices=mode_choices,
-                    value=mode_choices,
+                summary_span_cb = gr.CheckboxGroup(
+                    label="Span",
+                    choices=span_choices,
+                    value=span_choices,
+                )
+                summary_mode_kind_cb = gr.CheckboxGroup(
+                    label="Mode",
+                    choices=mode_kind_choices,
+                    value=mode_kind_choices,
                 )
                 summary_status = gr.Textbox(label="Status", interactive=False)
             with gr.Column(scale=5):
                 summary_html = gr.HTML(
                     value=_render_summary_html(
                         header,
-                        _filter_rows(initial_rows, backbone_choices, dataset_choices, mode_choices),
+                        _filter_rows(
+                            initial_rows,
+                            backbone_choices,
+                            dataset_choices,
+                            span_choices,
+                            mode_kind_choices,
+                        ),
                         metric_headers=metric_headers,
                     ),
                     elem_classes=["summary-panel"],
@@ -776,16 +883,25 @@ def build_summary_tab(
         summary_inputs = [
             summary_backbone_cb,
             summary_dataset_cb,
-            summary_mode_cb,
+            summary_span_cb,
+            summary_mode_kind_cb,
             training_loaded_state,
             summary_percentage_cb,
             summary_absolute_cb,
         ]
-        summary_outputs = [summary_html, summary_status]
+        summary_outputs = [
+            summary_backbone_cb,
+            summary_dataset_cb,
+            summary_span_cb,
+            summary_mode_kind_cb,
+            summary_html,
+            summary_status,
+        ]
         for ctrl in [
             summary_backbone_cb,
             summary_dataset_cb,
-            summary_mode_cb,
+            summary_span_cb,
+            summary_mode_kind_cb,
             summary_percentage_cb,
             summary_absolute_cb,
         ]:
@@ -801,7 +917,8 @@ def build_summary_tab(
                 training_loaded_state,
                 summary_backbone_cb,
                 summary_dataset_cb,
-                summary_mode_cb,
+                summary_span_cb,
+                summary_mode_kind_cb,
                 summary_percentage_cb,
                 summary_absolute_cb,
             ],
@@ -810,19 +927,14 @@ def build_summary_tab(
                 summary_training_btn,
                 summary_backbone_cb,
                 summary_dataset_cb,
-                summary_mode_cb,
+                summary_span_cb,
+                summary_mode_kind_cb,
                 summary_html,
                 summary_status,
             ],
             show_progress="minimal",
         )
         tab_summary.select(
-            _refresh,
-            inputs=summary_inputs,
-            outputs=summary_outputs,
-            show_progress="hidden",
-        )
-        blocks.load(
             _refresh,
             inputs=summary_inputs,
             outputs=summary_outputs,

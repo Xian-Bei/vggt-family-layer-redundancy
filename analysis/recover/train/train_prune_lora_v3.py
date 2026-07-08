@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from analysis.backbones.bootstrap import apply_pythonpath
@@ -14,14 +15,25 @@ from analysis.prune_plan import (
     resolve_named_prune_plan_path,
     resolve_prune_plan_path,
 )
-from analysis.training_plan import compose_training_unit_prune_plan, training_plan_path
-from analysis.schema.v3 import stage_dir
+from analysis.prune_plan.recovery_plan import compose_training_unit_prune_plan, training_plan_path
+from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT, stage_dir
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Train prune+LoRA (v3) via adapter.train_from_cache.")
+    p = argparse.ArgumentParser(description="Recover prune+LoRA (v3) via adapter.train_from_cache.")
     p.add_argument("--experiment", type=str, default="default")
-    p.add_argument("--dataset", type=str, required=True)
+    p.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help="Training cache dataset tag, or a comma/space separated list of tags.",
+    )
+    p.add_argument(
+        "--datasets",
+        type=str,
+        default="",
+        help="Optional comma/space separated training cache dataset tags. Overrides --dataset.",
+    )
     p.add_argument("--backbone", type=str, default="vggt")
     p.add_argument("--hf-model", type=str, default="")
     p.add_argument("--device", type=str, default="cuda")
@@ -39,16 +51,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Required prune selector (e.g. prune_span10).",
     )
     p.add_argument(
+        "--recovery-plan-root",
         "--training-plan-root",
+        dest="training_plan_root",
         type=Path,
         default=None,
-        help="Directory with training plan bundles (default: prune-plan-root).",
+        help="Directory with recovery plan bundles (default: prune-plan-root).",
     )
     p.add_argument(
+        "--recovery-plan-name",
         "--training-plan-name",
+        dest="training_plan_name",
         type=str,
         default="",
-        help="Required training plan name (e.g. training_lora_l1_r32).",
+        help="Required recovery plan name (e.g. recovery_lora_l1_r32).",
     )
     p.add_argument("--data-root", type=Path, default=None)
     p.add_argument("--epochs", type=int, default=1)
@@ -147,12 +163,26 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _parse_name_list(raw: str) -> list[str]:
+    names: list[str] = []
+    for name in str(raw or "").replace(",", " ").split():
+        name = name.strip()
+        if name:
+            names.append(name)
+    return names
+
+
 def main() -> None:
     args = _build_parser().parse_args()
     adapter = get_backbone(args.backbone)
     apply_pythonpath(adapter.name)
 
-    cache_dir = stage_dir(args.experiment, args.dataset, "cache")
+    dataset_names = _parse_name_list(args.datasets or args.dataset)
+    if not dataset_names:
+        raise SystemExit("--dataset/--datasets is required")
+    if any(name == "scannet" for name in dataset_names):
+        raise SystemExit("dataset tag 'scannet' is legacy; use scannet_dev50 or another cache output tag")
+    cache_dirs = [stage_dir(args.experiment, name, "cache") for name in dataset_names]
     if not str(args.prune_plan_name).strip():
         raise SystemExit("--prune-plan-name is required")
     plan_root = args.prune_plan_root or (Path("analysis_outputs_v3") / adapter.name)
@@ -160,7 +190,7 @@ def main() -> None:
     training_root = args.training_plan_root or plan_root
     training_plan_name = str(args.training_plan_name or "").strip()
     if not training_plan_name:
-        raise SystemExit("--training-plan-name is required")
+        raise SystemExit("--recovery-plan-name is required")
     try:
         compose_training_unit_prune_plan(
             prune_plan_root=plan_root,
@@ -183,14 +213,18 @@ def main() -> None:
                 f"Missing prune/training plan selector: prune={prune_plan_name} under {plan_root}, "
                 f"training={training_plan_path(training_root, training_plan_name)}"
             )
-    out_dir = args.output_dir or (stage_dir(args.experiment, args.dataset, prune_plan_name) / "train")
+    default_output_root = Path(os.environ.get("OUTPUT_ROOT", str(OUTPUT_ROOT_DEFAULT)))
+    output_kind = str(os.environ.get("OUTPUT_KIND", "train") or "train").strip() or "train"
+    out_dir = args.output_dir or (
+        default_output_root / str(args.experiment) / output_kind / prune_plan_name / training_plan_name
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     hf_model = str(args.hf_model or adapter.default_hf_model())
 
     train_args = TrainFromCacheArgs(
         experiment=str(args.experiment),
-        dataset=str(args.dataset),
-        cache_dir=cache_dir,
+        dataset=",".join(dataset_names),
+        cache_dir=cache_dirs[0],
         prune_plan_path=prune_path,
         output_dir=out_dir,
         hf_model=hf_model,
@@ -223,9 +257,11 @@ def main() -> None:
         prune_plan_name=prune_plan_name,
         training_plan_root=Path(training_root),
         training_plan_name=training_plan_name,
+        cache_dirs=tuple(cache_dirs),
     )
     print(
-        f"[train_prune_lora_v3] backbone={adapter.name} prune_plan={prune_path} -> adapter.train_from_cache",
+        f"[train_prune_lora_v3] backbone={adapter.name} datasets={','.join(dataset_names)} "
+        f"prune_plan={prune_path} -> adapter.train_from_cache",
         flush=True,
     )
     adapter.train_from_cache(train_args)

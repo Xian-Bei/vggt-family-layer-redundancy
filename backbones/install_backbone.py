@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install pinned backbone and inference-compression repositories for LaRe.
+"""Install pinned vendored component repositories for LaRe.
 
 Examples:
   python backbones/install_backbone.py vggt pi3
@@ -51,7 +51,7 @@ def canonical_names(lock: dict[str, Any], requested: list[str]) -> list[str]:
     for raw in requested:
         key = raw.strip().lower()
         if key not in reg:
-            raise SystemExit(f"Unknown backbone {raw!r}. Available: {', '.join(lock['backbones'])}, all")
+            raise SystemExit(f"Unknown component {raw!r}. Available: {', '.join(lock['backbones'])}, all")
         for canonical, spec in lock["backbones"].items():
             if spec is reg[key]:
                 if canonical not in names:

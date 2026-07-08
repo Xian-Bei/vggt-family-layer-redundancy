@@ -13,7 +13,7 @@
     },
     "fastvggt": {
       "component_type": "inference_compression",
-      "path": "backbones/FastVGGT",
+      "path": "submodules/FastVGGT",
       "url": "https://github.com/mystorm16/FastVGGT.git",
       "commit": "6526e275a29572653a034762bb3c6c9ce280ff55",
       "default_weight": {
@@ -24,7 +24,7 @@
     },
     "quantvggt": {
       "component_type": "inference_compression",
-      "path": "backbones/QuantVGGT",
+      "path": "submodules/QuantVGGT",
       "url": "git@github.com:wlfeng0509/QuantVGGT.git",
       "commit": "e6e0ca8859fb5cbc7683eec6c9b4773a1a3360ed",
       "default_weight": {
@@ -54,18 +54,6 @@
         "filename": "vggt_omega_1b_512.pt",
         "local_path": "backbones/vggt-omega/vggt_omega_1b_512.pt",
         "note": "Gated Hugging Face repo; users may need to request access and run huggingface-cli login."
-      }
-    },
-    "flashvggt": {
-      "path": "backbones/FlashVGGT",
-      "url": "https://github.com/wzpscott/FlashVGGT.git",
-      "commit": "93efde68bf5c7ba2ad9ef41c5b2314c27aff7f25",
-      "default_weight": {
-        "kind": "huggingface_files",
-        "repo_id": "ZipW/FlashVGGT",
-        "local_dir": "backbones/FlashVGGT/ckpts",
-        "filenames": ["flashvggt.pt", "flashvggt_stream.pt"],
-        "note": "Optional; LaRe currently does not include a FlashVGGT adapter by default."
       }
     }
   }

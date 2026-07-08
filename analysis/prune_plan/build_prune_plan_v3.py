@@ -15,14 +15,12 @@ from analysis.prune_plan import (
     PRUNE_PLAN_BUNDLE_FILENAME,
     PRUNE_PLAN_BUNDLE_SCHEMA_VERSION,
 )
-from analysis.prune_plan.build_prune_plan_v3_backup import (
-    _default_plan_root,
+from analysis.prune_plan.build_prune_plan_common import (
+    default_plan_root as _default_plan_root,
     load_similarity,
 )
 from analysis.redundancy.similarity_v3 import (
-    DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS,
     REDUNDANCY_GRAPH_REGIONS,
-    parse_exclude_token_regions,
 )
 from analysis.prune_plan.triangle_prune import (
     CORNER_RANKING_TOLERANCE,
@@ -31,10 +29,8 @@ from analysis.prune_plan.triangle_prune import (
     scan_endpoint_linked_triangles_with_candidates,
 )
 from analysis.prune_plan.visualize_triangle_prune import (
-    render_all_span_corner_heatmap,
+    render_corner_overview_heatmap,
     render_gt_component_heatmaps,
-    render_gt_aggregate_corner_heatmap,
-    render_gt_ranked_candidate_heatmap,
     render_gt_trajectory_score_plot,
     render_prune_span_drop_grid,
     render_budget_similarity_curve as render_span_similarity_curve,
@@ -43,7 +39,7 @@ from analysis.prune_plan.visualize_triangle_prune import (
 GT_RELATIVE_DEGRADATION_CAP_MULTIPLE = 0.0
 GT_COMPONENT_AGGREGATION = "mean"  # "mean", "min", or "max"; lower aggregate is selected.
 GT_COMPONENT_TOP_RANGE_CLIP_FRACTION = 0.0
-CKA_CORNER_COMPARISON_TOKEN_REGIONS = ("special", "patch", "all", "min", "mean")
+CKA_CORNER_COMPARISON_TOKEN_REGIONS = ("special", "patch", "all", "mean")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -65,7 +61,6 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=(*REDUNDANCY_GRAPH_REGIONS, "mean", "min"),
         default="all",
     )
-    p.add_argument("--exclude-token-regions", type=str, default="")
     p.add_argument("--prune-plan-root", type=Path, default=None)
     p.add_argument(
         "--output",
@@ -246,17 +241,18 @@ _GT_AGGREGATE_METRICS = (*_GT_POSE_METRICS, *_GT_POINT_METRICS)
 _HIGHER_IS_BETTER_GT_METRICS = frozenset({"depth_delta1", "nc"})
 
 
-def _clip_top_score_range(
+def _clip_top_score_values(
     scores: np.ndarray,
     *,
     fraction: float,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Clip the top fraction of a component's own finite score range."""
+    """Clip the largest fraction of a component's finite score values."""
     arr = np.asarray(scores, dtype=np.float64)
     out = np.array(arr, copy=True, dtype=np.float64)
     frac = max(0.0, min(1.0, float(fraction)))
     meta: dict[str, Any] = {
         "clip_fraction": float(frac),
+        "clip_mode": "top_value_fraction",
         "enabled": bool(frac > 0.0),
         "raw_min": None,
         "raw_max": None,
@@ -273,7 +269,7 @@ def _clip_top_score_range(
     if hi <= lo:
         meta["clip_threshold"] = hi
         return out, meta
-    threshold = hi - frac * (hi - lo)
+    threshold = float(np.nanquantile(arr[finite], 1.0 - frac))
     clip_mask = finite & (arr > threshold)
     out[clip_mask] = threshold
     meta["clip_threshold"] = float(threshold)
@@ -287,7 +283,7 @@ def _degrade_pct_to_upper_multiple_score(
     metric: str,
     upper_baseline: Optional[float],
     max_multiple: float = GT_RELATIVE_DEGRADATION_CAP_MULTIPLE,
-    top_range_clip_fraction: float = GT_COMPONENT_TOP_RANGE_CLIP_FRACTION,
+    top_value_clip_fraction: float = GT_COMPONENT_TOP_RANGE_CLIP_FRACTION,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Convert direction-normalized degrade_pct to a clipped 1..K raw-metric ratio.
 
@@ -295,7 +291,8 @@ def _degrade_pct_to_upper_multiple_score(
     where lower is better, the score is ``current / upper``.  For metrics where
     higher is better, the score is ``upper / current``.  Scores better than the
     upper baseline are floored to 1.0.  Before the absolute ``max_multiple`` cap,
-    the top fraction of this metric's own finite score range is clipped.  If
+    the largest fraction of this metric's own finite score values is clipped to
+    the corresponding quantile threshold.  If
     ``max_multiple >= 1`` catastrophic values are capped at ``max_multiple``; if
     ``max_multiple < 1`` the score is left uncapped.
     """
@@ -308,6 +305,7 @@ def _degrade_pct_to_upper_multiple_score(
         "max_multiple": float(max_multiple),
         "cap_enabled": bool(float(max_multiple) >= 1.0),
         "raw_bound": None,
+        "top_value_clip": None,
         "top_range_clip": None,
         "num_capped_high": 0,
         "num_floored_to_one": 0,
@@ -335,9 +333,9 @@ def _degrade_pct_to_upper_multiple_score(
         with np.errstate(divide="ignore", invalid="ignore"):
             scores = upper / np.maximum(raw_current, 1e-8)
         scores = np.where(np.isfinite(scores), scores, multiple if cap_enabled else np.nan)
-        scores, top_clip_meta = _clip_top_score_range(
+        scores, top_clip_meta = _clip_top_score_values(
             scores,
-            fraction=top_range_clip_fraction,
+            fraction=top_value_clip_fraction,
         )
         capped_scores = (
             np.clip(scores, 1.0, multiple)
@@ -350,6 +348,7 @@ def _degrade_pct_to_upper_multiple_score(
                 "cap_enabled": cap_enabled,
                 "raw_bound": float(raw_floor) if raw_floor is not None else None,
                 "bound_kind": "raw_floor" if cap_enabled else "none",
+                "top_value_clip": top_clip_meta,
                 "top_range_clip": top_clip_meta,
                 "num_capped_high": int(np.count_nonzero(scores > multiple)) if cap_enabled else 0,
                 "num_floored_to_one": int(np.count_nonzero(scores < 1.0)),
@@ -362,9 +361,9 @@ def _degrade_pct_to_upper_multiple_score(
         raw_ceiling = upper * multiple if cap_enabled else None
         raw_current = upper + arr[finite] * denom / 100.0
         scores = raw_current / upper
-        scores, top_clip_meta = _clip_top_score_range(
+        scores, top_clip_meta = _clip_top_score_values(
             scores,
-            fraction=top_range_clip_fraction,
+            fraction=top_value_clip_fraction,
         )
         capped_scores = (
             np.clip(scores, 1.0, multiple)
@@ -377,6 +376,7 @@ def _degrade_pct_to_upper_multiple_score(
                 "cap_enabled": cap_enabled,
                 "raw_bound": float(raw_ceiling) if raw_ceiling is not None else None,
                 "bound_kind": "raw_ceiling" if cap_enabled else "none",
+                "top_value_clip": top_clip_meta,
                 "top_range_clip": top_clip_meta,
                 "num_capped_high": int(np.count_nonzero(scores > multiple)) if cap_enabled else 0,
                 "num_floored_to_one": int(np.count_nonzero(scores < 1.0)),
@@ -460,7 +460,7 @@ def _load_gt_aggregate_from_skip_eval_report(
                 else None
             ),
             max_multiple=GT_RELATIVE_DEGRADATION_CAP_MULTIPLE,
-            top_range_clip_fraction=GT_COMPONENT_TOP_RANGE_CLIP_FRACTION,
+            top_value_clip_fraction=GT_COMPONENT_TOP_RANGE_CLIP_FRACTION,
         )
         component_heatmaps[str(metric_key)] = multiple_score
         component_metric_names.append(str(metric_key))
@@ -566,7 +566,8 @@ def _load_gt_aggregate_from_skip_eval_report(
             + (
                 f" Before the absolute cap, the top "
                 f"{GT_COMPONENT_TOP_RANGE_CLIP_FRACTION:g} fraction of each "
-                "component's own finite score range is clipped."
+                "component's largest finite score values are clipped to the "
+                "corresponding quantile threshold."
             )
             + f" Components are aggregated with {GT_COMPONENT_AGGREGATION!r}."
         ),
@@ -589,7 +590,6 @@ def run_build_prune_plan(
     backbone: str = "vggt",
     metric: str = "cka",
     token_region: str = "all",
-    exclude_token_regions: Sequence[str] = DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS,
     prune_plan_root: Optional[Path] = None,
     output_path: Optional[Path] = None,
     viz_out_dir: Optional[Path] = None,
@@ -603,7 +603,6 @@ def run_build_prune_plan(
         dataset=dataset,
         token_region=token_region,
         metric=metric,
-        exclude_token_regions=exclude_token_regions,
     )
     num_units = int(sim.shape[0])
     scan, eligible_candidates_by_span = (
@@ -632,6 +631,19 @@ def run_build_prune_plan(
     visualization_root = (
         viz_out_dir or (output_path.parent if output_path is not None else plan_root)
     )
+    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    for stale_name in [
+        f"prune_plan_{safe_backbone}_all_corners.png",
+        f"prune_plan_{safe_backbone}_token_corners.png",
+        f"prune_plan_{safe_backbone}_gt_corners.png",
+        f"prune_plan_{safe_backbone}_gt_ranked_candidates.png",
+        f"prune_plan_{safe_backbone}_gt_corners_and_ranked_candidates.png",
+    ]:
+        stale_path = visualization_root / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
+    for stale_path in visualization_root.glob(f"prune_plan_{safe_backbone}_token_*_all_corners.png"):
+        stale_path.unlink()
     gt_corner_score: Optional[np.ndarray] = None
     gt_component_heatmaps: dict[str, np.ndarray] = {}
     gt_corner_picks: list[TrianglePick] = []
@@ -662,96 +674,83 @@ def run_build_prune_plan(
         gt_score_trajectories.append(("GT best path", gt_corner_picks))
         if str(token_region) not in set(CKA_CORNER_COMPARISON_TOKEN_REGIONS):
             gt_score_trajectories.append((f"CKA selected path ({token_region})", scan))
-    corner_heatmap_path = render_all_span_corner_heatmap(
-        sim,
-        unit_ids,
-        scan,
-        span_to_candidate_picks=eligible_candidates_by_span,
-        out_dir=visualization_root,
-        backbone=backbone,
-        title=f"{backbone}: selected {selection_label} triangle vertices by dropped-unit count",
-        gt_score=gt_corner_score,
-        gt_picks=gt_corner_picks,
-        selected_path_label=f"CKA selected path ({token_region})",
-    )
-    print(f"Wrote all-span corner heatmap {corner_heatmap_path}", flush=True)
 
+    token_corner_items: list[
+        tuple[str, np.ndarray, Sequence[TrianglePick], dict[int, Sequence[TrianglePick]]]
+    ] = []
     for comparison_region in CKA_CORNER_COMPARISON_TOKEN_REGIONS:
         try:
-            region_unit_ids, region_sim, _region_source = load_similarity(
-                experiment=experiment,
-                dataset=dataset,
-                token_region=comparison_region,
-                metric=metric,
-                exclude_token_regions=exclude_token_regions,
-            )
-            if list(region_unit_ids) != list(unit_ids):
-                print(
-                    f"[warn] Skip token-region corner plot for {comparison_region}: "
-                    "unit_ids do not match the selected plan source.",
-                    flush=True,
+            if str(comparison_region) == str(token_region):
+                region_unit_ids = list(unit_ids)
+                region_sim = sim
+                region_scan = scan
+                region_candidates_by_span = eligible_candidates_by_span
+            else:
+                region_unit_ids, region_sim, _region_source = load_similarity(
+                    experiment=experiment,
+                    dataset=dataset,
+                    token_region=comparison_region,
+                    metric=metric,
                 )
-                continue
-            region_scan, region_candidates_by_span = (
-                scan_endpoint_linked_triangles_with_candidates(
-                    region_sim,
-                    region_unit_ids,
-                    ranking_tolerance=CORNER_RANKING_TOLERANCE,
-                    require_endpoint_linked_spans=REQUIRE_ENDPOINT_LINKED_SPANS,
+                if list(region_unit_ids) != list(unit_ids):
+                    print(
+                        f"[warn] Skip token-region corner panel for {comparison_region}: "
+                        "unit_ids do not match the selected plan source.",
+                        flush=True,
+                    )
+                    continue
+                region_scan, region_candidates_by_span = (
+                    scan_endpoint_linked_triangles_with_candidates(
+                        region_sim,
+                        region_unit_ids,
+                        ranking_tolerance=CORNER_RANKING_TOLERANCE,
+                        require_endpoint_linked_spans=REQUIRE_ENDPOINT_LINKED_SPANS,
+                    )
                 )
-            )
-            region_corner_path = render_all_span_corner_heatmap(
-                region_sim,
-                region_unit_ids,
-                region_scan,
-                span_to_candidate_picks=region_candidates_by_span,
-                out_dir=visualization_root,
-                backbone=backbone,
-                tag=f"token_{comparison_region}_all_corners",
-                title=(
-                    f"{backbone}: selected {selection_label} vertices "
-                    f"from {comparison_region} token CKA"
-                ),
-                gt_score=gt_corner_score,
-                gt_picks=gt_corner_picks,
-                selected_path_label=f"CKA selected path ({comparison_region})",
+            token_corner_items.append(
+                (
+                    str(comparison_region),
+                    np.asarray(region_sim, dtype=np.float64),
+                    list(region_scan),
+                    dict(region_candidates_by_span),
+                )
             )
             if gt_corner_score is not None and gt_corner_picks:
                 gt_score_trajectories.append(
                     (f"CKA selected path ({comparison_region})", region_scan)
                 )
-            print(
-                f"Wrote token-region corner heatmap {comparison_region}: {region_corner_path}",
-                flush=True,
-            )
         except Exception as exc:
             print(
-                f"[warn] Could not render token-region corner plot for "
+                f"[warn] Could not prepare token-region corner panel for "
                 f"{comparison_region}: {exc}",
                 flush=True,
             )
+    cka_score_trajectories = [
+        (name, picks)
+        for name, picks in gt_score_trajectories
+        if not str(name).lower().startswith("gt")
+    ]
+    if token_corner_items:
+        corner_overview_path = render_corner_overview_heatmap(
+            token_corner_items,
+            out_dir=visualization_root,
+            backbone=backbone,
+            selected_token_region=str(token_region),
+            gt_score=gt_corner_score,
+            gt_picks=gt_corner_picks,
+            metric_names=(
+                list(gt_corner_meta.get("metrics", []))
+                if isinstance(gt_corner_meta, dict)
+                else []
+            ),
+            cka_trajectories=cka_score_trajectories,
+            relative_degradation_cap_multiple=GT_RELATIVE_DEGRADATION_CAP_MULTIPLE,
+            component_aggregation=GT_COMPONENT_AGGREGATION,
+            selection_label=selection_label,
+        )
+        print(f"Wrote corner overview heatmap {corner_overview_path}", flush=True)
     if gt_corner_score is not None and gt_score_trajectories:
-        cka_score_trajectories = [
-            (name, picks)
-            for name, picks in gt_score_trajectories
-            if not str(name).lower().startswith("gt")
-        ]
         if gt_corner_picks:
-            gt_heatmap_path = render_gt_aggregate_corner_heatmap(
-                gt_corner_score,
-                gt_corner_picks,
-                out_dir=visualization_root,
-                backbone=backbone,
-                metric_names=(
-                    list(gt_corner_meta.get("metrics", []))
-                    if isinstance(gt_corner_meta, dict)
-                    else []
-                ),
-                cka_trajectories=cka_score_trajectories,
-                relative_degradation_cap_multiple=GT_RELATIVE_DEGRADATION_CAP_MULTIPLE,
-                component_aggregation=GT_COMPONENT_AGGREGATION,
-            )
-            print(f"Wrote GT aggregate corner heatmap {gt_heatmap_path}", flush=True)
             component_heatmap_path = render_gt_component_heatmaps(
                 gt_component_heatmaps,
                 out_dir=visualization_root,
@@ -760,14 +759,6 @@ def run_build_prune_plan(
             )
             if component_heatmap_path is not None:
                 print(f"Wrote GT component heatmaps {component_heatmap_path}", flush=True)
-            ranked_candidate_path = render_gt_ranked_candidate_heatmap(
-                gt_corner_score,
-                gt_corner_picks,
-                out_dir=visualization_root,
-                backbone=backbone,
-                cka_trajectories=cka_score_trajectories,
-            )
-            print(f"Wrote GT ranked candidate heatmap {ranked_candidate_path}", flush=True)
         score_plot_path = render_gt_trajectory_score_plot(
             gt_corner_score,
             gt_score_trajectories,
@@ -827,7 +818,6 @@ def run_build_prune_plan(
             "similarity_source": similarity_source,
             "metric": str(metric),
             "token_region": str(token_region),
-            "exclude_token_regions": [str(x) for x in exclude_token_regions],
             "triangle_legality": "all_diagonal_candidates",
             "corner_ranking_tolerance": float(CORNER_RANKING_TOLERANCE),
             "require_endpoint_linked_spans": bool(REQUIRE_ENDPOINT_LINKED_SPANS),
@@ -873,7 +863,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         backbone=args.backbone,
         metric=args.metric,
         token_region=args.token_region,
-        exclude_token_regions=parse_exclude_token_regions(args.exclude_token_regions),
         prune_plan_root=args.prune_plan_root,
         output_path=args.output,
         viz_out_dir=args.viz_out_dir,

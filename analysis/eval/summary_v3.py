@@ -57,27 +57,60 @@ def _dataset_sort_key(name: str) -> Tuple[int, str]:
 
 _PLAN_GROUP_SORT_RE = re.compile(r"^(?:prune_span(\d+)|plan_budget(\d+)|plan_t(\d+))$")
 _PRUNE_SPAN_RE = re.compile(r"^prune_span(\d+)$")
+_PRUNE_SPAN_PREFIX_RE = re.compile(r"^(prune_span\d+)(?:[_/].*)?$")
+_RECOVER_LABEL_RE = re.compile(r"^(prune_span\d+)_(recovery_.+)$")
 
 
-def _lower_label_sort_key(label: str) -> Tuple[int, int, str]:
+def _lower_label_sort_key(label: str) -> Tuple[int, int, int, str]:
     if label == "lower":
-        return (1, -1, label)
+        return (0, -1, 0, label)
     m = _PLAN_GROUP_SORT_RE.match(label)
     if m:
-        return (0, int(next(g for g in m.groups() if g is not None)), label)
-    return (2, 0, label)
+        return (0, int(next(g for g in m.groups() if g is not None)), 0, label)
+    span = _span_from_label(label)
+    if span is not None:
+        subrank = 0 if _label_base(label) == str(label or "").split("+", 1)[0] else 1
+        return (0, int(span), subrank, label)
+    return (2, 0, 0, label)
 
 
 def _label_base(label: str) -> str:
     base = str(label or "").split("+", 1)[0]
     if base.startswith("model/"):
         base = base.split("/", 1)[1]
+    if base.startswith("recover/"):
+        parts = base.split("/")
+        base = parts[2] if len(parts) >= 3 else base
+    if "/" in base:
+        base = base.split("/", 1)[0]
+    m = _PRUNE_SPAN_PREFIX_RE.match(base)
+    if m:
+        base = m.group(1)
     return base
 
 
 def _span_from_label(label: str) -> Optional[int]:
     m = _PRUNE_SPAN_RE.match(_label_base(label))
     return int(m.group(1)) if m else None
+
+
+def _plain_lower_span_label(label: str) -> bool:
+    base = str(label or "").split("+", 1)[0]
+    return bool(_PLAN_GROUP_SORT_RE.match(base))
+
+
+def _recover_label_parts(label: str) -> Optional[Tuple[str, str]]:
+    base = str(label or "").split("+", 1)[0]
+    m = _RECOVER_LABEL_RE.match(base)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _recover_label(prune_plan: str, recovery_plan: str) -> str:
+    prune = str(prune_plan or "").strip()
+    recovery = str(recovery_plan or "").strip()
+    return f"{prune}_{recovery}" if prune and recovery else prune or recovery
 
 
 def _format_param_count(n: int) -> str:
@@ -232,22 +265,30 @@ def _compression_tag(rec: EvalRecordV3) -> str:
 
 def _record_label(rec: EvalRecordV3, rel_run_dir: Path) -> tuple[str, str, str]:
     extra = rec.extra if isinstance(rec.extra, dict) else {}
+    parts = rel_run_dir.parts
+    compression = _compression_tag(rec)
+    if parts and parts[0] == "recover":
+        recovery_plan = parts[1] if len(parts) >= 2 else ""
+        raw_plan = parts[2] if len(parts) >= 3 else ""
+        base = _recover_label(raw_plan, recovery_plan)
+        return "recover", f"{base}+{compression}" if compression else base, raw_plan
+
     mode = str(extra.get("eval_mode", "")).strip().lower()
     if mode not in ("upper", "lower", "model"):
         mode = str(rec.model_name).strip().lower().split("_", 1)[0]
     if mode not in ("upper", "lower", "model"):
-        mode = rel_run_dir.parts[0].split("_", 1)[0].lower() if rel_run_dir.parts else "upper"
+        mode = parts[0].split("_", 1)[0].lower() if parts else "upper"
 
     raw_plan = ""
     if mode in ("lower", "model"):
-        raw_plan = rel_run_dir.parts[1] if len(rel_run_dir.parts) >= 2 else mode
+        raw_plan = parts[1] if len(parts) >= 2 else mode
         if mode == "lower":
             base = _normalize_lower_label(raw_plan)
         else:
-            base = f"model/{raw_plan}"
+            recovery_plan = parts[2] if len(parts) >= 3 else ""
+            base = _recover_label(raw_plan, recovery_plan) if recovery_plan else _recover_label(raw_plan, "model")
     else:
         base = "upper"
-    compression = _compression_tag(rec)
     return mode, f"{base}+{compression}" if compression else base, raw_plan
 
 
@@ -304,18 +345,17 @@ def _filter_to_current_prune_spans(
     return filtered
 
 
-def _plot_metric_curves_by_span(
+def _write_metric_curve_grid(
+    *,
     root: Path,
-    grouped: Dict[str, Dict[str, EvalRecordV3]],
-) -> List[Path]:
-    """For each dataset, plot all eval metrics from upper/span0 to max prune span."""
-    try:
-        import matplotlib.pyplot as plt  # type: ignore
-    except Exception as exc:
-        print(f"[warn] Could not import matplotlib for summary metric curves: {exc}", flush=True)
-        return []
+    ds_name: str,
+    upper_rec: EvalRecordV3,
+    span_items: List[Tuple[int, str, EvalRecordV3]],
+    out_dir: Path,
+    title_suffix: str,
+) -> Optional[Path]:
+    import matplotlib.pyplot as plt  # type: ignore
 
-    written: List[Path] = []
     metric_grid: List[List[Optional[str]]] = [
         ["ape", "are", "rpe_trans", "rpe_rot"],
         ["acc", "comp", "cd", "nc"],
@@ -323,6 +363,186 @@ def _plot_metric_curves_by_span(
     ]
     n_rows = 3
     n_cols = 4
+
+    xs = [0] + [int(span) for span, _label, _rec in span_items]
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.0 * n_cols, 3.25 * n_rows), squeeze=False)
+    for row_idx, row in enumerate(metric_grid):
+        for col_idx, key in enumerate(row):
+            ax = axes[row_idx][col_idx]
+            if key is None:
+                ax.axis("off")
+                continue
+            ys = [float(upper_rec.average.get(key, float("nan")))]
+            ys.extend(float(rec.average.get(key, float("nan"))) for _span, _label, rec in span_items)
+            has_data = any(math.isfinite(v) for v in ys)
+            if not has_data:
+                ax.axis("off")
+                continue
+            ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4)
+            ax.set_title(METRIC_HEADERS.get(key, key), fontsize=11, fontweight="bold")
+            ax.set_xlabel("Dropped units / prune span")
+            ax.grid(True, alpha=0.25)
+            ax.set_xlim(left=0)
+            ax.set_xticks(xs)
+    fig.suptitle(
+        f"{root.name} / {ds_name}: metrics from upper(span0) to max prune span{title_suffix}",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    safe_ds = str(ds_name).replace("/", "_").replace(" ", "_")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{safe_ds}_metrics_by_span.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def _write_recover_strategy_comparison_grid(
+    *,
+    root: Path,
+    ds_name: str,
+    upper_rec: EvalRecordV3,
+    lower_span_items: List[Tuple[int, str, EvalRecordV3]],
+    recover_items_by_plan: Dict[str, List[Tuple[int, str, EvalRecordV3]]],
+) -> Optional[Path]:
+    import matplotlib.pyplot as plt  # type: ignore
+
+    if not recover_items_by_plan and not lower_span_items:
+        return None
+
+    metric_grid: List[List[Optional[str]]] = [
+        ["ape", "are", "rpe_trans", "rpe_rot"],
+        ["acc", "comp", "cd", "nc"],
+        ["depth_abs_rel", "depth_delta1", "inference_time_ms", "infer_peak_vram_gb"],
+    ]
+    n_rows = 3
+    n_cols = 4
+    all_spans = sorted(
+        {
+            int(span)
+            for span, _label, _rec in lower_span_items
+        }
+        | {
+            int(span)
+            for recover_items in recover_items_by_plan.values()
+            for span, _label, _rec in recover_items
+        }
+    )
+    if not all_spans:
+        return None
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.0 * n_cols, 3.25 * n_rows), squeeze=False)
+    for row_idx, row in enumerate(metric_grid):
+        for col_idx, key in enumerate(row):
+            ax = axes[row_idx][col_idx]
+            if key is None:
+                ax.axis("off")
+                continue
+
+            upper_value = float(upper_rec.average.get(key, float("nan")))
+            has_data = math.isfinite(upper_value)
+            if math.isfinite(upper_value):
+                ax.axhline(
+                    upper_value,
+                    linestyle="--",
+                    color="#333333",
+                    linewidth=1.4,
+                    alpha=0.75,
+                    label="upper",
+                )
+                ax.scatter([0], [upper_value], color="#333333", marker="*", s=70, zorder=4)
+
+            lower_xs: List[int] = []
+            lower_ys: List[float] = []
+            lower_has_values = False
+            if math.isfinite(upper_value):
+                lower_xs.append(0)
+                lower_ys.append(upper_value)
+            for span, _label, rec in sorted(lower_span_items, key=lambda item: item[0]):
+                value = float(rec.average.get(key, float("nan")))
+                if not math.isfinite(value):
+                    continue
+                lower_xs.append(int(span))
+                lower_ys.append(value)
+                lower_has_values = True
+            if lower_has_values:
+                has_data = True
+                ax.plot(
+                    lower_xs,
+                    lower_ys,
+                    marker="s",
+                    linestyle=":",
+                    color="#666666",
+                    linewidth=1.9,
+                    markersize=4,
+                    label="lower",
+                )
+
+            for recovery_plan in sorted(recover_items_by_plan.keys()):
+                recover_items = sorted(recover_items_by_plan[recovery_plan], key=lambda item: item[0])
+                xs: List[int] = []
+                ys: List[float] = []
+                plan_has_values = False
+                if math.isfinite(upper_value):
+                    xs.append(0)
+                    ys.append(upper_value)
+                for span, _label, rec in recover_items:
+                    value = float(rec.average.get(key, float("nan")))
+                    if not math.isfinite(value):
+                        continue
+                    xs.append(int(span))
+                    ys.append(value)
+                    plan_has_values = True
+                if not plan_has_values:
+                    continue
+                has_data = True
+                ax.plot(
+                    xs,
+                    ys,
+                    marker="o",
+                    linewidth=1.8,
+                    markersize=4,
+                    label=recovery_plan.removeprefix("recovery_"),
+                )
+
+            if not has_data:
+                ax.axis("off")
+                continue
+            ax.set_title(METRIC_HEADERS.get(key, key), fontsize=11, fontweight="bold")
+            ax.set_xlabel("Dropped units / prune span")
+            ax.grid(True, alpha=0.25)
+            ax.set_xlim(left=0)
+            ax.set_xticks([0] + all_spans)
+            ax.legend(loc="best", fontsize=8)
+
+    fig.suptitle(
+        f"{root.name} / {ds_name}: lower and recover strategies vs upper",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    safe_ds = str(ds_name).replace("/", "_").replace(" ", "_")
+    out_dir = root / ds_name / "eval" / "recover"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{safe_ds}_recover_strategies_by_span.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def _plot_metric_curves_by_span(
+    root: Path,
+    grouped: Dict[str, Dict[str, EvalRecordV3]],
+) -> List[Path]:
+    """For each dataset, plot eval metrics from upper/span0 to max prune span."""
+    try:
+        import matplotlib.pyplot as plt  # noqa: F401  # type: ignore
+    except Exception as exc:
+        print(f"[warn] Could not import matplotlib for summary metric curves: {exc}", flush=True)
+        return []
+
+    written: List[Path] = []
 
     for ds_name in sorted(grouped.keys(), key=_dataset_sort_key):
         modes = grouped[ds_name]
@@ -333,47 +553,56 @@ def _plot_metric_curves_by_span(
             (
                 (span, label, rec)
                 for label, rec in modes.items()
-                if not str(label).split("+", 1)[0].startswith("model/")
+                if _plain_lower_span_label(label)
                 if (span := _span_from_label(label)) is not None
             ),
             key=lambda item: item[0],
         )
-        if not span_items:
-            continue
+        if span_items:
+            out_path = _write_metric_curve_grid(
+                root=root,
+                ds_name=ds_name,
+                upper_rec=upper_rec,
+                span_items=span_items,
+                out_dir=root / ds_name / "eval" / "lower",
+                title_suffix="",
+            )
+            if out_path is not None:
+                written.append(out_path)
 
-        xs = [0] + [int(span) for span, _label, _rec in span_items]
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.0 * n_cols, 3.25 * n_rows), squeeze=False)
-        for row_idx, row in enumerate(metric_grid):
-            for col_idx, key in enumerate(row):
-                ax = axes[row_idx][col_idx]
-                if key is None:
-                    ax.axis("off")
-                    continue
-                ys = [float(upper_rec.average.get(key, float("nan")))]
-                ys.extend(float(rec.average.get(key, float("nan"))) for _span, _label, rec in span_items)
-                has_data = any(math.isfinite(v) for v in ys)
-                if not has_data:
-                    ax.axis("off")
-                    continue
-                ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4)
-                ax.set_title(METRIC_HEADERS.get(key, key), fontsize=11, fontweight="bold")
-                ax.set_xlabel("Dropped units / prune span")
-                ax.grid(True, alpha=0.25)
-                ax.set_xlim(left=0)
-                ax.set_xticks(xs)
-        fig.suptitle(
-            f"{root.name} / {ds_name}: metrics from upper(span0) to max prune span",
-            fontsize=14,
-            fontweight="bold",
+        recover_items_by_plan: Dict[str, List[Tuple[int, str, EvalRecordV3]]] = {}
+        for label, rec in modes.items():
+            parts = _recover_label_parts(label)
+            if parts is None:
+                continue
+            _prune_plan, recovery_plan = parts
+            span = _span_from_label(label)
+            if span is None:
+                continue
+            recover_items_by_plan.setdefault(recovery_plan, []).append((int(span), label, rec))
+        for recovery_plan in sorted(recover_items_by_plan.keys()):
+            recover_items = sorted(recover_items_by_plan[recovery_plan], key=lambda item: item[0])
+            if not recover_items:
+                continue
+            out_path = _write_metric_curve_grid(
+                root=root,
+                ds_name=ds_name,
+                upper_rec=upper_rec,
+                span_items=recover_items,
+                out_dir=root / ds_name / "eval" / "recover" / recovery_plan,
+                title_suffix=f" ({recovery_plan})",
+            )
+            if out_path is not None:
+                written.append(out_path)
+        out_path = _write_recover_strategy_comparison_grid(
+            root=root,
+            ds_name=ds_name,
+            upper_rec=upper_rec,
+            lower_span_items=span_items,
+            recover_items_by_plan=recover_items_by_plan,
         )
-        fig.tight_layout(rect=(0, 0, 1, 0.97))
-        safe_ds = str(ds_name).replace("/", "_").replace(" ", "_")
-        out_dir = root / ds_name / "eval" / "lower"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{safe_ds}_metrics_by_span.png"
-        fig.savefig(out_path, dpi=150)
-        plt.close(fig)
-        written.append(out_path)
+        if out_path is not None:
+            written.append(out_path)
     return written
 
 

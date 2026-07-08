@@ -15,7 +15,7 @@ from analysis.inference_compression.contracts import (
     InferenceCompressionConfig,
 )
 from analysis.inference_compression.lora import merge_lora_linears
-from analysis.train.model import SkipIdentityBlock
+from analysis.recover.train.model import SkipIdentityBlock
 
 _DTYPE_BITS = {"w4a4": (4, 4), "w6a6": (6, 6), "w8a8": (8, 8)}
 
@@ -25,11 +25,11 @@ def _repo_root() -> Path:
 
 
 def _load_quant_modules():
-    evaluation_root = _repo_root() / "backbones" / "QuantVGGT" / "evaluation"
+    evaluation_root = _repo_root() / "submodules" / "QuantVGGT" / "evaluation"
     if not evaluation_root.is_dir():
         raise FileNotFoundError(
             f"QuantVGGT submodule is missing {evaluation_root}. "
-            "Run: git submodule update --init backbones/QuantVGGT"
+            "Run: git submodule update --init submodules/QuantVGGT"
         )
     root_str = str(evaluation_root)
     if root_str not in sys.path:

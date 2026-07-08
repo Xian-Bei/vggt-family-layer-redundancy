@@ -9,7 +9,7 @@ from typing import List, Mapping, Optional, Sequence, Union
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, Rectangle
-from matplotlib.ticker import FuncFormatter, MaxNLocator
+from matplotlib.ticker import FuncFormatter, MaxNLocator, MultipleLocator
 import numpy as np
 import torch
 
@@ -22,7 +22,8 @@ from analysis.triangular_heatmap import (
     triangle_xy,
 )
 
-TRAJECTORY_SCORE_MAX_SPAN = 24
+TRAJECTORY_SCORE_MAX_SPAN = 48
+TRAJECTORY_SCORE_SPAN_STEP = 2
 
 
 def _relative_degradation_vmax(
@@ -68,14 +69,19 @@ def _path_scores(score: Optional[np.ndarray], picks: Sequence[TrianglePick]) -> 
 def _path_span_scores(
     score: Optional[np.ndarray],
     picks: Sequence[TrianglePick],
+    *,
+    span_step: int = 1,
 ) -> list[tuple[int, float]]:
     if score is None:
         return []
     arr = np.asarray(score, dtype=np.float64)
     out: list[tuple[int, float]] = []
+    step = max(1, int(span_step))
     for pick in picks:
         span = int(pick.span)
         if span > int(TRAJECTORY_SCORE_MAX_SPAN):
+            continue
+        if span % step != 0:
             continue
         i = int(pick.i)
         j = int(pick.j)
@@ -84,6 +90,18 @@ def _path_span_scores(
             if np.isfinite(val):
                 out.append((span, val))
     return out
+
+
+def _path_span_average_score(
+    score: Optional[np.ndarray],
+    picks: Sequence[TrianglePick],
+    *,
+    span_step: int = 1,
+) -> Optional[float]:
+    vals = [val for _span, val in _path_span_scores(score, picks, span_step=span_step)]
+    if not vals:
+        return None
+    return float(np.mean(vals))
 
 
 def _path_average_score(score: Optional[np.ndarray], picks: Sequence[TrianglePick]) -> Optional[float]:
@@ -100,6 +118,13 @@ def _path_label(label: str, score: Optional[np.ndarray], picks: Sequence[Triangl
     return f"{label} (avg={avg:.3f})"
 
 
+def _display_token_region_label(region: str) -> str:
+    region_str = str(region)
+    if region_str == "special":
+        return "register"
+    return region_str
+
+
 def render_gt_trajectory_score_plot(
     score: np.ndarray,
     trajectories: Sequence[tuple[str, Sequence[TrianglePick]]],
@@ -112,9 +137,13 @@ def render_gt_trajectory_score_plot(
     out_dir.mkdir(parents=True, exist_ok=True)
     score_arr = np.asarray(score, dtype=np.float64)
     prepared: list[tuple[str, list[tuple[int, float]], Optional[float]]] = []
+    span_step = max(1, int(TRAJECTORY_SCORE_SPAN_STEP))
     for name, picks in trajectories:
-        points = sorted(_path_span_scores(score_arr, picks), key=lambda item: item[0])
-        avg = _path_average_score(score_arr, picks)
+        points = sorted(
+            _path_span_scores(score_arr, picks, span_step=span_step),
+            key=lambda item: item[0],
+        )
+        avg = _path_span_average_score(score_arr, picks, span_step=span_step)
         if points:
             prepared.append((str(name), points, avg))
     if not prepared:
@@ -153,7 +182,10 @@ def render_gt_trajectory_score_plot(
 
     cap = _relative_degradation_vmax([score_arr], relative_degradation_cap_multiple)
     ax.set_title(
-        f"{backbone}: GT aggregate score along selected trajectories (span ≤ {TRAJECTORY_SCORE_MAX_SPAN})",
+        (
+            f"{backbone}: GT aggregate score along selected trajectories "
+            f"(span ≤ {TRAJECTORY_SCORE_MAX_SPAN}, step={span_step})"
+        ),
         fontsize=15,
         fontweight="bold",
     )
@@ -161,7 +193,7 @@ def render_gt_trajectory_score_plot(
     ax.set_ylabel("Relative degradation multiple (lower is better)", fontsize=12, fontweight="bold")
     ax.set_xlim(left=0, right=min(max_x, int(TRAJECTORY_SCORE_MAX_SPAN)) + 0.5)
     ax.set_ylim(bottom=1.0, top=max(cap, max_y) * 1.03)
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.xaxis.set_major_locator(MultipleLocator(span_step))
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=9)
     safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
@@ -226,6 +258,8 @@ def _draw_cka_trajectories(
     ax,
     score: np.ndarray,
     trajectories: Sequence[tuple[str, Sequence[TrianglePick]]],
+    *,
+    label_vertices: bool = False,
 ) -> bool:
     """Draw one or more CKA-selected trajectories and return whether anything was drawn."""
     if not trajectories:
@@ -259,7 +293,7 @@ def _draw_cka_trajectories(
             markeredgewidth=0.5,
             markersize=3.0,
             linestyle="None",
-            label=f"{name} vertex" if index == 0 else None,
+            label=f"{name} vertex" if label_vertices and index == 0 else None,
         )
         drawn = True
     return drawn
@@ -487,6 +521,242 @@ def render_all_span_corner_heatmap(
     return out_path
 
 
+
+
+def _draw_span_candidate_segments_from_picks(
+    ax,
+    *,
+    n: int,
+    picks: Sequence[TrianglePick],
+    span_to_candidate_picks: Optional[Mapping[int, Sequence[TrianglePick]]] = None,
+    label: str = "Span candidates",
+) -> bool:
+    seen_candidate_label = False
+    for pick in picks:
+        span = int(pick.span)
+        if span_to_candidate_picks is None:
+            candidate_segments = [[(i, i + span) for i in range(0, n - span)]]
+        else:
+            candidates = sorted(
+                span_to_candidate_picks.get(span, ()),
+                key=lambda candidate: int(candidate.i),
+            )
+            candidate_segments: list[list[tuple[int, int]]] = []
+            current_segment: list[tuple[int, int]] = []
+            previous_i: Optional[int] = None
+            for candidate in candidates:
+                i = int(candidate.i)
+                j = int(candidate.j)
+                if previous_i is not None and i != previous_i + 1:
+                    if current_segment:
+                        candidate_segments.append(current_segment)
+                    current_segment = []
+                current_segment.append((i, j))
+                previous_i = i
+            if current_segment:
+                candidate_segments.append(current_segment)
+        for segment in candidate_segments:
+            if len(segment) < 2:
+                continue
+            points = [triangle_xy(i, j) for i, j in segment]
+            xs = [x for x, _y in points]
+            ys = [y for _x, y in points]
+            ax.plot(
+                xs,
+                ys,
+                "-",
+                color="white",
+                alpha=0.42,
+                linewidth=1.9,
+                label=label if not seen_candidate_label else None,
+            )
+            seen_candidate_label = True
+    return seen_candidate_label
+
+
+def _draw_gt_path(
+    ax,
+    score: Optional[np.ndarray],
+    picks: Sequence[TrianglePick],
+    *,
+    label: str = "GT best path",
+    marker_label: Optional[str] = None,
+) -> bool:
+    if not picks:
+        return False
+    points = [triangle_xy(pick.i, pick.j) for pick in picks]
+    xs = [x for x, _y in points]
+    ys = [y for _x, y in points]
+    if not xs:
+        return False
+    ax.plot(
+        xs,
+        ys,
+        "--",
+        color="red",
+        alpha=0.95,
+        linewidth=1.8,
+        label=_path_label(label, score, picks),
+    )
+    ax.plot(
+        xs,
+        ys,
+        "o",
+        markerfacecolor="red",
+        markeredgecolor="white",
+        markeredgewidth=0.6,
+        markersize=3.2,
+        linestyle="None",
+        label=marker_label,
+    )
+    return True
+
+
+def _draw_selected_path(
+    ax,
+    score: Optional[np.ndarray],
+    picks: Sequence[TrianglePick],
+    *,
+    label: str = "CKA selected path",
+    color: str = "#c000ff",
+    marker: str = "s",
+    marker_label: Optional[str] = None,
+) -> bool:
+    if not picks:
+        return False
+    points = [triangle_xy(pick.i, pick.j) for pick in picks]
+    xs = [x for x, _y in points]
+    ys = [y for _x, y in points]
+    if not xs:
+        return False
+    ax.plot(
+        xs,
+        ys,
+        "-",
+        color=color,
+        alpha=0.95,
+        linewidth=1.7,
+        label=_path_label(label, score, picks),
+    )
+    ax.plot(
+        xs,
+        ys,
+        marker,
+        markerfacecolor=color,
+        markeredgecolor="white",
+        markeredgewidth=0.6,
+        markersize=3.0,
+        linestyle="None",
+        label=marker_label,
+    )
+    return True
+
+
+def render_token_region_corner_grid(
+    token_region_items: Sequence[
+        tuple[str, np.ndarray, Sequence[TrianglePick], Optional[Mapping[int, Sequence[TrianglePick]]]]
+    ],
+    *,
+    out_dir: Path,
+    backbone: str,
+    selected_token_region: str,
+    gt_score: Optional[np.ndarray] = None,
+    gt_picks: Optional[Sequence[TrianglePick]] = None,
+    selection_label: str = "Endpoint-linked triangle",
+) -> Path:
+    """Render all token-region corner heatmaps in one 2x3 comparison figure."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not token_region_items:
+        raise ValueError("token_region_items must contain at least one token region")
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11), squeeze=False)
+    used_axes = []
+    last_im = None
+    selected_region = str(selected_token_region)
+    displayed_items = list(token_region_items[:5])
+
+    for index, (region, sim, picks, candidates_by_span) in enumerate(displayed_items):
+        row = 0 if index < 3 else 1
+        col = index if index < 3 else index - 3
+        ax = axes[row][col]
+        used_axes.append(ax)
+        n = int(sim.shape[0])
+        arr = _sim_to_heatmap_grid(np.asarray(sim, dtype=np.float64))
+        masked = np.ma.masked_invalid(arr)
+        last_im = imshow_upper_triangle(ax, masked, n, cmap="viridis", vmin=0.0, vmax=1.0)
+        display_region = _display_token_region_label(region)
+        is_selected = str(region) == selected_region
+        avg = _path_average_score(gt_score, picks)
+        title = f"{display_region}"
+        if is_selected:
+            title = f"SELECTED: {title}"
+        if avg is not None:
+            title += f"\nCKA avg={avg:.3f}"
+        ax.set_title(
+            title,
+            fontsize=12,
+            fontweight="bold" if is_selected else "normal",
+            color="red" if is_selected else "black",
+        )
+        configure_triangle_axes(ax, n, index_name="unit")
+        ax.tick_params(axis="both", labelsize=7)
+        _draw_span_candidate_segments_from_picks(
+            ax,
+            n=n,
+            picks=picks,
+            span_to_candidate_picks=candidates_by_span,
+        )
+        if gt_picks:
+            _draw_gt_path(ax, gt_score, gt_picks)
+        _draw_selected_path(
+            ax,
+            gt_score,
+            picks,
+            label=f"CKA selected path ({display_region})",
+            color="#c000ff",
+        )
+
+    for index in range(len(displayed_items), 6):
+        row = 0 if index < 3 else 1
+        col = index if index < 3 else index - 3
+        axes[row][col].axis("off")
+
+    if last_im is not None:
+        cbar = fig.colorbar(last_im, ax=used_axes, fraction=0.025, pad=0.015)
+        cbar.set_label("CKA similarity", fontsize=10)
+
+    legend_ax = axes[1][2]
+    if len(displayed_items) < 6:
+        legend_ax.axis("off")
+        handles = [
+            Line2D([0], [0], color="white", linewidth=1.9, label="Span candidates"),
+            Line2D([0], [0], color="#c000ff", marker="s", linewidth=1.7, label="CKA selected path"),
+        ]
+        if gt_picks:
+            handles.insert(
+                1,
+                Line2D(
+                    [0],
+                    [0],
+                    color="red",
+                    linestyle="--",
+                    marker="o",
+                    linewidth=1.8,
+                    label=_path_label("GT best path", gt_score, gt_picks),
+                ),
+            )
+        legend_ax.legend(handles=handles, loc="center", fontsize=10)
+
+    fig.suptitle(
+        f"{backbone}: token-region CKA corner-path comparison ({selection_label})",
+        fontsize=16,
+        fontweight="bold",
+    )
+    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    out_path = out_dir / f"prune_plan_{safe_backbone}_token_corners.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def _normalize_display_heatmap(values: np.ndarray) -> tuple[np.ndarray, float, float]:
@@ -742,7 +1012,7 @@ def render_gt_ranked_candidate_heatmap(
             markeredgewidth=0.6,
             markersize=3.5,
             linestyle="None",
-            label="Rank 1 vertex",
+            label=None,
         )
     cka_items: list[tuple[str, Sequence[TrianglePick]]] = []
     if cka_trajectories is not None:
@@ -757,6 +1027,341 @@ def render_gt_ranked_candidate_heatmap(
     out_path = out_dir / f"prune_plan_{safe_backbone}_gt_ranked_candidates.png"
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def _ranked_candidate_brightness(values: np.ndarray) -> np.ndarray:
+    values_arr = np.asarray(values, dtype=np.float64)
+    n = int(values_arr.shape[0])
+    ranked = np.full((n, n), np.nan, dtype=np.float64)
+    for span in range(1, n):
+        candidates: list[tuple[int, int, float]] = []
+        for i in range(0, n - span):
+            j = i + span
+            val = float(values_arr[i, j])
+            if np.isfinite(val):
+                candidates.append((i, j, val))
+        if not candidates:
+            continue
+        span_values = np.asarray([val for _i, _j, val in candidates], dtype=np.float64)
+        lo = float(np.nanmin(span_values))
+        hi = float(np.nanmax(span_values))
+        if hi <= lo:
+            for i, j, _val in candidates:
+                ranked[i, j] = 1.0
+        else:
+            denom = hi - lo
+            for i, j, val in candidates:
+                ranked[i, j] = 1.0 - (float(val) - lo) / denom
+    return ranked
+
+
+def render_gt_corner_comparison_heatmap(
+    score: np.ndarray,
+    picks: Sequence[TrianglePick],
+    *,
+    out_dir: Path,
+    backbone: str,
+    metric_names: Sequence[str],
+    cka_trajectories: Optional[Sequence[tuple[str, Sequence[TrianglePick]]]] = None,
+    relative_degradation_cap_multiple: float = 10.0,
+    component_aggregation: str = "mean",
+) -> Path:
+    """Render GT aggregate and within-span candidate brightness side-by-side."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    score_arr = np.asarray(score, dtype=np.float64)
+    n = int(score_arr.shape[0])
+    finite_score = np.isfinite(score_arr)
+    raw_min = float(np.nanmin(score_arr[finite_score])) if np.any(finite_score) else float("nan")
+    raw_max = float(np.nanmax(score_arr[finite_score])) if np.any(finite_score) else float("nan")
+    vmax = _relative_degradation_vmax([score_arr], relative_degradation_cap_multiple)
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 8.7), squeeze=False)
+    ax_score = axes[0][0]
+    ax_ranked = axes[0][1]
+
+    score_grid = _sim_to_heatmap_grid(score_arr)
+    score_masked = np.ma.masked_invalid(score_grid)
+    im_score = imshow_upper_triangle(
+        ax_score,
+        score_masked,
+        n,
+        cmap="viridis_r",
+        vmin=1.0,
+        vmax=vmax,
+    )
+    ax_score.set_title("GT aggregate relative degradation", fontsize=13, fontweight="bold")
+    configure_triangle_axes(ax_score, n, index_name="unit")
+    cbar_score = fig.colorbar(im_score, ax=ax_score, fraction=0.046, pad=0.04)
+    _format_relative_degradation_colorbar(cbar_score)
+    cbar_score.set_label(
+        (
+            f"Relative degradation multiple (1x = upper, {vmax:g}x = capped)"
+            if float(relative_degradation_cap_multiple) >= 1.0
+            else "Relative degradation multiple (1x = upper, uncapped)"
+        ),
+        fontsize=9,
+    )
+
+    ranked = _ranked_candidate_brightness(score_arr)
+    ranked_grid = _sim_to_heatmap_grid(ranked)
+    ranked_masked = np.ma.masked_invalid(ranked_grid)
+    im_ranked = imshow_upper_triangle(
+        ax_ranked,
+        ranked_masked,
+        n,
+        cmap="viridis",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    ax_ranked.set_title(
+        "GT candidates min-max scaled within each span",
+        fontsize=13,
+        fontweight="bold",
+    )
+    configure_triangle_axes(ax_ranked, n, index_name="unit")
+    cbar_ranked = fig.colorbar(im_ranked, ax=ax_ranked, fraction=0.046, pad=0.04)
+    cbar_ranked.set_label("Within-span brightness (1 = best/lowest score)", fontsize=9)
+
+    cka_items = list(cka_trajectories or [])
+    for ax in (ax_score, ax_ranked):
+        _draw_finite_score_candidate_segments(ax, score_arr)
+        drew_gt = _draw_gt_path(ax, score_arr, picks)
+        drew_cka = _draw_cka_trajectories(ax, score_arr, cka_items)
+        if drew_gt or drew_cka:
+            ax.legend(loc=TRIANGLE_EMPTY_LEGEND_LOC, fontsize=8)
+
+    if metric_names:
+        score_range = (
+            f"C multiple range: [{raw_min:.4f}, {raw_max:.4f}]\n"
+            if np.isfinite(raw_min) and np.isfinite(raw_max)
+            else ""
+        )
+        ax_score.text(
+            0.015,
+            0.015,
+            (
+                f"{score_range}aggregation: {component_aggregation}\n"
+                f"metrics: {', '.join(str(m) for m in metric_names)}"
+            ),
+            transform=ax_score.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=7,
+            color="black",
+            bbox={
+                "boxstyle": "round,pad=0.25",
+                "facecolor": "white",
+                "edgecolor": "#888888",
+                "alpha": 0.82,
+            },
+        )
+
+    fig.suptitle(
+        f"{backbone}: GT corner path and candidate-brightness comparison",
+        fontsize=16,
+        fontweight="bold",
+    )
+    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    out_path = out_dir / f"prune_plan_{safe_backbone}_gt_corners_and_ranked_candidates.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def render_corner_overview_heatmap(
+    token_region_items: Sequence[
+        tuple[str, np.ndarray, Sequence[TrianglePick], Optional[Mapping[int, Sequence[TrianglePick]]]]
+    ],
+    *,
+    out_dir: Path,
+    backbone: str,
+    selected_token_region: str,
+    gt_score: Optional[np.ndarray] = None,
+    gt_picks: Optional[Sequence[TrianglePick]] = None,
+    metric_names: Sequence[str] = (),
+    cka_trajectories: Optional[Sequence[tuple[str, Sequence[TrianglePick]]]] = None,
+    relative_degradation_cap_multiple: float = 10.0,
+    component_aggregation: str = "mean",
+    selection_label: str = "Endpoint-linked triangle",
+) -> Path:
+    """Render token CKA corners plus GT aggregate/ranked candidates in one 2-column grid."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not token_region_items and gt_score is None:
+        raise ValueError("Need at least one token-region panel or a GT score panel")
+
+    panels: list[tuple[str, object]] = []
+    for item in token_region_items:
+        panels.append(("token", item))
+    if gt_score is not None and gt_picks:
+        panels.append(("gt_score", None))
+        panels.append(("gt_ranked", None))
+
+    cols = 2
+    rows = int(np.ceil(len(panels) / cols))
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(15.5, max(6.4, rows * 6.0)),
+        squeeze=False,
+    )
+
+    selected_region = str(selected_token_region)
+    score_arr = None if gt_score is None else np.asarray(gt_score, dtype=np.float64)
+    gt_pick_list = list(gt_picks or [])
+    cka_items = list(cka_trajectories or [])
+    raw_min = raw_max = float("nan")
+    vmax = 1.0
+    if score_arr is not None:
+        finite_score = np.isfinite(score_arr)
+        raw_min = float(np.nanmin(score_arr[finite_score])) if np.any(finite_score) else float("nan")
+        raw_max = float(np.nanmax(score_arr[finite_score])) if np.any(finite_score) else float("nan")
+        vmax = _relative_degradation_vmax([score_arr], relative_degradation_cap_multiple)
+
+    for panel_index, (panel_kind, payload) in enumerate(panels):
+        row = panel_index // cols
+        col = panel_index % cols
+        ax = axes[row][col]
+
+        if panel_kind == "token":
+            region, sim, picks, candidates_by_span = payload  # type: ignore[misc]
+            sim_arr = np.asarray(sim, dtype=np.float64)
+            n = int(sim_arr.shape[0])
+            grid = _sim_to_heatmap_grid(sim_arr)
+            masked = np.ma.masked_invalid(grid)
+            im = imshow_upper_triangle(ax, masked, n, cmap="viridis", vmin=0.0, vmax=1.0)
+            display_region = _display_token_region_label(str(region))
+            is_selected = str(region) == selected_region
+            avg = _path_average_score(score_arr, picks) if score_arr is not None else None
+            title = f"{display_region}"
+            if is_selected:
+                title = f"SELECTED: {title}"
+            if avg is not None:
+                title += f"\nCKA avg={avg:.3f}"
+            ax.set_title(
+                title,
+                fontsize=12,
+                fontweight="bold" if is_selected else "normal",
+                color="red" if is_selected else "black",
+            )
+            configure_triangle_axes(ax, n, index_name="unit")
+            ax.tick_params(axis="both", labelsize=7)
+            _draw_span_candidate_segments_from_picks(
+                ax,
+                n=n,
+                picks=picks,
+                span_to_candidate_picks=candidates_by_span,
+            )
+            if score_arr is not None and gt_pick_list:
+                _draw_gt_path(ax, score_arr, gt_pick_list)
+            _draw_selected_path(
+                ax,
+                score_arr,
+                picks,
+                label=f"CKA selected path ({display_region})",
+                color="#c000ff",
+            )
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("CKA similarity", fontsize=8)
+            cbar.ax.tick_params(labelsize=7)
+            continue
+
+        if score_arr is None:
+            ax.axis("off")
+            continue
+
+        n = int(score_arr.shape[0])
+        if panel_kind == "gt_score":
+            score_grid = _sim_to_heatmap_grid(score_arr)
+            score_masked = np.ma.masked_invalid(score_grid)
+            im = imshow_upper_triangle(
+                ax,
+                score_masked,
+                n,
+                cmap="viridis_r",
+                vmin=1.0,
+                vmax=vmax,
+            )
+            ax.set_title("GT aggregate relative degradation", fontsize=12, fontweight="bold")
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            _format_relative_degradation_colorbar(cbar)
+            cbar.set_label(
+                (
+                    f"Relative degradation multiple (1x = upper, {vmax:g}x = capped)"
+                    if float(relative_degradation_cap_multiple) >= 1.0
+                    else "Relative degradation multiple (1x = upper, uncapped)"
+                ),
+                fontsize=8,
+            )
+            cbar.ax.tick_params(labelsize=7)
+            if metric_names:
+                score_range = (
+                    f"C multiple range: [{raw_min:.4f}, {raw_max:.4f}]\n"
+                    if np.isfinite(raw_min) and np.isfinite(raw_max)
+                    else ""
+                )
+                ax.text(
+                    0.015,
+                    0.015,
+                    (
+                        f"{score_range}aggregation: {component_aggregation}\n"
+                        f"metrics: {', '.join(str(m) for m in metric_names)}"
+                    ),
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="bottom",
+                    fontsize=6,
+                    color="black",
+                    bbox={
+                        "boxstyle": "round,pad=0.25",
+                        "facecolor": "white",
+                        "edgecolor": "#888888",
+                        "alpha": 0.82,
+                    },
+                )
+        else:
+            ranked = _ranked_candidate_brightness(score_arr)
+            ranked_grid = _sim_to_heatmap_grid(ranked)
+            ranked_masked = np.ma.masked_invalid(ranked_grid)
+            im = imshow_upper_triangle(
+                ax,
+                ranked_masked,
+                n,
+                cmap="viridis",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            ax.set_title(
+                "GT candidates min-max scaled within each span",
+                fontsize=12,
+                fontweight="bold",
+            )
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("Within-span brightness (1 = best/lowest score)", fontsize=8)
+            cbar.ax.tick_params(labelsize=7)
+
+        configure_triangle_axes(ax, n, index_name="unit")
+        ax.tick_params(axis="both", labelsize=7)
+        _draw_finite_score_candidate_segments(ax, score_arr)
+        drew_gt = _draw_gt_path(ax, score_arr, gt_pick_list)
+        drew_cka = _draw_cka_trajectories(ax, score_arr, cka_items)
+        if drew_gt or drew_cka:
+            ax.legend(loc=TRIANGLE_EMPTY_LEGEND_LOC, fontsize=6.5)
+
+    for empty_index in range(len(panels), rows * cols):
+        row = empty_index // cols
+        col = empty_index % cols
+        axes[row][col].axis("off")
+
+    fig.suptitle(
+        f"{backbone}: CKA token corners and GT corner comparison ({selection_label})",
+        fontsize=16,
+        fontweight="bold",
+    )
+    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    out_path = out_dir / f"prune_plan_{safe_backbone}_corner_overview.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
 

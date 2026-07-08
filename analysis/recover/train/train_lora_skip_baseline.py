@@ -56,10 +56,10 @@ from analysis.prune_plan import (
     unit_index_to_kind_layer,
     unit_index_to_unit_id,
 )
-from analysis.training_plan import compose_training_unit_prune_plan
+from analysis.prune_plan.recovery_plan import compose_training_unit_prune_plan
 from analysis.schema.v3 import dataset_output_tag, parse_dataset_plugin_args
 from analysis.backbones.cache_replay.vggt_family import mask_from_depth
-from analysis.train.model import build_skipped_layer_indices
+from analysis.recover.train.model import build_skipped_layer_indices
 from analysis.redundancy.cache_layout import (
     _replay_layer_files,
     load_scene_metadata,
@@ -181,6 +181,30 @@ def _load_scene_cache_row(cache_dir: Path, item: Dict[str, Any]) -> Dict[str, An
     row = dict(load_scene_metadata(cache_dir, item))
     row["pred"] = load_scene_pred(cache_dir, item)
     return row
+
+
+def _resolve_cache_dirs(args: argparse.Namespace) -> List[Path]:
+    raw = getattr(args, "cache_dir", None)
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [Path(p) for p in raw]
+    return [Path(raw)]
+
+
+def _load_training_scenes(cache_dirs: Sequence[Path], max_scenes: int) -> List[Dict[str, Any]]:
+    scenes: List[Dict[str, Any]] = []
+    for cache_dir in cache_dirs:
+        dataset_scenes = _load_manifest(Path(cache_dir))
+        if int(max_scenes) > 0:
+            dataset_scenes = dataset_scenes[: int(max_scenes)]
+        for item in dataset_scenes:
+            if not isinstance(item, dict):
+                continue
+            scene_item = dict(item)
+            scene_item["_cache_dir"] = str(cache_dir)
+            scenes.append(scene_item)
+    return scenes
 
 
 def _load_scannet_intrinsics(scene_dir: Path) -> np.ndarray:
@@ -859,14 +883,20 @@ def _extract_bound_payload(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("Train cache-first unit-prune + LoRA baseline.")
+    p = argparse.ArgumentParser("Train-based cache-first unit-prune + LoRA recovery.")
     p.add_argument(
         "--backbone",
         type=str,
         default=None,
         help="Backbone name (default: BACKEND env var, else vggt).",
     )
-    p.add_argument("--cache-dir", type=Path, required=True)
+    p.add_argument(
+        "--cache-dir",
+        type=Path,
+        action="append",
+        required=True,
+        help="Training cache directory. Repeat to train on multiple cache datasets.",
+    )
     p.add_argument("--hf-model", type=str, default="facebook/VGGT-1B")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument(
@@ -1094,13 +1124,24 @@ def main() -> None:
     if not lora_anchor_layers:
         raise SystemExit("Training plan has no trainable anchors; nothing to train.")
 
-    scenes = _load_manifest(args.cache_dir)
-    if int(args.max_scenes) > 0:
-        scenes = scenes[: int(args.max_scenes)]
+    cache_dirs = _resolve_cache_dirs(args)
+    if not cache_dirs:
+        raise SystemExit("At least one --cache-dir is required.")
+    scenes = _load_training_scenes(cache_dirs, int(args.max_scenes))
     if not scenes:
         raise SystemExit("No scenes selected from cache.")
 
-    num_layers = infer_num_layers(args.cache_dir, scenes)
+    num_layers = infer_num_layers(cache_dirs[0], [s for s in scenes if str(s.get("_cache_dir", "")) == str(cache_dirs[0])])
+    for cache_dir in cache_dirs[1:]:
+        cache_scenes = [s for s in scenes if str(s.get("_cache_dir", "")) == str(cache_dir)]
+        if not cache_scenes:
+            continue
+        cache_num_layers = infer_num_layers(cache_dir, cache_scenes)
+        if int(cache_num_layers) != int(num_layers):
+            raise SystemExit(
+                f"All training caches must have the same num_layers; got {cache_dirs[0]}={num_layers} "
+                f"and {cache_dir}={cache_num_layers}"
+            )
     if prune_plan.num_units != int(num_layers * 2):
         raise SystemExit(
             f"prune plan num_units={prune_plan.num_units} != expected {int(num_layers * 2)} from cache"
@@ -1118,7 +1159,8 @@ def main() -> None:
         json.dumps(
             {
                 "backbone": backbone,
-                "cache_dir": str(args.cache_dir),
+                "cache_dir": str(cache_dirs[0]),
+                "cache_dirs": [str(p) for p in cache_dirs],
                 "hf_model": args.hf_model,
                 "drop_indices": sorted(set(int(x) for x in prune_plan.drop)),
                 "lora_indices": lora_unit_indices,
@@ -1324,8 +1366,12 @@ def main() -> None:
         for si, item in enumerate(epoch_scenes):
             t_step0 = time.perf_counter()
             sid = str(item.get("scene_id", ""))
+            item_cache_dir_raw = str(item.get("_cache_dir", "")).strip()
+            if not item_cache_dir_raw:
+                raise RuntimeError(f"Scene {sid!r} is missing _cache_dir")
+            item_cache_dir = Path(item_cache_dir_raw)
             t_load0 = time.perf_counter()
-            row = _load_scene_cache_row(args.cache_dir, item)
+            row = _load_scene_cache_row(item_cache_dir, item)
             engine.validate_cache_row(row, num_layers=num_layers)
             layer_cpu_cache: Dict[int, torch.Tensor] = {}
 
@@ -1335,7 +1381,7 @@ def main() -> None:
                     return cached
                 map_loc = str(device) if device.type == "cuda" else "cpu"
                 t = load_scene_replay_layer(
-                    args.cache_dir,
+                    item_cache_dir,
                     item,
                     int(idx),
                     expected_num_layers=num_layers,
@@ -1346,12 +1392,12 @@ def main() -> None:
 
             from analysis.redundancy.cache_layout_v3 import require_minimal_cache_geometry
 
-            require_minimal_cache_geometry(row, cache_dir=args.cache_dir)
+            require_minimal_cache_geometry(row, cache_dir=item_cache_dir)
 
             teacher_pred = teacher_pred_to_map(row["pred"])
             adapter = get_backbone(backbone)
             h, w, seq_len, _patch_start = adapter.infer_train_cache_geometry(
-                row, model, _get_layer_cpu, cache_dir=args.cache_dir
+                row, model, _get_layer_cpu, cache_dir=item_cache_dir
             )
             dummy_images = adapter.build_train_dummy_images(row, model, device, _get_layer_cpu)
             t_load = time.perf_counter() - t_load0
@@ -1372,7 +1418,7 @@ def main() -> None:
                 if str(seed_kind).strip().lower() == "none":
                     from analysis.redundancy.cache_layout import load_scene_initial_tokens
 
-                    initial_tokens = load_scene_initial_tokens(args.cache_dir, item).to(
+                    initial_tokens = load_scene_initial_tokens(item_cache_dir, item).to(
                         device=device, non_blocking=(device.type == "cuda")
                     )
                 replay_kw: Dict[str, Any] = dict(
@@ -1613,6 +1659,7 @@ def main() -> None:
         "best_train_loss_total": best.get("loss_total"),
         "best_train_step": best.get("global_step"),
         "num_scenes": len(scenes),
+        "cache_dirs": [str(p) for p in cache_dirs],
         "drop_indices": sorted(set(int(x) for x in prune_plan.drop)),
         "lora_indices": lora_unit_indices,
         "train_unit_indices": train_unit_indices,

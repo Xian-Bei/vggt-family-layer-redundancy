@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 #
 # LaRe note: vendored from the official VGGT training repo
-# (backbones/vggt/training/loss.py). Used by analysis cache-replay training for
-# teacher-supervised camera / depth losses (compute_camera_loss, compute_depth_loss).
+# (backbones/vggt/training/loss.py). Kept with the VGGT adapters because these
+# teacher-supervised camera / depth losses are VGGT-family specific.
 
 import logging
 from dataclasses import dataclass
@@ -826,4 +826,3 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
 
     return flow_loss
 '''
-

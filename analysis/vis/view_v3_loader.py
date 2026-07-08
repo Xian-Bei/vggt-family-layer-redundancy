@@ -55,9 +55,9 @@ def discover_v3_backbones(output_root: Path) -> List[str]:
 
 def detect_v3_backbone_root(path: Path, *, output_root: Optional[Path] = None) -> Optional[Path]:
     """Return ``analysis_outputs_v3/<backbone>`` if *path* lies under a v3 backbone tree."""
-    from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT
-
-    root = Path(output_root or OUTPUT_ROOT_DEFAULT).resolve()
+    if output_root is None:
+        return None
+    root = Path(output_root).resolve()
     p = path.resolve()
     if not root.is_dir():
         return None

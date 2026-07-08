@@ -7,25 +7,34 @@ import gradio as gr
 
 
 GalleryItems = List[Tuple[str, str]]
-_POSE_METRICS = ("ape", "are", "rpe_trans", "rpe_rot")
-_POINT_METRICS = ("acc", "comp", "cd", "nc")
-_DEPTH_METRICS = ("depth_abs_rel", "depth_delta1")
-_METRIC_ORDER = (
-    *_POSE_METRICS,
-    *_DEPTH_METRICS,
-    *_POINT_METRICS,
-    "chamfer_distance",
-)
+RunsByBackbone = Dict[str, Dict[str, List[str]]]
+_DEFAULT_PLOT_GROUP = "all_prune_spans"
+_DEFAULT_RECOVERY_VIEW = "strategy_comparison"
 _BACKBONE_ORDER = ("vggt", "pi3", "vggt_omega")
-_DATASETS = (
-    ("scans_dev50", "scannet_dev50", "scans dev"),
-    ("scans_test50", "scannet_test50", "scans test"),
-    ("7scenes_test", "7scenes_test", "7scenes"),
-    ("nrgbd", "nrgbd", "nrgbd"),
-    ("nuscenes_val", "nuscenes_val", "nuscenes val"),
-    ("waymo_validation", "waymo_validation", "waymo validation"),
+_DATASET_ORDER = (
+    "mean",
+    "scannet_dev50",
+    "scannet_test50",
+    "7scenes_test",
+    "7scenes_train",
+    "nrgbd",
+    "nuscenes_val",
+    "nuscenes_train",
+    "waymo_validation",
+    "waymo_training",
 )
-_DATASET_KEYS = tuple(dataset for dataset, _dataset_tag, _label in _DATASETS)
+_DATASET_LABELS = {
+    "mean": "mean",
+    "scannet_dev50": "scans dev",
+    "scannet_test50": "scans test",
+    "7scenes_test": "7scenes",
+    "7scenes_train": "7scenes train",
+    "nrgbd": "nrgbd",
+    "nuscenes_val": "nuscenes val",
+    "nuscenes_train": "nuscenes train",
+    "waymo_validation": "waymo validation",
+    "waymo_training": "waymo training",
+}
 
 
 def _backbone_sort_key(name: str) -> Tuple[int, str]:
@@ -38,51 +47,102 @@ def _backbone_sort_key(name: str) -> Tuple[int, str]:
         return (len(_BACKBONE_ORDER), key)
 
 
-def _sort_models(models: Sequence[str]) -> List[str]:
-    return sorted([str(m) for m in models], key=_backbone_sort_key)
-
-
-def _sort_runs_by_plan(runs_by_plan: Dict[str, List[str]]) -> Dict[str, List[str]]:
+def _sort_runs_by_backbone(runs_by_backbone: RunsByBackbone) -> RunsByBackbone:
     return {
-        str(plan): _sort_models(models)
-        for plan, models in sorted(runs_by_plan.items())
+        str(backbone): {
+            str(plot_group): sorted(str(recovery_view) for recovery_view in recovery_views)
+            for plot_group, recovery_views in sorted(recovery_runs.items())
+        }
+        for backbone, recovery_runs in sorted(
+            runs_by_backbone.items(), key=lambda item: _backbone_sort_key(item[0])
+        )
     }
 
 
-def _metric_sort_key(metric: str) -> Tuple[int, str]:
-    key = str(metric)
+def _dataset_sort_key(name: str) -> Tuple[int, str]:
+    key = str(name or "").strip()
     try:
-        return (_METRIC_ORDER.index(key), key)
+        return (_DATASET_ORDER.index(key), key)
     except ValueError:
-        return (len(_METRIC_ORDER), key)
+        return (len(_DATASET_ORDER), key)
 
 
-def _items_for_metrics(items: GalleryItems, metrics: Tuple[str, ...]) -> GalleryItems:
-    by_metric = {str(item[1]): item for item in items}
-    return [by_metric[m] for m in metrics if m in by_metric]
+def _dataset_label(dataset_tag: str) -> str:
+    key = str(dataset_tag or "").strip()
+    if key in _DATASET_LABELS:
+        return _DATASET_LABELS[key]
+    return key.replace("_", " ")
 
 
-def _gallery_items_from_disk(run_dir: Path, dataset_tag: str) -> GalleryItems:
-    prefix = f"eval_plot_{dataset_tag}_"
-    items: GalleryItems = []
-    for path in sorted(run_dir.glob(f"{prefix}*.png")):
-        metric = path.stem[len(prefix):]
-        items.append((str(path.resolve()), metric))
-    return sorted(items, key=lambda item: _metric_sort_key(item[1]))
+def _discover_dataset_specs(recovery_root: Path, backbones: Sequence[str]) -> List[Tuple[str, str, str]]:
+    root = Path(recovery_root)
+    discovered = set()
+    for backbone in backbones:
+        backbone_dir = root / str(backbone)
+        if not backbone_dir.is_dir():
+            continue
+        for path in backbone_dir.glob("*/eval/recover/*_recover_strategies_by_span.png"):
+            dataset_tag = path.parent.parent.parent.name
+            expected = f"{dataset_tag}_recover_strategies_by_span.png"
+            if path.name == expected:
+                discovered.add(dataset_tag)
+    datasets = sorted(discovered, key=_dataset_sort_key)
+    if datasets:
+        datasets = ["mean", *datasets]
+    return [(dataset_tag, dataset_tag, _dataset_label(dataset_tag)) for dataset_tag in datasets]
 
 
-def build_lora_tab(
+def _plot_path(recovery_root: Path, backbone_name: str, dataset_tag: str) -> Path:
+    if str(dataset_tag) == "mean":
+        return (
+            Path(recovery_root)
+            / str(backbone_name)
+            / "eval"
+            / "recover"
+            / "mean_recover_strategies_by_span.png"
+        )
+    return (
+        Path(recovery_root)
+        / str(backbone_name)
+        / str(dataset_tag)
+        / "eval"
+        / "recover"
+        / f"{dataset_tag}_recover_strategies_by_span.png"
+    )
+
+
+def _gallery_items_from_disk(recovery_root: Path, backbone_name: str, dataset_tag: str) -> GalleryItems:
+    path = _plot_path(recovery_root, backbone_name, dataset_tag)
+    if not path.is_file():
+        return []
+    return [(str(path.resolve()), "lower + recovery strategies")]
+
+
+def build_recovery_tab(
     *,
     blocks: gr.Blocks,
-    lora_root: Path,
-    discover_lora_runs: Callable[[Path], Dict[str, List[str]]],
-    lora_plot_rows: Callable[[Path, str, str], Dict[str, GalleryItems]],
+    recovery_root: Path,
+    discover_recovery_runs: Callable[[Path], RunsByBackbone],
+    recovery_plot_rows: Callable[[Path, str, str, str], Dict[str, GalleryItems]],
+    tab_id: str = "recovery_results",
 ) -> Dict[str, Any]:
-    runs_by_plan = _sort_runs_by_plan(discover_lora_runs(Path(lora_root)))
-    plan_choices = list(runs_by_plan.keys())
-    initial_plan = plan_choices[0] if plan_choices else None
-    model_choices = runs_by_plan.get(str(initial_plan), []) if initial_plan else []
-    initial_model = model_choices[0] if model_choices else None
+    runs_by_backbone = _sort_runs_by_backbone(discover_recovery_runs(Path(recovery_root)))
+    backbone_choices = list(runs_by_backbone.keys())
+    initial_backbone = backbone_choices[0] if backbone_choices else None
+    plot_group_choices = (
+        list(runs_by_backbone.get(str(initial_backbone), {}).keys())
+        if initial_backbone
+        else []
+    )
+    initial_plot_group = plot_group_choices[0] if plot_group_choices else None
+    recovery_view_choices = (
+        runs_by_backbone.get(str(initial_backbone), {}).get(str(initial_plot_group), [])
+        if initial_backbone and initial_plot_group
+        else []
+    )
+    initial_recovery_view = recovery_view_choices[0] if recovery_view_choices else None
+    dataset_specs = _discover_dataset_specs(Path(recovery_root), backbone_choices)
+    dataset_keys = [dataset for dataset, _dataset_tag, _label in dataset_specs]
 
     def _gallery_values(
         rows: Dict[str, GalleryItems],
@@ -90,171 +150,261 @@ def build_lora_tab(
     ) -> Tuple[Any, ...]:
         selected = {str(dataset) for dataset in (selected_datasets or [])}
         out: List[Any] = []
-        for dataset, _dataset_tag, _label in _DATASETS:
-            items = rows.get(dataset, [])
-            visible = dataset in selected
-            out.extend(
-                [
-                    gr.update(
-                        value=_items_for_metrics(items, _POSE_METRICS), visible=visible
-                    ),
-                    gr.update(
-                        value=_items_for_metrics(items, _POINT_METRICS), visible=visible
-                    ),
-                    gr.update(
-                        value=_items_for_metrics(items, _DEPTH_METRICS), visible=visible
-                    ),
-                ]
+        for dataset, _dataset_tag, _label in dataset_specs:
+            out.append(
+                gr.update(
+                    value=rows.get(dataset, []),
+                    visible=dataset in selected,
+                )
             )
-        out.append(rows.get("training", []))
         return tuple(out)
 
-    def _rows_for_display(plan_name: str, model_name: str) -> Dict[str, GalleryItems]:
-        rows = dict(lora_plot_rows(Path(lora_root), plan_name, model_name))
-        run_dir = Path(lora_root) / str(model_name) / "scannet_dev50" / "train" / str(plan_name)
-        for row_key, dataset_tag, _label in _DATASETS:
+    def _rows_for_display(
+        backbone_name: str,
+        plot_group_name: str,
+        recovery_view_name: str,
+    ) -> Dict[str, GalleryItems]:
+        rows = dict(
+            recovery_plot_rows(
+                Path(recovery_root),
+                plot_group_name,
+                recovery_view_name,
+                backbone_name,
+            )
+        )
+        for row_key, dataset_tag, _label in dataset_specs:
             if not rows.get(row_key):
-                rows[row_key] = _gallery_items_from_disk(run_dir, dataset_tag)
+                rows[row_key] = _gallery_items_from_disk(
+                    Path(recovery_root),
+                    backbone_name,
+                    dataset_tag,
+                )
         return rows
 
+    def _status(
+        backbone_name: str,
+        plot_group_name: str,
+        recovery_view_name: str,
+        rows: Dict[str, GalleryItems],
+        *,
+        empty_suffix: str = "no images found",
+    ) -> str:
+        image_count = sum(len(v) for v in rows.values())
+        suffix = f"images={image_count}" if image_count else empty_suffix
+        return (
+            f"backbone={backbone_name} | plot_group={plot_group_name} | "
+            f"recovery_view={recovery_view_name} | {suffix}"
+        )
+
     def _refresh(
-        plan_name: str,
-        model_name: str,
+        backbone_name: str,
+        plot_group_name: str,
+        recovery_view_name: str,
         selected_datasets: Sequence[str],
     ):
-        plan_name = str(plan_name or "").strip()
-        model_name = str(model_name or "").strip()
-        if not plan_name or not model_name:
+        backbone_name = str(backbone_name or "").strip()
+        plot_group_name = str(plot_group_name or "").strip()
+        recovery_view_name = str(recovery_view_name or "").strip()
+        if not backbone_name or not plot_group_name or not recovery_view_name:
             return (
                 *_gallery_values({}, selected_datasets),
-                "No pruning plan/model selected.",
+                "No backbone/recovery plot group selected.",
             )
-        rows = _rows_for_display(plan_name, model_name)
+        rows = _rows_for_display(backbone_name, plot_group_name, recovery_view_name)
         return (
             *_gallery_values(rows, selected_datasets),
+            _status(backbone_name, plot_group_name, recovery_view_name, rows),
+        )
+
+    def _backbone_changed(backbone_name: str, selected_datasets: Sequence[str]):
+        backbone_name = str(backbone_name or "").strip()
+        plot_group_choices = list(runs_by_backbone.get(backbone_name, {}).keys())
+        plot_group_name = plot_group_choices[0] if plot_group_choices else ""
+        recovery_view_choices = (
+            runs_by_backbone.get(backbone_name, {}).get(plot_group_name, [])
+            if plot_group_name
+            else []
+        )
+        recovery_view_name = recovery_view_choices[0] if recovery_view_choices else ""
+        rows = (
+            _rows_for_display(backbone_name, plot_group_name, recovery_view_name)
+            if recovery_view_name
+            else {}
+        )
+        return (
+            gr.update(choices=plot_group_choices, value=plot_group_name),
+            gr.update(choices=recovery_view_choices, value=recovery_view_name),
+            *_gallery_values(rows, selected_datasets),
             (
-                f"plan={plan_name} | model={model_name} | "
-                f"images={sum(len(v) for v in rows.values())}"
+                _status(backbone_name, plot_group_name, recovery_view_name, rows)
+                if recovery_view_name
+                else f"backbone={backbone_name} | no recovery plots found"
             ),
         )
 
-    def _plan_changed(plan_name: str, selected_datasets: Sequence[str]):
-        plan_name = str(plan_name or "").strip()
-        choices = _sort_models(runs_by_plan.get(plan_name, []))
-        model_name = choices[0] if choices else ""
-        rows = _rows_for_display(plan_name, model_name) if model_name else {}
+    def _plot_group_changed(
+        backbone_name: str,
+        plot_group_name: str,
+        selected_datasets: Sequence[str],
+    ):
+        backbone_name = str(backbone_name or "").strip()
+        plot_group_name = str(plot_group_name or "").strip()
+        recovery_view_choices = runs_by_backbone.get(backbone_name, {}).get(plot_group_name, [])
+        recovery_view_name = recovery_view_choices[0] if recovery_view_choices else ""
+        rows = (
+            _rows_for_display(backbone_name, plot_group_name, recovery_view_name)
+            if recovery_view_name
+            else {}
+        )
         return (
-            gr.update(choices=choices, value=model_name),
+            gr.update(choices=recovery_view_choices, value=recovery_view_name),
             *_gallery_values(rows, selected_datasets),
             (
-                f"plan={plan_name} | model={model_name} | "
-                f"images={sum(len(v) for v in rows.values())}"
-                if model_name
-                else f"plan={plan_name} | no trained models found"
+                _status(backbone_name, plot_group_name, recovery_view_name, rows)
+                if recovery_view_name
+                else (
+                    f"backbone={backbone_name} | plot_group={plot_group_name} | "
+                    "no recovery views found"
+                )
             ),
         )
 
-    with gr.Tab("LoRA Results") as tab_lora:
-        gr.Markdown("## LoRA Results")
+    def _recovery_view_changed(
+        backbone_name: str,
+        plot_group_name: str,
+        recovery_view_name: str,
+        selected_datasets: Sequence[str],
+    ):
+        backbone_name = str(backbone_name or "").strip()
+        plot_group_name = str(plot_group_name or "").strip()
+        recovery_view_name = str(recovery_view_name or "").strip()
+        rows = (
+            _rows_for_display(backbone_name, plot_group_name, recovery_view_name)
+            if backbone_name and plot_group_name and recovery_view_name
+            else {}
+        )
+        return (
+            *_gallery_values(rows, selected_datasets),
+            (
+                _status(backbone_name, plot_group_name, recovery_view_name, rows)
+                if rows
+                else (
+                    f"backbone={backbone_name} | plot_group={plot_group_name} | "
+                    f"recovery_view={recovery_view_name} | no images found"
+                )
+            ),
+        )
+
+    with gr.Tab("Recovery Results", id=tab_id) as tab_recovery:
+        gr.Markdown("## Recovery Results")
         with gr.Row():
             with gr.Column(scale=1):
-                lora_plan_dd = gr.Dropdown(
-                    label="Pruning plan",
-                    choices=plan_choices,
-                    value=initial_plan,
+                recovery_backbone_dd = gr.Dropdown(
+                    label="Backbone",
+                    choices=backbone_choices,
+                    value=initial_backbone,
                 )
-                lora_model_dd = gr.Dropdown(
-                    label="Model",
-                    choices=model_choices,
-                    value=initial_model,
+                recovery_plot_group_dd = gr.Dropdown(
+                    label="Plot group",
+                    choices=plot_group_choices,
+                    value=initial_plot_group,
                 )
-                lora_dataset_cb = gr.CheckboxGroup(
+                recovery_view_dd = gr.Dropdown(
+                    label="Recovery view",
+                    choices=recovery_view_choices,
+                    value=initial_recovery_view,
+                )
+                recovery_dataset_cb = gr.CheckboxGroup(
                     label="Dataset",
                     choices=[
-                        (label, dataset) for dataset, _dataset_tag, label in _DATASETS
+                        (label, dataset) for dataset, _dataset_tag, label in dataset_specs
                     ],
-                    value=list(_DATASET_KEYS),
+                    value=list(dataset_keys),
                 )
-                lora_info = gr.Textbox(label="Status", interactive=False)
+                recovery_info = gr.Textbox(label="Status", interactive=False)
             with gr.Column(scale=5):
                 eval_galleries: List[gr.Gallery] = []
-                for _dataset, _dataset_tag, label in _DATASETS:
+                for _dataset, _dataset_tag, label in dataset_specs:
                     eval_galleries.append(
                         gr.Gallery(
-                            label=f"{label} · pose",
-                            columns=4,
+                            label=f"{label} · lower/recovery comparison",
+                            columns=1,
                             rows=1,
                             height="auto",
                             object_fit="contain",
-                            elem_classes=["results-gallery", "lora-eval-gallery"],
+                            elem_classes=["results-gallery", "recovery-eval-gallery"],
                         )
                     )
-                    eval_galleries.append(
-                        gr.Gallery(
-                            label=f"{label} · point",
-                            columns=4,
-                            rows=1,
-                            height="auto",
-                            object_fit="contain",
-                            elem_classes=["results-gallery", "lora-eval-gallery"],
-                        )
-                    )
-                    eval_galleries.append(
-                        gr.Gallery(
-                            label=f"{label} · depth",
-                            columns=4,
-                            rows=1,
-                            height="auto",
-                            object_fit="contain",
-                            elem_classes=["results-gallery", "lora-eval-gallery"],
-                        )
-                    )
-                training_gallery = gr.Gallery(
-                    label="training",
-                    columns=2,
-                    rows=1,
-                    height="auto",
-                    object_fit="contain",
-                    elem_classes=["results-gallery", "lora-training-gallery"],
-                )
 
         gallery_outputs = [
             *eval_galleries,
-            training_gallery,
-            lora_info,
+            recovery_info,
         ]
-        lora_plan_dd.change(
-            _plan_changed,
-            inputs=[lora_plan_dd, lora_dataset_cb],
-            outputs=[lora_model_dd, *gallery_outputs],
+        recovery_backbone_dd.change(
+            _backbone_changed,
+            inputs=[recovery_backbone_dd, recovery_dataset_cb],
+            outputs=[recovery_plot_group_dd, recovery_view_dd, *gallery_outputs],
             show_progress="minimal",
             trigger_mode="always_last",
         )
-        lora_model_dd.change(
-            _refresh,
-            inputs=[lora_plan_dd, lora_model_dd, lora_dataset_cb],
+        recovery_plot_group_dd.change(
+            _plot_group_changed,
+            inputs=[recovery_backbone_dd, recovery_plot_group_dd, recovery_dataset_cb],
+            outputs=[recovery_view_dd, *gallery_outputs],
+            show_progress="minimal",
+            trigger_mode="always_last",
+        )
+        recovery_view_dd.change(
+            _recovery_view_changed,
+            inputs=[
+                recovery_backbone_dd,
+                recovery_plot_group_dd,
+                recovery_view_dd,
+                recovery_dataset_cb,
+            ],
             outputs=gallery_outputs,
             show_progress="minimal",
             trigger_mode="always_last",
         )
-        lora_dataset_cb.change(
+        recovery_dataset_cb.change(
             _refresh,
-            inputs=[lora_plan_dd, lora_model_dd, lora_dataset_cb],
-            outputs=gallery_outputs,
-            show_progress="hidden",
-            trigger_mode="always_last",
-        )
-        tab_lora.select(
-            _refresh,
-            inputs=[lora_plan_dd, lora_model_dd, lora_dataset_cb],
+            inputs=[
+                recovery_backbone_dd,
+                recovery_plot_group_dd,
+                recovery_view_dd,
+                recovery_dataset_cb,
+            ],
             outputs=gallery_outputs,
             show_progress="minimal",
+            trigger_mode="always_last",
         )
         blocks.load(
             _refresh,
-            inputs=[lora_plan_dd, lora_model_dd, lora_dataset_cb],
+            inputs=[
+                recovery_backbone_dd,
+                recovery_plot_group_dd,
+                recovery_view_dd,
+                recovery_dataset_cb,
+            ],
             outputs=gallery_outputs,
             show_progress="minimal",
         )
 
-    return {"tab": tab_lora}
+    return {"tab": tab_recovery}
+
+
+def build_lora_tab(
+    *,
+    blocks: gr.Blocks,
+    lora_root: Path,
+    discover_lora_runs: Callable[[Path], RunsByBackbone],
+    lora_plot_rows: Callable[[Path, str, str, str], Dict[str, GalleryItems]],
+    tab_id: str = "recovery_results",
+) -> Dict[str, Any]:
+    return build_recovery_tab(
+        blocks=blocks,
+        recovery_root=lora_root,
+        discover_recovery_runs=discover_lora_runs,
+        recovery_plot_rows=lora_plot_rows,
+        tab_id=tab_id,
+    )

@@ -159,14 +159,13 @@ data/*
 data/7scenes/
 data/neural_rgbd_data/
 data/nuscenes/
-data/quantvggt/
 data/scans_dev50/
 data/scans_test50/
 data/waymo/
 data/waymo_raw/
 data/__pycache__/
-analysis_outputs/
-analysis_outputs_v3/
+submodules/quantvggt/
+analysis_outputs*/
 .gradio/
 examples/
 nouse/

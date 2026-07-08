@@ -5,7 +5,7 @@ set -euo pipefail
 # These are deployment parameters, not evaluation dataset payloads or VGGT weights.
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-DEST_DIR="${QUANTVGGT_PARAMS_DIR:-${REPO_ROOT}/data/quantvggt/w4a4_official}"
+DEST_DIR="${QUANTVGGT_PARAMS_DIR:-${REPO_ROOT}/submodules/quantvggt/w4a4_official}"
 FORCE_DOWNLOAD="${QUANTVGGT_FORCE_DOWNLOAD:-0}"
 HF_REVISION="831f53a9351aa2b857069d56f37523febd0e0218"
 BASE_URL="https://huggingface.co/wlfeng/QuantVGGT/resolve/${HF_REVISION}/a44_quant_model_tracker_fixed_e20.pt_sym"

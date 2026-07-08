@@ -15,14 +15,15 @@ def launch_cache_replay_training(backbone: str, args: TrainFromCacheArgs) -> Non
     apply_pythonpath(name)
     os.environ["BACKEND"] = name
     train_dtype = str(args.dtype)
+    cache_dirs = [str(p) for p in (getattr(args, "cache_dirs", None) or ()) if str(p)]
+    if not cache_dirs:
+        cache_dirs = [str(args.cache_dir)]
     train_argv = [
         sys.executable,
         "-m",
-        "analysis.train.train_lora_skip_baseline",
+        "analysis.recover.train.train_lora_skip_baseline",
         "--backbone",
         name,
-        "--cache-dir",
-        str(args.cache_dir),
         "--hf-model",
         str(args.hf_model),
         "--output-dir",
@@ -50,6 +51,8 @@ def launch_cache_replay_training(backbone: str, args: TrainFromCacheArgs) -> Non
         "--max-eval-views",
         str(int(args.max_eval_views)),
     ]
+    for cache_dir in cache_dirs:
+        train_argv.extend(["--cache-dir", cache_dir])
     training_plan_root = str(getattr(args, "training_plan_root", "") or "")
     training_plan_name = str(getattr(args, "training_plan_name", "") or "")
     if training_plan_root:

@@ -1,3 +1,5 @@
+"""Recovery-plan helpers layered on top of prune-span bundles."""
+
 from __future__ import annotations
 
 import json
@@ -14,34 +16,72 @@ from analysis.prune_plan import (
 )
 
 TRAINING_PLAN_BUNDLE_SCHEMA_VERSION = "training_plan_bundle_v1"
-TRAINING_PLAN_METHODS = ("lora_prune", "train_original")
+TRAINING_PLAN_METHODS = (
+    "recovery_lora",
+    "recovery_train",
+    "recovery_diag",
+    "recovery_rotate",
+    "recovery_ghost",
+)
+TRAINABLE_RECOVERY_METHODS = ("recovery_lora", "recovery_train")
+TRAINING_FREE_RECOVERY_METHODS = ("recovery_diag", "recovery_rotate", "recovery_ghost")
 
 _SPAN_SELECTOR_RE = re.compile(r"^prune_span(?P<span>\d+)$")
+
+
+def execution_method(method: str) -> str:
+    method_key = str(method).strip().lower()
+    if method_key == "recovery_lora":
+        return "lora_prune"
+    if method_key == "recovery_train":
+        return "train_original"
+    return method_key
 
 
 def training_plan_name(*, method: str, lora_prefix: int, lora_rank: int = 0) -> str:
     method_key = str(method).strip().lower()
     prefix = int(lora_prefix)
-    if method_key == "lora_prune":
-        return f"training_lora_l{prefix}_r{int(lora_rank)}"
-    if method_key == "train_original":
-        return f"training_original_l{prefix}"
+    if method_key == "recovery_lora":
+        return f"recovery_lora_l{prefix}_r{int(lora_rank)}"
+    if method_key == "recovery_train":
+        return f"recovery_train_l{prefix}"
+    if method_key in TRAINING_FREE_RECOVERY_METHODS:
+        return method_key
     raise ValueError(f"unknown training plan method: {method!r}")
 
 
 def training_plan_filename(name: str) -> str:
-    key = str(name or "").strip()
+    key = normalize_training_plan_name(name)
     if not key:
         raise ValueError("training plan name must be non-empty")
     return key if key.endswith(".json") else f"{key}.json"
+
+
+def normalize_training_plan_name(name: str) -> str:
+    key = str(name or "").strip()
+    suffix = ".json"
+    had_json_suffix = key.endswith(suffix)
+    stem = key[: -len(suffix)] if had_json_suffix else key
+    return f"{stem}{suffix}" if had_json_suffix else stem
 
 
 def training_plan_path(root: Path, name: str) -> Path:
     return Path(root) / training_plan_filename(name)
 
 
+def _legacy_training_plan_path(root: Path, name: str) -> Path:
+    key = str(name or "").strip()
+    if not key:
+        raise ValueError("training plan name must be non-empty")
+    return Path(root) / (key if key.endswith(".json") else f"{key}.json")
+
+
 def load_training_plan_bundle(root: Path, name: str) -> Dict[str, Any]:
     path = training_plan_path(root, name)
+    if not path.is_file():
+        legacy_path = _legacy_training_plan_path(root, name)
+        if legacy_path.is_file():
+            path = legacy_path
     if not path.is_file():
         raise FileNotFoundError(f"Missing training plan bundle: {path}")
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -58,7 +98,8 @@ def load_training_plan_bundle(root: Path, name: str) -> Dict[str, Any]:
 
 def list_training_plan_names(root: Path) -> List[str]:
     out: List[str] = []
-    for path in sorted(Path(root).glob("training_*.json")):
+    paths = list(Path(root).glob("recovery_*.json"))
+    for path in sorted(set(paths)):
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -115,11 +156,12 @@ def compose_training_unit_prune_plan(
             f"Training plan {training_plan!r} has no record for {prune_selector!r}"
         )
     method = str(bundle.get("method", "")).strip().lower()
+    exec_method = execution_method(method)
     if method not in TRAINING_PLAN_METHODS:
-        raise ValueError(f"Invalid training plan method: {method!r}")
+        raise ValueError(f"Invalid recovery plan method: {method!r}")
     lora_raw = record.get("lora", {})
     lora: Dict[str, UnitLoraSpec] = {}
-    if method == "lora_prune":
+    if exec_method == "lora_prune":
         if not isinstance(lora_raw, dict):
             raise ValueError(f"Invalid lora record for {prune_selector}: expected object")
         lora = {
@@ -132,14 +174,19 @@ def compose_training_unit_prune_plan(
     extra.update(
         {
             "training_plan_schema_version": TRAINING_PLAN_BUNDLE_SCHEMA_VERSION,
-            "training_plan_name": str(training_plan).removesuffix(".json"),
-            "training_method": method,
+            "training_plan_name": normalize_training_plan_name(training_plan).removesuffix(".json"),
+            "training_method": exec_method,
+            "recovery_method": method,
             "lora_prefix": int(bundle.get("lora_prefix", 0)),
             "lora_rank": int(bundle.get("lora_rank", 0)),
             "lora_indices": [int(x) for x in list(record.get("lora_indices", []))],
             "train_unit_indices": [int(x) for x in list(record.get("train_unit_indices", []))],
             "cache_unit_ids": [str(x) for x in list(record.get("cache_unit_ids", []))],
             "cache_unit_indices": [int(x) for x in list(record.get("cache_unit_indices", []))],
+            "recovery_source_unit_index": record.get("source_unit_index"),
+            "recovery_target_unit_index": record.get("target_unit_index"),
+            "recovery_source_unit_id": record.get("source_unit_id"),
+            "recovery_target_unit_id": record.get("target_unit_id"),
         }
     )
     out = UnitPrunePlan(

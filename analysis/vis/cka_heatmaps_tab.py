@@ -4,11 +4,6 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import gradio as gr
 
-from analysis.redundancy.similarity_v3 import (
-    DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS,
-    REDUNDANCY_GRAPH_REGIONS,
-)
-
 _BACKBONE_ORDER: Tuple[str, ...] = (
     "vggt",
     "pi3",
@@ -117,9 +112,8 @@ def build_cka_heatmaps_tab(
     def _refresh_sorted(
         token_region: str,
         sim_cutoff_value: float,
-        exclude_token_regions: List[str],
     ) -> Tuple[Any, ...]:
-        raw = tuple(refresh_cka_heatmaps_cb(token_region, sim_cutoff_value, exclude_token_regions))
+        raw = tuple(refresh_cka_heatmaps_cb(token_region, sim_cutoff_value))
         cells_per_model = len(source_dataset_names) + 1
         total = len(source_model_names) * cells_per_model
         if len(raw) < total + 1:
@@ -165,12 +159,6 @@ def build_cka_heatmaps_tab(
                     step=0.01,
                     interactive=bool(dataset_names and model_names and token_region_names),
                 )
-                cka_exclude_token_regions = gr.CheckboxGroup(
-                    label="Exclude from mean/min",
-                    choices=list(REDUNDANCY_GRAPH_REGIONS),
-                    value=list(DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS),
-                    interactive=bool(dataset_names and model_names and token_region_names),
-                )
                 cka_info = gr.Textbox(label="Displayed counts", interactive=False)
             with gr.Column(scale=5, elem_classes=["cka-heatmap-matrix"]):
                 cka_images: List[gr.Image] = []
@@ -207,7 +195,7 @@ def build_cka_heatmaps_tab(
                 else:
                     gr.Markdown("No v3 redundancy outputs found for CKA heatmaps.")
 
-        cka_inputs = [cka_token_region, cka_sim_cutoff_slider, cka_exclude_token_regions]
+        cka_inputs = [cka_token_region, cka_sim_cutoff_slider]
         cka_outputs = [*cka_images, cka_info]
 
         if cka_images:
@@ -235,7 +223,6 @@ def build_cka_heatmaps_tab(
 
             _bind_refresh(cka_token_region.change)
             _bind_refresh(cka_sim_cutoff_slider.release)
-            _bind_refresh(cka_exclude_token_regions.change)
             _bind_refresh(tab_cka.select, with_trigger_mode=False)
         else:
             cka_info.value = "No v3 redundancy outputs found for CKA heatmaps."
@@ -244,7 +231,6 @@ def build_cka_heatmaps_tab(
         "tab": tab_cka,
         "cka_token_region": cka_token_region,
         "cka_sim_cutoff_slider": cka_sim_cutoff_slider,
-        "cka_exclude_token_regions": cka_exclude_token_regions,
         "cka_images": cka_images,
         "cka_info": cka_info,
         "cka_inputs": cka_inputs,

@@ -119,8 +119,7 @@ def _reshape_global_to_match_frame(frame: torch.Tensor, global_t: torch.Tensor) 
     )
 
 
-def _load_unit_tensor(scene_dir: Path, unit_id: str, *, map_location: Optional[str] = None) -> torch.Tensor:
-    path = scene_dir / "layers" / f"{unit_id}.pt"
+def _load_unit_tensor(path: Path, *, map_location: Optional[str] = None) -> torch.Tensor:
     if not path.is_file():
         raise FileNotFoundError(f"Missing layer unit file {path}")
     load_kw: Dict[str, Any] = {"weights_only": False}
@@ -137,6 +136,22 @@ def _load_unit_tensor(scene_dir: Path, unit_id: str, *, map_location: Optional[s
     if t.dim() != 4:
         raise ValueError(f"Expected 4D unit tensor at {path}, got {tuple(t.shape)}")
     return t.contiguous()
+
+
+def _unit_path_from_manifest(
+    cache_dir: Path,
+    scene_dir: Path,
+    item: Dict[str, Any],
+    unit_id: str,
+) -> tuple[Path, bool]:
+    layer_files = item.get("layer_files")
+    if isinstance(layer_files, dict):
+        rel = str(layer_files.get(unit_id, "")).strip()
+        if rel:
+            return cache_dir / rel, True
+        return scene_dir / "layers" / f"{unit_id}.pt", False
+    path = scene_dir / "layers" / f"{unit_id}.pt"
+    return path, path.is_file()
 
 
 def _missing_partner_like(ref: torch.Tensor) -> torch.Tensor:
@@ -157,22 +172,20 @@ def load_scene_replay_layer_v3(
         raise ValueError(f"layer_idx must be >= 0, got {layer_idx}")
     scene_dir = cache_dir / str(item.get("dir", item.get("scene_id", "")))
     frame_id, global_id = f"frame_{layer_idx}", f"global_{layer_idx}"
-    frame_path = scene_dir / "layers" / f"{frame_id}.pt"
-    global_path = scene_dir / "layers" / f"{global_id}.pt"
-    has_f = frame_path.is_file()
-    has_g = global_path.is_file()
+    frame_path, has_f = _unit_path_from_manifest(cache_dir, scene_dir, item, frame_id)
+    global_path, has_g = _unit_path_from_manifest(cache_dir, scene_dir, item, global_id)
     if not has_f and not has_g:
         raise FileNotFoundError(f"Scene {scene_dir.name} missing both {frame_id} and {global_id} under layers/")
     if has_f:
-        ft = _load_unit_tensor(scene_dir, frame_id, map_location=map_location)
+        ft = _load_unit_tensor(frame_path, map_location=map_location)
         if has_g:
             gt = _reshape_global_to_match_frame(
-                ft, _load_unit_tensor(scene_dir, global_id, map_location=map_location)
+                ft, _load_unit_tensor(global_path, map_location=map_location)
             )
         else:
             gt = _missing_partner_like(ft)
     else:
-        gt_raw = _load_unit_tensor(scene_dir, global_id, map_location=map_location)
+        gt_raw = _load_unit_tensor(global_path, map_location=map_location)
         gt = gt_raw.contiguous()
         ft = _missing_partner_like(gt_raw)
     return torch.cat([ft, gt], dim=-1).contiguous()
@@ -196,9 +209,9 @@ def load_scene_replay_layers_v3(
     layers: List[torch.Tensor] = []
     for i in range(int(depth)):
         frame_id, global_id = f"frame_{i}", f"global_{i}"
-        frame_path = scene_dir / "layers" / f"{frame_id}.pt"
-        global_path = scene_dir / "layers" / f"{global_id}.pt"
-        if not frame_path.is_file() and not global_path.is_file():
+        _, has_f = _unit_path_from_manifest(cache_dir, scene_dir, item, frame_id)
+        _, has_g = _unit_path_from_manifest(cache_dir, scene_dir, item, global_id)
+        if not has_f and not has_g:
             raise FileNotFoundError(
                 f"Scene {scene_dir.name} missing both {frame_id} and {global_id} under layers/"
             )

@@ -23,16 +23,18 @@ PRUNE="${PRUNE:-0,1}"
 PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-${REPO_ROOT}/analysis/prune_plan}"
 # Pruned eval selectors use the split plan layout:
 #   PLAN_GROUP / PRUNE_PLAN_NAME: explicit prune selectors such as "prune_span5 prune_span10"
-#   PLAN_MAX_DROP_RATIO + PLAN_TEST_COUNT: auto-sample prune_spanN selectors from prune_plan_all.json
-# For model-mode eval, TRAINING_PLAN_NAME optionally composes the prune selector with
-# a training plan bundle such as "training_lora_l1_r32".
+#   PLAN_MIN_DROP + PLAN_MAX_DROP + PLAN_DROP_STEP: select prune_spanN by an inclusive range.
+# For model-mode eval, RECOVERY_PLAN_NAME optionally composes
+# the prune selector with a recovery plan bundle such as "recovery_lora_l1_r32".
 PRUNE_PLAN_NAME="${PRUNE_PLAN_NAME:-}"
 PLAN_GROUP="${PLAN_GROUP:-}"
-PLAN_MAX_DROP_RATIO="${PLAN_MAX_DROP_RATIO:-}"
-PLAN_TEST_COUNT="${PLAN_TEST_COUNT:-}"
-TRAINING_PLAN_ROOT="${TRAINING_PLAN_ROOT:-}"
-TRAINING_PLAN_NAME="${TRAINING_PLAN_NAME:-}"
+PLAN_MIN_DROP="${PLAN_MIN_DROP:-}"
+PLAN_MAX_DROP="${PLAN_MAX_DROP:-}"
+PLAN_DROP_STEP="${PLAN_DROP_STEP:-}"
+RECOVERY_PLAN_ROOT="${RECOVERY_PLAN_ROOT:-}"
+RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
 MAX_SCENES="${MAX_SCENES:-0}"
+WRITE_SUMMARY="${WRITE_SUMMARY:-1}"
 
 #############################################
 
@@ -97,8 +99,8 @@ if [[ "${#PLAN_GROUP_LIST[@]}" -gt 0 && "${#PRUNE_PLAN_NAME_LIST[@]}" -gt 0 ]]; 
 fi
 for _prune_value in "${PRUNE_LIST[@]}"; do
   _prune_value="${_prune_value//[[:space:]]/}"
-  if [[ "${_prune_value}" == "1" && "${#PLAN_GROUP_LIST[@]}" -eq 0 && "${#PRUNE_PLAN_NAME_LIST[@]}" -eq 0 && ( -z "${PLAN_MAX_DROP_RATIO}" || -z "${PLAN_TEST_COUNT}" ) ]]; then
-    echo "error: PLAN_GROUP/PRUNE_PLAN_NAME or PLAN_MAX_DROP_RATIO+PLAN_TEST_COUNT is required when PRUNE includes 1." >&2
+  if [[ "${_prune_value}" == "1" && "${#PLAN_GROUP_LIST[@]}" -eq 0 && "${#PRUNE_PLAN_NAME_LIST[@]}" -eq 0 && ( -z "${PLAN_MIN_DROP}" || -z "${PLAN_MAX_DROP}" || -z "${PLAN_DROP_STEP}" ) ]]; then
+    echo "error: PLAN_GROUP/PRUNE_PLAN_NAME or PLAN_MIN_DROP+PLAN_MAX_DROP+PLAN_DROP_STEP is required when PRUNE includes 1." >&2
     exit 1
   fi
 done
@@ -191,38 +193,34 @@ for g in list_plan_groups(Path(os.environ['PRUNE_PLAN_ROOT_FOR_PY'])):
 "
 }
 
-python_select_prune_spans() {
+python_select_prune_span_range() {
   local root="$1"
-  local ratio="$2"
-  local count="$3"
-  PRUNE_PLAN_ROOT_FOR_PY="${root}" PLAN_MAX_DROP_RATIO_FOR_PY="${ratio}" PLAN_TEST_COUNT_FOR_PY="${count}" conda run --no-capture-output -n "${CONDA_ENV}" python -c "
+  local min_drop="$2"
+  local max_drop="$3"
+  local step="$4"
+  PRUNE_PLAN_ROOT_FOR_PY="${root}" PLAN_MIN_DROP_FOR_PY="${min_drop}" PLAN_MAX_DROP_FOR_PY="${max_drop}" PLAN_DROP_STEP_FOR_PY="${step}" conda run --no-capture-output -n "${CONDA_ENV}" python -c "
 import os
 from pathlib import Path
 from analysis.prune_plan import load_prune_plan_bundle
 root = Path(os.environ['PRUNE_PLAN_ROOT_FOR_PY'])
-ratio = float(os.environ['PLAN_MAX_DROP_RATIO_FOR_PY'])
-count = int(os.environ['PLAN_TEST_COUNT_FOR_PY'])
-if ratio <= 0 or ratio > 1:
-    raise SystemExit('PLAN_MAX_DROP_RATIO must be in (0,1]')
-if count <= 0:
-    raise SystemExit('PLAN_TEST_COUNT must be > 0')
+try:
+    min_drop = int(os.environ['PLAN_MIN_DROP_FOR_PY'])
+    max_drop = int(os.environ['PLAN_MAX_DROP_FOR_PY'])
+    step = int(os.environ['PLAN_DROP_STEP_FOR_PY'])
+except ValueError as exc:
+    raise SystemExit('PLAN_MIN_DROP, PLAN_MAX_DROP, and PLAN_DROP_STEP must be integers') from exc
+if min_drop < 0:
+    raise SystemExit('PLAN_MIN_DROP must be >= 0')
+if max_drop < min_drop:
+    raise SystemExit('PLAN_MAX_DROP must be >= PLAN_MIN_DROP')
+if step <= 0:
+    raise SystemExit('PLAN_DROP_STEP must be > 0')
 b = load_prune_plan_bundle(root)
-n = int(b.get('num_units', 0))
 spans = sorted(int(k) for k in b.get('spans', {}).keys() if str(k).isdigit())
-max_span = min(max(spans, default=0), max(1, int(round(n * ratio))))
-eligible = [s for s in spans if 1 <= s <= max_span]
-if not eligible:
-    raise SystemExit(f'no prune spans <= {max_span} under {root}')
-targets = [int(round(i * max_span / count)) for i in range(1, count + 1)]
-selected = []
-for target in targets:
-    target = max(1, min(max_span, int(target)))
-    if target in eligible:
-        pick = target
-    else:
-        pick = min(eligible, key=lambda s: (abs(s - target), s))
-    if pick not in selected:
-        selected.append(pick)
+available = set(spans)
+selected = [s for s in range(min_drop, max_drop + 1, step) if s > 0 and s in available]
+if not selected:
+    raise SystemExit(f'no available prune spans in [{min_drop}, {max_drop}] step {step} under {root}')
 for s in selected:
     print(f'prune_span{s}')
 "
@@ -250,11 +248,26 @@ checkpoint_for_model_mode() {
     echo "${CHECKPOINT}"
     return
   fi
-  if [[ -n "${prune_plan_name}" && -n "${TRAINING_PLAN_NAME}" ]]; then
-    echo "${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${scannet_tag}/train/${prune_plan_name}/${TRAINING_PLAN_NAME}/checkpoints/latest.pt"
+  if [[ -n "${prune_plan_name}" && -n "${RECOVERY_PLAN_NAME}" ]]; then
+    local recover_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/recover/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
+    local new_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/train/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
+    local legacy_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${scannet_tag}/train/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
+    if [[ -f "${recover_ckpt}" ]]; then
+      echo "${recover_ckpt}"
+    elif [[ -f "${new_ckpt}" || ! -f "${legacy_ckpt}" ]]; then
+      echo "${new_ckpt}"
+    else
+      echo "${legacy_ckpt}"
+    fi
     return
   fi
-  echo "${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${scannet_tag}/train/checkpoints/latest.pt"
+  local new_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/train/checkpoints/latest.pt"
+  local legacy_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${scannet_tag}/train/checkpoints/latest.pt"
+  if [[ -f "${new_ckpt}" || ! -f "${legacy_ckpt}" ]]; then
+    echo "${new_ckpt}"
+  else
+    echo "${legacy_ckpt}"
+  fi
 }
 
 run_eval_dataset() {
@@ -279,7 +292,11 @@ run_eval_dataset() {
   if [[ "${mode}" == "lower" && -n "${plan_group}" ]]; then
     out_dir="${out_dir}/${plan_group}"
   elif [[ "${mode}" == "model" && -n "${prune_plan_name}" ]]; then
-    out_dir="${out_dir}/${prune_plan_name}"
+    if [[ -n "${RECOVERY_PLAN_NAME}" ]]; then
+      out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/recover/${RECOVERY_PLAN_NAME}/${prune_plan_name}"
+    else
+      out_dir="${out_dir}/${prune_plan_name}"
+    fi
   fi
   local extra=(
     --eval-mode "${mode}"
@@ -292,10 +309,10 @@ run_eval_dataset() {
     --fastvggt-merge-ratio "${FASTVGGT_MERGE_RATIO}"
     --quantvggt-dtype "${QUANTVGGT_DTYPE}"
   )
-  local training_root="${TRAINING_PLAN_ROOT:-${PRUNE_PLAN_ROOT}}"
-  if [[ -n "${TRAINING_PLAN_NAME}" ]]; then
-    extra+=(--training-plan-root "${training_root}")
-    extra+=(--training-plan-name "${TRAINING_PLAN_NAME}")
+  local recovery_root="${RECOVERY_PLAN_ROOT:-${PRUNE_PLAN_ROOT}}"
+  if [[ -n "${RECOVERY_PLAN_NAME}" ]]; then
+    extra+=(--recovery-plan-root "${recovery_root}")
+    extra+=(--recovery-plan-name "${RECOVERY_PLAN_NAME}")
   fi
   if [[ -n "${QUANTVGGT_PARAMS_DIR}" ]]; then
     extra+=(--quantvggt-params-dir "${QUANTVGGT_PARAMS_DIR}")
@@ -343,7 +360,7 @@ run_eval_dataset() {
       if [[ -f "${ckpt}" ]]; then
         extra+=(--checkpoint "${ckpt}")
       else
-        echo "error: model mode requires checkpoint (set CHECKPOINT or train first): ${ckpt}" >&2
+        echo "error: model mode requires checkpoint (set CHECKPOINT or recover first): ${ckpt}" >&2
         return 1
       fi
       ;;
@@ -444,16 +461,16 @@ run_eval_for_prune_variants() {
     done
     return
   fi
-  if [[ -n "${PLAN_MAX_DROP_RATIO}" || -n "${PLAN_TEST_COUNT}" ]]; then
-    if [[ -z "${PLAN_MAX_DROP_RATIO}" || -z "${PLAN_TEST_COUNT}" ]]; then
-      echo "error: PLAN_MAX_DROP_RATIO and PLAN_TEST_COUNT must be set together." >&2
+  if [[ -n "${PLAN_MIN_DROP}" || -n "${PLAN_MAX_DROP}" || -n "${PLAN_DROP_STEP}" ]]; then
+    if [[ -z "${PLAN_MIN_DROP}" || -z "${PLAN_MAX_DROP}" || -z "${PLAN_DROP_STEP}" ]]; then
+      echo "error: PLAN_MIN_DROP, PLAN_MAX_DROP, and PLAN_DROP_STEP must be set together." >&2
       exit 1
     fi
     local selected_groups=()
     local sg
     while IFS= read -r sg; do
       [[ -n "${sg}" ]] && selected_groups+=("${sg}")
-    done < <(python_select_prune_spans "${PRUNE_PLAN_ROOT}" "${PLAN_MAX_DROP_RATIO}" "${PLAN_TEST_COUNT}")
+    done < <(python_select_prune_span_range "${PRUNE_PLAN_ROOT}" "${PLAN_MIN_DROP}" "${PLAN_MAX_DROP}" "${PLAN_DROP_STEP}")
     for sg in "${selected_groups[@]}"; do
       run_eval_group_variant "${bb}" "${sg}"
     done
@@ -496,10 +513,12 @@ for bb in "${BB_LIST[@]}"; do
       run_datasets_for_backbone "${bb}" "${prune_flag}" ""
     fi
   done
-  echo "   [summary] ${OUTPUT_ROOT}/${bb}/summary_comparison.md"
-  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.summary_v3 \
-    --experiment "${bb}" \
-    --prune-plan-root "${PRUNE_PLAN_ROOT}"
+  if truthy "${WRITE_SUMMARY}"; then
+    echo "   [summary] ${OUTPUT_ROOT}/${bb}/summary_comparison.md"
+    conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.summary_v3 \
+      --experiment "${bb}" \
+      --prune-plan-root "${PRUNE_PLAN_ROOT}"
+  fi
 done
 
 echo "== done =="

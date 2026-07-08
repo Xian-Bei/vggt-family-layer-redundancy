@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from analysis.train.model import LoRALinear
+from analysis.recover.train.model import LoRALinear
 
 
 def _replace_child(parent: nn.Module, name: str, module: nn.Module) -> None:

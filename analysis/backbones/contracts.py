@@ -105,6 +105,7 @@ class TrainFromCacheArgs:
     prune_plan_name: str = ""
     training_plan_root: Path = Path("")
     training_plan_name: str = ""
+    cache_dirs: Sequence[Path] = field(default_factory=tuple)
 
 
 @dataclass
@@ -435,6 +436,19 @@ class BackboneAdapter(ABC):
             self.inject_lora_plan(model, lora_actions)
         elif prune_plan is not None:
             raise ValueError("Legacy prune plan formats are no longer supported")
+        recovery_specs = payload.get("recovery_specs")
+        recovery_weights = payload.get("recovery_weights")
+        if recovery_weights is not None and not (isinstance(recovery_specs, list) and recovery_specs):
+            raise ValueError("Compact recovery checkpoint is missing recovery_specs")
+        if isinstance(recovery_specs, list) and recovery_specs:
+            from analysis.recover.operators import apply_recovery_weights, install_recovery_modules
+
+            device = next(model.parameters()).device
+            install_recovery_modules(model, self, recovery_specs, device=device)
+            if recovery_weights is not None:
+                apply_recovery_weights(model, self, recovery_specs, recovery_weights, device=device)
+        if "model_state_dict" not in payload and recovery_weights is not None:
+            return
         state = payload.get("model_state_dict", payload)
         model.load_state_dict(state, strict=False)
 

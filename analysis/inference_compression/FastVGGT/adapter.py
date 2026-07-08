@@ -25,10 +25,10 @@ def _repo_root() -> Path:
 
 @lru_cache(maxsize=1)
 def _token_merge_function() -> Callable[..., Tuple[Callable, Callable]]:
-    source = _repo_root() / "backbones" / "FastVGGT" / "merging" / "merge.py"
+    source = _repo_root() / "submodules" / "FastVGGT" / "merging" / "merge.py"
     if not source.is_file():
         raise FileNotFoundError(
-            f"FastVGGT submodule is missing {source}. Run: git submodule update --init backbones/FastVGGT"
+            f"FastVGGT submodule is missing {source}. Run: git submodule update --init submodules/FastVGGT"
         )
     spec = importlib.util.spec_from_file_location("lare_fastvggt_merge", source)
     if spec is None or spec.loader is None:

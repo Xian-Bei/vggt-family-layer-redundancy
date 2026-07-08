@@ -27,9 +27,9 @@ from analysis.prune_plan import (
     load_named_prune_plan,
     resolve_prune_plan_path,
 )
-from analysis.training_plan import compose_training_unit_prune_plan
+from analysis.prune_plan.recovery_plan import compose_training_unit_prune_plan
 from analysis.schema.v3 import EvalRecordV3, stage_dir
-from analysis.train.checkpoint_v3 import EvalMode, apply_eval_model_structure
+from analysis.recover.train.checkpoint_v3 import EvalMode, apply_eval_model_structure
 
 _EVAL_MODES = ("upper", "lower", "model")
 
@@ -96,16 +96,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Prune selector for lower/model modes (e.g. prune_span10).",
     )
     p.add_argument(
+        "--recovery-plan-root",
         "--training-plan-root",
+        dest="training_plan_root",
         type=Path,
         default=None,
-        help="Training plan root for model mode. Defaults to prune-plan-root.",
+        help="Recovery plan root for model mode. Defaults to prune-plan-root.",
     )
     p.add_argument(
+        "--recovery-plan-name",
         "--training-plan-name",
+        dest="training_plan_name",
         type=str,
         default="",
-        help="Training plan name for model mode (e.g. training_lora_l1_r32).",
+        help="Recovery plan name for model mode (e.g. recovery_lora_l1_r32).",
     )
     p.add_argument(
         "--export-vis-2d",

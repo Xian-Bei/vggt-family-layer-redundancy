@@ -371,11 +371,5 @@ def build_eval_tab(
             outputs=outputs_all,
             show_progress="minimal",
         )
-        blocks.load(
-            _full_refresh,
-            inputs=inputs_all,
-            outputs=outputs_all,
-            show_progress="minimal",
-        )
 
     return {"tab": tab_eval}

@@ -42,7 +42,7 @@ and `run_eval.sh` intentionally does not perform calibration on the fly.
 Download and verify the official W4A4 files with:
 
 ```bash
-bash data/setup_quantvggt_params.sh
+bash submodules/setup_quantvggt_params.sh
 ```
 
 The default path can then be passed as:
@@ -50,7 +50,7 @@ The default path can then be passed as:
 ```bash
 INFERENCE_COMPRESSION=quantvggt \
 QUANTVGGT_DTYPE=w4a4 \
-QUANTVGGT_PARAMS_DIR=data/quantvggt/w4a4_official \
+QUANTVGGT_PARAMS_DIR=submodules/quantvggt/w4a4_official \
   bash run_eval.sh
 ```
 

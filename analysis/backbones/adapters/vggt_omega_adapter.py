@@ -23,7 +23,7 @@ from analysis.backbones.contracts import (
 )
 from analysis.backbones.registry import register
 from analysis.schema.v3 import LayerUnitSpec, PruneAction
-from analysis.train.model import inject_lora_attn
+from analysis.recover.train.model import inject_lora_attn
 
 
 def _repo_root() -> Path:

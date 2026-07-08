@@ -13,46 +13,7 @@ from analysis.redundancy.metrics import pairwise_similarity_matrices
 from analysis.schema.v3 import SCHEMA_VERSION, stage_dir
 
 REDUNDANCY_GRAPH_REGIONS = ("special", "camera", "patch", "all")
-DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS: Tuple[str, ...] = ()
 LEGACY_REDUNDANCY_GRAPH_V3 = "redundancy_graph_v3.npz"
-
-
-def parse_exclude_token_regions(spec: str) -> Tuple[str, ...]:
-    """Parse comma-separated token regions excluded from mean/min aggregation."""
-    raw = str(spec or "").strip()
-    if not raw:
-        return DEFAULT_AGGREGATION_EXCLUDE_TOKEN_REGIONS
-    allowed = set(REDUNDANCY_GRAPH_REGIONS)
-    out: List[str] = []
-    for part in raw.split(","):
-        region = part.strip().lower()
-        if not region:
-            continue
-        if region not in allowed:
-            raise ValueError(
-                f"Unknown exclude token region {region!r}; allowed: {sorted(allowed)}"
-            )
-        if region not in out:
-            out.append(region)
-    return tuple(out)
-
-
-def regions_for_aggregation(
-    available_regions: Sequence[str],
-    *,
-    exclude_token_regions: Sequence[str],
-) -> List[str]:
-    """Drop excluded regions while preserving ``available_regions`` order."""
-    exclude = {
-        str(region).strip().lower()
-        for region in exclude_token_regions
-        if str(region).strip()
-    }
-    return [
-        region
-        for region in available_regions
-        if str(region).strip().lower() not in exclude
-    ]
 
 
 def redundancy_graph_filename(region: str) -> str:

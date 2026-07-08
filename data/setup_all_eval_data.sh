@@ -7,7 +7,6 @@ set -euo pipefail
 # 3) Neural RGB-D
 # 4) nuScenes front-camera subset (requires local raw nuScenes)
 # 5) Waymo front-camera subset (optional; requires gcloud auth + Waymo terms)
-# 6) QuantVGGT official W4A4 deployment parameters (optional; about 3.83 GB)
 #
 # Usage:
 #   bash data/setup_all_eval_data.sh
@@ -20,8 +19,6 @@ DATA_DIR="${REPO_ROOT}/data"
 CLEAN_DOWNLOADS="${CLEAN_DOWNLOADS:-0}"
 RUN_NUSCENES="${RUN_NUSCENES:-1}"
 RUN_WAYMO="${RUN_WAYMO:-0}"
-RUN_QUANTVGGT_PARAMS="${RUN_QUANTVGGT_PARAMS:-0}"
-QUANTVGGT_PARAMS_DIR="${QUANTVGGT_PARAMS_DIR:-${DATA_DIR}/quantvggt/w4a4_official}"
 NUSCENES_DATA_ROOT="${NUSCENES_DATA_ROOT:-/media/fengyi/bb/nuscenes}"
 NUSCENES_TARGET_DIR="${NUSCENES_TARGET_DIR:-${DATA_DIR}/nuscenes}"
 NUSCENES_VERSION="${NUSCENES_VERSION:-v1.0-trainval}"
@@ -55,19 +52,19 @@ echo "REPO_ROOT=${REPO_ROOT}"
 echo "DATA_DIR=${DATA_DIR}"
 echo
 
-echo "[1/6] ScanNet splits + extraction"
+echo "[1/5] ScanNet splits + extraction"
 bash "${DATA_DIR}/setup_scannet.sh"
 echo
 
-echo "[2/6] 7Scenes"
+echo "[2/5] 7Scenes"
 bash "${DATA_DIR}/setup_7scenes.sh"
 echo
 
-echo "[3/6] Neural RGB-D"
+echo "[3/5] Neural RGB-D"
 bash "${DATA_DIR}/setup_nrgbd.sh"
 echo
 
-echo "[4/6] nuScenes front-camera subset"
+echo "[4/5] nuScenes front-camera subset"
 if [[ "${RUN_NUSCENES}" == "0" || "${RUN_NUSCENES}" == "false" ]]; then
   echo "[skip] RUN_NUSCENES=${RUN_NUSCENES}"
 elif [[ ! -d "${NUSCENES_DATA_ROOT}" ]]; then
@@ -89,7 +86,7 @@ else
 fi
 echo
 
-echo "[5/6] Waymo front-camera subset"
+echo "[5/5] Waymo front-camera subset"
 if [[ "${RUN_WAYMO}" == "0" || "${RUN_WAYMO}" == "false" ]]; then
   echo "[skip] RUN_WAYMO=${RUN_WAYMO}"
   echo "       Set RUN_WAYMO=1 after accepting Waymo terms and running gcloud auth login."
@@ -107,16 +104,6 @@ else
   DRIVING_DEPTH_MAX="${DRIVING_DEPTH_MAX}" \
   DRIVING_DEPTH_MIN_SAMPLES="${DRIVING_DEPTH_MIN_SAMPLES}" \
     bash "${DATA_DIR}/setup_waymo.sh"
-fi
-echo
-
-echo "[6/6] QuantVGGT official W4A4 deployment parameters"
-if [[ "${RUN_QUANTVGGT_PARAMS}" == "0" || "${RUN_QUANTVGGT_PARAMS}" == "false" ]]; then
-  echo "[skip] RUN_QUANTVGGT_PARAMS=${RUN_QUANTVGGT_PARAMS}"
-  echo "       Set RUN_QUANTVGGT_PARAMS=1 to download and verify the 3.83 GB official parameters."
-else
-  QUANTVGGT_PARAMS_DIR="${QUANTVGGT_PARAMS_DIR}" \
-    bash "${DATA_DIR}/setup_quantvggt_params.sh"
 fi
 echo
 

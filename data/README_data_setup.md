@@ -7,7 +7,6 @@ This folder includes reproducible scripts to prepare all datasets used by the ev
 - Neural RGB-D (NRGBD)
 - nuScenes front-camera subset (requires a local raw nuScenes copy)
 - Waymo front-camera subset (optional; requires Waymo terms + Google Cloud auth)
-- QuantVGGT official W4A4 deployment parameters (optional; 3.83 GB)
 
 ## One-command setup
 
@@ -24,15 +23,6 @@ This wrapper runs:
 3. `data/setup_nrgbd.sh`
 4. `python data/extract_nuscenes.py`
 5. `data/setup_waymo.sh` only when `RUN_WAYMO=1`
-6. `data/setup_quantvggt_params.sh` only when `RUN_QUANTVGGT_PARAMS=1`
-
-The model-deployment parameters are skipped by default because ordinary dataset
-evaluation does not need them. Download and verify them as part of the full
-workflow with:
-
-```bash
-RUN_QUANTVGGT_PARAMS=1 bash data/setup_all_eval_data.sh
-```
 
 Waymo is skipped by default because it requires a Google-authenticated bucket
 download and roughly 100 GB for the 50+50 raw subset:
@@ -330,50 +320,6 @@ records. The associated vehicle-frame points are transformed into the OpenCV
 range-image value is a LiDAR ray distance and is intentionally **not** used as
 depth, because VGGT predicts projective camera-Z depth.
 
-### QuantVGGT Official W4A4 Parameters
-
-QuantVGGT deployment uses two precomputed calibration-state files published in
-the [official Hugging Face repository](https://huggingface.co/wlfeng/QuantVGGT/tree/main).
-They are optional and are not dataset samples or VGGT/LaRe model checkpoints.
-
-Download only these two required files, resume partial downloads, and verify
-their official byte sizes and SHA-256 digests with:
-
-```bash
-bash data/setup_quantvggt_params.sh
-```
-
-The default destination is `data/quantvggt/w4a4_official` and the total
-download is approximately 3.83 GB. To select another location:
-
-```bash
-QUANTVGGT_PARAMS_DIR=/path/to/quantvggt/w4a4 \
-  bash data/setup_quantvggt_params.sh
-```
-
-The same step can be enabled in the top-level workflow:
-
-```bash
-RUN_QUANTVGGT_PARAMS=1 \
-QUANTVGGT_PARAMS_DIR=data/quantvggt/w4a4_official \
-  bash data/setup_all_eval_data.sh
-```
-
-The downloader preserves a same-size file that fails verification and stops by
-default. Set `QUANTVGGT_FORCE_DOWNLOAD=1` to rename that file with an `.invalid`
-suffix and fetch a clean copy. The official repository currently publishes
-only W4A4 deployment parameters; its separate `calib_data.pt` is calibration
-input data and is intentionally not downloaded by this inference-only step.
-
-Use the downloaded parameters during evaluation with:
-
-```bash
-INFERENCE_COMPRESSION=quantvggt \
-QUANTVGGT_DTYPE=w4a4 \
-QUANTVGGT_PARAMS_DIR=data/quantvggt/w4a4_official \
-  bash run_eval.sh
-```
-
 ## Driving sparse-depth format and validation
 
 nuScenes and Waymo use the same compressed per-frame NPZ schema:
@@ -469,10 +415,6 @@ data/
 │   │   ├── lidar/
 │   │   └── depth_points/FRONT/
 │   └── validation/<scene_id>/
-└── quantvggt/
-    └── w4a4_official/
-        ├── qs_frame_parameters_total.pth
-        └── qs_global_parameters_total.pth
 ```
 
 ## Notes on reproducibility
@@ -482,7 +424,6 @@ data/
 - `setup_nrgbd.sh` normalizes the extracted folder layout and verifies required files.
 - `extract_nuscenes.py` samples train/val scenes with `NUSCENES_SEED`, records the selected names in `selected_scenes.json`, and records the official sparse-depth format/source metadata.
 - `setup_waymo.sh` downloads/extracts a fixed Waymo `training`/`validation` subset when `RUN_WAYMO=1`.
-- `setup_quantvggt_params.sh` pins the official W4A4 Hugging Face revision, byte sizes, and SHA-256 digests.
 - `download_waymo_subset.py` samples Waymo `training`/`validation` tfrecords with a fixed seed and records manifests. With seed `20260616` and count `50`, the official bucket currently exposes 798 training and 202 validation scenes before sampling.
 
 ## Script index
@@ -492,7 +433,6 @@ data/
 - `setup_7scenes.sh`: 7Scenes download + extraction + depth projection + validation
 - `setup_nrgbd.sh`: NRGBD download + extraction + layout normalization + validation
 - `setup_waymo.sh`: Waymo raw subset download + extraction wrapper
-- `setup_quantvggt_params.sh`: resumable, verified QuantVGGT W4A4 parameter download
 - `preprocess_7scenes_depth_proj.py`: 7Scenes `depth.png -> depth.proj.png`
 - `extract_nuscenes.py`: nuScenes front-camera subset extraction
 - `download_waymo_subset.py`: Waymo raw subset download from GCS

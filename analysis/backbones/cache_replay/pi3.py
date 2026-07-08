@@ -14,7 +14,7 @@ from analysis.backbones.cache_replay.common import ReplayResult, is_skipped, spl
 from analysis.backbones.contracts import PredictionLossWeights, TrainingHyperparams
 from analysis.backbones.registry import get_backbone
 from analysis.schema.v3 import PruneAction, parse_dataset_plugin_args
-from analysis.train.model import count_unique_params
+from analysis.recover.train.model import count_unique_params
 
 
 def pi3_official_dataset_name(dataset_name: str) -> str:

@@ -20,8 +20,8 @@ CACHE_SCANNET_DEV50="${CACHE_SCANNET_DEV50:-0}"
 SKIP_REDUNDANCY="${SKIP_REDUNDANCY:-0}"
 PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-${REPO_ROOT}/analysis/prune_plan}"
 PRUNE_PLAN_NAME="${PRUNE_PLAN_NAME:-}"
-TRAINING_PLAN_ROOT="${TRAINING_PLAN_ROOT:-}"
-TRAINING_PLAN_NAME="${TRAINING_PLAN_NAME:-}"
+RECOVERY_PLAN_ROOT="${RECOVERY_PLAN_ROOT:-}"
+RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
 
 
 #############################################
@@ -86,11 +86,11 @@ run_one_dataset() {
     if [[ -n "${PRUNE_PLAN_NAME}" ]]; then
       prune_args+=(--prune-plan-name "${PRUNE_PLAN_NAME}")
     fi
-    if [[ -n "${TRAINING_PLAN_ROOT}" ]]; then
-      prune_args+=(--training-plan-root "${TRAINING_PLAN_ROOT}")
+    if [[ -n "${RECOVERY_PLAN_ROOT}" ]]; then
+      prune_args+=(--recovery-plan-root "${RECOVERY_PLAN_ROOT}")
     fi
-    if [[ -n "${TRAINING_PLAN_NAME}" ]]; then
-      prune_args+=(--training-plan-name "${TRAINING_PLAN_NAME}")
+    if [[ -n "${RECOVERY_PLAN_NAME}" ]]; then
+      prune_args+=(--recovery-plan-name "${RECOVERY_PLAN_NAME}")
     fi
   fi
   local skip_red_args=()
@@ -106,7 +106,7 @@ run_one_dataset() {
     output_dataset_args=(--output-dataset "${output_dataset}")
   fi
 
-  echo "== cache v3 dataset=${dataset}${split:+_${split}}${output_dataset:+ -> ${output_dataset}} backbone=${backbone} save_cache=${save_cache} skip_redundancy=${SKIP_REDUNDANCY} prune_plan_root=${PRUNE_PLAN_ROOT:-<off>} prune_plan_name=${PRUNE_PLAN_NAME:-<auto>} training_plan_name=${TRAINING_PLAN_NAME:-<auto>} =="
+  echo "== cache v3 dataset=${dataset}${split:+_${split}}${output_dataset:+ -> ${output_dataset}} backbone=${backbone} save_cache=${save_cache} skip_redundancy=${SKIP_REDUNDANCY} prune_plan_root=${PRUNE_PLAN_ROOT:-<off>} prune_plan_name=${PRUNE_PLAN_NAME:-<auto>} recovery_plan_name=${RECOVERY_PLAN_NAME:-<auto>} =="
   conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.redundancy.cache_redundancy_v3 \
     --experiment "${backbone}" \
     --dataset "${dataset}" \

@@ -69,7 +69,7 @@
 5. **重参数化 / Flattening。** **FlattenGPT** [P-10] 将相邻 Transformer block 压平为一个 block，**ReplaceMe** 也属于偏 training-free 的近邻，把"冗余消除"提升为系统性的结构重写。
 6. **动态复用 / 缓存式补偿。** 不永久改变结构，而在运行时复用历史特征或缓存中间状态（**ProfilingDiT** 类）。
 
-**与本文关系。** 我们在结构上属于 (1) **直接删除**——区间内 frame / global 块替换为 `SkipIdentityBlock`（[analysis/train/model.py](../analysis/train/model.py)）——但通过 (3) **蒸馏 + LoRA** 进行恢复。LoRA 既是补偿模块，又能在推理期合并回原参数，因此 **同时具备 (1) 的"零额外推理参数"与 (3) 的"精度恢复能力"**。**与现有所有蒸馏式恢复工作不同的是，我们完全不使用 GT 标签，纯用 teacher 输出作为监督**——这一 GT-free 设定显著降低了对标注数据的依赖。
+**与本文关系。** 我们在结构上属于 (1) **直接删除**——区间内 frame / global 块替换为 `SkipIdentityBlock`（[analysis/recover/train/model.py](../analysis/recover/train/model.py)）——但通过 (3) **蒸馏 + LoRA** 进行恢复。LoRA 既是补偿模块，又能在推理期合并回原参数，因此 **同时具备 (1) 的"零额外推理参数"与 (3) 的"精度恢复能力"**。**与现有所有蒸馏式恢复工作不同的是，我们完全不使用 GT 标签，纯用 teacher 输出作为监督**——这一 GT-free 设定显著降低了对标注数据的依赖。
 
 ### 2.3 3D Foundation Model 压缩
 
@@ -189,7 +189,7 @@ function BuildSkipPlan(M_both, M_global, τ):
 > | 0.85（压缩率较高的一档；摘要与 headline 所用） | [4, 11] (8 层) | [18, 23] (6 层) | 8 | 14 |
 > | 0.80 | TBD | TBD | TBD | TBD |
 >
-> 上表两档在实现中对应仓库内的 JSON 区间文件（便于复现）：[中等压缩率档](../analysis/train/config_90_vggt.json)、[较高压缩率档](../analysis/train/config_85_vggt.json)。
+> 上表两档在实现中对应仓库内的 JSON 区间文件（便于复现）：[中等压缩率档](../analysis/recover/train/config_90_vggt.json)、[较高压缩率档](../analysis/recover/train/config_85_vggt.json)。
 
 ### 3.5 GT-Free LoRA 自蒸馏较准
 
@@ -199,7 +199,7 @@ function BuildSkipPlan(M_both, M_global, τ):
 
 给定 §3.4 得到的 \((I_1, I_2)\)，我们按以下规则构造 student：
 
-- **删层**：对 \(\ell \in I_1\) 同时将 \(F_\ell, G_\ell\) 替换为 `SkipIdentityBlock`；对 \(\ell \in I_2\) 仅将 \(G_\ell\) 替换为 `SkipIdentityBlock`，保留 \(F_\ell\)（实现见 [analysis/train/model.py](../analysis/train/model.py) 的 `replace_skipped_layers_with_identity`）。
+- **删层**：对 \(\ell \in I_1\) 同时将 \(F_\ell, G_\ell\) 替换为 `SkipIdentityBlock`；对 \(\ell \in I_2\) 仅将 \(G_\ell\) 替换为 `SkipIdentityBlock`，保留 \(F_\ell\)（实现见 [analysis/recover/train/model.py](../analysis/recover/train/model.py) 的 `replace_skipped_layers_with_identity`）。
 - **LoRA 注入**：在每个区间 **起点的前一层** \(\ell^\star = l - 1\) 的 attention 子模块（`attn.qkv` 与 `attn.proj`）上注入 LoRA（rank \(r\)、scale \(\alpha\)，实现见同文件的 `LoRALinear` 与 `inject_lora_attn`）；如果区间内 frame block 也被 skip，则区间内的 frame attention 也注入；如果区间内 frame block 保留（skip\_global 模式），则该区间内每个 frame 的 attention 同样注入 LoRA，以补偿"上下文中 global 缺失"造成的分布偏移。
 
 正向计算上，被替换为 `SkipIdentityBlock` 的层只把输入直接传到输出；其余层保持原 VGGT 权重，但被注入 LoRA 的 attention 线性变换变为 \(W' x + (B A) x\)（\(W\) 冻结，仅 \(B, A\) 可训）。
@@ -210,7 +210,7 @@ function BuildSkipPlan(M_both, M_global, τ):
 - **监督来源**：在每个 batch 上 teacher 同样前向，记录两类信号：
   1. **中间层 hidden state** \(\{h^T_\ell\}\)（位置取自删层区间的端点附近，便于与 student 直接对齐）；
   2. **最终预测** \(\hat y^T = (\text{pose\_enc}^T, \text{depth}^T)\)。
-- **完全不使用 GT 标签**——任何相机位姿、深度、点云的 ground truth 都不参与损失计算（对应 [analysis/train/train_lora_skip_baseline.py](../analysis/train/train_lora_skip_baseline.py) 的 `--target-source teacher`）。
+- **完全不使用 GT 标签**——任何相机位姿、深度、点云的 ground truth 都不参与损失计算（对应 [analysis/recover/train/train_lora_skip_baseline.py](../analysis/recover/train/train_lora_skip_baseline.py) 的 `--target-source teacher`）。
 
 #### 3.5.3 自蒸馏损失
 
@@ -277,7 +277,7 @@ flowchart LR
 - **优化器**：AdamW，`lr=3e-5`、`weight_decay=0.05`、`min_lr=1e-8`、`warmup_ratio=0.05`、`grad_clip_max_norm=1.0`；
 - **训练规模**：`epochs=50`，`max_scenes=50`（仅 ScanNet `scans_dev50`）；
 - **LoRA**：`rank=8`、`alpha=16`、`dropout=0`；
-- **损失权重**（与表 2 两档默认实验 JSON 中设定一致，见 [较高压缩率档](../analysis/train/config_85_vggt.json)、[中等压缩率档](../analysis/train/config_90_vggt.json)）：\(w_{\text{align}} = w_{\text{mse}} = w_{\cos} = w_{\text{cka}} = w_{\text{pred}} = w_{\text{camera}} = w_{\text{depth}} = 1.0\)；
+- **损失权重**（与表 2 两档默认实验 JSON 中设定一致，见 [较高压缩率档](../analysis/recover/train/config_85_vggt.json)、[中等压缩率档](../analysis/recover/train/config_90_vggt.json)）：\(w_{\text{align}} = w_{\text{mse}} = w_{\cos} = w_{\text{cka}} = w_{\text{pred}} = w_{\text{camera}} = w_{\text{depth}} = 1.0\)；
 - **target source**：`teacher` ⇒ GT-free；
 - **数值精度**：bfloat16 混合精度 + activation checkpointing。
 

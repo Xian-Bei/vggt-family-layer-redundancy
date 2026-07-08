@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 
-from analysis.train import train_prune_lora_v3
+from analysis.recover.train import train_prune_lora_v3
 
 
 def main() -> None:
