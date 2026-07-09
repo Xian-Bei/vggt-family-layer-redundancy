@@ -32,7 +32,6 @@ SKIP_GT_EVAL_RESUME="${SKIP_GT_EVAL_RESUME:-1}"
 
 DEVICE="${DEVICE:-cuda}"
 CONDA_ENV="${CONDA_ENV:-vggt}"
-HF_MODEL="${HF_MODEL:-}"
 
 # shellcheck source=run_backbones_lib.sh
 source "${REPO_ROOT}/run_backbones_lib.sh"
@@ -62,9 +61,6 @@ run_skip_eval_dataset() {
     --max-frames "${MAX_FRAMES}"
     --max-span "${SKIP_GT_EVAL_MAX_SPAN}"
   )
-  if [[ -n "${HF_MODEL}" ]]; then
-    extra+=(--hf-model "${HF_MODEL}")
-  fi
   if truthy "${SKIP_GT_EVAL_TIMING}"; then
     extra+=(--timing)
   fi

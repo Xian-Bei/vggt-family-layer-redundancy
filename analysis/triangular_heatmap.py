@@ -38,6 +38,8 @@ def configure_triangle_axes(
     n: int,
     *,
     index_name: str,
+    xlabel: Optional[str] = None,
+    ylabel: Optional[str] = None,
     tick_step: int = 2,
     label_fontsize: Optional[float] = None,
     label_fontweight: Optional[str] = None,
@@ -54,8 +56,8 @@ def configure_triangle_axes(
         label_kwargs["fontsize"] = label_fontsize
     if label_fontweight is not None:
         label_kwargs["fontweight"] = label_fontweight
-    ax.set_xlabel(f"{index_name} index i", **label_kwargs)
-    ax.set_ylabel(f"{index_name} index j", **label_kwargs)
+    ax.set_xlabel(str(xlabel) if xlabel is not None else f"{index_name} index i", **label_kwargs)
+    ax.set_ylabel(str(ylabel) if ylabel is not None else f"{index_name} index j", **label_kwargs)
     ax.set_xlim(-0.5, float(n) - 0.5)
     ax.set_ylim(-0.5, float(n) - 0.5)
     if use_major_locator:

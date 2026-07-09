@@ -17,17 +17,7 @@ RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-analysis_outputs_v3}"
 EVAL_BOUNDS_ROOT="${EVAL_BOUNDS_ROOT:-${REPO_ROOT}/${OUTPUT_ROOT}}"
 EVAL_MAX_SCENES="${EVAL_MAX_SCENES:-0}"
-EVAL_SCANNET_DEV50="${EVAL_SCANNET_DEV50:-0}"
-EVAL_SCANNET_TEST50="${EVAL_SCANNET_TEST50:-0}"
-EVAL_7SCENES_TRAIN="${EVAL_7SCENES_TRAIN:-0}"
-EVAL_7SCENES_TEST="${EVAL_7SCENES_TEST:-1}"
-EVAL_NRGBD="${EVAL_NRGBD:-0}"
-EVAL_NUSCENES_TRAIN="${EVAL_NUSCENES_TRAIN:-0}"
-EVAL_NUSCENES_VAL="${EVAL_NUSCENES_VAL:-0}"
-EVAL_WAYMO_TRAINING="${EVAL_WAYMO_TRAINING:-0}"
-EVAL_WAYMO_VALIDATION="${EVAL_WAYMO_VALIDATION:-0}"
 
-HF_MODEL="${HF_MODEL:-}"
 DEVICE="${DEVICE:-cuda}"
 CONDA_ENV="${CONDA_ENV:-vggt}"
 DTYPE="${DTYPE:-bfloat16}"
@@ -36,13 +26,10 @@ EVAL_EPOCH="${EVAL_EPOCH:-1}"
 SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-1}"
 EVAL_AT_START="${EVAL_AT_START:-0}"
 
-ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
-ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
-ROOT_NUSCENES="${ROOT_NUSCENES:-data/nuscenes}"
-ROOT_WAYMO="${ROOT_WAYMO:-data/waymo}"
-
 source "${REPO_ROOT}/run_backbones_lib.sh"
 parse_backbones_list
+parse_dataset_list "${EVAL}" "EVAL" "${DATASET_KEYS[@]}"
+EVAL_LIST=("${PARSED_DATASETS[@]}")
 
 PRUNE_PLAN_NAME_LIST=()
 read -r -a _PRUNE_PLAN_NAME_RAW <<< "${PRUNE_PLAN_NAME//,/ }"
@@ -100,23 +87,10 @@ run_trainable_recovery() {
     EVAL_AT_START="${EVAL_AT_START}" \
     EVAL_BOUNDS_ROOT="${EVAL_BOUNDS_ROOT}" \
     EVAL_MAX_SCENES="${EVAL_MAX_SCENES}" \
-    EVAL_SCANNET_DEV50="${EVAL_SCANNET_DEV50}" \
-    EVAL_SCANNET_TEST50="${EVAL_SCANNET_TEST50}" \
-    EVAL_7SCENES_TRAIN="${EVAL_7SCENES_TRAIN}" \
-    EVAL_7SCENES_TEST="${EVAL_7SCENES_TEST}" \
-    EVAL_NRGBD="${EVAL_NRGBD}" \
-    EVAL_NUSCENES_TRAIN="${EVAL_NUSCENES_TRAIN}" \
-    EVAL_NUSCENES_VAL="${EVAL_NUSCENES_VAL}" \
-    EVAL_WAYMO_TRAINING="${EVAL_WAYMO_TRAINING}" \
-    EVAL_WAYMO_VALIDATION="${EVAL_WAYMO_VALIDATION}" \
+    EVAL="${EVAL}" \
     CONDA_ENV="${CONDA_ENV}" \
     DEVICE="${DEVICE}" \
     DTYPE="${DTYPE}" \
-    ROOT_7SCENES="${ROOT_7SCENES}" \
-    ROOT_NRGBD="${ROOT_NRGBD}" \
-    ROOT_NUSCENES="${ROOT_NUSCENES}" \
-    ROOT_WAYMO="${ROOT_WAYMO}" \
-    HF_MODEL="${HF_MODEL}" \
     bash "run_lora_skip_baseline.sh"
 }
 
@@ -128,9 +102,6 @@ run_closed_form_recovery() {
   local recovery_root="${RECOVERY_PLAN_ROOT:-${plan_root}}"
   local out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/recover/${prune_plan_name}/${recovery_plan_name}"
   local hf_args=()
-  if [[ -n "${HF_MODEL}" ]]; then
-    hf_args=(--hf-model "${HF_MODEL}")
-  fi
   echo "== recover v3 datasets=${DATASETS} backbone=${backbone} prune_plan_name=${prune_plan_name} recovery_plan_name=${recovery_plan_name} =="
   conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.recover.recover_prune_v3 \
     --experiment "${backbone}" \
@@ -145,7 +116,7 @@ run_closed_form_recovery() {
     --recovery-plan-name "${recovery_plan_name}" \
     --output-dir "${out_dir}" \
     "${hf_args[@]}"
-  if [[ "${EVAL_SCANNET_DEV50}" == "1" || "${EVAL_SCANNET_TEST50}" == "1" || "${EVAL_7SCENES_TRAIN}" == "1" || "${EVAL_7SCENES_TEST}" == "1" || "${EVAL_NRGBD}" == "1" || "${EVAL_NUSCENES_TRAIN}" == "1" || "${EVAL_NUSCENES_VAL}" == "1" || "${EVAL_WAYMO_TRAINING}" == "1" || "${EVAL_WAYMO_VALIDATION}" == "1" ]]; then
+  if [[ "${#EVAL_LIST[@]}" -gt 0 ]]; then
     BACKBONES="${backbone}" \
       PRUNE=1 \
       PRUNE_PLAN_ROOT="${plan_root}" \
@@ -156,23 +127,10 @@ run_closed_form_recovery() {
       MAX_SCENES="${EVAL_MAX_SCENES}" \
       CONDA_ENV="${CONDA_ENV}" \
       DEVICE="${DEVICE}" \
-      RUN_SCANNET_DEV50="${EVAL_SCANNET_DEV50}" \
-      RUN_SCANNET_TEST50="${EVAL_SCANNET_TEST50}" \
-      RUN_7SCENES_TRAIN="${EVAL_7SCENES_TRAIN}" \
-      RUN_7SCENES_TEST="${EVAL_7SCENES_TEST}" \
-      RUN_NRGBD="${EVAL_NRGBD}" \
-      RUN_NUSCENES_TRAIN="${EVAL_NUSCENES_TRAIN}" \
-      RUN_NUSCENES_VAL="${EVAL_NUSCENES_VAL}" \
-      RUN_WAYMO_TRAINING="${EVAL_WAYMO_TRAINING}" \
-      RUN_WAYMO_VALIDATION="${EVAL_WAYMO_VALIDATION}" \
+      RUN="${EVAL}" \
       EXPORT_VIS_2D=0 \
       EXPORT_VIS_3D=0 \
       WRITE_SUMMARY=0 \
-      HF_MODEL="${HF_MODEL}" \
-      ROOT_7SCENES="${ROOT_7SCENES}" \
-      ROOT_NRGBD="${ROOT_NRGBD}" \
-      ROOT_NUSCENES="${ROOT_NUSCENES}" \
-      ROOT_WAYMO="${ROOT_WAYMO}" \
       bash "run_eval.sh"
   fi
 }

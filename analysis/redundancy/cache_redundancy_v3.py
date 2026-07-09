@@ -26,6 +26,7 @@ from analysis.redundancy.similarity_v3 import (
     parse_token_regions,
     should_compute_scene_redundancy,
     unit_map_to_flat_layers_by_region,
+    validate_metric_names,
     write_redundancy_outputs,
 )
 from analysis.schema.v3 import SCHEMA_VERSION, CacheManifestV3, stage_dir
@@ -64,7 +65,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-span", type=int, default=8)
     p.add_argument("--max-tokens", type=int, default=4096, help="Per-layer token subsample for similarity (0=all).")
     p.add_argument("--token-regions", type=str, default="all")
-    p.add_argument("--similarity-threshold", type=float, default=0.95)
     p.add_argument(
         "--prune-plan-root",
         type=Path,
@@ -246,7 +246,6 @@ def run_cache_redundancy(
     max_span: int = 8,
     max_tokens: int = 4096,
     token_regions: str = "all",
-    similarity_threshold: float = 0.95,
     progress: bool = True,
     prune_plan_root: Optional[Path] = None,
     plan_name: str = "",
@@ -266,7 +265,7 @@ def run_cache_redundancy(
     torch_device = torch.device(device)
     amp_dt = amp_dtype_for_device(torch_device)
     hf = str(hf_model or adapter.default_hf_model())
-    metric_names = [m.strip() for m in metrics.split(",") if m.strip()]
+    metric_names = validate_metric_names([m.strip() for m in metrics.split(",") if m.strip()])
     regions = parse_token_regions(token_regions)
     compute_redundancy = should_compute_scene_redundancy(
         skip_redundancy=skip_redundancy,
@@ -533,7 +532,6 @@ def main() -> None:
         max_span=int(args.max_span),
         max_tokens=int(args.max_tokens),
         token_regions=str(args.token_regions),
-        similarity_threshold=float(args.similarity_threshold),
         progress=True,
         prune_plan_root=args.prune_plan_root,
         plan_name=str(args.prune_plan_name),

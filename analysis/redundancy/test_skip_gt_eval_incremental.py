@@ -104,7 +104,7 @@ class IncrementalSkipReplayTest(unittest.TestCase):
 
 class SkipCheckpointTest(unittest.TestCase):
     def test_span_enumeration(self) -> None:
-        self.assertEqual(len(list(iter_unit_spans(48, max_span=8))), 396)
+        self.assertEqual(len(list(iter_unit_spans(48, max_span=8))), 356)
 
     def test_point_metric_family_is_retained(self) -> None:
         from analysis.redundancy.skip_gt_eval_v3 import normalize_metrics
@@ -166,8 +166,10 @@ class SkipCheckpointTest(unittest.TestCase):
                 "skip_eval_scenes_v3.json",
                 "skip_eval_v3.npz",
                 "skip_eval_summary_v3.json",
+                "skip_eval_interval_index_v3.json",
             ):
                 self.assertTrue((root / name).is_file(), name)
+            self.assertTrue((root / "i0_j0" / "summary.json").is_file())
             summary = json.loads((root / "skip_eval_summary_v3.json").read_text())
             self.assertEqual(summary["num_scenes_completed"], 1)
 

@@ -5,16 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
-BACKBONES="${BACKBONES:-vggt}"
-RUN_SCANNET_DEV50="${RUN_SCANNET_DEV50:-0}"
-RUN_SCANNET_TEST50="${RUN_SCANNET_TEST50:-0}"
-RUN_7SCENES_TEST="${RUN_7SCENES_TEST:-0}"
-RUN_7SCENES_TRAIN="${RUN_7SCENES_TRAIN:-0}"
-RUN_NRGBD="${RUN_NRGBD:-0}"
-RUN_NUSCENES_TRAIN="${RUN_NUSCENES_TRAIN:-0}"
-RUN_NUSCENES_VAL="${RUN_NUSCENES_VAL:-0}"
-RUN_WAYMO_TRAINING="${RUN_WAYMO_TRAINING:-0}"
-RUN_WAYMO_VALIDATION="${RUN_WAYMO_VALIDATION:-0}"
+RUN="${RUN:-}"
 
 EXPORT_VIS_2D="${EXPORT_VIS_2D:-1}"
 EXPORT_VIS_3D="${EXPORT_VIS_3D:-0}"
@@ -22,12 +13,14 @@ EXPORT_VIS_3D="${EXPORT_VIS_3D:-0}"
 PRUNE="${PRUNE:-0,1}"
 PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-${REPO_ROOT}/analysis/prune_plan}"
 # Pruned eval selectors use the split plan layout:
-#   PLAN_GROUP / PRUNE_PLAN_NAME: explicit prune selectors such as "prune_span5 prune_span10"
-#   PLAN_MIN_DROP + PLAN_MAX_DROP + PLAN_DROP_STEP: select prune_spanN by an inclusive range.
+#   PLAN_GROUP / PRUNE_PLAN_NAME: explicit physical interval selectors such as "i9_j19 i8_j20".
+#   PLAN_STRATEGY: strategy keys from prune_plan_all.json, such as "ours gt cosine".
+#   PLAN_MIN_DROP + PLAN_MAX_DROP + PLAN_DROP_STEP: select interval union from strategies by range.
 # For model-mode eval, RECOVERY_PLAN_NAME optionally composes
 # the prune selector with a recovery plan bundle such as "recovery_lora_l1_r32".
 PRUNE_PLAN_NAME="${PRUNE_PLAN_NAME:-}"
 PLAN_GROUP="${PLAN_GROUP:-}"
+PLAN_STRATEGY="${PLAN_STRATEGY:-}"
 PLAN_MIN_DROP="${PLAN_MIN_DROP:-}"
 PLAN_MAX_DROP="${PLAN_MAX_DROP:-}"
 PLAN_DROP_STEP="${PLAN_DROP_STEP:-}"
@@ -38,16 +31,9 @@ WRITE_SUMMARY="${WRITE_SUMMARY:-1}"
 
 #############################################
 
-ROOT_SCANNET_DEV50="${ROOT_SCANNET_DEV50:-data/scans_dev50}"
-ROOT_SCANNET_TEST50="${ROOT_SCANNET_TEST50:-data/scans_test50}"
-ROOT_7SCENES="${ROOT_7SCENES:-data/7scenes}"
-ROOT_NRGBD="${ROOT_NRGBD:-data/neural_rgbd_data}"
-ROOT_NUSCENES="${ROOT_NUSCENES:-data/nuscenes}"
-ROOT_WAYMO="${ROOT_WAYMO:-data/waymo}"
 DEVICE="${DEVICE:-cuda}"
 CONDA_ENV="${CONDA_ENV:-vggt}"
 CHECKPOINT="${CHECKPOINT:-}"
-HF_MODEL="${HF_MODEL:-}"
 INFERENCE_COMPRESSION="${INFERENCE_COMPRESSION:-none}"
 FASTVGGT_MERGE_START="${FASTVGGT_MERGE_START:-0}"
 FASTVGGT_MERGE_RATIO="${FASTVGGT_MERGE_RATIO:-0.9}"
@@ -58,6 +44,8 @@ QUANTVGGT_PARAMS_DIR="${QUANTVGGT_PARAMS_DIR:-}"
 # shellcheck source=run_backbones_lib.sh
 source "${REPO_ROOT}/run_backbones_lib.sh"
 parse_backbones_list
+parse_dataset_list "${RUN}" "RUN" "${DATASET_KEYS[@]}"
+RUN_LIST=("${PARSED_DATASETS[@]}")
 
 PRUNE_N=0
 parse_prune_list() {
@@ -83,10 +71,16 @@ parse_prune_list
 
 PLAN_GROUP_LIST=()
 PRUNE_PLAN_NAME_LIST=()
+PLAN_STRATEGY_LIST=()
 read -r -a _PLAN_GROUP_RAW <<< "${PLAN_GROUP//,/ }"
 for _value in "${_PLAN_GROUP_RAW[@]}"; do
   _value="${_value//[[:space:]]/}"
   [[ -n "${_value}" ]] && PLAN_GROUP_LIST+=("${_value}")
+done
+read -r -a _PLAN_STRATEGY_RAW <<< "${PLAN_STRATEGY//,/ }"
+for _value in "${_PLAN_STRATEGY_RAW[@]}"; do
+  _value="${_value//[[:space:]]/}"
+  [[ -n "${_value}" ]] && PLAN_STRATEGY_LIST+=("${_value}")
 done
 read -r -a _PRUNE_PLAN_NAME_RAW <<< "${PRUNE_PLAN_NAME//,/ }"
 for _value in "${_PRUNE_PLAN_NAME_RAW[@]}"; do
@@ -97,10 +91,14 @@ if [[ "${#PLAN_GROUP_LIST[@]}" -gt 0 && "${#PRUNE_PLAN_NAME_LIST[@]}" -gt 0 ]]; 
   echo "error: set only one of PLAN_GROUP or PRUNE_PLAN_NAME for prune-span eval." >&2
   exit 1
 fi
+if [[ "${#PLAN_STRATEGY_LIST[@]}" -gt 0 && ( "${#PLAN_GROUP_LIST[@]}" -gt 0 || "${#PRUNE_PLAN_NAME_LIST[@]}" -gt 0 ) ]]; then
+  echo "error: set PLAN_STRATEGY with range selectors, or explicit PLAN_GROUP/PRUNE_PLAN_NAME, not both." >&2
+  exit 1
+fi
 for _prune_value in "${PRUNE_LIST[@]}"; do
   _prune_value="${_prune_value//[[:space:]]/}"
-  if [[ "${_prune_value}" == "1" && "${#PLAN_GROUP_LIST[@]}" -eq 0 && "${#PRUNE_PLAN_NAME_LIST[@]}" -eq 0 && ( -z "${PLAN_MIN_DROP}" || -z "${PLAN_MAX_DROP}" || -z "${PLAN_DROP_STEP}" ) ]]; then
-    echo "error: PLAN_GROUP/PRUNE_PLAN_NAME or PLAN_MIN_DROP+PLAN_MAX_DROP+PLAN_DROP_STEP is required when PRUNE includes 1." >&2
+  if [[ "${_prune_value}" == "1" && "${#PLAN_GROUP_LIST[@]}" -eq 0 && "${#PRUNE_PLAN_NAME_LIST[@]}" -eq 0 && "${#PLAN_STRATEGY_LIST[@]}" -eq 0 && ( -z "${PLAN_MIN_DROP}" || -z "${PLAN_MAX_DROP}" || -z "${PLAN_DROP_STEP}" ) ]]; then
+    echo "error: PLAN_GROUP/PRUNE_PLAN_NAME, PLAN_STRATEGY, or PLAN_MIN_DROP+PLAN_MAX_DROP+PLAN_DROP_STEP is required when PRUNE includes 1." >&2
     exit 1
   fi
 done
@@ -193,15 +191,16 @@ for g in list_plan_groups(Path(os.environ['PRUNE_PLAN_ROOT_FOR_PY'])):
 "
 }
 
-python_select_prune_span_range() {
+python_select_interval_range() {
   local root="$1"
   local min_drop="$2"
   local max_drop="$3"
   local step="$4"
-  PRUNE_PLAN_ROOT_FOR_PY="${root}" PLAN_MIN_DROP_FOR_PY="${min_drop}" PLAN_MAX_DROP_FOR_PY="${max_drop}" PLAN_DROP_STEP_FOR_PY="${step}" conda run --no-capture-output -n "${CONDA_ENV}" python -c "
+  local strategies="$5"
+  PRUNE_PLAN_ROOT_FOR_PY="${root}" PLAN_MIN_DROP_FOR_PY="${min_drop}" PLAN_MAX_DROP_FOR_PY="${max_drop}" PLAN_DROP_STEP_FOR_PY="${step}" PLAN_STRATEGY_FOR_PY="${strategies}" conda run --no-capture-output -n "${CONDA_ENV}" python -c "
 import os
 from pathlib import Path
-from analysis.prune_plan import load_prune_plan_bundle
+from analysis.prune_plan import strategy_interval_selectors
 root = Path(os.environ['PRUNE_PLAN_ROOT_FOR_PY'])
 try:
     min_drop = int(os.environ['PLAN_MIN_DROP_FOR_PY'])
@@ -215,18 +214,22 @@ if max_drop < min_drop:
     raise SystemExit('PLAN_MAX_DROP must be >= PLAN_MIN_DROP')
 if step <= 0:
     raise SystemExit('PLAN_DROP_STEP must be > 0')
-b = load_prune_plan_bundle(root)
-spans = sorted(int(k) for k in b.get('spans', {}).keys() if str(k).isdigit())
-available = set(spans)
-selected = [s for s in range(min_drop, max_drop + 1, step) if s > 0 and s in available]
+strategies = [x for x in os.environ.get('PLAN_STRATEGY_FOR_PY', '').replace(',', ' ').split() if x.strip()]
+selected = strategy_interval_selectors(
+    root,
+    strategies=strategies,
+    min_drop=min_drop,
+    max_drop=max_drop,
+    drop_step=step,
+)
 if not selected:
-    raise SystemExit(f'no available prune spans in [{min_drop}, {max_drop}] step {step} under {root}')
-for s in selected:
-    print(f'prune_span{s}')
+    raise SystemExit(f'no available prune intervals in [{min_drop}, {max_drop}] step {step} under {root}')
+for selector in selected:
+    print(selector)
 "
 }
 
-# upper: full pretrained; lower: apply prune_spanN only; model: apply prune_spanN plus finetuned checkpoint.
+# upper: full pretrained; lower: apply one physical interval only; model: apply prune plan plus finetuned checkpoint.
 resolve_eval_mode() {
   local prune_flag="$1"
   if truthy "${prune_flag}"; then
@@ -317,9 +320,6 @@ run_eval_dataset() {
   if [[ -n "${QUANTVGGT_PARAMS_DIR}" ]]; then
     extra+=(--quantvggt-params-dir "${QUANTVGGT_PARAMS_DIR}")
   fi
-  if [[ -n "${HF_MODEL}" ]]; then
-    extra+=(--hf-model "${HF_MODEL}")
-  fi
   extra+=(--max-frames "${MAX_FRAMES}")
   if [[ -n "${split}" ]]; then
     extra+=(--split "${split}")
@@ -377,6 +377,45 @@ run_eval_dataset() {
     "${extra[@]}"
 }
 
+run_eval_dataset_key() {
+  local key="$1"
+  local backbone="$2"
+  local mode="$3"
+  local model_name="$4"
+  local prune_plan_name="${5:-}"
+  local plan_group="${6:-}"
+
+  case "${key}" in
+    SCANNET_DEV50)
+      run_eval_dataset "scannet" "${ROOT_SCANNET_DEV50}" "${backbone}" "${mode}" "${model_name}" "scannet_dev50" "${prune_plan_name}" "${plan_group}"
+      ;;
+    SCANNET_TEST50)
+      run_eval_dataset "scannet" "${ROOT_SCANNET_TEST50}" "${backbone}" "${mode}" "${model_name}" "scannet_test50" "${prune_plan_name}" "${plan_group}"
+      ;;
+    7SCENES_TEST)
+      run_eval_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "${mode}" "${model_name}" "7scenes_test" "${prune_plan_name}" "${plan_group}" "test"
+      ;;
+    7SCENES_TRAIN)
+      run_eval_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "${mode}" "${model_name}" "7scenes_train" "${prune_plan_name}" "${plan_group}" "train"
+      ;;
+    NRGBD)
+      run_eval_dataset "nrgbd" "${ROOT_NRGBD}" "${backbone}" "${mode}" "${model_name}" "nrgbd" "${prune_plan_name}" "${plan_group}"
+      ;;
+    NUSCENES_VAL)
+      run_eval_dataset "nuscenes" "${ROOT_NUSCENES}" "${backbone}" "${mode}" "${model_name}" "nuscenes_val" "${prune_plan_name}" "${plan_group}" "val"
+      ;;
+    NUSCENES_TRAIN)
+      run_eval_dataset "nuscenes" "${ROOT_NUSCENES}" "${backbone}" "${mode}" "${model_name}" "nuscenes_train" "${prune_plan_name}" "${plan_group}" "train"
+      ;;
+    WAYMO_VALIDATION)
+      run_eval_dataset "waymo" "${ROOT_WAYMO}" "${backbone}" "${mode}" "${model_name}" "waymo_validation" "${prune_plan_name}" "${plan_group}" "validation"
+      ;;
+    WAYMO_TRAINING)
+      run_eval_dataset "waymo" "${ROOT_WAYMO}" "${backbone}" "${mode}" "${model_name}" "waymo_training" "${prune_plan_name}" "${plan_group}" "training"
+      ;;
+  esac
+}
+
 run_datasets_for_backbone() {
   local backbone="$1"
   local prune_flag="$2"
@@ -395,33 +434,10 @@ run_datasets_for_backbone() {
     fi
   fi
 
-  if truthy "${RUN_SCANNET_DEV50}"; then
-    run_eval_dataset "scannet" "${ROOT_SCANNET_DEV50}" "${backbone}" "${mode}" "${model_name}" "scannet_dev50" "${prune_plan_name}" "${plan_group}"
-  fi
-  if truthy "${RUN_SCANNET_TEST50}"; then
-    run_eval_dataset "scannet" "${ROOT_SCANNET_TEST50}" "${backbone}" "${mode}" "${model_name}" "scannet_test50" "${prune_plan_name}" "${plan_group}"
-  fi
-  if truthy "${RUN_7SCENES_TEST}"; then
-    run_eval_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "${mode}" "${model_name}" "7scenes_test" "${prune_plan_name}" "${plan_group}" "test"
-  fi
-  if truthy "${RUN_7SCENES_TRAIN}"; then
-    run_eval_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "${mode}" "${model_name}" "7scenes_train" "${prune_plan_name}" "${plan_group}" "train"
-  fi
-  if [[ "${RUN_NRGBD}" == "1" || "${RUN_NRGBD}" == "true" ]]; then
-    run_eval_dataset "nrgbd" "${ROOT_NRGBD}" "${backbone}" "${mode}" "${model_name}" "nrgbd" "${prune_plan_name}" "${plan_group}"
-  fi
-  if truthy "${RUN_NUSCENES_VAL}"; then
-    run_eval_dataset "nuscenes" "${ROOT_NUSCENES}" "${backbone}" "${mode}" "${model_name}" "nuscenes_val" "${prune_plan_name}" "${plan_group}" "val"
-  fi
-  if truthy "${RUN_NUSCENES_TRAIN}"; then
-    run_eval_dataset "nuscenes" "${ROOT_NUSCENES}" "${backbone}" "${mode}" "${model_name}" "nuscenes_train" "${prune_plan_name}" "${plan_group}" "train"
-  fi
-  if truthy "${RUN_WAYMO_VALIDATION}"; then
-    run_eval_dataset "waymo" "${ROOT_WAYMO}" "${backbone}" "${mode}" "${model_name}" "waymo_validation" "${prune_plan_name}" "${plan_group}" "validation"
-  fi
-  if truthy "${RUN_WAYMO_TRAINING}"; then
-    run_eval_dataset "waymo" "${ROOT_WAYMO}" "${backbone}" "${mode}" "${model_name}" "waymo_training" "${prune_plan_name}" "${plan_group}" "training"
-  fi
+  local dataset_key
+  for dataset_key in "${RUN_LIST[@]}"; do
+    run_eval_dataset_key "${dataset_key}" "${backbone}" "${mode}" "${model_name}" "${prune_plan_name}" "${plan_group}"
+  done
 }
 
 run_eval_group_variant() {
@@ -434,7 +450,7 @@ run_eval_group_variant() {
     echo "warning: skip missing prune-span selector for ${bb}: ${group} under ${PRUNE_PLAN_ROOT}" >&2
     return 0
   fi
-  run_datasets_for_backbone "${bb}" "1" "${canonical}" "${group}"
+  run_datasets_for_backbone "${bb}" "1" "${canonical}" "${canonical}"
 }
 
 run_eval_for_prune_variants() {
@@ -443,6 +459,18 @@ run_eval_for_prune_variants() {
     local requested_group
     for requested_group in "${PLAN_GROUP_LIST[@]}"; do
       run_eval_group_variant "${bb}" "${requested_group}"
+    done
+    return
+  fi
+  if [[ "${#PLAN_STRATEGY_LIST[@]}" -gt 0 && -z "${PLAN_MIN_DROP}${PLAN_MAX_DROP}${PLAN_DROP_STEP}" ]]; then
+    local strategy_selectors=()
+    local strategy_csv="${PLAN_STRATEGY_LIST[*]}"
+    local selector
+    while IFS= read -r selector; do
+      [[ -n "${selector}" ]] && strategy_selectors+=("${selector}")
+    done < <(python_select_interval_range "${PRUNE_PLAN_ROOT}" "1" "9999" "1" "${strategy_csv}")
+    for selector in "${strategy_selectors[@]}"; do
+      run_eval_group_variant "${bb}" "${selector}"
     done
     return
   fi
@@ -468,9 +496,10 @@ run_eval_for_prune_variants() {
     fi
     local selected_groups=()
     local sg
+    local strategy_csv="${PLAN_STRATEGY_LIST[*]}"
     while IFS= read -r sg; do
       [[ -n "${sg}" ]] && selected_groups+=("${sg}")
-    done < <(python_select_prune_span_range "${PRUNE_PLAN_ROOT}" "${PLAN_MIN_DROP}" "${PLAN_MAX_DROP}" "${PLAN_DROP_STEP}")
+    done < <(python_select_interval_range "${PRUNE_PLAN_ROOT}" "${PLAN_MIN_DROP}" "${PLAN_MAX_DROP}" "${PLAN_DROP_STEP}" "${strategy_csv}")
     for sg in "${selected_groups[@]}"; do
       run_eval_group_variant "${bb}" "${sg}"
     done
@@ -499,7 +528,7 @@ run_eval_for_prune_variants() {
   done
 }
 
-echo "== eval v3 backbones=${BACKBONES} (n=${BB_N}) PRUNE=${PRUNE} (n=${PRUNE_N}) MAX_FRAMES=${MAX_FRAMES} COMPRESSION=${INFERENCE_COMPRESSION} VIS_2D=${EXPORT_VIS_2D} VIS_3D=${EXPORT_VIS_3D} =="
+echo "== eval v3 backbones=${BACKBONES} (n=${BB_N}) RUN=${RUN:-<none>} PRUNE=${PRUNE} (n=${PRUNE_N}) MAX_FRAMES=${MAX_FRAMES} COMPRESSION=${INFERENCE_COMPRESSION} VIS_2D=${EXPORT_VIS_2D} VIS_3D=${EXPORT_VIS_3D} =="
 
 for bb in "${BB_LIST[@]}"; do
   bb="${bb//[[:space:]]/}"

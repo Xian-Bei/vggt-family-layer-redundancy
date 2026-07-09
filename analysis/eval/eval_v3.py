@@ -93,7 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="prune_plan_name",
         type=str,
         default="",
-        help="Prune selector for lower/model modes (e.g. prune_span10).",
+        help="Prune selector for lower/model modes (e.g. i9_j19).",
     )
     p.add_argument(
         "--recovery-plan-root",

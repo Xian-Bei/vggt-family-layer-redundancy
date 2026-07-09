@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+
+SUPPORTED_SIMILARITY_METRICS = frozenset({"cosine", "cka", "neg_mse", "cca", "pwcca"})
+DEFAULT_SIMILARITY_METRICS = ("cosine", "cka", "neg_mse")
 
 
 def upper_triangle_length(num_layers: int) -> int:
@@ -131,13 +134,58 @@ def token_mean_squared_error_tensor(x: torch.Tensor, y: torch.Tensor) -> torch.T
     return F.mse_loss(x, y)
 
 
-def _cca_singular_values(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+def _normalize_similarity_metric_names(
+    metric_names: Optional[Iterable[str]],
+    *,
+    compute_pwcca: bool = False,
+) -> Tuple[str, ...]:
+    if metric_names is None:
+        names = list(DEFAULT_SIMILARITY_METRICS)
+        if compute_pwcca:
+            names.append("pwcca")
+    else:
+        names = [str(name).strip().lower() for name in metric_names if str(name).strip()]
+        if compute_pwcca and "pwcca" not in names:
+            names.append("pwcca")
+    unknown = sorted(set(names).difference(SUPPORTED_SIMILARITY_METRICS))
+    if unknown:
+        raise ValueError(
+            f"Unsupported similarity metric(s): {unknown}; "
+            f"allowed: {sorted(SUPPORTED_SIMILARITY_METRICS)}"
+        )
+    out: List[str] = []
+    for name in names:
+        if name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def _svd_reduce_for_cca(x: torch.Tensor, keep_components: int) -> torch.Tensor:
+    x = x - x.mean(dim=0, keepdim=True)
+    if x.numel() == 0:
+        return x
+    _u, _s, vh = torch.linalg.svd(x, full_matrices=False)
+    k = min(max(1, int(keep_components)), int(vh.shape[0]))
+    # Return principal-component scores [N, k]. This is the SVCCA/PWCCA
+    # pre-step and keeps the covariance eigensystems small enough for layer scans.
+    return x @ vh[:k].t()
+
+
+def _cca_decomposition(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    eps: float = 1e-5,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     x = x - x.mean(dim=0, keepdim=True)
     y = y - y.mean(dim=0, keepdim=True)
 
     n = x.shape[0]
-    cxx = (x.t() @ x) / max(n - 1, 1) + eps * torch.eye(x.shape[1], device=x.device)
-    cyy = (y.t() @ y) / max(n - 1, 1) + eps * torch.eye(y.shape[1], device=y.device)
+    cxx = (x.t() @ x) / max(n - 1, 1) + eps * torch.eye(
+        x.shape[1], device=x.device, dtype=x.dtype
+    )
+    cyy = (y.t() @ y) / max(n - 1, 1) + eps * torch.eye(
+        y.shape[1], device=y.device, dtype=y.dtype
+    )
     cxy = (x.t() @ y) / max(n - 1, 1)
 
     ex, vx = torch.linalg.eigh(cxx)
@@ -148,7 +196,14 @@ def _cca_singular_values(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) ->
     inv_sqrt_x = vx @ torch.diag(ex.rsqrt()) @ vx.t()
     inv_sqrt_y = vy @ torch.diag(ey.rsqrt()) @ vy.t()
     tmat = inv_sqrt_x @ cxy @ inv_sqrt_y
-    return torch.linalg.svdvals(tmat)
+    u, corr, _vh = torch.linalg.svd(tmat, full_matrices=False)
+    x_dirs = inv_sqrt_x @ u
+    return corr, x_dirs
+
+
+def _cca_singular_values(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    corr, _x_dirs = _cca_decomposition(x, y, eps=eps)
+    return corr
 
 
 def neg_mean_squared_error(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -160,22 +215,32 @@ def neg_mean_squared_error(x: torch.Tensor, y: torch.Tensor) -> float:
     return float((-token_mean_squared_error_tensor(x, y)).item())
 
 
+def cca_similarity(x: torch.Tensor, y: torch.Tensor, keep_components: int = 64) -> float:
+    """SVCCA-style mean canonical correlation after SVD dimensionality reduction."""
+    x, y = _flatten_tokens_pair(x, y)
+    x_proj = _svd_reduce_for_cca(x, keep_components)
+    y_proj = _svd_reduce_for_cca(y, keep_components)
+    corr = _cca_singular_values(x_proj, y_proj).clamp(0.0, 1.0)
+    if corr.numel() == 0:
+        return 0.0
+    return float(corr.mean().item())
+
+
 def pwcca_similarity(x: torch.Tensor, y: torch.Tensor, keep_components: int = 64) -> float:
+    """Projection-weighted CCA after the same SVD reduction used by :func:`cca_similarity`."""
     x, y = _flatten_tokens_pair(x, y)
 
-    # SVD pre-whitening to reduce noise and compute cost.
-    ux, sx, _ = torch.linalg.svd(x, full_matrices=False)
-    uy, sy, _ = torch.linalg.svd(y, full_matrices=False)
-    kx = min(keep_components, ux.shape[1])
-    ky = min(keep_components, uy.shape[1])
-    x_proj = ux[:, :kx] * sx[:kx]
-    y_proj = uy[:, :ky] * sy[:ky]
+    x_proj = _svd_reduce_for_cca(x, keep_components)
+    y_proj = _svd_reduce_for_cca(y, keep_components)
 
-    corr = _cca_singular_values(x_proj, y_proj)
+    corr, x_dirs = _cca_decomposition(x_proj, y_proj)
     corr = corr.clamp(0.0, 1.0)
     if corr.numel() == 0:
         return 0.0
-    weights = corr / (corr.sum() + 1e-8)
+    x_centered = x_proj - x_proj.mean(dim=0, keepdim=True)
+    x_canonical = x_centered @ x_dirs
+    weights = x_canonical.abs().sum(dim=0)
+    weights = weights / weights.sum().clamp_min(1e-8)
     return float((weights * corr).sum().item())
 
 
@@ -185,22 +250,28 @@ def pairwise_similarity_matrices(
     compute_pwcca: bool = False,
     device: Optional[Union[str, torch.device]] = None,
     *,
+    metric_names: Optional[Iterable[str]] = None,
     progress: bool = False,
     progress_desc: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Pairwise cosine / linear CKA / optional PWCCA / neg-MSE between layer token tensors.
+    Pairwise similarity matrices between layer token tensors.
 
     If ``device`` is set (e.g. ``cuda``), layer tensors are moved to that device once for
     all pairs; metric matrices are returned on **CPU** float64.
 
-    PWCCA dominates cost on large ``N``; it is **off by default** (``compute_pwcca=False``).
-    When disabled, the returned dict has **no** ``pwcca`` key.
+    ``metric_names`` selects from cosine, cka, neg_mse, cca, pwcca.  If omitted,
+    the historical default is cosine / CKA / neg-MSE, plus PWCCA when
+    ``compute_pwcca=True``.
 
     If ``metric_seconds`` is a dict, accumulate wall seconds per metric over all pairs.
     """
     if len(layer_tokens) == 0:
         return {}
+    requested = _normalize_similarity_metric_names(
+        metric_names,
+        compute_pwcca=compute_pwcca,
+    )
 
     if device is not None:
         dev = torch.device(device) if isinstance(device, str) else device
@@ -209,12 +280,10 @@ def pairwise_similarity_matrices(
         dev = layer_tokens[0].device
 
     num_layers = len(layer_tokens)
-    cos = torch.zeros(num_layers, num_layers, device=dev, dtype=torch.float64)
-    cka = torch.zeros(num_layers, num_layers, device=dev, dtype=torch.float64)
-    neg_mse = torch.zeros(num_layers, num_layers, device=dev, dtype=torch.float64)
-    pwcca_m: Optional[torch.Tensor] = None
-    if compute_pwcca:
-        pwcca_m = torch.zeros(num_layers, num_layers, device=dev, dtype=torch.float64)
+    mats = {
+        name: torch.zeros(num_layers, num_layers, device=dev, dtype=torch.float64)
+        for name in requested
+    }
 
     def _acc(name: str, t0: float) -> None:
         if metric_seconds is not None:
@@ -239,40 +308,41 @@ def pairwise_similarity_matrices(
         for i in range(num_layers):
             for j in range(i, num_layers):
                 t0 = time.perf_counter()
-                cos_v = sample_cosine_similarity(layer_tokens[i], layer_tokens[j])
-                _acc("cosine", t0)
+                if "cosine" in mats:
+                    cos_v = sample_cosine_similarity(layer_tokens[i], layer_tokens[j])
+                    mats["cosine"][i, j] = mats["cosine"][j, i] = cos_v
+                    _acc("cosine", t0)
 
                 t0 = time.perf_counter()
-                cka_v = linear_cka(layer_tokens[i], layer_tokens[j])
-                _acc("cka", t0)
+                if "cka" in mats:
+                    cka_v = linear_cka(layer_tokens[i], layer_tokens[j])
+                    mats["cka"][i, j] = mats["cka"][j, i] = cka_v
+                    _acc("cka", t0)
 
-                if compute_pwcca and pwcca_m is not None:
+                if "cca" in mats:
+                    t0 = time.perf_counter()
+                    cca_v = cca_similarity(layer_tokens[i], layer_tokens[j])
+                    _acc("cca", t0)
+                    mats["cca"][i, j] = mats["cca"][j, i] = cca_v
+
+                if "pwcca" in mats:
                     t0 = time.perf_counter()
                     pw_v = pwcca_similarity(layer_tokens[i], layer_tokens[j])
                     _acc("pwcca", t0)
-                    pwcca_m[i, j] = pwcca_m[j, i] = pw_v
+                    mats["pwcca"][i, j] = mats["pwcca"][j, i] = pw_v
 
                 t0 = time.perf_counter()
-                nm_v = neg_mean_squared_error(layer_tokens[i], layer_tokens[j])
-                _acc("neg_mse", t0)
-
-                cos[i, j] = cos[j, i] = cos_v
-                cka[i, j] = cka[j, i] = cka_v
-                neg_mse[i, j] = neg_mse[j, i] = nm_v
+                if "neg_mse" in mats:
+                    nm_v = neg_mean_squared_error(layer_tokens[i], layer_tokens[j])
+                    _acc("neg_mse", t0)
+                    mats["neg_mse"][i, j] = mats["neg_mse"][j, i] = nm_v
                 if pbar is not None:
                     pbar.update(1)
     finally:
         if pbar is not None:
             pbar.close()
 
-    out: Dict[str, torch.Tensor] = {
-        "cosine": cos.cpu(),
-        "cka": cka.cpu(),
-        "neg_mse": neg_mse.cpu(),
-    }
-    if pwcca_m is not None:
-        out["pwcca"] = pwcca_m.cpu()
-    return out
+    return {name: mat.cpu() for name, mat in mats.items()}
 
 
 def paired_layer_similarity_matrices(
@@ -281,6 +351,8 @@ def paired_layer_similarity_matrices(
     metric_seconds: Optional[Dict[str, float]] = None,
     compute_pwcca: bool = False,
     device: Optional[Union[str, torch.device]] = None,
+    *,
+    metric_names: Optional[Iterable[str]] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Per-layer similarity between paired tensors ``(x_i, y_i)``.
@@ -294,6 +366,10 @@ def paired_layer_similarity_matrices(
         return {}
     if len(x_layers) != len(y_layers):
         raise ValueError(f"Expected same number of x/y layers, got {len(x_layers)} vs {len(y_layers)}")
+    requested = _normalize_similarity_metric_names(
+        metric_names,
+        compute_pwcca=compute_pwcca,
+    )
 
     if device is not None:
         dev = torch.device(device) if isinstance(device, str) else device
@@ -303,12 +379,10 @@ def paired_layer_similarity_matrices(
         dev = x_layers[0].device
 
     num_layers = len(x_layers)
-    cos = torch.full((num_layers, num_layers), float("nan"), device=dev, dtype=torch.float64)
-    cka = torch.full((num_layers, num_layers), float("nan"), device=dev, dtype=torch.float64)
-    neg_mse = torch.full((num_layers, num_layers), float("nan"), device=dev, dtype=torch.float64)
-    pwcca_m: Optional[torch.Tensor] = None
-    if compute_pwcca:
-        pwcca_m = torch.full((num_layers, num_layers), float("nan"), device=dev, dtype=torch.float64)
+    mats = {
+        name: torch.full((num_layers, num_layers), float("nan"), device=dev, dtype=torch.float64)
+        for name in requested
+    }
 
     def _acc(name: str, t0: float) -> None:
         if metric_seconds is not None:
@@ -316,35 +390,36 @@ def paired_layer_similarity_matrices(
 
     for i in range(num_layers):
         t0 = time.perf_counter()
-        cos_v = sample_cosine_similarity(x_layers[i], y_layers[i])
-        _acc("cosine", t0)
+        if "cosine" in mats:
+            cos_v = sample_cosine_similarity(x_layers[i], y_layers[i])
+            _acc("cosine", t0)
+            mats["cosine"][i, i] = cos_v
 
         t0 = time.perf_counter()
-        cka_v = linear_cka(x_layers[i], y_layers[i])
-        _acc("cka", t0)
+        if "cka" in mats:
+            cka_v = linear_cka(x_layers[i], y_layers[i])
+            _acc("cka", t0)
+            mats["cka"][i, i] = cka_v
 
-        if compute_pwcca and pwcca_m is not None:
+        if "cca" in mats:
+            t0 = time.perf_counter()
+            cca_v = cca_similarity(x_layers[i], y_layers[i])
+            _acc("cca", t0)
+            mats["cca"][i, i] = cca_v
+
+        if "pwcca" in mats:
             t0 = time.perf_counter()
             pw_v = pwcca_similarity(x_layers[i], y_layers[i])
             _acc("pwcca", t0)
-            pwcca_m[i, i] = pw_v
+            mats["pwcca"][i, i] = pw_v
 
         t0 = time.perf_counter()
-        nm_v = neg_mean_squared_error(x_layers[i], y_layers[i])
-        _acc("neg_mse", t0)
+        if "neg_mse" in mats:
+            nm_v = neg_mean_squared_error(x_layers[i], y_layers[i])
+            _acc("neg_mse", t0)
+            mats["neg_mse"][i, i] = nm_v
 
-        cos[i, i] = cos_v
-        cka[i, i] = cka_v
-        neg_mse[i, i] = nm_v
-
-    out: Dict[str, torch.Tensor] = {
-        "cosine": cos.cpu(),
-        "cka": cka.cpu(),
-        "neg_mse": neg_mse.cpu(),
-    }
-    if pwcca_m is not None:
-        out["pwcca"] = pwcca_m.cpu()
-    return out
+    return {name: mat.cpu() for name, mat in mats.items()}
 
 
 def stable_rank(weight: torch.Tensor, eps: float = 1e-8) -> float:
@@ -366,4 +441,3 @@ def spectral_stats(weight: torch.Tensor) -> Dict[str, float]:
         "stable_rank": stable_rank(weight),
         "effective_rank": effective_rank(weight),
     }
-

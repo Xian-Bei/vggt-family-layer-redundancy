@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from analysis.prune_plan import (
+    bundle_interval_records,
+    bundle_strategy_records,
+    is_interval_selector,
     is_plan_group_name,
     load_prune_plan_bundle,
     plan_group_from_name,
@@ -58,6 +61,7 @@ def _dataset_sort_key(name: str) -> Tuple[int, str]:
 _PLAN_GROUP_SORT_RE = re.compile(r"^(?:prune_span(\d+)|plan_budget(\d+)|plan_t(\d+))$")
 _PRUNE_SPAN_RE = re.compile(r"^prune_span(\d+)$")
 _PRUNE_SPAN_PREFIX_RE = re.compile(r"^(prune_span\d+)(?:[_/].*)?$")
+_INTERVAL_LABEL_RE = re.compile(r"^i(?P<i>\d+)_j(?P<j>\d+)$")
 _RECOVER_LABEL_RE = re.compile(r"^(prune_span\d+)_(recovery_.+)$")
 
 
@@ -71,6 +75,10 @@ def _lower_label_sort_key(label: str) -> Tuple[int, int, int, str]:
     if span is not None:
         subrank = 0 if _label_base(label) == str(label or "").split("+", 1)[0] else 1
         return (0, int(span), subrank, label)
+    interval_span = _interval_span_from_label(label)
+    if interval_span is not None:
+        i, j, span_value = interval_span
+        return (0, int(span_value), 0, f"{i:04d}_{j:04d}_{label}")
     return (2, 0, 0, label)
 
 
@@ -94,9 +102,26 @@ def _span_from_label(label: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _interval_span_from_label(label: str) -> Optional[Tuple[int, int, int]]:
+    m = _INTERVAL_LABEL_RE.match(_label_base(label))
+    if not m:
+        return None
+    i = int(m.group("i"))
+    j = int(m.group("j"))
+    return i, j, j - i + 1
+
+
 def _plain_lower_span_label(label: str) -> bool:
     base = str(label or "").split("+", 1)[0]
-    return bool(_PLAN_GROUP_SORT_RE.match(base))
+    return bool(_PLAN_GROUP_SORT_RE.match(base) or _INTERVAL_LABEL_RE.match(base))
+
+
+def _drop_count_from_lower_label(label: str) -> Optional[int]:
+    span = _span_from_label(label)
+    if span is not None:
+        return int(span)
+    interval = _interval_span_from_label(label)
+    return int(interval[2]) if interval is not None else None
 
 
 def _recover_label_parts(label: str) -> Optional[Tuple[str, str]]:
@@ -176,24 +201,28 @@ def _read_aggregator_param_counts_from_bundle(
         print("[warn] Invalid prune plan param_accounting.total_params; Block params omitted.", flush=True)
         return None, {}
 
+    intervals = bundle_interval_records(bundle)
     spans = bundle.get("spans", {})
     if not isinstance(spans, dict):
-        print("[warn] Invalid prune plan bundle: spans is not an object; Block params omitted.", flush=True)
-        return upper, {}
+        spans = {}
 
     lower_by_label: Dict[str, int] = {}
     for label in labels:
-        span = _span_from_label(label)
-        if span is None:
-            continue
-        raw = spans.get(str(int(span)))
+        raw: Any = None
+        base = _label_base(label)
+        if is_interval_selector(base):
+            raw = intervals.get(base)
+        if raw is None:
+            span = _span_from_label(label)
+            if span is not None:
+                raw = spans.get(str(int(span)))
         if not isinstance(raw, dict):
-            print(f"[warn] Missing span {span} in prune plan bundle for label {label!r}.", flush=True)
+            print(f"[warn] Missing interval/span in prune plan bundle for label {label!r}.", flush=True)
             continue
         value: Any = raw.get("aggregator_params")
         if value is None:
             print(
-                f"[warn] Span {span} has no aggregator_params in prune plan bundle "
+                f"[warn] Plan record has no aggregator_params in prune plan bundle "
                 f"for label {label!r}.",
                 flush=True,
             )
@@ -202,7 +231,7 @@ def _read_aggregator_param_counts_from_bundle(
             lower_by_label[label] = int(value)
         except Exception:
             print(
-                f"[warn] Invalid aggregator_params={value!r} for span {span} "
+                f"[warn] Invalid aggregator_params={value!r} "
                 f"and label {label!r}.",
                 flush=True,
             )
@@ -321,16 +350,15 @@ def _filter_to_current_prune_spans(
     grouped: Dict[str, Dict[str, EvalRecordV3]],
     prune_plan_root: Path,
 ) -> Dict[str, Dict[str, EvalRecordV3]]:
-    """Drop stale legacy plan labels when a split prune-span bundle exists."""
+    """Drop stale legacy plan labels when a split prune-plan bundle exists."""
     try:
-        from analysis.prune_plan import list_plan_groups, prune_plan_bundle_path
-
         if not prune_plan_bundle_path(prune_plan_root).is_file():
             return grouped
-        valid_spans = set(list_plan_groups(prune_plan_root))
+        bundle = load_prune_plan_bundle(prune_plan_root)
+        valid_intervals = set(bundle_interval_records(bundle).keys())
     except Exception:
         return grouped
-    if not valid_spans:
+    if not valid_intervals:
         return grouped
 
     filtered: Dict[str, Dict[str, EvalRecordV3]] = {}
@@ -338,7 +366,7 @@ def _filter_to_current_prune_spans(
         keep: Dict[str, EvalRecordV3] = {}
         for label, rec in modes.items():
             base = _label_base(label)
-            if label == "upper" or label.startswith("upper+") or base in valid_spans:
+            if label == "upper" or label.startswith("upper+") or base in valid_intervals:
                 keep[label] = rec
         if keep:
             filtered[ds_name] = keep
@@ -393,6 +421,137 @@ def _write_metric_curve_grid(
     safe_ds = str(ds_name).replace("/", "_").replace(" ", "_")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{safe_ds}_metrics_by_span.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def _strategy_items_for_dataset(
+    *,
+    prune_plan_root: Path,
+    modes: Dict[str, EvalRecordV3],
+) -> Dict[str, List[Tuple[int, str, str, EvalRecordV3]]]:
+    try:
+        bundle = load_prune_plan_bundle(prune_plan_root)
+    except Exception as exc:
+        print(f"[warn] Could not load prune strategy bundle for plots: {exc}", flush=True)
+        return {}
+    intervals = bundle_interval_records(bundle)
+    strategies = bundle_strategy_records(bundle)
+    out: Dict[str, List[Tuple[int, str, str, EvalRecordV3]]] = {}
+    for strategy_key, strategy_record in strategies.items():
+        display = str(strategy_record.get("display_name", strategy_key))
+        points = strategy_record.get("points", {})
+        if not isinstance(points, dict):
+            continue
+        items: List[Tuple[int, str, str, EvalRecordV3]] = []
+        for drop_key, interval_key in sorted(
+            points.items(),
+            key=lambda item: int(item[0]) if str(item[0]).isdigit() else 10**9,
+        ):
+            if not str(drop_key).isdigit():
+                continue
+            interval_label = str(interval_key)
+            if interval_label not in intervals:
+                print(
+                    f"[warn] Strategy {strategy_key!r} references missing interval "
+                    f"{interval_label!r}; skipping point.",
+                    flush=True,
+                )
+                continue
+            rec = modes.get(interval_label)
+            if rec is None:
+                print(
+                    f"[warn] Missing lower eval for strategy {display} drop={drop_key}: "
+                    f"lower/{interval_label}",
+                    flush=True,
+                )
+                continue
+            items.append((int(drop_key), display, interval_label, rec))
+        if items:
+            out[display] = items
+    return out
+
+
+def _write_strategy_metric_curve_grid(
+    *,
+    root: Path,
+    ds_name: str,
+    upper_rec: EvalRecordV3,
+    strategy_items: Dict[str, List[Tuple[int, str, str, EvalRecordV3]]],
+    out_dir: Path,
+) -> Optional[Path]:
+    import matplotlib.pyplot as plt  # type: ignore
+
+    if not strategy_items:
+        return None
+    metric_grid: List[List[Optional[str]]] = [
+        ["ape", "are", "rpe_trans", "rpe_rot"],
+        ["acc", "comp", "cd", "nc"],
+        ["depth_abs_rel", "depth_delta1", "inference_time_ms", "infer_peak_vram_gb"],
+    ]
+    all_drops = sorted(
+        {
+            int(drop)
+            for items in strategy_items.values()
+            for drop, _display, _interval, _rec in items
+        }
+    )
+    if not all_drops:
+        return None
+    fig, axes = plt.subplots(3, 4, figsize=(20, 9.75), squeeze=False)
+    for row_idx, row in enumerate(metric_grid):
+        for col_idx, key in enumerate(row):
+            ax = axes[row_idx][col_idx]
+            if key is None:
+                ax.axis("off")
+                continue
+            upper_value = float(upper_rec.average.get(key, float("nan")))
+            has_data = math.isfinite(upper_value)
+            if math.isfinite(upper_value):
+                ax.scatter([0], [upper_value], color="#333333", marker="*", s=70, zorder=4)
+                ax.axhline(
+                    upper_value,
+                    linestyle="--",
+                    color="#333333",
+                    linewidth=1.2,
+                    alpha=0.65,
+                    label="upper",
+                )
+            for display, items in strategy_items.items():
+                xs: List[int] = []
+                ys: List[float] = []
+                if math.isfinite(upper_value):
+                    xs.append(0)
+                    ys.append(upper_value)
+                for drop, _display, _interval, rec in sorted(items, key=lambda item: item[0]):
+                    value = float(rec.average.get(key, float("nan")))
+                    if not math.isfinite(value):
+                        continue
+                    xs.append(int(drop))
+                    ys.append(value)
+                if len(xs) <= (1 if math.isfinite(upper_value) else 0):
+                    continue
+                has_data = True
+                ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4, label=display)
+            if not has_data:
+                ax.axis("off")
+                continue
+            ax.set_title(METRIC_HEADERS.get(key, key), fontsize=11, fontweight="bold")
+            ax.set_xlabel("Dropped units")
+            ax.grid(True, alpha=0.25)
+            ax.set_xlim(left=0)
+            ax.set_xticks([0] + all_drops)
+            ax.legend(loc="best", fontsize=8)
+    fig.suptitle(
+        f"{root.name} / {ds_name}: lower strategies vs upper",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    safe_ds = str(ds_name).replace("/", "_").replace(" ", "_")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{safe_ds}_lower_strategies_by_drop.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return out_path
@@ -534,6 +693,7 @@ def _write_recover_strategy_comparison_grid(
 def _plot_metric_curves_by_span(
     root: Path,
     grouped: Dict[str, Dict[str, EvalRecordV3]],
+    prune_plan_root: Path,
 ) -> List[Path]:
     """For each dataset, plot eval metrics from upper/span0 to max prune span."""
     try:
@@ -549,16 +709,29 @@ def _plot_metric_curves_by_span(
         upper_rec = modes.get("upper")
         if upper_rec is None:
             continue
+        strategy_items = _strategy_items_for_dataset(
+            prune_plan_root=prune_plan_root,
+            modes=modes,
+        )
+        strategy_plot = _write_strategy_metric_curve_grid(
+            root=root,
+            ds_name=ds_name,
+            upper_rec=upper_rec,
+            strategy_items=strategy_items,
+            out_dir=root / ds_name / "eval" / "lower",
+        )
+        if strategy_plot is not None:
+            written.append(strategy_plot)
         span_items = sorted(
             (
                 (span, label, rec)
                 for label, rec in modes.items()
                 if _plain_lower_span_label(label)
-                if (span := _span_from_label(label)) is not None
+                if (span := _drop_count_from_lower_label(label)) is not None
             ),
             key=lambda item: item[0],
         )
-        if span_items:
+        if not strategy_items and span_items:
             out_path = _write_metric_curve_grid(
                 root=root,
                 ds_name=ds_name,
@@ -722,7 +895,7 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content, encoding="utf-8")
     print(f"Wrote {out}")
-    for plot_path in _plot_metric_curves_by_span(root, grouped):
+    for plot_path in _plot_metric_curves_by_span(root, grouped, Path(args.prune_plan_root)):
         print(f"Wrote {plot_path}", flush=True)
 
 

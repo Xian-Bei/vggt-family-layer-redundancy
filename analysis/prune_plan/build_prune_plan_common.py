@@ -16,6 +16,7 @@ from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT, stage_dir
 
 
 REDUNDANCY_AGGREGATIONS = frozenset({"mean", "min"})
+DATASET_LIST_AGGREGATION = "mean"
 
 
 def plan_name(t: int, l: int) -> str:
@@ -153,6 +154,34 @@ def _available_datasets(
     return datasets
 
 
+def parse_dataset_list(dataset: str) -> List[str]:
+    """Parse one dataset name or an explicit dataset list for mean aggregation."""
+    raw = str(dataset or "").strip()
+    datasets = [part.strip() for part in raw.replace(",", " ").split() if part.strip()]
+    if not datasets:
+        raise ValueError("Dataset is required")
+
+    invalid_selectors = [
+        name for name in datasets if name.strip().lower() in REDUNDANCY_AGGREGATIONS
+    ]
+    if invalid_selectors:
+        raise ValueError(
+            "Dataset aggregation selectors are no longer supported: "
+            f"{invalid_selectors}. Specify the datasets to average explicitly, "
+            "for example --dataset scannet_dev50,nuscenes_train."
+        )
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for name in datasets:
+        key = name.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(name.strip())
+    return out
+
+
 def load_similarity(
     *,
     experiment: str,
@@ -160,14 +189,9 @@ def load_similarity(
     token_region: str,
     metric: str,
 ) -> Tuple[List[str], np.ndarray, Dict[str, object]]:
-    dataset_selector = str(dataset).strip().lower()
     token_selector = str(token_region).strip().lower()
     metric_key = f"{metric.strip().lower()}_mean"
-    datasets = (
-        _available_datasets(experiment, token_selector)
-        if dataset_selector in REDUNDANCY_AGGREGATIONS
-        else [dataset]
-    )
+    datasets = parse_dataset_list(dataset)
     if not datasets:
         raise FileNotFoundError(
             f"No datasets with token-region {token_selector!r} redundancy graphs found under "
@@ -201,14 +225,16 @@ def load_similarity(
 
     assert unit_ids is not None
     sim = (
-        reduce_similarity_matrices(dataset_matrices, dataset_selector)
-        if dataset_selector in REDUNDANCY_AGGREGATIONS
+        reduce_similarity_matrices(dataset_matrices, DATASET_LIST_AGGREGATION)
+        if len(dataset_matrices) > 1
         else dataset_matrices[0]
     )
+    dataset_selector = ",".join(str(name) for name in datasets)
     provenance: Dict[str, object] = {
         "metric_key": metric_key,
         "dataset_selector": dataset_selector,
         "datasets": [str(name) for name in datasets],
+        "dataset_aggregation": DATASET_LIST_AGGREGATION if len(datasets) > 1 else None,
         "token_region_selector": token_selector,
         "aggregation_order": ["token_region", "dataset"],
         "token_regions_by_dataset": regions_by_dataset,

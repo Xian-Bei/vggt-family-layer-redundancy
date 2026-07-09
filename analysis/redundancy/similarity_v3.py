@@ -9,7 +9,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from analysis.redundancy.metrics import pairwise_similarity_matrices
+from analysis.redundancy.metrics import (
+    SUPPORTED_SIMILARITY_METRICS,
+    pairwise_similarity_matrices,
+)
 from analysis.schema.v3 import SCHEMA_VERSION, stage_dir
 
 REDUNDANCY_GRAPH_REGIONS = ("special", "camera", "patch", "all")
@@ -206,6 +209,7 @@ def compute_scene_similarity(
     sims = pairwise_similarity_matrices(
         tuple(flat_layers),
         device=metric_device,
+        metric_names=metric_names,
         progress=progress,
         progress_desc=progress_desc,
     )
@@ -215,6 +219,22 @@ def compute_scene_similarity(
             continue
         mat = sims[m]
         out[m] = mat.numpy() if hasattr(mat, "numpy") else np.asarray(mat)
+    return out
+
+
+def validate_metric_names(metric_names: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    for raw in metric_names:
+        name = str(raw).strip().lower()
+        if not name:
+            continue
+        if name not in SUPPORTED_SIMILARITY_METRICS:
+            raise ValueError(
+                f"Unsupported similarity metric {name!r}; "
+                f"allowed: {sorted(SUPPORTED_SIMILARITY_METRICS)}"
+            )
+        if name not in out:
+            out.append(name)
     return out
 
 
@@ -290,10 +310,57 @@ def write_redundancy_outputs(
             continue
         out_npz = acc.finalize_npz(fallback_unit_ids=unit_ids)
         out_npz_path = red_dir / redundancy_graph_filename(str(region))
-        np.savez(out_npz_path, **out_npz)
+        merged_npz = _merge_existing_redundancy_npz(out_npz_path, out_npz)
+        tmp_path = out_npz_path.with_suffix(out_npz_path.suffix + ".tmp.npz")
+        np.savez(tmp_path, **merged_npz)
+        tmp_path.replace(out_npz_path)
         written.append(out_npz_path)
         print(f"Wrote {out_npz_path} ({timing_total_s:.1f}s)", file=sys.stderr)
 
     if not written:
         raise RuntimeError("No redundancy graphs were written (no scenes accumulated).")
     return written
+
+
+def _object_array_to_str_list(value: Any) -> List[str]:
+    arr = np.asarray(value, dtype=object).reshape(-1)
+    return [str(item) for item in arr]
+
+
+def _scalar_object_str(value: Any) -> str:
+    arr = np.asarray(value, dtype=object).reshape(-1)
+    return str(arr[0]) if arr.size else ""
+
+
+def _merge_existing_redundancy_npz(
+    path: Path,
+    new_payload: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    if not path.is_file():
+        return dict(new_payload)
+
+    with np.load(path, allow_pickle=True) as existing_npz:
+        existing: Dict[str, np.ndarray] = {key: existing_npz[key] for key in existing_npz.files}
+
+    for key in ("unit_ids", "scene_ids"):
+        if key in existing and key in new_payload:
+            old_values = _object_array_to_str_list(existing[key])
+            new_values = _object_array_to_str_list(new_payload[key])
+            if old_values and new_values and old_values != new_values:
+                raise ValueError(
+                    f"Refusing to merge redundancy metrics into {path}: {key} changed "
+                    f"(old n={len(old_values)}, new n={len(new_values)})."
+                )
+
+    if "token_region" in existing and "token_region" in new_payload:
+        old_region = _scalar_object_str(existing["token_region"])
+        new_region = _scalar_object_str(new_payload["token_region"])
+        if old_region and new_region and old_region != new_region:
+            raise ValueError(
+                f"Refusing to merge redundancy metrics into {path}: token_region changed "
+                f"from {old_region!r} to {new_region!r}."
+            )
+
+    merged = dict(existing)
+    merged.update(new_payload)
+    return merged

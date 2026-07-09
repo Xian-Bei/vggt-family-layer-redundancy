@@ -226,6 +226,23 @@ def _triangle_pick_from_indices(
     )
 
 
+def _closed_interval_pick_from_bounds(
+    unit_ids: Sequence[str],
+    start: int,
+    end: int,
+) -> TrianglePick:
+    start_i = int(start)
+    end_i = int(end)
+    return TrianglePick(
+        i=start_i,
+        j=end_i,
+        span=end_i - start_i + 1,
+        unit_i=str(unit_ids[start_i]),
+        unit_j=str(unit_ids[end_i]),
+        dropped_unit_ids=tuple(unit_ids[k] for k in range(start_i, end_i + 1)),
+    )
+
+
 def scan_nested_dense_triangles_from_max(
     sim: np.ndarray,
     unit_ids: Sequence[str],
@@ -347,6 +364,78 @@ def scan_endpoint_linked_triangles_with_candidates(
         selected = best_by_corner(eligible)
         selected_by_span[span] = selected
         eligible_by_span[span] = tuple(eligible)
+        current = selected
+
+    picks = [selected_by_span[span] for span in sorted(selected_by_span)]
+    return picks, eligible_by_span
+
+
+def scan_endpoint_linked_closed_intervals_with_candidates(
+    score: np.ndarray,
+    unit_ids: Sequence[str],
+    *,
+    ranking_tolerance: float = CORNER_RANKING_TOLERANCE,
+    require_endpoint_linked_spans: bool = REQUIRE_ENDPOINT_LINKED_SPANS,
+) -> Tuple[
+    List[TrianglePick],
+    Dict[int, Tuple[TrianglePick, ...]],
+]:
+    """Return closed-interval drop picks for an interval score matrix.
+
+    ``score[start, end]`` is interpreted as the score for deleting the closed
+    interval ``[start, end]``.  The returned ``TrianglePick`` keeps the legacy
+    field names but uses ``i=start``, ``j=end``, and ``span=drop_count``.
+    """
+    n = len(unit_ids)
+    if score.shape != (n, n):
+        raise ValueError(f"score shape {score.shape} != ({n}, {n}) for {n} unit_ids")
+    values = np.asarray(score, dtype=np.float64)
+    rank_tol = float(ranking_tolerance)
+    candidates_by_span: dict[int, List[TrianglePick]] = {}
+    for drop_count in range(1, n + 1):
+        candidates: List[TrianglePick] = []
+        for start in range(0, n - drop_count + 1):
+            end = start + drop_count - 1
+            val = float(values[start, end])
+            if not np.isfinite(val):
+                continue
+            candidates.append(_closed_interval_pick_from_bounds(unit_ids, start, end))
+        if candidates:
+            candidates_by_span[drop_count] = candidates
+    if not candidates_by_span:
+        return [], {}
+
+    def best_by_score(candidates: Sequence[TrianglePick]) -> TrianglePick:
+        best = candidates[0]
+        best_score = float(values[int(best.i), int(best.j)])
+        for candidate in candidates[1:]:
+            score_value = float(values[int(candidate.i), int(candidate.j)])
+            if score_value > best_score + rank_tol:
+                best = candidate
+                best_score = score_value
+        return best
+
+    selected_by_span: dict[int, TrianglePick] = {}
+    eligible_by_span: dict[int, Tuple[TrianglePick, ...]] = {}
+    current: Optional[TrianglePick] = None
+    for drop_count in sorted(candidates_by_span, reverse=True):
+        candidates = candidates_by_span[drop_count]
+        if current is None or not bool(require_endpoint_linked_spans):
+            eligible = candidates
+        else:
+            current_i = int(current.i)
+            current_j = int(current.j)
+            eligible = [
+                candidate
+                for candidate in candidates
+                if current_i <= int(candidate.i) <= current_j
+                or current_i <= int(candidate.j) <= current_j
+            ]
+            if not eligible:
+                continue
+        selected = best_by_score(eligible)
+        selected_by_span[drop_count] = selected
+        eligible_by_span[drop_count] = tuple(eligible)
         current = selected
 
     picks = [selected_by_span[span] for span in sorted(selected_by_span)]

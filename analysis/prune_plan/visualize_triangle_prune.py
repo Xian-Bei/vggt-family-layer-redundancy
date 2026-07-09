@@ -132,6 +132,7 @@ def render_gt_trajectory_score_plot(
     out_dir: Path,
     backbone: str,
     relative_degradation_cap_multiple: float = 10.0,
+    tag: Optional[str] = None,
 ) -> Optional[Path]:
     """Plot GT aggregate relative-degradation score along each selected trajectory."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -197,7 +198,12 @@ def render_gt_trajectory_score_plot(
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=9)
     safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
-    out_path = out_dir / f"prune_plan_{safe_backbone}_gt_trajectory_scores.png"
+    safe_tag = (
+        str(tag).replace("/", "_").replace(" ", "_")
+        if tag
+        else f"prune_plan_{safe_backbone}_gt_trajectory_scores"
+    )
+    out_path = out_dir / f"{safe_tag}.png"
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -216,12 +222,12 @@ def _draw_finite_score_candidate_segments(
         return
     n = int(arr.shape[0])
     seen_label = False
-    for span in range(1, n):
+    for span in range(1, n + 1):
         segments: list[list[tuple[int, int]]] = []
         current_segment: list[tuple[int, int]] = []
         previous_i: Optional[int] = None
-        for i in range(0, n - span):
-            j = i + span
+        for i in range(0, n - span + 1):
+            j = i + span - 1
             if not np.isfinite(float(arr[i, j])):
                 if current_segment:
                     segments.append(current_segment)
@@ -308,6 +314,7 @@ def render_budget_similarity_curve(
     backbone: str,
     threshold: Optional[float],
     selection_label: str = "Endpoint-linked triangle",
+    tag: Optional[str] = None,
 ) -> Path:
     """Plot selected corner similarity by drop count and mark requested budgets."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -375,7 +382,12 @@ def render_budget_similarity_curve(
     ax.legend(loc="best", prop={"size": 12, "weight": "bold"})
     fig.tight_layout()
     safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
-    out_path = out_dir / f"prune_plan_{safe_backbone}_curve.png"
+    safe_tag = (
+        str(tag).replace("/", "_").replace(" ", "_")
+        if tag
+        else f"prune_plan_{safe_backbone}_curve"
+    )
+    out_path = out_dir / f"{safe_tag}.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return out_path
@@ -406,7 +418,7 @@ def render_all_span_corner_heatmap(
     if title is None:
         title = f"{backbone}: selected endpoint-linked triangle vertices by dropped-unit count"
     ax.set_title(title, fontsize=13, fontweight="bold")
-    configure_triangle_axes(ax, n, index_name="unit")
+    configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     seen_candidate_label = False
@@ -414,7 +426,7 @@ def render_all_span_corner_heatmap(
         span = int(pick.span)
         if span_to_candidate_picks is None:
             candidate_segments = [
-                [(i, i + span) for i in range(0, n - span)]
+                [(i, i + span - 1) for i in range(0, n - span + 1)]
             ]
         else:
             candidates = sorted(
@@ -535,7 +547,7 @@ def _draw_span_candidate_segments_from_picks(
     for pick in picks:
         span = int(pick.span)
         if span_to_candidate_picks is None:
-            candidate_segments = [[(i, i + span) for i in range(0, n - span)]]
+            candidate_segments = [[(i, i + span - 1) for i in range(0, n - span + 1)]]
         else:
             candidates = sorted(
                 span_to_candidate_picks.get(span, ()),
@@ -698,7 +710,7 @@ def render_token_region_corner_grid(
             fontweight="bold" if is_selected else "normal",
             color="red" if is_selected else "black",
         )
-        configure_triangle_axes(ax, n, index_name="unit")
+        configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
         ax.tick_params(axis="both", labelsize=7)
         _draw_span_candidate_segments_from_picks(
             ax,
@@ -804,7 +816,7 @@ def render_gt_aggregate_corner_heatmap(
         fontsize=13,
         fontweight="bold",
     )
-    configure_triangle_axes(ax, n, index_name="unit")
+    configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     _format_relative_degradation_colorbar(cbar)
     cbar.set_label(
@@ -918,7 +930,7 @@ def render_gt_component_heatmaps(
             masked = np.ma.masked_invalid(arr)
             im = imshow_upper_triangle(ax, masked, n, cmap="viridis_r", vmin=1.0, vmax=vmax)
             ax.set_title(str(metric), fontsize=11, fontweight="bold")
-            configure_triangle_axes(ax, n, index_name="unit")
+            configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
             ax.tick_params(axis="both", labelsize=6)
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             _format_relative_degradation_colorbar(cbar)
@@ -955,10 +967,10 @@ def render_gt_ranked_candidate_heatmap(
     values = np.asarray(score, dtype=np.float64)
     n = int(values.shape[0])
     ranked = np.full((n, n), np.nan, dtype=np.float64)
-    for span in range(1, n):
+    for span in range(1, n + 1):
         candidates: list[tuple[int, int, float]] = []
-        for i in range(0, n - span):
-            j = i + span
+        for i in range(0, n - span + 1):
+            j = i + span - 1
             val = float(values[i, j])
             if np.isfinite(val):
                 candidates.append((i, j, val))
@@ -985,7 +997,7 @@ def render_gt_ranked_candidate_heatmap(
         fontsize=13,
         fontweight="bold",
     )
-    configure_triangle_axes(ax, n, index_name="unit")
+    configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("Within-span min-max brightness (1 = best/lowest score)", fontsize=10)
     _draw_finite_score_candidate_segments(ax, values)
@@ -1035,10 +1047,10 @@ def _ranked_candidate_brightness(values: np.ndarray) -> np.ndarray:
     values_arr = np.asarray(values, dtype=np.float64)
     n = int(values_arr.shape[0])
     ranked = np.full((n, n), np.nan, dtype=np.float64)
-    for span in range(1, n):
+    for span in range(1, n + 1):
         candidates: list[tuple[int, int, float]] = []
-        for i in range(0, n - span):
-            j = i + span
+        for i in range(0, n - span + 1):
+            j = i + span - 1
             val = float(values_arr[i, j])
             if np.isfinite(val):
                 candidates.append((i, j, val))
@@ -1092,7 +1104,7 @@ def render_gt_corner_comparison_heatmap(
         vmax=vmax,
     )
     ax_score.set_title("GT aggregate relative degradation", fontsize=13, fontweight="bold")
-    configure_triangle_axes(ax_score, n, index_name="unit")
+    configure_triangle_axes(ax_score, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
     cbar_score = fig.colorbar(im_score, ax=ax_score, fraction=0.046, pad=0.04)
     _format_relative_degradation_colorbar(cbar_score)
     cbar_score.set_label(
@@ -1120,7 +1132,7 @@ def render_gt_corner_comparison_heatmap(
         fontsize=13,
         fontweight="bold",
     )
-    configure_triangle_axes(ax_ranked, n, index_name="unit")
+    configure_triangle_axes(ax_ranked, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
     cbar_ranked = fig.colorbar(im_ranked, ax=ax_ranked, fraction=0.046, pad=0.04)
     cbar_ranked.set_label("Within-span brightness (1 = best/lowest score)", fontsize=9)
 
@@ -1185,6 +1197,7 @@ def render_corner_overview_heatmap(
     relative_degradation_cap_multiple: float = 10.0,
     component_aggregation: str = "mean",
     selection_label: str = "Endpoint-linked triangle",
+    tag: Optional[str] = None,
 ) -> Path:
     """Render token CKA corners plus GT aggregate/ranked candidates in one 2-column grid."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1245,7 +1258,7 @@ def render_corner_overview_heatmap(
                 fontweight="bold" if is_selected else "normal",
                 color="red" if is_selected else "black",
             )
-            configure_triangle_axes(ax, n, index_name="unit")
+            configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
             ax.tick_params(axis="both", labelsize=7)
             _draw_span_candidate_segments_from_picks(
                 ax,
@@ -1341,7 +1354,7 @@ def render_corner_overview_heatmap(
             cbar.set_label("Within-span brightness (1 = best/lowest score)", fontsize=8)
             cbar.ax.tick_params(labelsize=7)
 
-        configure_triangle_axes(ax, n, index_name="unit")
+        configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
         ax.tick_params(axis="both", labelsize=7)
         _draw_finite_score_candidate_segments(ax, score_arr)
         drew_gt = _draw_gt_path(ax, score_arr, gt_pick_list)
@@ -1355,12 +1368,17 @@ def render_corner_overview_heatmap(
         axes[row][col].axis("off")
 
     fig.suptitle(
-        f"{backbone}: CKA token corners and GT corner comparison ({selection_label})",
+        f"{backbone}: interval-score CKA and GT comparison ({selection_label}; i=0 boundary score placeholder)",
         fontsize=16,
         fontweight="bold",
     )
     safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
-    out_path = out_dir / f"prune_plan_{safe_backbone}_corner_overview.png"
+    safe_tag = (
+        str(tag).replace("/", "_").replace(" ", "_")
+        if tag
+        else f"prune_plan_{safe_backbone}_corner_overview"
+    )
+    out_path = out_dir / f"{safe_tag}.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
@@ -1614,6 +1632,8 @@ def render_prune_span_drop_grid(
     span_to_drop_indices: Mapping[int, Sequence[int]],
     out_dir: Path,
     backbone: str,
+    tag: Optional[str] = None,
+    title: Optional[str] = None,
 ) -> Path:
     """Render the prune-only n*n grid: row=drop count, col=unit, red cells are dropped."""
     safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
@@ -1625,8 +1645,8 @@ def render_prune_span_drop_grid(
         out_dir=out_dir,
         backbone=backbone,
         lora_prefix=0,
-        tag=f"prune_plan_{safe_backbone}_drop_grid",
-        title=f"{backbone}: prune span-by-unit drop grid",
+        tag=tag or f"prune_plan_{safe_backbone}_drop_grid",
+        title=title or f"{backbone}: prune span-by-unit drop grid",
         show_empty_overlays_in_legend=False,
     )
 
@@ -1675,7 +1695,7 @@ def render_triangle_prune_heatmap(
         else:
             title = f"CKA + dense triangles (tau={threshold}, n={len(picks)})"
     ax.set_title(title)
-    configure_triangle_axes(ax, n, index_name="unit")
+    configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     for k, pick in enumerate(picks):
@@ -1690,7 +1710,7 @@ def render_triangle_prune_heatmap(
             markersize=12,
             label=f"T{k} ({pick.i},{pick.j})" if k < 6 else None,
         )
-    drop_idxs = sorted({idx for p in picks for idx in range(int(p.i) + 1, int(p.j) + 1) if idx >= 0})
+    drop_idxs = sorted({idx for p in picks for idx in range(int(p.i), int(p.j) + 1) if idx >= 0})
     for k, idx in enumerate(drop_idxs):
         ax.plot(
             idx,

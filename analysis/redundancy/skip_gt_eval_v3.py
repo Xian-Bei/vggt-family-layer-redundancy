@@ -107,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-span",
         type=int,
         default=0,
-        help="Max unit span (j-i) inclusive; 0 means full upper triangle.",
+        help="Max closed-interval drop count; 0 means full upper triangle.",
     )
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--no-progress", action="store_true")
@@ -133,7 +133,7 @@ def iter_unit_spans(n: int, *, max_span: int) -> Iterable[Tuple[int, int]]:
         return
     cap = int(max_span)
     for i in range(n):
-        j_max = n - 1 if cap <= 0 else min(n - 1, i + cap)
+        j_max = n - 1 if cap <= 0 else min(n - 1, i + cap - 1)
         for j in range(i, j_max + 1):
             yield i, j
 
@@ -679,6 +679,17 @@ def _finalize_skip_outputs_from_disk(
     }
     summary_path = out_root / "skip_eval_summary_v3.json"
     _atomic_write_json(summary_path, summary)
+    try:
+        from analysis.redundancy.convert_skip_eval_to_intervals import (
+            materialize_skip_eval_intervals,
+        )
+
+        materialize_skip_eval_intervals(out_root, commit=True)
+    except Exception as exc:
+        print(
+            f"[warn] Could not materialize skip_eval interval layout under {out_root}: {exc}",
+            file=sys.stderr,
+        )
     print(
         f"Wrote {report_path} ({len(spans)} spans, {n_units} units, {len(complete_rows)} scenes)",
         file=sys.stderr,

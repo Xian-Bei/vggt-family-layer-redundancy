@@ -14,6 +14,7 @@ import numpy as np
 from analysis.prune_plan import (
     PRUNE_PLAN_BUNDLE_FILENAME,
     PRUNE_PLAN_BUNDLE_SCHEMA_VERSION,
+    interval_selector,
 )
 from analysis.prune_plan.build_prune_plan_common import (
     default_plan_root as _default_plan_root,
@@ -26,7 +27,7 @@ from analysis.prune_plan.triangle_prune import (
     CORNER_RANKING_TOLERANCE,
     REQUIRE_ENDPOINT_LINKED_SPANS,
     TrianglePick,
-    scan_endpoint_linked_triangles_with_candidates,
+    scan_endpoint_linked_closed_intervals_with_candidates,
 )
 from analysis.prune_plan.visualize_triangle_prune import (
     render_corner_overview_heatmap,
@@ -51,7 +52,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dataset",
         type=str,
         required=True,
-        help="Dataset name, or mean/min to aggregate available datasets.",
+        help=(
+            "Dataset name, or comma/space separated dataset names to average explicitly "
+            "(for example scannet_dev50,nuscenes_train). Dataset values 'mean'/'min' are not supported."
+        ),
     )
     p.add_argument("--backbone", type=str, default="vggt")
     p.add_argument("--metric", type=str, default="cka")
@@ -218,6 +222,26 @@ def _unpack_upper_triangle(packed: list, n: int) -> np.ndarray:
             mat[i, j] = float(packed[k])
             k += 1
     return mat
+
+
+def build_interval_score_matrix(sim: np.ndarray) -> np.ndarray:
+    """Build closed-interval scores from unit-to-unit similarities.
+
+    Cell ``[start, end]`` represents deleting the closed interval
+    ``[start, end]``.  For ``start > 0`` it uses the raw similarity between
+    boundary unit ``start - 1`` and endpoint ``end``.  The input/embedding
+    boundary for ``start == 0`` is not stored yet, so this row is a deterministic
+    placeholder.
+    """
+    values = np.asarray(sim, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] != values.shape[1]:
+        raise ValueError(f"expected square similarity matrix, got shape={values.shape}")
+    n = int(values.shape[0])
+    out = np.full((n, n), np.nan, dtype=np.float64)
+    for start in range(n):
+        for end in range(start, n):
+            out[start, end] = 0.0 if start == 0 else float(values[start - 1, end])
+    return out
 
 
 def _parse_metric_selector(selector: str, available: Sequence[str]) -> list[str]:
@@ -393,12 +417,7 @@ def _load_gt_aggregate_from_skip_eval_report(
     unit_ids: Sequence[str],
     metric_selector: str,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], list[TrianglePick], dict[str, Any]]:
-    """Build aggregate GT heatmap C and convert best [a,b] spans to corners.
-
-    Skip-eval spans are closed drop intervals [a,b].  Prune-plan corners encode
-    deleted units as (i,j] = i+1..j, so [a,b] maps to corner (a-1,b).  Spans
-    starting at a=0 are not representable in this convention and are skipped.
-    """
+    """Build an aggregate GT heatmap over closed drop intervals [start, end]."""
     report_path = Path(report_path)
     raw = json.loads(report_path.read_text(encoding="utf-8"))
     mode = ""
@@ -443,13 +462,13 @@ def _load_gt_aggregate_from_skip_eval_report(
             continue
         skip_values = _unpack_upper_triangle(packed, n)
         corner_values = np.full((n, n), np.nan, dtype=np.float64)
-        for a in range(1, n):
-            b_max = n - 1 if not has_cap else min(n - 1, a + max_span)
+        for a in range(0, n):
+            b_max = n - 1 if not has_cap else min(n - 1, a + max_span - 1)
             for b in range(a, b_max + 1):
                 val = float(skip_values[a, b])
                 if not math.isfinite(val):
                     continue
-                corner_values[a - 1, b] = val
+                corner_values[a, b] = val
         multiple_score, scaling_meta = _degrade_pct_to_upper_multiple_score(
             corner_values,
             metric=str(metric_key),
@@ -510,38 +529,38 @@ def _load_gt_aggregate_from_skip_eval_report(
                 )
 
     best_by_drop_count: dict[int, tuple[float, int, int]] = {}
-    for i in range(0, n - 1):
-        for j in range(i + 1, n):
-            val = float(aggregate[i, j])
+    for start in range(0, n):
+        for end in range(start, n):
+            val = float(aggregate[start, end])
             if not math.isfinite(val):
                 continue
-            drop_count = int(j - i)
+            drop_count = int(end - start + 1)
             current = best_by_drop_count.get(drop_count)
             if current is None or val < current[0] - 1e-12:
-                best_by_drop_count[drop_count] = (val, i, j)
+                best_by_drop_count[drop_count] = (val, start, end)
 
     picks: list[TrianglePick] = []
     records: list[dict[str, Any]] = []
     for drop_count in sorted(best_by_drop_count):
-        value, corner_i, corner_j = best_by_drop_count[drop_count]
-        a = int(corner_i + 1)
-        b = int(corner_j)
+        value, start, end = best_by_drop_count[drop_count]
         pick = TrianglePick(
-            i=corner_i,
-            j=corner_j,
+            i=start,
+            j=end,
             span=int(drop_count),
-            unit_i=str(unit_ids[corner_i]),
-            unit_j=str(unit_ids[corner_j]),
-            dropped_unit_ids=tuple(str(unit_ids[k]) for k in range(a, b + 1)),
+            unit_i=str(unit_ids[start]),
+            unit_j=str(unit_ids[end]),
+            dropped_unit_ids=tuple(str(unit_ids[k]) for k in range(start, end + 1)),
         )
         picks.append(pick)
         records.append(
             {
                 "span": int(drop_count),
-                "i": int(corner_i),
-                "j": int(corner_j),
-                "skip_span_i": int(a),
-                "skip_span_j": int(b),
+                "i": int(start),
+                "j": int(end),
+                "start": int(start),
+                "end": int(end),
+                "skip_span_i": int(start),
+                "skip_span_j": int(end),
                 "aggregate_score": float(value),
             }
         )
@@ -573,7 +592,7 @@ def _load_gt_aggregate_from_skip_eval_report(
         ),
         "metric_records": metric_records,
         "fusion_mode": mode,
-        "span_mapping": "skip_eval closed [a,b] -> prune corner (a-1,b); spans with a=0 are not representable",
+        "span_mapping": "skip_eval closed [a,b] -> prune closed interval i{a}_j{b}",
         "records": records,
     }
     return aggregate, component_heatmaps, picks, meta
@@ -581,6 +600,123 @@ def _load_gt_aggregate_from_skip_eval_report(
 
 def _default_gt_corner_report_path(plan_root: Path) -> Path:
     return Path(plan_root) / "scannet_dev50" / "skip_eval" / "skip_eval_report_v3.json"
+
+
+def _pick_drop_indices(pick: TrianglePick) -> list[int]:
+    return list(range(int(pick.i), int(pick.j) + 1))
+
+
+def _record_from_pick(
+    *,
+    pick: TrianglePick,
+    unit_ids: Sequence[str],
+    num_units: int,
+    param_accounting: dict[str, Any],
+    score_name: str,
+    score_value: float,
+    source_strategy: str,
+) -> dict[str, Any]:
+    start = int(pick.i)
+    end = int(pick.j)
+    key = interval_selector(start, end)
+    drop = _pick_drop_indices(pick)
+    score_source_index = start - 1
+    score_placeholder = bool(start == 0 and str(score_name) == "corner_similarity")
+    record: dict[str, Any] = {
+        "selector": key,
+        "i": start,
+        "j": end,
+        "start": start,
+        "end": end,
+        "span": int(pick.span),
+        "drop_count": len(drop),
+        "score_source_index": int(score_source_index),
+        "score_source_unit_id": (
+            "input_embedding" if start == 0 else str(unit_ids[score_source_index])
+        ),
+        "score_endpoint_unit_index": end,
+        "score_endpoint_unit_id": str(unit_ids[end]) if 0 <= end < len(unit_ids) else "",
+        "score_placeholder": score_placeholder,
+        "unit_i": str(pick.unit_i),
+        "unit_j": str(pick.unit_j),
+        "drop": [int(idx) for idx in drop],
+        "dropped_unit_ids": [
+            str(unit_ids[int(idx)]) for idx in drop if 0 <= int(idx) < len(unit_ids)
+        ],
+        "source_strategies": [str(source_strategy)],
+        **_span_param_record(
+            param_accounting=param_accounting,
+            num_units=num_units,
+            drop_count=len(drop),
+        ),
+    }
+    if math.isfinite(float(score_value)):
+        record[str(score_name)] = float(score_value)
+    return record
+
+
+def _merge_interval_record(
+    intervals: dict[str, dict[str, Any]],
+    record: dict[str, Any],
+    *,
+    source_strategy: str,
+) -> None:
+    key = str(record["selector"])
+    existing = intervals.get(key)
+    if existing is None:
+        intervals[key] = record
+        return
+    strategies = set(str(x) for x in list(existing.get("source_strategies", [])))
+    strategies.add(str(source_strategy))
+    existing["source_strategies"] = sorted(strategies)
+    for k, v in record.items():
+        if k not in existing:
+            existing[k] = v
+
+
+def _strategy_from_picks(
+    *,
+    key: str,
+    display_name: str,
+    picks: Sequence[TrianglePick],
+    unit_ids: Sequence[str],
+    num_units: int,
+    param_accounting: dict[str, Any],
+    score: Optional[np.ndarray],
+    score_name: str,
+    source: dict[str, Any],
+    intervals: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    points: dict[str, str] = {}
+    scores: dict[str, float] = {}
+    score_arr = None if score is None else np.asarray(score, dtype=np.float64)
+    for pick in sorted(picks, key=lambda p: int(p.span)):
+        span = int(pick.span)
+        value = float("nan")
+        if score_arr is not None:
+            value = float(score_arr[int(pick.i), int(pick.j)])
+        record = _record_from_pick(
+            pick=pick,
+            unit_ids=unit_ids,
+            num_units=num_units,
+            param_accounting=param_accounting,
+            score_name=score_name,
+            score_value=value,
+            source_strategy=key,
+        )
+        interval_key = str(record["selector"])
+        _merge_interval_record(intervals, record, source_strategy=key)
+        points[str(span)] = interval_key
+        if math.isfinite(value):
+            scores[str(span)] = float(value)
+    return {
+        "display_name": display_name,
+        "x_axis": "drop_count",
+        "points": points,
+        "scores": scores,
+        "score_name": score_name,
+        "source": source,
+    }
 
 
 def run_build_prune_plan(
@@ -605,9 +741,10 @@ def run_build_prune_plan(
         metric=metric,
     )
     num_units = int(sim.shape[0])
+    interval_score = build_interval_score_matrix(sim)
     scan, eligible_candidates_by_span = (
-        scan_endpoint_linked_triangles_with_candidates(
-            sim,
+        scan_endpoint_linked_closed_intervals_with_candidates(
+            interval_score,
             unit_ids,
             ranking_tolerance=CORNER_RANKING_TOLERANCE,
             require_endpoint_linked_spans=REQUIRE_ENDPOINT_LINKED_SPANS,
@@ -670,6 +807,98 @@ def run_build_prune_plan(
             )
         except Exception as exc:
             print(f"[warn] Could not load GT corner path from {gt_report_path}: {exc}", flush=True)
+
+    interval_records: dict[str, dict[str, Any]] = {}
+    strategies: dict[str, dict[str, Any]] = {}
+    strategies["ours"] = _strategy_from_picks(
+        key="ours",
+        display_name="Ours",
+        picks=scan,
+        unit_ids=unit_ids,
+        num_units=num_units,
+        param_accounting=param_accounting,
+        score=interval_score,
+        score_name="corner_similarity",
+        source={
+            "kind": "similarity",
+            "metric": str(metric),
+            "token_region": str(token_region),
+            "dataset": str(dataset),
+            "similarity_source": similarity_source,
+            "interval_score": "C[start,end]=sim[start-1,end] for start>0; C[0,end]=0 placeholder",
+            "triangle_selection": (
+                "endpoint_linked_descending_best_interval_score"
+                if bool(REQUIRE_ENDPOINT_LINKED_SPANS)
+                else "independent_best_interval_score_per_drop_count"
+            ),
+        },
+        intervals=interval_records,
+    )
+    try:
+        cosine_unit_ids, cosine_sim, cosine_similarity_source = load_similarity(
+            experiment=experiment,
+            dataset=dataset,
+            token_region=token_region,
+            metric="cosine",
+        )
+        if list(cosine_unit_ids) != list(unit_ids):
+            print(
+                "[warn] Skip Cosine strategy: unit_ids do not match Ours source.",
+                flush=True,
+            )
+        else:
+            cosine_interval_score = build_interval_score_matrix(cosine_sim)
+            cosine_scan, _cosine_candidates = scan_endpoint_linked_closed_intervals_with_candidates(
+                cosine_interval_score,
+                cosine_unit_ids,
+                ranking_tolerance=CORNER_RANKING_TOLERANCE,
+                require_endpoint_linked_spans=REQUIRE_ENDPOINT_LINKED_SPANS,
+            )
+            strategies["cosine"] = _strategy_from_picks(
+                key="cosine",
+                display_name="Cosine",
+                picks=cosine_scan,
+                unit_ids=unit_ids,
+                num_units=num_units,
+                param_accounting=param_accounting,
+                score=cosine_interval_score,
+                score_name="corner_similarity",
+                source={
+                    "kind": "similarity",
+                    "metric": "cosine",
+                    "token_region": str(token_region),
+                    "dataset": str(dataset),
+                    "similarity_source": cosine_similarity_source,
+                    "interval_score": "C[start,end]=sim[start-1,end] for start>0; C[0,end]=0 placeholder",
+                    "triangle_selection": (
+                        "endpoint_linked_descending_best_interval_score"
+                        if bool(REQUIRE_ENDPOINT_LINKED_SPANS)
+                        else "independent_best_interval_score_per_drop_count"
+                    ),
+                },
+                intervals=interval_records,
+            )
+    except Exception as exc:
+        print(f"[warn] Could not build Cosine strategy: {exc}", flush=True)
+    if gt_corner_score is not None and gt_corner_picks:
+        strategies["gt"] = _strategy_from_picks(
+            key="gt",
+            display_name="GT",
+            picks=gt_corner_picks,
+            unit_ids=unit_ids,
+            num_units=num_units,
+            param_accounting=param_accounting,
+            score=gt_corner_score,
+            score_name="gt_aggregate_score",
+            source={
+                "kind": "skip_eval_gt",
+                "report": str(gt_report_path),
+                "metric_selector": str(gt_corner_metric),
+                "meta": gt_corner_meta,
+            },
+            intervals=interval_records,
+        )
+
     if gt_corner_score is not None and gt_corner_picks:
         gt_score_trajectories.append(("GT best path", gt_corner_picks))
         if str(token_region) not in set(CKA_CORNER_COMPARISON_TOKEN_REGIONS):
@@ -682,7 +911,7 @@ def run_build_prune_plan(
         try:
             if str(comparison_region) == str(token_region):
                 region_unit_ids = list(unit_ids)
-                region_sim = sim
+                region_sim = interval_score
                 region_scan = scan
                 region_candidates_by_span = eligible_candidates_by_span
             else:
@@ -699,8 +928,9 @@ def run_build_prune_plan(
                         flush=True,
                     )
                     continue
+                region_sim = build_interval_score_matrix(region_sim)
                 region_scan, region_candidates_by_span = (
-                    scan_endpoint_linked_triangles_with_candidates(
+                    scan_endpoint_linked_closed_intervals_with_candidates(
                         region_sim,
                         region_unit_ids,
                         ranking_tolerance=CORNER_RANKING_TOLERANCE,
@@ -747,6 +977,7 @@ def run_build_prune_plan(
             relative_degradation_cap_multiple=GT_RELATIVE_DEGRADATION_CAP_MULTIPLE,
             component_aggregation=GT_COMPONENT_AGGREGATION,
             selection_label=selection_label,
+            tag=f"prune_plan_{safe_backbone}_ours_corner_overview",
         )
         print(f"Wrote corner overview heatmap {corner_overview_path}", flush=True)
     if gt_corner_score is not None and gt_score_trajectories:
@@ -765,43 +996,47 @@ def run_build_prune_plan(
             out_dir=visualization_root,
             backbone=backbone,
             relative_degradation_cap_multiple=GT_RELATIVE_DEGRADATION_CAP_MULTIPLE,
+            tag=f"prune_plan_{safe_backbone}_ours_gt_trajectory_scores",
         )
         if score_plot_path is not None:
             print(f"Wrote GT trajectory score plot {score_plot_path}", flush=True)
 
-    span_records: dict[str, dict] = {}
-    for scan_pick in scan:
-        span = int(scan_pick.span)
-        drop = list(range(int(scan_pick.i) + 1, int(scan_pick.j) + 1))
-        span_records[str(span)] = {
-            "span": span,
-            "selector": f"prune_span{span}",
-            "i": int(scan_pick.i),
-            "j": int(scan_pick.j),
-            "unit_i": str(scan_pick.unit_i),
-            "unit_j": str(scan_pick.unit_j),
-            "drop": [int(idx) for idx in drop],
-            "dropped_unit_ids": [
-                str(unit_ids[int(idx)]) for idx in drop if 0 <= int(idx) < len(unit_ids)
-            ],
-            "corner_similarity": float(sim[int(scan_pick.i), int(scan_pick.j)]),
-            **_span_param_record(
-                param_accounting=param_accounting,
-                num_units=num_units,
-                drop_count=len(drop),
-            ),
-        }
+    for strategy_key, strategy_record in strategies.items():
+        points = strategy_record.get("points", {})
+        if not isinstance(points, dict) or not points:
+            continue
+        span_to_drop_indices: dict[int, list[int]] = {}
+        for span_key, interval_key in points.items():
+            if not str(span_key).isdigit():
+                continue
+            interval_record = interval_records.get(str(interval_key))
+            if not isinstance(interval_record, dict):
+                continue
+            span_to_drop_indices[int(span_key)] = [
+                int(x) for x in list(interval_record.get("drop", []))
+            ]
+        if not span_to_drop_indices:
+            continue
+        display_name = str(strategy_record.get("display_name", strategy_key))
+        prune_grid_path = render_prune_span_drop_grid(
+            num_units=num_units,
+            span_to_drop_indices=span_to_drop_indices,
+            out_dir=visualization_root,
+            backbone=backbone,
+            tag=f"prune_plan_{safe_backbone}_{strategy_key}_drop_grid",
+            title=f"{backbone}: {display_name} prune drop grid",
+        )
+        print(f"Wrote {display_name} prune drop grid {prune_grid_path}", flush=True)
 
-    prune_grid_path = render_prune_span_drop_grid(
-        num_units=num_units,
-        span_to_drop_indices={
-            int(span): [int(x) for x in record.get("drop", [])]
-            for span, record in span_records.items()
-        },
-        out_dir=visualization_root,
-        backbone=backbone,
-    )
-    print(f"Wrote prune drop grid {prune_grid_path}", flush=True)
+    ours_points = strategies.get("ours", {}).get("points", {})
+    span_records: dict[str, dict[str, Any]] = {}
+    if isinstance(ours_points, dict):
+        for span_key, interval_key in ours_points.items():
+            if not str(span_key).isdigit():
+                continue
+            record = interval_records.get(str(interval_key))
+            if isinstance(record, dict):
+                span_records[str(int(span_key))] = dict(record)
 
     bundle = {
         "schema_version": PRUNE_PLAN_BUNDLE_SCHEMA_VERSION,
@@ -810,6 +1045,19 @@ def run_build_prune_plan(
         "num_units": int(num_units),
         "param_accounting": param_accounting,
         "source_cache": "",
+        "intervals": {
+            key: interval_records[key]
+            for key in sorted(
+                interval_records.keys(),
+                key=lambda k: (
+                    int(interval_records[k].get("drop_count", 0)),
+                    int(interval_records[k].get("i", 0)),
+                    int(interval_records[k].get("j", 0)),
+                    k,
+                ),
+            )
+        },
+        "strategies": strategies,
         "spans": {
             str(span): span_records[str(span)]
             for span in sorted((int(k) for k in span_records.keys()))
@@ -819,12 +1067,19 @@ def run_build_prune_plan(
             "metric": str(metric),
             "token_region": str(token_region),
             "triangle_legality": "all_diagonal_candidates",
+            "interval_semantics": "closed interval iS_jE drops units S through E",
+            "interval_score": {
+                "matrix": "C[start,end]",
+                "start_positive": "C[start,end]=raw_similarity[start-1,end]",
+                "start_zero": "C[0,end]=0.0",
+                "start_zero_placeholder": True,
+            },
             "corner_ranking_tolerance": float(CORNER_RANKING_TOLERANCE),
             "require_endpoint_linked_spans": bool(REQUIRE_ENDPOINT_LINKED_SPANS),
             "triangle_selection": (
-                "endpoint_linked_descending_best_corner"
+                "endpoint_linked_descending_best_interval_score"
                 if bool(REQUIRE_ENDPOINT_LINKED_SPANS)
-                else "independent_best_corner_per_span"
+                else "independent_best_interval_score_per_drop_count"
             ),
             "gt_corner_path": gt_corner_meta,
             "max_available_span": int(max_available_span),
@@ -834,18 +1089,20 @@ def run_build_prune_plan(
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     bundle_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
     print(
-        f"Wrote {bundle_path} (spans={len(span_records)}, max_available_span={max_available_span})",
+        f"Wrote {bundle_path} (intervals={len(interval_records)}, strategies={len(strategies)}, "
+        f"ours_spans={len(span_records)}, max_available_span={max_available_span})",
         flush=True,
     )
 
     curve_path = render_span_similarity_curve(
         scan,
-        sim,
+        interval_score,
         {},
         out_dir=visualization_root,
         backbone=backbone,
         threshold=None,
         selection_label=f"{selection_label.title()} triangle",
+        tag=f"prune_plan_{safe_backbone}_ours_curve",
     )
     print(
         f"Wrote prune-span curve {curve_path} "
