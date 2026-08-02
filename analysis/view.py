@@ -20,11 +20,13 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 import numpy as np
 import torch
 import threading
@@ -39,10 +41,32 @@ except ImportError as exc:  # pragma: no cover - import guard for optional demo 
 
 from analysis.backbones.bootstrap import apply_pythonpath
 from analysis.backbones.registry import get_backbone
-from .redundancy.metrics import upper_triangle_pack, upper_triangle_unpack_for_heatmap
-from analysis.prune_plan.build_prune_plan_common import load_similarity
+from analysis.prune_plan import load_named_prune_plan
+from .redundancy.metrics import (
+    upper_packed_to_symmetric_matrix,
+    upper_triangle_pack,
+)
+from analysis.redundancy.graph_io import load_similarity
+from analysis.redundancy.remaining_skip_rebase import (
+    build_marginal_skip_maps,
+    resolve_plan_interval,
+)
+from analysis.redundancy.remaining_skip_layout import (
+    REMAINING_INDEX_FILENAME,
+    REMAINING_INTERNAL_DIR,
+)
 from analysis.redundancy.similarity_v3 import (
     REDUNDANCY_GRAPH_REGIONS,
+    list_redundancy_graph_regions,
+    resolve_redundancy_graph_path,
+)
+from analysis.redundancy.skip_metric_scaling import (
+    HIGHER_IS_BETTER as SHARED_SKIP_HIGHER_IS_BETTER,
+    SEVEN_METRIC_KEYS,
+    degradation_pct_to_multiple,
+    minmax_normalize_finite,
+    normalized_degradation_to_retention,
+    normalize_metric_components,
 )
 from analysis.triangular_heatmap import configure_triangle_axes, imshow_upper_triangle, triangle_xy
 from analysis.eval.scannet_eval import SceneData, load_scene_images
@@ -53,7 +77,17 @@ from .redundancy.visualize_pair_attention import (
     _overlay_patch_map,
     _reconstruct_qk,
 )
-from .vis import build_cka_heatmaps_tab, build_eval_tab, build_heatmaps_tab, build_recovery_tab, build_summary_tab
+from .vis import (
+    build_brute_force_tab,
+    build_cka_heatmaps_tab,
+    build_eval_tab,
+    build_heatmaps_tab,
+    build_pruning_plan_tab,
+    build_recovery_overview_tab,
+    build_recovery_tab,
+    build_summary_tab,
+)
+from .vis.heatmaps_tab import HEATMAP_REAL_DATASETS
 # from .vis import build_pair_tab  # Pair Attention tab disabled
 
 OUTPUT_ROOT_DEFAULT = Path(os.environ.get("OUTPUT_ROOT", "analysis_outputs_v3"))
@@ -111,7 +145,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root-nrgbd", type=Path, default=Path("data/neural_rgbd_data"))
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--server-name", type=str, default="127.0.0.1")
-    p.add_argument("--server-port", type=int, default=7866)
+    p.add_argument("--server-port", type=int, default=7860)
     p.add_argument("--viser-host", type=str, default="127.0.0.1", help="Host for embedded Viser server.")
     p.add_argument("--viser-port", type=int, default=8090, help="Port for embedded Viser server.")
     p.add_argument(
@@ -147,9 +181,10 @@ class Stage2SceneReport:
 
 SIMILARITY_METRICS: List[Tuple[str, str]] = [
     ("cka", "CKA"),
-    ("cosine", "cosine"),
+    ("cosine", "Cosine"),
+    ("cca", "CCA"),
+    ("inv_mse", "Inv_MSE"),
     ("pwcca", "PWCCA"),
-    ("neg_mse", "-MSE"),
 ]
 
 SKIP_MAIN_METRICS: List[Tuple[str, str]] = [
@@ -171,7 +206,8 @@ SKIP_POINT_METRICS: List[Tuple[str, str]] = [
     ("nc", "Normal consistency"),
 ]
 
-SKIP_HIGHER_IS_BETTER = {"depth_delta1", "nc"}
+SKIP_HIGHER_IS_BETTER = SHARED_SKIP_HIGHER_IS_BETTER
+SKIP_SEVEN_METRIC_KEYS = set(SEVEN_METRIC_KEYS)
 
 
 class PairAttentionController:
@@ -279,7 +315,9 @@ class PairAttentionController:
         if cached is not None:
             return cached
         root = self.v3_output_root / key[0]
-        reports = self._discover_v3_skip_reports(root / key[1] / "skip_eval")
+        reports = self._discover_v3_skip_reports(root / key[1] / "eval" / "pruning")
+        if not reports:
+            reports = self._discover_v3_skip_reports(root / key[1] / "skip_eval")
         if not reports:
             reports = self._discover_skip_reports_in_dir(root / key[1] / "prune")
         self._v3_skip_report_cache[key] = reports
@@ -422,6 +460,13 @@ class PairAttentionController:
         return any(
             self.get_similarity_report_for_dataset(ds, "mean") is not None
             for ds in getattr(self, "stage2_real_datasets", [])
+        )
+
+    def has_cross_dataset_skip(self) -> bool:
+        datasets = list(getattr(self, "stage2_real_datasets", []))
+        return bool(datasets) and all(
+            "mean" in self._v3_skip_reports_for_dataset(ds)
+            for ds in datasets
         )
 
     def num_heads(self) -> int:
@@ -695,8 +740,12 @@ class PairAttentionController:
         return self._discover_v3_similarity_reports(Path(self.analysis_similarity_dir))
 
     def _discover_skip_reports(self) -> Dict[str, Stage2SceneReport]:
-        skip_v3_dir = self.v3_backbone_root() / self.dataset / "skip_eval"
+        skip_v3_dir = self.v3_backbone_root() / self.dataset / "eval" / "pruning"
         reports = self._discover_v3_skip_reports(skip_v3_dir)
+        if reports:
+            return reports
+        legacy_skip_v3_dir = self.v3_backbone_root() / self.dataset / "skip_eval"
+        reports = self._discover_v3_skip_reports(legacy_skip_v3_dir)
         if reports:
             return reports
         return self._discover_skip_reports_in_dir(self.analysis_skip_dir)
@@ -996,13 +1045,14 @@ class EvalViserController:
             return f"Loaded scene={scene_id} | pred_points={int(pts.shape[0])} | gt={'on' if show_gt else 'off'}"
 
 
-def _gallery_update(items: List[np.ndarray]):
+def _gallery_update(items: List[Any]):
     return gr.update(value=items, columns=max(1, len(items)))
 
 
 STAGE2_METRIC_ROW_POSE = "pose"
 STAGE2_METRIC_ROW_DEPTH = "depth"
 STAGE2_METRIC_ROW_POINT = "point cloud"
+STAGE2_METRIC_ROW_NC = "nc"
 STAGE2_TOKEN_ROW_SPECIAL = "special"
 STAGE2_TOKEN_ROW_CAMERA = "camera"
 STAGE2_TOKEN_ROW_PATCH = "patch"
@@ -1026,16 +1076,18 @@ def _is_stage2_virtual_dataset(dataset: str) -> bool:
     return str(dataset or "").strip().lower() in STAGE2_VIRTUAL_DATASETS
 
 
-def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
-    """Discover dataset tags under analysis_outputs_v3/<backbone>/.
+def _discover_similarity_dataset_tags(
+    backbone_root: Path,
+    *,
+    artifact_stage: str,
+) -> List[str]:
+    """Discover dataset tags containing similarity graphs for one artifact stage.
 
-    For Heatmap Stage2 we only care about datasets that actually have v3 redundancy
-    outputs (similarity/skip reports). Datasets with only v3 cache but no redundancy
-    should be omitted from the dropdown and excluded from "min" aggregation.
+    Datasets with only unrelated cache/eval artifacts are omitted.
     """
     root = Path(backbone_root)
     if not root.is_dir():
-        return ["scannet_dev50", "scannet_test50", "7scenes", "nrgbd"]
+        return []
     tags: List[str] = []
     for p in sorted(root.iterdir()):
         if not p.is_dir():
@@ -1043,10 +1095,10 @@ def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
         name = str(p.name).strip()
         if not name or name.startswith(".") or _is_stage2_virtual_dataset(name):
             continue
-        # Only include datasets with actual v3 redundancy outputs.
+        # Only include datasets with actual graphs for the selected stage.
         from analysis.vis.view_v3_loader import redundancy_dir_has_graphs
 
-        if redundancy_dir_has_graphs(p / "redundancy"):
+        if redundancy_dir_has_graphs(p / str(artifact_stage)):
             tags.append(name)
     # Prefer ScanNet splits first for UX.
     prefer = ["scannet_dev50", "scannet_test50", "scannet", "7scenes", "nrgbd"]
@@ -1060,10 +1112,60 @@ def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
     return out
 
 
+def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
+    """Discover regular redundancy dataset tags for the Stage2 heatmap UI."""
+    if not Path(backbone_root).is_dir():
+        return ["scannet_dev50", "scannet_test50", "7scenes", "nrgbd"]
+    return _discover_similarity_dataset_tags(
+        backbone_root,
+        artifact_stage="redundancy",
+    )
+
+
 def _discover_v3_dataset_tags_across_backbones(output_root: Path, backbones: Sequence[str]) -> List[str]:
     tags: List[str] = []
     for backbone in backbones:
         for tag in _discover_v3_dataset_tags(Path(output_root) / str(backbone)):
+            if tag not in tags:
+                tags.append(tag)
+    return tags
+
+
+def _discover_similarity_backbones(output_root: Path, *, artifact_stage: str) -> List[str]:
+    root = Path(output_root)
+    if not root.is_dir():
+        return []
+    preferred = ("vggt", "pi3", "vggt_omega")
+    discovered: List[str] = []
+    for backbone_dir in root.iterdir():
+        if not backbone_dir.is_dir() or backbone_dir.name.startswith("."):
+            continue
+        if _discover_similarity_dataset_tags(
+            backbone_dir,
+            artifact_stage=artifact_stage,
+        ):
+            discovered.append(backbone_dir.name)
+    return sorted(
+        discovered,
+        key=lambda name: (
+            preferred.index(name) if name in preferred else len(preferred),
+            name,
+        ),
+    )
+
+
+def _discover_similarity_dataset_tags_across_backbones(
+    output_root: Path,
+    backbones: Sequence[str],
+    *,
+    artifact_stage: str,
+) -> List[str]:
+    tags: List[str] = []
+    for backbone in backbones:
+        for tag in _discover_similarity_dataset_tags(
+            Path(output_root) / str(backbone),
+            artifact_stage=artifact_stage,
+        ):
             if tag not in tags:
                 tags.append(tag)
     return tags
@@ -1084,23 +1186,46 @@ def _heatmaps_resolve_filters(
         pct_ok = bool(controller.stage1_eval_by_scene)
     else:
         pct_ok = scene_key in controller.stage1_eval_by_scene
-    choices_vm = ["absolute", "pct"]
+    choices_vm = ["absolute", "multiple"]
     vm = str(value_mode or "absolute")
-    if vm == "pct" and not pct_ok:
-        vm = "absolute"
     if vm not in choices_vm:
         vm = "absolute"
     if _is_stage2_virtual_dataset(controller.dataset):
-        has_skip = False
+        has_skip = controller.has_cross_dataset_skip()
         has_sim = controller.has_cross_dataset_similarity()
+        pct_ok = has_skip
     else:
         has_skip = bool(scene_id) and controller.get_skip_report(scene_id) is not None
         has_sim = bool(scene_id) and controller.get_similarity_report(scene_id) is not None
 
+    if has_skip and not pct_ok and not _is_stage2_virtual_dataset(controller.dataset):
+        skip_entry = controller.get_skip_report(scene_key)
+        fusion = skip_entry.report.get("fusion_by_mode") if skip_entry is not None else None
+        pct_ok = isinstance(fusion, dict) and any(
+            isinstance(payload, dict)
+            and isinstance(payload.get("gt_degrade_pct_upper_by_metric"), dict)
+            for payload in fusion.values()
+        )
+    if vm == "multiple" and not pct_ok:
+        vm = "absolute"
+
     token_choices: List[str] = []
     if has_sim:
         if _is_stage2_virtual_dataset(controller.dataset):
-            token_choices = [STAGE2_TOKEN_ROW_ALL]
+            virtual_maps = _build_cross_dataset_similarity_regions(
+                controller,
+                controller.union_stage2_modes(getattr(controller, "stage2_real_datasets", [])),
+                sim_gamma=1.0,
+                sim_cutoff=0.0,
+                aggregate=str(controller.dataset),
+            )
+            present = {
+                region
+                for mode_maps in virtual_maps.values()
+                for region in STAGE2_TOKEN_ROW_ORDER
+                if _similarity_region_has_data(mode_maps, region)
+            }
+            token_choices = [region for region in STAGE2_TOKEN_ROW_ORDER if region in present]
         else:
             sim_report = controller.get_similarity_report(scene_key)
             by_mode = (
@@ -1121,16 +1246,11 @@ def _heatmaps_resolve_filters(
 
     if has_skip:
         allowed_m = {
-            STAGE2_METRIC_ROW_POSE,
             STAGE2_METRIC_ROW_DEPTH,
-            STAGE2_METRIC_ROW_POINT,
+            STAGE2_METRIC_ROW_NC,
         }
         if metric_rows is None:
-            m_val = [
-                STAGE2_METRIC_ROW_POSE,
-                STAGE2_METRIC_ROW_DEPTH,
-                STAGE2_METRIC_ROW_POINT,
-            ]
+            m_val = []
         else:
             m_val = [x for x in metric_rows if x in allowed_m]
     else:
@@ -1139,7 +1259,11 @@ def _heatmaps_resolve_filters(
     if has_sim:
         allowed_t = set(token_choices)
         if token_rows is None:
-            t_val = list(token_choices)
+            t_val = (
+                [STAGE2_TOKEN_ROW_MEAN]
+                if STAGE2_TOKEN_ROW_MEAN in allowed_t
+                else list(token_choices[:1])
+            )
         else:
             t_val = [x for x in token_rows if x in allowed_t]
             if not t_val:
@@ -1180,8 +1304,8 @@ def _heatmaps_gr_controls_from_resolved(
         sim_gamma_update["value"] = float(sim_gamma)
         sim_cutoff_update["value"] = float(sim_cutoff)
     return (
-        gr.update(choices=["absolute", "pct"], value=vm, interactive=True, elem_classes=cls_vm),
-        gr.update(interactive=pct_ok and vm == "pct"),
+        gr.update(choices=["absolute", "multiple"], value=vm, interactive=True, elem_classes=cls_vm),
+        gr.update(interactive=has_skip),
         gr.update(**metric_update),
         gr.update(**token_update),
         gr.update(**sim_gamma_update),
@@ -1343,7 +1467,7 @@ def _lora_plot_rows(
 
 
 def _has_recovery_plot_outputs(backbone_dir: Path) -> bool:
-    return any(backbone_dir.glob("*/eval/recover/*_recover_strategies_by_span.png"))
+    return any(backbone_dir.glob("*/eval/recovery/*_recovery_strategies_by_span.png"))
 
 
 def _discover_recovery_runs(root: Path) -> Dict[str, Dict[str, List[str]]]:
@@ -1373,15 +1497,15 @@ def _recovery_dataset_gallery_item(
     label: str,
 ) -> List[Tuple[str, str]]:
     if str(dataset_tag) == "mean":
-        path = Path(root) / str(model_name) / "eval" / "recover" / "mean_recover_strategies_by_span.png"
+        path = Path(root) / str(model_name) / "eval" / "recovery" / "mean_recovery_strategies_by_span.png"
     else:
         path = (
             Path(root)
             / str(model_name)
             / str(dataset_tag)
             / "eval"
-            / "recover"
-            / f"{dataset_tag}_recover_strategies_by_span.png"
+            / "recovery"
+            / f"{dataset_tag}_recovery_strategies_by_span.png"
         )
     if not path.is_file():
         return []
@@ -1393,9 +1517,9 @@ def _recovery_dataset_tags(root: Path, model_name: str) -> List[str]:
     tags = set()
     if not model_dir.is_dir():
         return []
-    for path in model_dir.glob("*/eval/recover/*_recover_strategies_by_span.png"):
+    for path in model_dir.glob("*/eval/recovery/*_recovery_strategies_by_span.png"):
         dataset_tag = path.parent.parent.parent.name
-        if path.name == f"{dataset_tag}_recover_strategies_by_span.png":
+        if path.name == f"{dataset_tag}_recovery_strategies_by_span.png":
             tags.add(dataset_tag)
     order = (
         "scannet_dev50",
@@ -1453,7 +1577,7 @@ def _generate_mean_recovery_plot(root: Path, model_name: str) -> Optional[Path]:
 
     upper_bucket: Dict[str, List[float]] = {}
     lower_buckets: Dict[int, Dict[str, List[float]]] = {}
-    recover_buckets: Dict[str, Dict[int, Dict[str, List[float]]]] = {}
+    recovery_buckets: Dict[str, Dict[int, Dict[str, List[float]]]] = {}
     all_spans = set()
 
     for dataset_tag in dataset_tags:
@@ -1476,9 +1600,9 @@ def _generate_mean_recovery_plot(root: Path, model_name: str) -> Optional[Path]:
                     _read_eval_average(rec_path),
                 )
 
-        recover_root = eval_root / "recover"
-        if recover_root.is_dir():
-            for plan_dir in sorted((p for p in recover_root.iterdir() if p.is_dir()), key=lambda p: p.name):
+        recovery_root = eval_root / "recovery"
+        if recovery_root.is_dir():
+            for plan_dir in sorted((p for p in recovery_root.iterdir() if p.is_dir()), key=lambda p: p.name):
                 for rec_path in sorted(plan_dir.glob("prune_span*/eval_record_v3.json")):
                     m = _RECOVERY_SPAN_RE.match(rec_path.parent.name)
                     if not m:
@@ -1486,7 +1610,7 @@ def _generate_mean_recovery_plot(root: Path, model_name: str) -> Optional[Path]:
                     span = int(m.group(1))
                     all_spans.add(span)
                     _append_average_values(
-                        recover_buckets.setdefault(plan_dir.name, {}).setdefault(span, {}),
+                        recovery_buckets.setdefault(plan_dir.name, {}).setdefault(span, {}),
                         _read_eval_average(rec_path),
                     )
 
@@ -1495,9 +1619,9 @@ def _generate_mean_recovery_plot(root: Path, model_name: str) -> Optional[Path]:
 
     upper_mean = _mean_metric_values(upper_bucket)
     lower_mean = {span: _mean_metric_values(bucket) for span, bucket in lower_buckets.items()}
-    recover_mean = {
+    recovery_mean = {
         plan: {span: _mean_metric_values(bucket) for span, bucket in by_span.items()}
-        for plan, by_span in recover_buckets.items()
+        for plan, by_span in recovery_buckets.items()
     }
     spans = sorted(all_spans)
 
@@ -1542,14 +1666,14 @@ def _generate_mean_recovery_plot(root: Path, model_name: str) -> Optional[Path]:
                     label="lower",
                 )
 
-            for plan in sorted(recover_mean.keys()):
+            for plan in sorted(recovery_mean.keys()):
                 xs: List[int] = []
                 ys: List[float] = []
                 if math.isfinite(upper_value):
                     xs.append(0)
                     ys.append(upper_value)
                 for span in spans:
-                    value = float(recover_mean.get(plan, {}).get(span, {}).get(metric, float("nan")))
+                    value = float(recovery_mean.get(plan, {}).get(span, {}).get(metric, float("nan")))
                     if not math.isfinite(value):
                         continue
                     xs.append(span)
@@ -1577,14 +1701,14 @@ def _generate_mean_recovery_plot(root: Path, model_name: str) -> Optional[Path]:
             ax.legend(loc="best", fontsize=8)
 
     fig.suptitle(
-        f"{model_name} / mean: lower and recover strategies vs upper",
+        f"{model_name} / mean: lower and recovery strategies vs upper",
         fontsize=14,
         fontweight="bold",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    out_dir = model_dir / "eval" / "recover"
+    out_dir = model_dir / "eval" / "recovery"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "mean_recover_strategies_by_span.png"
+    out_path = out_dir / "mean_recovery_strategies_by_span.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return out_path
@@ -1636,22 +1760,36 @@ def _stage2_row_visibility_flags(
     similarity_regions_by_mode: Dict[str, set[str]],
 ) -> List[bool]:
     active_modes = {str(m) for m in selected_modes}
-    metrics = {str(m) for m in metric_rows}
     tokens = {str(t) for t in token_rows}
     out: List[bool] = []
     for mode in mode_order:
         on = mode in active_modes
         has_skip = mode in skip_modes
         sim_regions = similarity_regions_by_mode.get(mode, set())
-        out.append(on and has_skip and STAGE2_METRIC_ROW_POSE in metrics)
-        out.append(on and has_skip and STAGE2_METRIC_ROW_DEPTH in metrics)
-        out.append(on and has_skip and STAGE2_METRIC_ROW_POINT in metrics)
-        out.append(on and STAGE2_TOKEN_ROW_SPECIAL in tokens and "special" in sim_regions)
-        out.append(on and STAGE2_TOKEN_ROW_CAMERA in tokens and "camera" in sim_regions)
-        out.append(on and STAGE2_TOKEN_ROW_PATCH in tokens and "patch" in sim_regions)
-        out.append(on and STAGE2_TOKEN_ROW_ALL in tokens and "all" in sim_regions)
-        out.append(on and STAGE2_TOKEN_ROW_MEAN in tokens and "mean" in sim_regions)
-        out.append(on and STAGE2_TOKEN_ROW_MIN in tokens and "min" in sim_regions)
+        combined_visible = on and has_skip and any(
+            token in tokens and region in sim_regions
+            for token, region in (
+                (STAGE2_TOKEN_ROW_SPECIAL, "special"),
+                (STAGE2_TOKEN_ROW_CAMERA, "camera"),
+                (STAGE2_TOKEN_ROW_PATCH, "patch"),
+                (STAGE2_TOKEN_ROW_ALL, "all"),
+                (STAGE2_TOKEN_ROW_MEAN, "mean"),
+                (STAGE2_TOKEN_ROW_MIN, "min"),
+            )
+        )
+        out.extend(
+            [
+                False,
+                False,
+                combined_visible,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ]
+        )
     return out
 
 
@@ -1678,7 +1816,6 @@ def _stage2_requested_block_keys(
     similarity_regions_by_mode: Dict[str, set[str]],
 ) -> set[str]:
     active_modes = {str(m) for m in selected_modes}
-    metrics = {str(m) for m in metric_rows}
     tokens = {str(t) for t in token_rows}
     requested: set[str] = set()
     for mode in mode_order:
@@ -1687,24 +1824,18 @@ def _stage2_requested_block_keys(
         skip_main, skip_depth, skip_point, sim_special, sim_camera, sim_patch, sim_all, sim_mean, sim_min = _stage2_block_keys_for_mode(mode)
         has_skip = mode in skip_modes
         sim_regions = similarity_regions_by_mode.get(mode, set())
-        if has_skip and STAGE2_METRIC_ROW_POSE in metrics:
-            requested.add(skip_main)
-        if has_skip and STAGE2_METRIC_ROW_DEPTH in metrics:
-            requested.add(skip_depth)
-        if has_skip and STAGE2_METRIC_ROW_POINT in metrics:
+        if has_skip:
             requested.add(skip_point)
-        if STAGE2_TOKEN_ROW_SPECIAL in tokens and "special" in sim_regions:
-            requested.add(sim_special)
-        if STAGE2_TOKEN_ROW_CAMERA in tokens and "camera" in sim_regions:
-            requested.add(sim_camera)
-        if STAGE2_TOKEN_ROW_PATCH in tokens and "patch" in sim_regions:
-            requested.add(sim_patch)
-        if STAGE2_TOKEN_ROW_ALL in tokens and "all" in sim_regions:
-            requested.add(sim_all)
-        if STAGE2_TOKEN_ROW_MEAN in tokens and "mean" in sim_regions:
-            requested.add(sim_mean)
-        if STAGE2_TOKEN_ROW_MIN in tokens and "min" in sim_regions:
-            requested.add(sim_min)
+        for token, region, block_key in (
+            (STAGE2_TOKEN_ROW_SPECIAL, "special", sim_special),
+            (STAGE2_TOKEN_ROW_CAMERA, "camera", sim_camera),
+            (STAGE2_TOKEN_ROW_PATCH, "patch", sim_patch),
+            (STAGE2_TOKEN_ROW_ALL, "all", sim_all),
+            (STAGE2_TOKEN_ROW_MEAN, "mean", sim_mean),
+            (STAGE2_TOKEN_ROW_MIN, "min", sim_min),
+        ):
+            if has_skip and token in tokens and region in sim_regions:
+                requested.add(block_key)
     return requested
 
 
@@ -1993,6 +2124,8 @@ def _similarity_maps_for_skip_mode(
         return similarity_by_mode[skip_mode]
     if "default" in similarity_by_mode:
         return similarity_by_mode["default"]
+    if similarity_by_mode:
+        return next(iter(similarity_by_mode.values()))
     return {"patch": {}, "special": {}, "camera": {}, "all": {}}
 
 
@@ -2044,12 +2177,27 @@ def _packed_delta_to_pct(
     return out
 
 
+def _degradation_pct_maps_to_multiples(
+    maps_by_mode: Dict[str, Dict[str, List[float]]],
+) -> Dict[str, Dict[str, List[float]]]:
+    """Convert positive-when-worse percentages to upper-relative metric ratios."""
+    out: Dict[str, Dict[str, List[float]]] = {}
+    for mode, metric_map in maps_by_mode.items():
+        converted: Dict[str, List[float]] = {}
+        for metric_key, packed in metric_map.items():
+            converted[metric_key] = degradation_pct_to_multiple(
+                np.asarray(packed, dtype=np.float64), metric=metric_key
+            ).tolist()
+        if converted:
+            out[mode] = converted
+    return out
+
+
 def _heatmap_rgb_from_packed(
     packed: List[float],
     num_layers: int,
     title: str,
     *,
-    fill_value: float = float("nan"),
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     tick_suffix: str = "",
@@ -2057,10 +2205,16 @@ def _heatmap_rgb_from_packed(
     markers: Optional[List[Tuple[int, int, str]]] = None,
     label_fontsize: Optional[float] = None,
     tick_fontsize: Optional[float] = None,
+    show_colorbar_histogram: bool = False,
+    colorbar_decimals: Optional[int] = 1,
+    colorbar_segments: Optional[int] = 5,
 ) -> np.ndarray:
-    grid = upper_triangle_unpack_for_heatmap(packed, num_layers, fill_value)
-    arr = np.asarray(grid, dtype=np.float64)
-    finite_vals = arr[np.isfinite(arr)]
+    # All heatmaps share one display policy: reconstruct the full symmetric
+    # matrix from the stored inclusive upper triangle before rendering.
+    grid = upper_packed_to_symmetric_matrix(packed, num_layers)
+    arr_values = np.asarray(grid, dtype=np.float64)
+    finite_vals = arr_values[np.isfinite(arr_values)]
+    arr = arr_values
     if np.any(np.isnan(arr)):
         arr = np.ma.masked_invalid(arr)
 
@@ -2069,14 +2223,63 @@ def _heatmap_rgb_from_packed(
         label_fs = float(label_fontsize)
     if tick_fontsize is not None:
         tick_fs = float(tick_fontsize)
-    fig, ax = plt.subplots(figsize=(9, 8))
+    row_mean_ax: Optional[plt.Axes] = None
+    column_mean_ax: Optional[plt.Axes] = None
+    colorbar_ax: Optional[plt.Axes] = None
+    if show_colorbar_histogram:
+        fig, ax = plt.subplots(figsize=(11, 9))
+        divider = make_axes_locatable(ax)
+        row_mean_ax = divider.append_axes("top", size="20%", pad=0.03, sharex=ax)
+        column_mean_ax = divider.append_axes("right", size="20%", pad=0.03, sharey=ax)
+        colorbar_ax = divider.append_axes("right", size="5%", pad=0.10)
+    else:
+        fig, ax = plt.subplots(figsize=(9, 8))
     imshow_kw: Dict[str, Any] = {"cmap": cmap}
     if vmin is not None:
         imshow_kw["vmin"] = vmin
     if vmax is not None:
         imshow_kw["vmax"] = vmax
     im = imshow_upper_triangle(ax, arr, num_layers, **imshow_kw)
-    if str(title or "").strip():
+    gap_indices = [
+        index
+        for index in range(num_layers)
+        if not np.any(np.isfinite(arr_values[index, :]))
+        and not np.any(np.isfinite(arr_values[:, index]))
+    ]
+    gap_ranges: List[Tuple[int, int]] = []
+    for index in gap_indices:
+        if gap_ranges and index == gap_ranges[-1][1]:
+            gap_ranges[-1] = (gap_ranges[-1][0], index + 1)
+        else:
+            gap_ranges.append((index, index + 1))
+    for start, end in gap_ranges:
+        span = float(end - start)
+        hatch_style = {
+            "facecolor": "#f3f4f6",
+            "edgecolor": "#cbd5e1",
+            "hatch": "/",
+            "linewidth": 0.5,
+            "zorder": 3,
+        }
+        ax.add_patch(
+            Rectangle(
+                (float(start) - 0.5, -0.5),
+                span,
+                float(num_layers),
+                **hatch_style,
+            )
+        )
+        ax.add_patch(
+            Rectangle(
+                (-0.5, float(start) - 0.5),
+                float(num_layers),
+                span,
+                **hatch_style,
+            )
+        )
+    if str(title or "").strip() and show_colorbar_histogram:
+        fig.suptitle(title, fontsize=title_fs, fontweight="bold", y=0.995)
+    elif str(title or "").strip():
         ax.set_title(title, fontsize=title_fs, fontweight="bold", pad=12)
     configure_triangle_axes(
         ax,
@@ -2090,7 +2293,40 @@ def _heatmap_rgb_from_packed(
         bold_tick_labels=True,
         use_major_locator=True,
     )
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar = (
+        fig.colorbar(im, cax=colorbar_ax)
+        if colorbar_ax is not None
+        else fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    )
+    if row_mean_ax is not None and column_mean_ax is not None:
+        display_values = arr_values.T
+        finite_mask = np.isfinite(display_values)
+        finite_sums = np.where(finite_mask, display_values, 0.0)
+        row_counts = finite_mask.sum(axis=1)
+        column_counts = finite_mask.sum(axis=0)
+        row_means = np.divide(
+            finite_sums.sum(axis=1),
+            row_counts,
+            out=np.full(num_layers, np.nan, dtype=np.float64),
+            where=row_counts > 0,
+        )
+        column_means = np.divide(
+            finite_sums.sum(axis=0),
+            column_counts,
+            out=np.full(num_layers, np.nan, dtype=np.float64),
+            where=column_counts > 0,
+        )
+        indices = np.arange(num_layers, dtype=np.float64)
+        row_mean_ax.plot(indices, column_means, color="#2563eb", linewidth=2.0)
+        row_mean_ax.set_xlim(-0.5, float(num_layers) - 0.5)
+        row_mean_ax.set_ylabel("column mean", fontweight="bold")
+        row_mean_ax.tick_params(axis="x", labelbottom=False)
+        row_mean_ax.grid(alpha=0.2)
+        column_mean_ax.plot(row_means, indices, color="#2563eb", linewidth=2.0)
+        column_mean_ax.set_ylim(-0.5, float(num_layers) - 0.5)
+        column_mean_ax.set_xlabel("row mean", fontweight="bold")
+        column_mean_ax.tick_params(axis="y", labelleft=False)
+        column_mean_ax.grid(alpha=0.2)
     cbar.ax.tick_params(labelsize=tick_fs, width=2.0, length=6)
     for lb in cbar.ax.get_yticklabels():
         lb.set_fontweight("bold")
@@ -2111,20 +2347,42 @@ def _heatmap_rgb_from_packed(
         if abs(data_max - data_min) < 1e-12:
             cbar.set_ticks([data_min])
         else:
-            cbar.set_ticks(np.linspace(data_min, data_max, num=5).tolist())
-        if tick_suffix:
+            tick_count = (
+                max(1, int(colorbar_segments)) + 1
+                if colorbar_segments is not None
+                else 5
+            )
+            cbar.set_ticks(
+                np.linspace(data_min, data_max, num=tick_count).tolist()
+            )
+        if colorbar_decimals is not None or tick_suffix:
             ticks = list(cbar.get_ticks())
             labels: List[str] = []
+            decimals = (
+                max(0, int(colorbar_decimals))
+                if colorbar_decimals is not None
+                else None
+            )
             for tick in ticks:
                 tick_val = float(tick)
-                if abs(tick_val - round(tick_val)) < 1e-9:
+                if decimals is not None:
+                    labels.append(f"{tick_val:.{decimals}f}{tick_suffix}")
+                elif abs(tick_val - round(tick_val)) < 1e-9:
                     labels.append(f"{int(round(tick_val))}{tick_suffix}")
                 else:
                     labels.append(f"{tick_val:.1f}{tick_suffix}")
             cbar.set_ticklabels(labels)
             for lb in cbar.ax.get_yticklabels():
                 lb.set_fontweight("bold")
-    fig.tight_layout()
+    if show_colorbar_histogram:
+        fig.subplots_adjust(
+            left=0.10,
+            right=0.92,
+            bottom=0.10,
+            top=0.90,
+        )
+    else:
+        fig.tight_layout()
 
     buf = io.BytesIO()
     fig.savefig(buf, dpi=150, format="png")
@@ -2276,21 +2534,163 @@ def _signed_packed_cutoff(
     return out
 
 
+def _similarity_display_packed(
+    packed: List[float],
+    *,
+    metric_key: str,
+    sim_gamma: float,
+    sim_cutoff: float,
+) -> List[float]:
+    """Apply the same numeric controls used by similarity heatmap rendering."""
+    displayed = list(packed)
+    if metric_key in {"cka", "cosine"}:
+        if abs(sim_gamma - 1.0) > 1e-12:
+            displayed = _similarity_packed_gamma_01(displayed, sim_gamma)
+        if sim_cutoff > 0.0:
+            displayed = _similarity_packed_cutoff_01(
+                displayed,
+                sim_cutoff,
+            )
+    return displayed
+
+
+def _packed_strict_upper_pearson(
+    left_packed: Sequence[float],
+    right_packed: Sequence[float],
+    num_layers: int,
+) -> Optional[float]:
+    """Pearson r over common finite strict-upper entries; diagonal is excluded."""
+    try:
+        left = np.asarray(
+            upper_packed_to_symmetric_matrix(left_packed, num_layers),
+            dtype=np.float64,
+        )
+        right = np.asarray(
+            upper_packed_to_symmetric_matrix(right_packed, num_layers),
+            dtype=np.float64,
+        )
+    except (TypeError, ValueError):
+        return None
+    upper = np.triu_indices(int(num_layers), k=1)
+    x = left[upper]
+    y = right[upper]
+    valid = np.isfinite(x) & np.isfinite(y)
+    if np.count_nonzero(valid) < 2:
+        return None
+    x = x[valid]
+    y = y[valid]
+    if np.ptp(x) <= 1e-12 or np.ptp(y) <= 1e-12:
+        return None
+    score = float(np.corrcoef(x, y)[0, 1])
+    return score if math.isfinite(score) else None
+
+
+def _score_title_suffix(
+    *,
+    horizontal: Optional[float] = None,
+    vertical: Optional[float] = None,
+) -> str:
+    parts: List[str] = []
+    if horizontal is not None:
+        parts.append(f"H r={horizontal:.3f}")
+    if vertical is not None:
+        parts.append(f"V r={vertical:.3f}")
+    return f" | {' · '.join(parts)}" if parts else ""
+
+
+def _gallery_item_with_score(
+    image: np.ndarray,
+    score_suffix: str,
+) -> Any:
+    """Attach score text as a Gradio Gallery caption instead of raster text."""
+    caption = str(score_suffix).strip()
+    if caption.startswith("|"):
+        caption = caption[1:].strip()
+    return (image, caption) if caption else image
+
+
+def _similarity_score_suffixes(
+    similarity_upper: Mapping[str, Any],
+    num_layers: int,
+    *,
+    horizontal_reference: Optional[Sequence[float]] = None,
+    vertical_reference: Optional[Mapping[str, Sequence[float]]] = None,
+    sim_gamma: float,
+    sim_cutoff: float,
+    current_is_displayed: bool = False,
+    vertical_reference_is_displayed: bool = False,
+) -> Dict[str, str]:
+    suffixes: Dict[str, str] = {}
+    for metric_key, _metric_label in _metric_entries_for_similarity_maps(
+        dict(similarity_upper)
+    ):
+        packed = _coerce_packed(similarity_upper.get(metric_key))
+        if packed is None:
+            continue
+        displayed = (
+            packed
+            if current_is_displayed
+            else _similarity_display_packed(
+                packed,
+                metric_key=metric_key,
+                sim_gamma=sim_gamma,
+                sim_cutoff=sim_cutoff,
+            )
+        )
+        horizontal = (
+            _packed_strict_upper_pearson(
+                displayed,
+                horizontal_reference,
+                num_layers,
+            )
+            if horizontal_reference is not None
+            else None
+        )
+        original = (
+            _coerce_packed(vertical_reference.get(metric_key))
+            if vertical_reference is not None
+            else None
+        )
+        vertical = (
+            _packed_strict_upper_pearson(
+                (
+                    original
+                    if vertical_reference_is_displayed
+                    else _similarity_display_packed(
+                        original,
+                        metric_key=metric_key,
+                        sim_gamma=sim_gamma,
+                        sim_cutoff=sim_cutoff,
+                    )
+                ),
+                displayed,
+                num_layers,
+            )
+            if original is not None
+            else None
+        )
+        suffixes[metric_key] = _score_title_suffix(
+            horizontal=horizontal,
+            vertical=vertical,
+        )
+    return suffixes
+
+
 def _similarity_metric_entries(similarity_upper: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Metrics present in this report (subset of :data:`SIMILARITY_METRICS`)."""
     available = {str(k) for k in similarity_upper.keys()}
     return [(k, label) for k, label in SIMILARITY_METRICS if k in available]
 
 
-def _build_cross_dataset_similarity_all(
+def _build_cross_dataset_similarity_regions(
     controller: PairAttentionController,
     mode_order: List[str],
     *,
     sim_gamma: float,
     sim_cutoff: float,
     aggregate: str,
-) -> Dict[str, Dict[str, List[float]]]:
-    """Per skip mode: all-token similarity packed vectors aggregated over real datasets (scene mean)."""
+) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
+    """Aggregate every on-disk token region over real datasets, then derive mean/min regions."""
     per_dataset_maps: List[Dict[str, Dict[str, Dict[str, List[float]]]]] = []
     for ds in getattr(controller, "stage2_real_datasets", []):
         report = controller.get_similarity_report_for_dataset(ds, "mean")
@@ -2303,26 +2703,54 @@ def _build_cross_dataset_similarity_all(
     agg_key = str(aggregate or STAGE2_MIN_DATASET).strip().lower()
     reducer = _packed_elementwise_mean if agg_key == STAGE2_MEAN_DATASET else _packed_elementwise_min
 
-    out: Dict[str, Dict[str, List[float]]] = {}
+    out: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
     for mode in mode_order:
-        metric_packs: Dict[str, List[List[float]]] = {}
-        for by_mode in per_dataset_maps:
-            all_map = by_mode.get(mode, {}).get("all", {})
-            if not isinstance(all_map, dict):
-                continue
-            for metric_key, packed in all_map.items():
-                if not packed:
-                    continue
-                processed = list(packed)
-                if metric_key in {"cka", "cosine"}:
-                    if abs(sim_gamma - 1.0) > 1e-12:
-                        processed = _similarity_packed_gamma_01(processed, sim_gamma)
-                    if sim_cutoff > 0.0:
-                        processed = _similarity_packed_cutoff_01(processed, sim_cutoff)
-                metric_packs.setdefault(str(metric_key), []).append(processed)
-        if metric_packs:
-            out[mode] = {k: reducer(v) for k, v in metric_packs.items()}
-    return out
+        mode_out: Dict[str, Dict[str, List[float]]] = {}
+        for region in ("special", "camera", "patch", "all"):
+            metric_names = {
+                str(metric)
+                for by_mode in per_dataset_maps
+                for metric in by_mode.get(mode, {}).get(region, {})
+            }
+            region_out: Dict[str, List[float]] = {}
+            for metric_key in metric_names:
+                rows: List[List[float]] = []
+                for by_mode in per_dataset_maps:
+                    packed = by_mode.get(mode, {}).get(region, {}).get(metric_key)
+                    if not packed:
+                        break
+                    processed = list(packed)
+                    if metric_key in {"cka", "cosine"}:
+                        if abs(sim_gamma - 1.0) > 1e-12:
+                            processed = _similarity_packed_gamma_01(processed, sim_gamma)
+                        if sim_cutoff > 0.0:
+                            processed = _similarity_packed_cutoff_01(processed, sim_cutoff)
+                    rows.append(processed)
+                if len(rows) == len(per_dataset_maps):
+                    region_out[metric_key] = reducer(rows)
+            if region_out:
+                mode_out[region] = region_out
+        if mode_out:
+            out[mode] = mode_out
+    return _similarity_maps_with_token_aggregations(out)
+
+
+def _build_cross_dataset_similarity_all(
+    controller: PairAttentionController,
+    mode_order: List[str],
+    *,
+    sim_gamma: float,
+    sim_cutoff: float,
+    aggregate: str,
+) -> Dict[str, Dict[str, List[float]]]:
+    regions = _build_cross_dataset_similarity_regions(
+        controller,
+        mode_order,
+        sim_gamma=sim_gamma,
+        sim_cutoff=sim_cutoff,
+        aggregate=aggregate,
+    )
+    return {mode: mode_maps.get("all", {}) for mode, mode_maps in regions.items() if mode_maps.get("all")}
 
 
 def _build_cross_dataset_min_similarity_all(
@@ -2340,6 +2768,56 @@ def _build_cross_dataset_min_similarity_all(
         sim_cutoff=sim_cutoff,
         aggregate=STAGE2_MIN_DATASET,
     )
+
+
+def _build_cross_dataset_skip_maps(
+    controller: PairAttentionController,
+    *,
+    value_mode: str,
+    aggregate: str,
+) -> Dict[str, Dict[str, List[float]]]:
+    """Aggregate mean-scene skip maps over the Heatmaps real-dataset allowlist."""
+    per_dataset: List[Dict[str, Dict[str, List[float]]]] = []
+    for dataset in getattr(controller, "stage2_real_datasets", []):
+        entry = controller._v3_skip_reports_for_dataset(str(dataset)).get("mean")
+        if entry is None:
+            continue
+        report = dict(entry.report)
+        report["skip_value_mode"] = "pct" if value_mode == "multiple" else "absolute"
+        maps = _extract_skip_metric_maps_by_mode(report)
+        if value_mode == "multiple":
+            fusion = report.get("fusion_by_mode")
+            has_saved_pct = isinstance(fusion, dict) and any(
+                isinstance(payload, dict)
+                and isinstance(payload.get("gt_degrade_pct_upper_by_metric"), dict)
+                for payload in fusion.values()
+            )
+            if not has_saved_pct:
+                raise gr.Error(
+                    f"Dataset {dataset!r} lacks saved degradation percentages required for multiple aggregation."
+                )
+            maps = _degradation_pct_maps_to_multiples(maps)
+        per_dataset.append(maps)
+
+    if not per_dataset:
+        return {}
+    reducer = _packed_elementwise_mean if aggregate == STAGE2_MEAN_DATASET else _packed_elementwise_min
+    modes = {mode for maps in per_dataset for mode in maps}
+    out: Dict[str, Dict[str, List[float]]] = {}
+    for mode in modes:
+        metric_names = {
+            metric
+            for maps in per_dataset
+            for metric in maps.get(mode, {})
+        }
+        metric_out: Dict[str, List[float]] = {}
+        for metric in metric_names:
+            packed_rows = [maps[mode][metric] for maps in per_dataset if metric in maps.get(mode, {})]
+            if len(packed_rows) == len(per_dataset):
+                metric_out[metric] = reducer(packed_rows)
+        if metric_out:
+            out[mode] = metric_out
+    return out
 
 
 def _metric_entries_for_similarity_maps(
@@ -2362,71 +2840,145 @@ def _render_similarity_gallery(
     sim_gamma: float,
     sim_cutoff: float,
     metric_entries: Optional[List[Tuple[str, str]]] = None,
-    prune_overlay: bool = False,
-    prune_metric_key: str = "cka",
-    prune_n: int = 2,
-) -> List[np.ndarray]:
+    show_colorbar_histogram: bool = False,
+    normalize_similarity: bool = False,
+    colorbar_decimals: Optional[int] = 1,
+    colorbar_segments: Optional[int] = 5,
+    title_suffix_by_metric: Optional[Mapping[str, str]] = None,
+) -> List[Any]:
     """role_short: one-letter tag, e.g. S (special) / P (patch) / A (all tokens)."""
-    images: List[np.ndarray] = []
+    images: List[Any] = []
     tag = (role_short or "?").strip()[:1].upper()
     entries = metric_entries if metric_entries is not None else _metric_entries_for_similarity_maps(similarity_upper)
     if not entries:
         entries = list(SIMILARITY_METRICS)
 
-    overlay_markers: Optional[List[Tuple[int, int, str]]] = None
-    prune_key = str(prune_metric_key or "").strip().lower()
-    if prune_overlay and prune_key in {"cka", "cosine"}:
-        packed_for_prune = _coerce_packed(similarity_upper.get(prune_key))
-        if packed_for_prune is not None:
-            processed = list(packed_for_prune)
-            if abs(sim_gamma - 1.0) > 1e-12:
-                processed = _similarity_packed_gamma_01(processed, sim_gamma)
-            triangle_thresh = float(sim_cutoff) if float(sim_cutoff) > 1e-9 else 0.9
-            for_triangle = (
-                _similarity_packed_cutoff_01(processed, sim_cutoff)
-                if float(sim_cutoff) > 1e-9
-                else processed
-            )
-            grid = upper_triangle_unpack_for_heatmap(for_triangle, num_layers, float("nan"))
-            sim_mat = np.zeros((num_layers, num_layers), dtype=np.float64)
-            for i in range(num_layers):
-                sim_mat[i, i] = 1.0
-                for j in range(i + 1, num_layers):
-                    v = grid[i][j]
-                    if v == v:
-                        sim_mat[i, j] = float(v)
-            from analysis.prune_plan.triangle_prune import greedy_dense_triangles
-
-            picks, _ = greedy_dense_triangles(
-                sim_mat,
-                unit_ids=[f"u{i}" for i in range(num_layers)],
-                threshold=triangle_thresh,
-                max_triangles=int(max(0, prune_n)),
-            )
-            overlay_markers = [(p.i, p.j, str(k)) for k, p in enumerate(picks)]
     for metric_key, metric_label in entries:
         packed = _coerce_packed(similarity_upper.get(metric_key))
         if packed is None:
             continue
-        if metric_key in {"cka", "cosine"}:
-            if abs(sim_gamma - 1.0) > 1e-12:
-                packed = _similarity_packed_gamma_01(packed, sim_gamma)
-            if sim_cutoff > 0.0:
-                packed = _similarity_packed_cutoff_01(packed, sim_cutoff)
-        vmin = 0.0 if metric_key != "neg_mse" else None
-        vmax = 1.0 if metric_key != "neg_mse" else None
-        markers = overlay_markers if overlay_markers and str(metric_key).lower() == prune_key else None
+        packed = _similarity_display_packed(
+            packed,
+            metric_key=metric_key,
+            sim_gamma=sim_gamma,
+            sim_cutoff=sim_cutoff,
+        )
+        if normalize_similarity:
+            normalized, _meta = minmax_normalize_finite(
+                np.asarray(packed, dtype=np.float64)
+            )
+            packed = normalized.tolist()
+        vmin = 0.0
+        vmax = 1.0
+        score_suffix = (title_suffix_by_metric or {}).get(metric_key, "")
         images.append(
-            _heatmap_rgb_from_packed(
-                packed,
-                num_layers,
-                f"{tag}·{metric_label}",
-                vmin=vmin,
-                vmax=vmax,
-                markers=markers,
+            _gallery_item_with_score(
+                _heatmap_rgb_from_packed(
+                    packed,
+                    num_layers,
+                    f"{tag}·{metric_label}",
+                    vmin=vmin,
+                    vmax=vmax,
+                    cmap="coolwarm",
+                    show_colorbar_histogram=show_colorbar_histogram,
+                    colorbar_decimals=colorbar_decimals,
+                    colorbar_segments=colorbar_segments,
+                ),
+                score_suffix,
             )
         )
     return images
+
+
+def _render_similarity_marginal_gallery(
+    marginal_similarity: Dict[str, Any],
+    num_layers: int,
+    *,
+    show_colorbar_histogram: bool = False,
+    title_suffix_by_metric: Optional[Mapping[str, str]] = None,
+) -> List[Any]:
+    """Render similarity rebased by the first prune interval's ``1 - sim``."""
+    images: List[Any] = []
+    entries = _metric_entries_for_similarity_maps(marginal_similarity)
+    for metric_key, metric_label in entries:
+        packed = _coerce_packed(marginal_similarity.get(metric_key))
+        if packed is None:
+            continue
+        images.append(
+            _gallery_item_with_score(
+                _heatmap_rgb_from_packed(
+                    packed,
+                    num_layers,
+                    f"Marginal · {metric_label}",
+                    vmin=0.0,
+                    vmax=1.0,
+                    cmap="coolwarm",
+                    show_colorbar_histogram=show_colorbar_histogram,
+                    colorbar_decimals=1,
+                ),
+                (title_suffix_by_metric or {}).get(metric_key, ""),
+            )
+        )
+    return images
+
+
+def _rebase_similarity_packed(
+    remaining_packed: List[float],
+    original_packed: List[float],
+    *,
+    num_layers: int,
+    base_interval: Tuple[int, int],
+    apply_similarity_controls: bool,
+    sim_gamma: float,
+    sim_cutoff: float,
+) -> List[float]:
+    """Add the first prune interval's ``1 - similarity`` to remaining values."""
+    remaining = list(remaining_packed)
+    original = list(original_packed)
+    if apply_similarity_controls:
+        if abs(sim_gamma - 1.0) > 1e-12:
+            original = _similarity_packed_gamma_01(original, sim_gamma)
+            remaining = _similarity_packed_gamma_01(remaining, sim_gamma)
+        if sim_cutoff > 0.0:
+            original = _similarity_packed_cutoff_01(
+                original,
+                sim_cutoff,
+            )
+            remaining = _similarity_packed_cutoff_01(
+                remaining,
+                sim_cutoff,
+            )
+    expected = int(num_layers) * (int(num_layers) + 1) // 2
+    if len(original) != expected or len(remaining) != expected:
+        raise ValueError(
+            "Original and remaining similarity maps must use the aligned "
+            f"{num_layers}-unit catalog"
+        )
+    start, end = (int(base_interval[0]), int(base_interval[1]))
+    original_matrix = np.asarray(
+        upper_packed_to_symmetric_matrix(original, num_layers),
+        dtype=np.float64,
+    )
+    base_similarity = float(original_matrix[start, end])
+    if not math.isfinite(base_similarity):
+        raise ValueError(
+            f"Base interval ({start}, {end}) similarity is not finite"
+        )
+    base_degradation = 1.0 - base_similarity
+    return [
+        (
+            float("nan")
+            if math.isnan(float(value))
+            else float(
+                np.clip(
+                    float(value) + base_degradation,
+                    0.0,
+                    1.0,
+                )
+            )
+        )
+        for value in remaining
+    ]
 
 
 _CKA_TOKEN_REGION_ORDER: Tuple[str, ...] = ("camera", "special", "all", "patch", "mean", "min")
@@ -2470,13 +3022,50 @@ def _discover_cka_token_regions(
         except ValueError:
             return (len(_CKA_TOKEN_REGION_ORDER), name)
 
-    discovered = sorted(discovered, key=_sort_key)
     if discovered:
-        for agg in ("mean", "min"):
-            if agg not in discovered:
-                discovered.append(agg)
-        discovered = sorted(discovered, key=_sort_key)
-    return discovered
+        for aggregate in (STAGE2_TOKEN_ROW_MEAN, STAGE2_TOKEN_ROW_MIN):
+            if aggregate not in seen:
+                discovered.append(aggregate)
+    return sorted(discovered, key=_sort_key)
+
+
+def _discover_graph_cka_token_regions(
+    *,
+    output_root: Path,
+    datasets: Sequence[str],
+    models: Sequence[str],
+    artifact_stage: str,
+) -> List[str]:
+    discovered: set[str] = set()
+    for backbone in models:
+        for dataset in datasets:
+            graph_dir = (
+                Path(output_root)
+                / str(backbone)
+                / str(dataset)
+                / str(artifact_stage)
+            )
+            for region in list_redundancy_graph_regions(graph_dir):
+                path = resolve_redundancy_graph_path(graph_dir, region)
+                if path is None:
+                    continue
+                try:
+                    with np.load(path, allow_pickle=True) as graph:
+                        if "cka_mean" in graph:
+                            discovered.add(str(region))
+                except (OSError, ValueError):
+                    continue
+
+    if discovered:
+        discovered.update({STAGE2_TOKEN_ROW_MEAN, STAGE2_TOKEN_ROW_MIN})
+
+    def _sort_key(name: str) -> Tuple[int, str]:
+        try:
+            return (_CKA_TOKEN_REGION_ORDER.index(name), name)
+        except ValueError:
+            return (len(_CKA_TOKEN_REGION_ORDER), name)
+
+    return sorted(discovered, key=_sort_key)
 
 
 def _cka_detail_from_provenance(provenance: Dict[str, object]) -> str:
@@ -2526,6 +3115,8 @@ def _render_cka_heatmap_for_backbone(
     dataset: str,
     token_region: str,
     sim_cutoff: float,
+    artifact_stage: str = "redundancy",
+    output_root: Path = OUTPUT_ROOT_DEFAULT,
 ) -> Tuple[Optional[np.ndarray], str]:
     region_key = str(token_region or "").strip().lower()
     try:
@@ -2534,6 +3125,9 @@ def _render_cka_heatmap_for_backbone(
             dataset=str(dataset),
             token_region=region_key,
             metric="cka",
+            artifact_stage=artifact_stage,
+            output_root=output_root,
+            align_dropped_units=(artifact_stage == "remaining_redundancy"),
         )
     except FileNotFoundError as exc:
         return None, str(exc)
@@ -2556,36 +3150,341 @@ def _render_skip_gallery(
     *,
     value_mode: str,
     sim_cutoff: float = 0.0,
+    show_colorbar_histogram: bool = False,
+    normalize_seven_metrics: bool = False,
+    percentile_clip: float = 100.0,
+    colorbar_decimals: Optional[int] = 1,
+    title_prefix: str = "",
 ) -> List[np.ndarray]:
     images: List[np.ndarray] = []
     for metric_key, metric_label in metrics:
         packed = skip_metric_map.get(metric_key)
         if packed is None:
             continue
-        degradation_packed = (
-            [-float(value) for value in packed]
-            if value_mode == "absolute" and metric_key in SKIP_HIGHER_IS_BETTER
-            else packed
-        )
+        if value_mode == "absolute":
+            degradation_packed = []
+            for value in packed:
+                scalar = float(value)
+                if math.isnan(scalar):
+                    degradation_packed.append(float("nan"))
+                    continue
+                if metric_key in SKIP_HIGHER_IS_BETTER:
+                    scalar = -scalar
+                degradation_packed.append(max(0.0, scalar))
+        else:
+            degradation_packed = [
+                float("nan") if math.isnan(float(value)) else max(1.0, float(value))
+                for value in packed
+            ]
+        arr = np.asarray(degradation_packed, dtype=np.float64)
+        finite = np.isfinite(arr)
+        percentile = float(np.clip(percentile_clip, 0.0, 100.0))
+        if percentile < 100.0 and np.any(finite):
+            threshold = float(np.nanpercentile(arr[finite], percentile))
+            arr[finite] = np.minimum(arr[finite], threshold)
+        degradation_packed = arr.tolist()
+        normalized = bool(normalize_seven_metrics and metric_key in SKIP_SEVEN_METRIC_KEYS)
+        if normalized:
+            arr, _meta = minmax_normalize_finite(
+                np.asarray(degradation_packed, dtype=np.float64)
+            )
+            degradation_packed = arr.tolist()
         if sim_cutoff > 0.0:
             degradation_packed = _signed_packed_cutoff(
                 degradation_packed,
                 sim_cutoff,
             )
-        if value_mode == "pct":
-            title = f"{metric_label} degradation %"
-        else:
-            title = f"{metric_label} degradation Δ"
+        title = (
+            f"{metric_label} normalized"
+            if normalized
+            else
+            f"{metric_label} degradation multiple"
+            if value_mode == "multiple"
+            else f"{metric_label} degradation Δ"
+        )
+        if title_prefix:
+            title = f"{title_prefix} · {title}"
+        display_packed = (
+            normalized_degradation_to_retention(
+                np.asarray(degradation_packed, dtype=np.float64)
+            ).tolist()
+            if normalized
+            else [
+                float("nan") if math.isnan(float(value)) else -float(value)
+                for value in degradation_packed
+            ]
+        )
         images.append(
             _heatmap_rgb_from_packed(
-                degradation_packed,
+                display_packed,
                 num_layers,
                 title,
-                tick_suffix="%" if value_mode == "pct" else "",
-                cmap="viridis_r",
+                vmin=0.0 if normalized else None,
+                vmax=(
+                    1.0
+                    if normalized
+                    else (0.0 if value_mode == "absolute" else -1.0)
+                ),
+                tick_suffix="" if normalized else ("×" if value_mode == "multiple" else ""),
+                cmap="viridis",
+                show_colorbar_histogram=show_colorbar_histogram,
+                colorbar_decimals=colorbar_decimals,
             )
         )
     return images
+
+
+def _render_skip_seven_metric_mean(
+    skip_metric_map: Dict[str, List[float]],
+    num_layers: int,
+    *,
+    value_mode: str,
+    show_colorbar_histogram: bool = False,
+    normalize_seven_metrics: bool = False,
+    percentile_clip: float = 100.0,
+    title_prefix: str = "",
+    title_suffix: str = "",
+) -> Any:
+    packed_mean = _skip_seven_metric_display_packed(
+        skip_metric_map,
+        value_mode=value_mode,
+        normalize_seven_metrics=normalize_seven_metrics,
+        percentile_clip=percentile_clip,
+    )
+    if packed_mean is None:
+        return np.full((1200, 1350, 3), 255, dtype=np.uint8)
+    title = (
+        "7-metric normalized retention"
+        if normalize_seven_metrics
+        else "7-metric mean"
+    )
+    if title_prefix:
+        title = f"{title_prefix} · {title}"
+    return _gallery_item_with_score(
+        _heatmap_rgb_from_packed(
+            packed_mean,
+            num_layers,
+            title,
+            vmin=0.0 if normalize_seven_metrics else None,
+            vmax=(
+                1.0
+                if normalize_seven_metrics
+                else (0.0 if value_mode == "absolute" else -1.0)
+            ),
+            tick_suffix=(
+                ""
+                if normalize_seven_metrics
+                else ("×" if value_mode == "multiple" else "")
+            ),
+            cmap="coolwarm",
+            show_colorbar_histogram=show_colorbar_histogram,
+        ),
+        title_suffix,
+    )
+
+
+def _skip_seven_metric_display_packed(
+    skip_metric_map: Dict[str, List[float]],
+    *,
+    value_mode: str,
+    normalize_seven_metrics: bool,
+    percentile_clip: float = 100.0,
+) -> Optional[List[float]]:
+    """Build the numeric 7-metric heatmap before raster rendering."""
+    components: Dict[str, np.ndarray] = {}
+    for metric_key, _label in [*SKIP_MAIN_METRICS, *SKIP_POINT_METRICS[:3]]:
+        packed = skip_metric_map.get(metric_key)
+        if packed is None:
+            continue
+        arr = np.asarray(packed, dtype=np.float64)
+        if value_mode == "absolute":
+            if metric_key in SKIP_HIGHER_IS_BETTER:
+                arr = -arr
+            arr = np.maximum(arr, 0.0)
+        else:
+            arr = np.maximum(arr, 1.0)
+        finite = np.isfinite(arr)
+        percentile = float(np.clip(percentile_clip, 0.0, 100.0))
+        if percentile < 100.0 and np.any(finite):
+            threshold = float(np.nanpercentile(arr[finite], percentile))
+            arr[finite] = np.minimum(arr[finite], threshold)
+        components[metric_key] = arr
+    if not components:
+        return None
+    if normalize_seven_metrics:
+        _normalized, aggregate, _meta = normalize_metric_components(components)
+        packed_mean = aggregate.tolist()
+    else:
+        with np.errstate(all="ignore"):
+            packed_mean = np.nanmean(np.stack(list(components.values()), axis=0), axis=0).tolist()
+    display_mean = (
+        normalized_degradation_to_retention(
+            np.asarray(packed_mean, dtype=np.float64)
+        ).tolist()
+        if normalize_seven_metrics
+        else [
+            float("nan") if math.isnan(float(value)) else -float(value)
+            for value in packed_mean
+        ]
+    )
+    return display_mean
+
+
+def _render_skip_metric_mean(
+    skip_metric_map: Dict[str, List[float]],
+    num_layers: int,
+    metrics: Sequence[Tuple[str, str]],
+    *,
+    title: str,
+    cmap: str,
+    value_mode: str,
+    show_colorbar_histogram: bool = False,
+    normalize_metrics: bool = False,
+    percentile_clip: float = 100.0,
+) -> Optional[np.ndarray]:
+    """Render an element-wise mean over a selected family of skip metrics."""
+    components: Dict[str, np.ndarray] = {}
+    for metric_key, _label in metrics:
+        packed = skip_metric_map.get(metric_key)
+        if packed is None:
+            continue
+        arr = np.asarray(packed, dtype=np.float64)
+        if value_mode == "absolute":
+            if metric_key in SKIP_HIGHER_IS_BETTER:
+                arr = -arr
+            arr = np.maximum(arr, 0.0)
+        else:
+            arr = np.maximum(arr, 1.0)
+        finite = np.isfinite(arr)
+        percentile = float(np.clip(percentile_clip, 0.0, 100.0))
+        if percentile < 100.0 and np.any(finite):
+            threshold = float(np.nanpercentile(arr[finite], percentile))
+            arr[finite] = np.minimum(arr[finite], threshold)
+        components[metric_key] = arr
+    if not components:
+        return None
+    if normalize_metrics:
+        normalized = [
+            minmax_normalize_finite(component)[0]
+            for component in components.values()
+        ]
+        with np.errstate(all="ignore"):
+            packed_mean = np.nanmean(np.stack(normalized, axis=0), axis=0)
+    else:
+        with np.errstate(all="ignore"):
+            packed_mean = np.nanmean(
+                np.stack(list(components.values()), axis=0),
+                axis=0,
+            )
+    display_mean = (
+        normalized_degradation_to_retention(packed_mean).tolist()
+        if normalize_metrics
+        else [
+            float("nan") if math.isnan(float(value)) else -float(value)
+            for value in packed_mean.tolist()
+        ]
+    )
+    return _heatmap_rgb_from_packed(
+        display_mean,
+        num_layers,
+        f"{title} normalized mean" if normalize_metrics else f"{title} mean",
+        vmin=0.0 if normalize_metrics else None,
+        vmax=(
+            1.0
+            if normalize_metrics
+            else (0.0 if value_mode == "absolute" else -1.0)
+        ),
+        tick_suffix="" if normalize_metrics else ("×" if value_mode == "multiple" else ""),
+        cmap=cmap,
+        show_colorbar_histogram=show_colorbar_histogram,
+    )
+
+
+def _align_skip_maps_to_full_unit_catalog(
+    maps_by_mode: Dict[str, Dict[str, List[float]]],
+    *,
+    remaining_unit_ids: Sequence[str],
+    full_unit_ids: Sequence[str],
+) -> Dict[str, Dict[str, List[float]]]:
+    """Restore dropped-unit rows/columns as NaN gaps in remaining skip maps."""
+    remaining = [str(unit_id) for unit_id in remaining_unit_ids]
+    full = [str(unit_id) for unit_id in full_unit_ids]
+    if not remaining or not full:
+        return maps_by_mode
+    if len(set(full)) != len(full) or len(set(remaining)) != len(remaining):
+        raise ValueError("Duplicate unit_ids in pruning/remaining_pruning report")
+    full_index = {unit_id: index for index, unit_id in enumerate(full)}
+    missing = [unit_id for unit_id in remaining if unit_id not in full_index]
+    if missing:
+        raise ValueError(
+            "remaining_pruning contains units absent from pruning report: "
+            + ", ".join(missing[:8])
+        )
+    remaining_indices = [full_index[unit_id] for unit_id in remaining]
+    aligned_by_mode: Dict[str, Dict[str, List[float]]] = {}
+    for mode, metric_maps in maps_by_mode.items():
+        aligned_metrics: Dict[str, List[float]] = {}
+        for metric, packed in metric_maps.items():
+            compact = np.asarray(
+                upper_packed_to_symmetric_matrix(packed, len(remaining)),
+                dtype=np.float64,
+            )
+            aligned = np.full((len(full), len(full)), np.nan, dtype=np.float64)
+            aligned[np.ix_(remaining_indices, remaining_indices)] = compact
+            aligned_metrics[metric] = upper_triangle_pack(
+                torch.from_numpy(aligned)
+            )
+        if aligned_metrics:
+            aligned_by_mode[mode] = aligned_metrics
+    return aligned_by_mode
+
+
+def _build_remaining_marginal_maps(
+    *,
+    original_report: Dict[str, Any],
+    remaining_report: Dict[str, Any],
+    value_mode: str,
+) -> Tuple[Dict[str, Dict[str, List[float]]], str]:
+    """Rebase remaining skip maps to the exact prune-plan interval result."""
+    provenance = remaining_report.get("base_prune_plan")
+    if not isinstance(provenance, dict):
+        raise ValueError("remaining_pruning report is missing base_prune_plan provenance")
+    plan_root_raw = str(provenance.get("prune_plan_root", "")).strip()
+    plan_name = str(provenance.get("prune_plan_name", "")).strip()
+    if not plan_root_raw or not plan_name:
+        raise ValueError(
+            "remaining_pruning base_prune_plan must record prune_plan_root and prune_plan_name"
+        )
+    full_unit_ids = [
+        str(unit_id) for unit_id in original_report.get("unit_ids", [])
+    ]
+    remaining_unit_ids = [
+        str(unit_id) for unit_id in remaining_report.get("unit_ids", [])
+    ]
+    expected_dropped_unit_ids = [
+        str(unit_id)
+        for unit_id in provenance.get("dropped_unit_ids", [])
+    ]
+    plan = load_named_prune_plan(Path(plan_root_raw), plan_name)
+    start, end, selector = resolve_plan_interval(
+        plan,
+        full_unit_ids=full_unit_ids,
+        expected_dropped_unit_ids=expected_dropped_unit_ids,
+    )
+    compact = build_marginal_skip_maps(
+        original_report=original_report,
+        remaining_report=remaining_report,
+        base_interval=(start, end),
+        value_mode=str(value_mode),
+    )
+    return (
+        _align_skip_maps_to_full_unit_catalog(
+            compact,
+            remaining_unit_ids=remaining_unit_ids,
+            full_unit_ids=full_unit_ids,
+        ),
+        selector,
+    )
 
 
 def _figure_to_rgb(fig: plt.Figure) -> np.ndarray:
@@ -2595,6 +3494,25 @@ def _figure_to_rgb(fig: plt.Figure) -> np.ndarray:
     rgb = buf[..., :3].copy()
     plt.close(fig)
     return rgb
+
+
+def _message_heatmap_rgb(title: str, message: str) -> np.ndarray:
+    fig, ax = plt.subplots(figsize=(9, 8))
+    ax.set_title(str(title), fontsize=18, fontweight="bold", pad=12)
+    ax.text(
+        0.5,
+        0.5,
+        str(message),
+        ha="center",
+        va="center",
+        fontsize=16,
+        color="#64748b",
+        wrap=True,
+        transform=ax.transAxes,
+    )
+    ax.set_axis_off()
+    fig.tight_layout()
+    return _figure_to_rgb(fig)
 
 
 def _plot_overlay(ax: plt.Axes, image: np.ndarray, title: str) -> None:
@@ -2702,7 +3620,7 @@ def _build_stage2_skip_maps(
     if skip_report_entry is None:
         return {}, "skip report missing"
     report = dict(skip_report_entry.report)
-    report["skip_value_mode"] = "pct" if value_mode != "absolute" else "absolute"
+    report["skip_value_mode"] = "pct" if value_mode == "multiple" else "absolute"
     skip_by_mode = _extract_skip_metric_maps_by_mode(report)
     if value_mode == "absolute":
         return skip_by_mode, "skip rows use saved absolute delta"
@@ -2714,7 +3632,10 @@ def _build_stage2_skip_maps(
             for payload in fusion_by_mode.values()
         )
         if has_pct:
-            return skip_by_mode, "skip rows use saved pct degrade vs upper"
+            return (
+                _degradation_pct_maps_to_multiples(skip_by_mode),
+                "skip rows use saved pct degrade converted to upper-relative multiples",
+            )
 
     if scene_id == "mean":
         if not skip_by_mode:
@@ -2758,7 +3679,10 @@ def _build_stage2_skip_maps(
                 f"scene_ids in full_report_skip.json."
             )
         detail = f"{n_fused} scenes" if n_fused > 0 else "full_report"
-        return pct_by_mode, f"mean Δ from full_report, pct+clip vs mean Stage1 ({detail})"
+        return (
+            _degradation_pct_maps_to_multiples(pct_by_mode),
+            f"mean Δ from full_report, converted to upper-relative multiples ({detail})",
+        )
 
     baseline_row = controller.stage1_eval_by_scene.get(scene_id)
     if baseline_row is None:
@@ -2778,89 +3702,10 @@ def _build_stage2_skip_maps(
             )
         if pct_metric_map:
             pct_by_mode[mode] = pct_metric_map
-    return pct_by_mode, "skip rows use on-the-fly pct vs Stage1 baseline"
-
-
-def _normalize_prune_n(value: Any, *, default: int = 2) -> int:
-    try:
-        v = float(value)
-        if not math.isfinite(v):
-            raise ValueError("non-finite prune n")
-        n = int(round(v))
-    except (TypeError, ValueError):
-        n = int(default)
-    return max(0, min(n, 20))
-
-
-def _stage2_prune_render_sig(
-    *,
-    prune_overlay: bool,
-    prune_metric_key: str,
-    prune_n: int,
-    sim_cutoff: float,
-) -> Tuple[bool, str, int, int]:
     return (
-        bool(prune_overlay),
-        str(prune_metric_key or "cka").strip().lower(),
-        int(prune_n),
-        _sim_cutoff_key(sim_cutoff),
+        _degradation_pct_maps_to_multiples(pct_by_mode),
+        "skip rows use on-the-fly upper-relative multiples vs Stage1 baseline",
     )
-
-
-def _stage2_prune_status_text(
-    similarity_upper: Dict[str, Any],
-    *,
-    num_layers: int,
-    sim_gamma: float,
-    sim_cutoff: float,
-    prune_metric_key: str,
-    prune_n: int,
-    prune_overlay: bool,
-) -> str:
-    if not bool(prune_overlay):
-        return ""
-    metric_key = str(prune_metric_key or "").strip().lower()
-    if metric_key not in {"cka", "cosine"}:
-        return f"Prune status unavailable: metric={metric_key} not supported."
-    packed = _coerce_packed(similarity_upper.get(metric_key))
-    if packed is None:
-        return f"Prune status unavailable: missing {metric_key} similarity."
-    processed = list(packed)
-    if abs(float(sim_gamma) - 1.0) > 1e-12:
-        processed = _similarity_packed_gamma_01(processed, float(sim_gamma))
-    threshold = float(sim_cutoff) if float(sim_cutoff) > 1e-9 else 0.9
-    for_triangle = (
-        _similarity_packed_cutoff_01(processed, float(sim_cutoff))
-        if float(sim_cutoff) > 1e-9
-        else processed
-    )
-    grid = upper_triangle_unpack_for_heatmap(for_triangle, int(num_layers), float("nan"))
-    sim_mat = np.zeros((int(num_layers), int(num_layers)), dtype=np.float64)
-    for i in range(int(num_layers)):
-        sim_mat[i, i] = 1.0
-        for j in range(i + 1, int(num_layers)):
-            v = grid[i][j]
-            if v == v:
-                sim_mat[i, j] = float(v)
-    from analysis.prune_plan.triangle_prune import greedy_dense_triangles
-
-    picks, _ = greedy_dense_triangles(
-        sim_mat,
-        unit_ids=[f"u{i}" for i in range(int(num_layers))],
-        threshold=float(threshold),
-        max_triangles=int(max(0, prune_n)),
-    )
-    if not picks:
-        return f"No dense triangles found (metric={metric_key}, threshold={threshold:.3f})."
-    lines = [f"metric={metric_key} threshold={threshold:.3f} n={int(max(0, prune_n))}"]
-    for idx, p in enumerate(picks, start=1):
-        start = int(p.i) + 1
-        length = int(p.j) - int(p.i)
-        corner = float(sim_mat[int(p.i), int(p.j)])
-        lines.append(
-            f"[{idx}] start={start} len={length} corner_sim={corner:.4f} (i={int(p.i)}, j={int(p.j)})"
-        )
-    return "\n".join(lines)
 
 
 def _prepare_stage2_render(
@@ -2873,10 +3718,9 @@ def _prepare_stage2_render(
     mode_order: List[str],
     *,
     requested_blocks: Optional[set[str]] = None,
-    prune_overlay: bool = False,
-    prune_metric_key: str = "cka",
-    prune_n: int = 2,
-) -> Tuple[Dict[str, List[np.ndarray]], str, str]:
+    show_colorbar_histogram: bool = False,
+    normalize_seven_metrics: bool = False,
+) -> Tuple[Dict[str, List[np.ndarray]], str]:
     virtual_dataset = str(controller.dataset).strip().lower() if _is_stage2_virtual_dataset(controller.dataset) else ""
     virtual_view = bool(virtual_dataset)
     if virtual_view:
@@ -2885,38 +3729,80 @@ def _prepare_stage2_render(
     clip_key = int(round(float(np.clip(pct_clip_percent, 0.0, 100.0))))
     gamma_key = _sim_gamma_key(sim_gamma)
     cutoff_key = _sim_cutoff_key(sim_cutoff)
-    prune_n_i = _normalize_prune_n(prune_n)
-    prune_metric = str(prune_metric_key or "cka").strip().lower()
-    prune_sig = _stage2_prune_render_sig(
-        prune_overlay=bool(prune_overlay),
-        prune_metric_key=prune_metric,
-        prune_n=prune_n_i,
-        sim_cutoff=sim_cutoff,
+    show_nc_requested = bool(requested_blocks and "__show_nc__" in requested_blocks)
+    cache_key = (
+        "combined_mean_raw_similarity_v3",
+        scene_id,
+        value_mode,
+        clip_key,
+        gamma_key,
+        cutoff_key,
+        virtual_dataset,
+        show_nc_requested,
+        bool(show_colorbar_histogram),
+        bool(normalize_seven_metrics),
     )
-    cache_key = (scene_id, value_mode, clip_key, gamma_key, cutoff_key, virtual_dataset, *prune_sig)
     cached = controller.stage2_render_cache.get(cache_key)
     if cached is not None:
         galleries = dict(cached[0])
         info = cached[1]
-        prune_status = cached[2] if len(cached) > 2 else ""
     else:
         galleries = {}
         info = ""
-        prune_status = ""
 
     all_blocks: set[str] = set()
     for mode in mode_order:
         all_blocks.update(_stage2_block_keys_for_mode(mode))
     target_blocks = set(requested_blocks) if requested_blocks is not None else all_blocks
-    if all(key in galleries for key in target_blocks) and info and not bool(prune_overlay):
-        return galleries, info, prune_status
+    show_nc = "__show_nc__" in target_blocks
+    target_blocks.discard("__show_nc__")
+
+    def _compose_visible_galleries(
+        raw_galleries: Dict[str, List[np.ndarray]],
+    ) -> Dict[str, List[np.ndarray]]:
+        composed = dict(raw_galleries)
+        for current_mode in mode_order:
+            (
+                _skip_main,
+                _skip_depth,
+                skip_point,
+                sim_special,
+                sim_camera,
+                sim_patch,
+                sim_all,
+                sim_mean,
+                sim_min,
+            ) = _stage2_block_keys_for_mode(current_mode)
+            if skip_point not in target_blocks:
+                continue
+            similarity_images: List[np.ndarray] = []
+            for block_key in (
+                sim_special,
+                sim_camera,
+                sim_patch,
+                sim_all,
+                sim_mean,
+                sim_min,
+            ):
+                if block_key in target_blocks:
+                    similarity_images.extend(
+                        raw_galleries.get(block_key, [])
+                    )
+            composed[skip_point] = [
+                *raw_galleries.get(skip_point, []),
+                *similarity_images,
+            ]
+        return composed
+
+    if all(key in galleries for key in target_blocks) and info:
+        return _compose_visible_galleries(galleries), info
 
     num_layers = int(controller.resolve_stage2_num_layers(scene_id))
     if num_layers <= 0:
         label = f"dataset={virtual_dataset} (mean)" if virtual_view else scene_id
         raise gr.Error(f"No similarity report with num_layers found for {label!r}.")
 
-    virtual_all_by_mode: Dict[str, Dict[str, List[float]]] = {}
+    virtual_similarity_by_mode: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
     if virtual_view:
         if not controller.has_cross_dataset_similarity():
             ds_list = list(getattr(controller, "stage2_real_datasets", []))
@@ -2924,7 +3810,7 @@ def _prepare_stage2_render(
                 f"Dataset {virtual_dataset} needs full_report_similarity.json (mean) under each of "
                 f"{', '.join(ds_list) if ds_list else '<no datasets discovered>'}."
             )
-        virtual_all_by_mode = _build_cross_dataset_similarity_all(
+        virtual_similarity_by_mode = _build_cross_dataset_similarity_regions(
             controller,
             mode_order,
             sim_gamma=sim_gamma,
@@ -2933,10 +3819,14 @@ def _prepare_stage2_render(
         )
         similarity_report = None
         similarity_by_mode = {}
-        skip_by_mode: Dict[str, Dict[str, List[float]]] = {}
+        skip_by_mode = _build_cross_dataset_skip_maps(
+            controller,
+            value_mode=value_mode,
+            aggregate=virtual_dataset,
+        )
         op_label = "element-wise mean" if virtual_dataset == STAGE2_MEAN_DATASET else "element-wise min"
         skip_source = (
-            f"{virtual_dataset} view: {op_label} of all-token similarity (mean) over "
+            f"{virtual_dataset} view: {op_label} over "
             + ", ".join(list(getattr(controller, "stage2_real_datasets", [])))
         )
     else:
@@ -2946,25 +3836,52 @@ def _prepare_stage2_render(
             similarity_by_mode = _similarity_maps_with_token_aggregations(
                 _extract_similarity_metric_maps_by_mode(similarity_report.report)
             )
-        skip_by_mode, skip_source = _build_stage2_skip_maps(controller, scene_id, value_mode, float(clip_key))
+        skip_by_mode, skip_source = _build_stage2_skip_maps(controller, scene_id, value_mode, 100.0)
 
     missing_similarity_notes: List[str] = []
     for mode in mode_order:
         skip_main, skip_depth, skip_point, sim_special, sim_camera, sim_patch, sim_all, sim_mean, sim_min = _stage2_block_keys_for_mode(mode)
-        if not virtual_view and skip_main in target_blocks and skip_main not in galleries:
+        horizontal_reference = (
+            _skip_seven_metric_display_packed(
+                skip_by_mode.get(mode, {}),
+                value_mode=value_mode,
+                normalize_seven_metrics=True,
+                percentile_clip=clip_key,
+            )
+            if normalize_seven_metrics
+            else None
+        )
+
+        def _horizontal_suffixes(
+            metric_maps: Mapping[str, Any],
+        ) -> Dict[str, str]:
+            return _similarity_score_suffixes(
+                metric_maps,
+                num_layers,
+                horizontal_reference=horizontal_reference,
+                sim_gamma=sim_gamma,
+                sim_cutoff=sim_cutoff,
+            )
+
+        if skip_main in target_blocks and skip_main not in galleries:
             galleries[skip_main] = _render_skip_gallery(
                 skip_by_mode.get(mode, {}),
                 num_layers,
                 SKIP_MAIN_METRICS,
                 value_mode=value_mode,
                 sim_cutoff=sim_cutoff,
+                show_colorbar_histogram=show_colorbar_histogram,
+                normalize_seven_metrics=normalize_seven_metrics,
+                percentile_clip=clip_key,
             )
         if virtual_view:
-            all_maps = virtual_all_by_mode.get(mode, {})
-            if not all_maps:
-                continue
-            sim_entry = {"all": all_maps, "special": {}, "patch": {}}
-            report_metrics = list(all_maps.keys())
+            sim_entry = _similarity_maps_for_skip_mode(
+                virtual_similarity_by_mode,
+                mode,
+            )
+            report_metrics = sorted(
+                {metric for region_maps in sim_entry.values() for metric in region_maps}
+            )
         else:
             sim_entry = _similarity_maps_for_skip_mode(similarity_by_mode, mode)
             report_metrics = list(similarity_report.report.get("metrics", [])) if similarity_report else None
@@ -2972,7 +3889,7 @@ def _prepare_stage2_render(
             sim_entry.get("all", {}),
             report_metrics=report_metrics,
         )
-        if not virtual_view and sim_special in target_blocks and sim_special not in galleries:
+        if sim_special in target_blocks and sim_special not in galleries:
             if not _similarity_region_has_data(sim_entry, "special"):
                 missing_similarity_notes.append(
                     _missing_similarity_region_note(
@@ -2988,8 +3905,13 @@ def _prepare_stage2_render(
                 role_short="S",
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
+                show_colorbar_histogram=show_colorbar_histogram,
+                normalize_similarity=False,
+                title_suffix_by_metric=_horizontal_suffixes(
+                    sim_entry.get("special", {})
+                ),
             )
-        if not virtual_view and sim_camera in target_blocks and sim_camera not in galleries:
+        if sim_camera in target_blocks and sim_camera not in galleries:
             if not _similarity_region_has_data(sim_entry, "camera"):
                 missing_similarity_notes.append(
                     _missing_similarity_region_note(
@@ -3005,24 +3927,35 @@ def _prepare_stage2_render(
                 role_short="C",
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
+                show_colorbar_histogram=show_colorbar_histogram,
+                normalize_similarity=False,
+                title_suffix_by_metric=_horizontal_suffixes(
+                    sim_entry.get("camera", {})
+                ),
             )
-        if not virtual_view and skip_depth in target_blocks and skip_depth not in galleries:
+        if skip_depth in target_blocks and skip_depth not in galleries:
             galleries[skip_depth] = _render_skip_gallery(
                 skip_by_mode.get(mode, {}),
                 num_layers,
                 SKIP_DEPTH_METRICS,
                 value_mode=value_mode,
                 sim_cutoff=sim_cutoff,
+                show_colorbar_histogram=show_colorbar_histogram,
+                normalize_seven_metrics=normalize_seven_metrics,
+                percentile_clip=clip_key,
             )
-        if not virtual_view and skip_point in target_blocks and skip_point not in galleries:
-            galleries[skip_point] = _render_skip_gallery(
-                skip_by_mode.get(mode, {}),
-                num_layers,
-                SKIP_POINT_METRICS,
-                value_mode=value_mode,
-                sim_cutoff=sim_cutoff,
-            )
-        if not virtual_view and sim_patch in target_blocks and sim_patch not in galleries:
+        if skip_point in target_blocks and skip_point not in galleries:
+            galleries[skip_point] = [
+                _render_skip_seven_metric_mean(
+                    skip_by_mode.get(mode, {}),
+                    num_layers,
+                    value_mode=value_mode,
+                    show_colorbar_histogram=show_colorbar_histogram,
+                    normalize_seven_metrics=normalize_seven_metrics,
+                    percentile_clip=clip_key,
+                )
+            ]
+        if sim_patch in target_blocks and sim_patch not in galleries:
             if not _similarity_region_has_data(sim_entry, "patch"):
                 missing_similarity_notes.append(
                     _missing_similarity_region_note(
@@ -3038,8 +3971,13 @@ def _prepare_stage2_render(
                 role_short="P",
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
+                show_colorbar_histogram=show_colorbar_histogram,
+                normalize_similarity=False,
+                title_suffix_by_metric=_horizontal_suffixes(
+                    sim_entry.get("patch", {})
+                ),
             )
-        if sim_all in target_blocks and (sim_all not in galleries or bool(prune_overlay)):
+        if sim_all in target_blocks and sim_all not in galleries:
             sim_all_maps = sim_entry.get("all", {})
             if not _similarity_region_has_data(sim_entry, "all"):
                 missing_similarity_notes.append(
@@ -3057,58 +3995,58 @@ def _prepare_stage2_render(
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
                 metric_entries=metric_entries,
-                prune_overlay=bool(prune_overlay),
-                prune_metric_key=prune_metric,
-                prune_n=prune_n_i,
+                show_colorbar_histogram=show_colorbar_histogram,
+                normalize_similarity=False,
+                title_suffix_by_metric=_horizontal_suffixes(sim_all_maps),
             )
-            if bool(prune_overlay):
-                prune_status = _stage2_prune_status_text(
-                    sim_all_maps,
-                    num_layers=num_layers,
-                    sim_gamma=sim_gamma,
-                    sim_cutoff=sim_cutoff,
-                    prune_metric_key=prune_metric,
-                    prune_n=prune_n_i,
-                    prune_overlay=bool(prune_overlay),
-                )
-        if not virtual_view and sim_mean in target_blocks and sim_mean not in galleries:
+        if sim_mean in target_blocks and sim_mean not in galleries:
             galleries[sim_mean] = _render_similarity_gallery(
                 sim_entry.get("mean", {}),
                 num_layers,
                 role_short="μ",
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
+                show_colorbar_histogram=show_colorbar_histogram,
+                normalize_similarity=False,
+                title_suffix_by_metric=_horizontal_suffixes(
+                    sim_entry.get("mean", {})
+                ),
             )
-        if not virtual_view and sim_min in target_blocks and sim_min not in galleries:
+        if sim_min in target_blocks and sim_min not in galleries:
             galleries[sim_min] = _render_similarity_gallery(
                 sim_entry.get("min", {}),
                 num_layers,
                 role_short="m",
                 sim_gamma=sim_gamma,
                 sim_cutoff=sim_cutoff,
+                show_colorbar_histogram=show_colorbar_histogram,
+                normalize_similarity=False,
+                title_suffix_by_metric=_horizontal_suffixes(
+                    sim_entry.get("min", {})
+                ),
             )
     rendered = len(galleries)
     total = len(all_blocks)
     if virtual_view:
         info = (
-            f"dataset={virtual_dataset} | scene=mean | rendered={rendered}/{total} blocks | {skip_source} | "
-            f"pct_clip={clip_key}%"
+            f"dataset={virtual_dataset} | scene=mean | rendered={rendered}/{total} blocks | {skip_source}"
         )
     else:
-        info = f"scene={scene_id} | view={value_mode} | rendered={rendered}/{total} blocks | {skip_source} | pct_clip={clip_key}%"
+        info = (
+            f"scene={scene_id} | view={value_mode} | "
+            f"rendered={rendered}/{total} blocks | {skip_source}"
+        )
     if abs(sim_gamma - 1.0) > 1e-12:
         info += f" | sim_gamma={gamma_key / 1000.0:.3f}"
     if cutoff_key > 0:
         info += f" | sim_cutoff={cutoff_key / 1000.0:.3f}"
-    if bool(prune_overlay):
-        info += f" | prune_metric={prune_metric} n={prune_n_i}"
     if missing_similarity_notes:
         unique_notes = list(dict.fromkeys(missing_similarity_notes))
         info += " | " + " ; ".join(unique_notes[:4])
         if len(unique_notes) > 4:
             info += f" ; +{len(unique_notes) - 4} more missing similarity rows"
-    controller.stage2_render_cache[cache_key] = (galleries, info, prune_status)
-    return galleries, info, prune_status
+    controller.stage2_render_cache[cache_key] = (galleries, info)
+    return _compose_visible_galleries(galleries), info
 
 
 def _stage2_modes_for_controller(controller: PairAttentionController) -> List[str]:
@@ -3123,16 +4061,16 @@ def _preferred_stage2_scene(
     controller: PairAttentionController,
     scene_ids: Sequence[str],
 ) -> Optional[str]:
-    """Prefer a concrete scene with skip data so the Δ controls are useful immediately."""
-    for scene_id in scene_ids:
-        if scene_id != "mean" and controller.get_skip_report(scene_id) is not None:
-            return str(scene_id)
+    """Use the aggregate scene by default when it exists."""
+    if "mean" in scene_ids:
+        return "mean"
     return str(scene_ids[0]) if scene_ids else None
 
 
 def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     # Stage2 dataset tags come from v3 outputs on disk.
-    stage2_real = _discover_v3_dataset_tags(controller.v3_backbone_root())
+    discovered_stage2_real = set(_discover_v3_dataset_tags(controller.v3_backbone_root()))
+    stage2_real = [dataset for dataset in HEATMAP_REAL_DATASETS if dataset in discovered_stage2_real]
     # If no dataset tag has v3 redundancy for this backbone, keep empty.
     # This prevents "only-cache" datasets (e.g. scannet_test50) from showing up
     # and from participating in "min" computations.
@@ -3159,6 +4097,42 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
     for fallback_mode in ("mixed_units", "v3_units", "default"):
         if fallback_mode not in stage2_modes_all:
             stage2_modes_all.append(fallback_mode)
+    brute_force_backbones = list(controller.v3_backbones)
+    brute_force_datasets = [
+        dataset
+        for dataset in _discover_v3_dataset_tags_across_backbones(
+            controller.v3_output_root,
+            brute_force_backbones,
+        )
+        if any(
+            token in dataset.lower()
+            for token in ("scannet", "scans_", "7scenes", "nuscenes", "waymo")
+        )
+    ]
+    brute_force_modes: List[str] = []
+    for brute_force_backbone in brute_force_backbones:
+        for brute_force_dataset in brute_force_datasets:
+            skip_reports = controller._v3_skip_reports_for_dataset(
+                brute_force_dataset,
+                backbone=brute_force_backbone,
+            )
+            for skip_mode in _discover_skip_modes(skip_reports):
+                if skip_mode not in brute_force_modes:
+                    brute_force_modes.append(skip_mode)
+    if not brute_force_modes:
+        brute_force_modes = ["mixed_units"]
+    brute_force_skip_default_datasets = [
+        dataset
+        for dataset in brute_force_datasets
+        if any(
+            "mean"
+            in controller._v3_skip_reports_for_dataset(
+                dataset,
+                backbone=backbone,
+            )
+            for backbone in brute_force_backbones
+        )
+    ]
     n_stage2_galleries = 9 * len(stage2_modes_all)
     cka_models = list(controller.v3_backbones)
     cka_datasets = (
@@ -3166,34 +4140,50 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         if cka_models
         else list(stage2_real)
     )
-    cka_token_regions = [
-        STAGE2_TOKEN_ROW_CAMERA,
-        STAGE2_TOKEN_ROW_SPECIAL,
-        STAGE2_TOKEN_ROW_ALL,
-        STAGE2_TOKEN_ROW_PATCH,
-        STAGE2_TOKEN_ROW_MEAN,
-        STAGE2_TOKEN_ROW_MIN,
-    ] if cka_models and cka_datasets else []
+    cka_token_regions = _discover_cka_token_regions(controller, cka_datasets, cka_models)
+    remaining_cka_stage = "remaining_redundancy"
+    remaining_cka_models = _discover_similarity_backbones(
+        controller.v3_output_root,
+        artifact_stage=remaining_cka_stage,
+    )
+    remaining_cka_datasets = _discover_similarity_dataset_tags_across_backbones(
+        controller.v3_output_root,
+        remaining_cka_models,
+        artifact_stage=remaining_cka_stage,
+    )
+    remaining_cka_token_regions = _discover_graph_cka_token_regions(
+        output_root=controller.v3_output_root,
+        datasets=remaining_cka_datasets,
+        models=remaining_cka_models,
+        artifact_stage=remaining_cka_stage,
+    )
     lora_root = controller.lora_root
-    stage2_last_render_key: Dict[str, Any] = {"cache_key": None}
+    stage2_last_render_keys: Dict[str, Any] = {}
     dataset_switch_output_len: Dict[str, int] = {"count": 0}
     cka_render_cache: Dict[Tuple[Any, ...], Optional[np.ndarray]] = {}
+    remaining_cka_render_cache: Dict[Tuple[Any, ...], Optional[np.ndarray]] = {}
+    brute_force_controller_cache: Dict[Tuple[str, str, str], PairAttentionController] = {}
+    brute_force_render_cache: Dict[Tuple[Any, ...], List[np.ndarray]] = {}
+    heatmaps_controller_cache: Dict[
+        Tuple[str, str], PairAttentionController
+    ] = {}
 
     def _empty_stage2_visual_updates() -> Tuple[Any, ...]:
         gal = tuple(gr.update(value=[]) for _ in range(n_stage2_galleries))
         col = tuple(gr.update(visible=False) for _ in range(n_stage2_galleries))
-        # outputs: galleries, cols, prune_status, stage2_info, then 6 controls
-        return (*gal, *col, gr.update(value=""), "No Stage2 scenes for this dataset.")
+        # outputs: galleries, cols, stage2_info, then 6 controls
+        return (*gal, *col, "No Stage2 scenes for this dataset.")
 
     def _stage2_noop_updates() -> Tuple[Any, ...]:
-        # outputs: 2*n_galleries + prune_status + stage2_info + 6 controls
-        return tuple(gr.update() for _ in range(2 * n_stage2_galleries + 8))
+        # outputs: 2*n_galleries + stage2_info + 6 controls
+        return tuple(gr.update() for _ in range(2 * n_stage2_galleries + 7))
 
     def _dataset_noop_updates() -> Tuple[Any, ...]:
         count = max(0, int(dataset_switch_output_len["count"]))
         return tuple(gr.update() for _ in range(count))
 
     def _stage2_visual_bundle(
+        render_controller: PairAttentionController,
         scene_id: Optional[str],
         value_mode: str,
         pct_clip_percent: float,
@@ -3201,9 +4191,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         filter_token_rows: List[str] | None,
         sim_gamma_value: float,
         sim_cutoff_value: float,
-        prune_overlay: bool,
-        prune_metric_key: str,
-        prune_n: float,
+        show_colorbar_histogram: bool,
+        normalize_seven_metrics: bool,
+        show_remaining_pruning: bool,
         *,
         request_seq: Optional[int],
         force_gallery_refresh: bool,
@@ -3221,21 +4211,15 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         if not math.isfinite(sim_cutoff):
             sim_cutoff = 0.0
         sim_cutoff = float(np.clip(sim_cutoff, 0.0, 1.0))
-        prune_on = bool(prune_overlay)
-        prune_metric = str(prune_metric_key or "cka").strip().lower()
-        prune_n_i = _normalize_prune_n(prune_n)
-        prune_sig = _stage2_prune_render_sig(
-            prune_overlay=prune_on,
-            prune_metric_key=prune_metric,
-            prune_n=prune_n_i,
-            sim_cutoff=sim_cutoff,
-        )
-        if _is_stage2_virtual_dataset(controller.dataset):
+        if _is_stage2_virtual_dataset(render_controller.dataset):
             scene_id = "mean"
         if not scene_id:
-            stage2_last_render_key["cache_key"] = None
+            stage2_last_render_keys.pop(
+                render_controller.v3_backbone,
+                None,
+            )
             vm, m_val, t_val, choices_vm, token_choices, has_skip, has_sim, pct_ok = _heatmaps_resolve_filters(
-                controller,
+                render_controller,
                 None,
                 str(value_mode or "absolute"),
                 filter_metric_rows,
@@ -3254,30 +4238,60 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 pct_ok,
                 write_values=True,
             )
-            if request_seq is not None and request_seq != controller.stage2_request_seq:
+            if (
+                request_seq is not None
+                and request_seq != render_controller.stage2_request_seq
+            ):
                 return _stage2_noop_updates()
             return (*_empty_stage2_visual_updates(), *ctrl)
 
         vm, m_val, t_val, choices_vm, token_choices, has_skip, has_sim, pct_ok = _heatmaps_resolve_filters(
-            controller,
+            render_controller,
             scene_id,
             str(value_mode or "absolute"),
             list(filter_metric_rows) if filter_metric_rows is not None else None,
             list(filter_token_rows) if filter_token_rows is not None else None,
         )
-        current_modes = _stage2_modes_for_controller(controller)
+        current_modes = _stage2_modes_for_controller(render_controller)
         selected_modes = list(current_modes)
-        if _is_stage2_virtual_dataset(controller.dataset):
-            skip_modes: set[str] = set()
-            similarity_regions_by_mode = {mode: {"all"} for mode in current_modes}
+        if _is_stage2_virtual_dataset(render_controller.dataset):
+            virtual_skip_maps = _build_cross_dataset_skip_maps(
+                render_controller,
+                value_mode=vm,
+                aggregate=str(render_controller.dataset),
+            )
+            skip_modes = set(virtual_skip_maps)
+            virtual_similarity_maps = _build_cross_dataset_similarity_regions(
+                render_controller,
+                current_modes,
+                sim_gamma=sim_gamma,
+                sim_cutoff=sim_cutoff,
+                aggregate=str(render_controller.dataset),
+            )
+            similarity_regions_by_mode = {
+                mode: {
+                    region
+                    for region in STAGE2_TOKEN_ROW_ORDER
+                    if _similarity_region_has_data(
+                        _similarity_maps_for_skip_mode(
+                            virtual_similarity_maps,
+                            mode,
+                        ),
+                        region,
+                    )
+                }
+                for mode in current_modes
+            }
         else:
-            skip_report = controller.get_skip_report(str(scene_id))
+            skip_report = render_controller.get_skip_report(str(scene_id))
             skip_modes = set(
                 _extract_skip_metric_maps_by_mode(skip_report.report).keys()
                 if skip_report is not None
                 else []
             )
-            similarity_report = controller.get_similarity_report(str(scene_id))
+            similarity_report = render_controller.get_similarity_report(
+                str(scene_id)
+            )
             similarity_by_mode = (
                 _similarity_maps_with_token_aggregations(
                     _extract_similarity_metric_maps_by_mode(similarity_report.report)
@@ -3286,32 +4300,48 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 else {}
             )
             similarity_regions_by_mode: Dict[str, set[str]] = {}
-            default_regions = {
-                region
-                for region in STAGE2_TOKEN_ROW_ORDER
-                if _similarity_region_has_data(similarity_by_mode.get("default", {}), region)
-            }
             for mode in current_modes:
-                entry = similarity_by_mode.get(mode, {})
+                entry = _similarity_maps_for_skip_mode(
+                    similarity_by_mode,
+                    mode,
+                )
                 regions = {
                     region
                     for region in STAGE2_TOKEN_ROW_ORDER
                     if _similarity_region_has_data(entry, region)
                 }
-                similarity_regions_by_mode[mode] = regions or set(default_regions)
+                similarity_regions_by_mode[mode] = regions
 
         clip_key = int(round(float(np.clip(float(pct_clip_percent), 0.0, 100.0))))
         gamma_key = _sim_gamma_key(sim_gamma)
         cutoff_key = _sim_cutoff_key(sim_cutoff)
-        virtual_dataset = str(controller.dataset).strip().lower() if _is_stage2_virtual_dataset(controller.dataset) else ""
-        cache_key = (str(scene_id), vm, clip_key, gamma_key, cutoff_key, virtual_dataset, *prune_sig)
-        prune_sig_changed = stage2_last_render_key.get("prune_sig") != prune_sig
+        virtual_dataset = (
+            str(render_controller.dataset).strip().lower()
+            if _is_stage2_virtual_dataset(render_controller.dataset)
+            else ""
+        )
+        show_nc = STAGE2_METRIC_ROW_NC in set(m_val)
+        cache_key = (
+            "combined_mean_raw_similarity_v3",
+            str(scene_id),
+            vm,
+            clip_key,
+            gamma_key,
+            cutoff_key,
+            virtual_dataset,
+            show_nc,
+            bool(show_colorbar_histogram),
+            bool(normalize_seven_metrics),
+            bool(show_remaining_pruning),
+        )
         force_updates = (
             force_gallery_refresh
-            or stage2_last_render_key["cache_key"] != cache_key
-            or prune_sig_changed
+            or stage2_last_render_keys.get(
+                render_controller.v3_backbone
+            )
+            != cache_key
         )
-        cached_before = controller.stage2_render_cache.get(cache_key)
+        cached_before = render_controller.stage2_render_cache.get(cache_key)
         before_keys = set(cached_before[0].keys()) if cached_before is not None else set()
         requested_blocks = _stage2_requested_block_keys(
             stage2_modes_all,
@@ -3321,8 +4351,8 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             skip_modes,
             similarity_regions_by_mode,
         )
-        galleries, details, prune_status_text = _prepare_stage2_render(
-            controller,
+        galleries, details = _prepare_stage2_render(
+            render_controller,
             scene_id,
             vm,
             pct_clip_percent,
@@ -3330,17 +4360,49 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             sim_cutoff,
             stage2_modes_all,
             requested_blocks=requested_blocks,
-            prune_overlay=prune_on,
-            prune_metric_key=prune_metric,
-            prune_n=prune_n_i,
+            show_colorbar_histogram=bool(show_colorbar_histogram),
+            normalize_seven_metrics=bool(normalize_seven_metrics),
         )
+        if show_remaining_pruning:
+            remaining_notes: List[str] = []
+            for mode in stage2_modes_all:
+                skip_point = _stage2_block_keys_for_mode(mode)[2]
+                if skip_point not in galleries:
+                    continue
+                extra_images, extra_note = _heatmaps_remaining_images(
+                    backbone=render_controller.v3_backbone,
+                    dataset=render_controller.dataset,
+                    scene_id=str(scene_id),
+                    mode=mode,
+                    token_rows=t_val,
+                    value_mode=vm,
+                    percentile_clip=clip_key,
+                    sim_gamma=sim_gamma,
+                    sim_cutoff=sim_cutoff,
+                    show_colorbar_histogram=bool(show_colorbar_histogram),
+                    normalize_seven_metrics=bool(normalize_seven_metrics),
+                    expected_columns=max(
+                        1,
+                        len(galleries.get(skip_point, [])),
+                    ),
+                )
+                if extra_images:
+                    galleries[skip_point] = [
+                        *galleries.get(skip_point, []),
+                        *extra_images,
+                    ]
+                if extra_note:
+                    remaining_notes.append(extra_note)
+            if remaining_notes:
+                details += " | " + " ; ".join(dict.fromkeys(remaining_notes))
+            else:
+                details += " | remaining rows enabled"
         after_keys = set(galleries.keys())
         keys_to_update = (requested_blocks & after_keys) if force_updates else (requested_blocks - before_keys)
-        if prune_sig_changed:
-            for mode in selected_modes:
-                keys_to_update.add(f"sim_{mode}_all")
-
-        if request_seq is not None and request_seq != controller.stage2_request_seq:
+        if (
+            request_seq is not None
+            and request_seq != render_controller.stage2_request_seq
+        ):
             return _stage2_noop_updates()
 
         block_updates: List[Any] = []
@@ -3381,9 +4443,1792 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             pct_ok,
             write_values=write_values,
         )
-        stage2_last_render_key["cache_key"] = cache_key
-        stage2_last_render_key["prune_sig"] = prune_sig
-        return tuple([*block_updates, *vis_updates, prune_status_text, details, *ctrl])
+        stage2_last_render_keys[
+            render_controller.v3_backbone
+        ] = cache_key
+        return tuple([*block_updates, *vis_updates, details, *ctrl])
+
+    def _heatmaps_controller(
+        backbone: str,
+        dataset: str,
+    ) -> PairAttentionController:
+        key = (str(backbone), str(dataset).strip().lower())
+        cached = heatmaps_controller_cache.get(key)
+        if cached is not None:
+            return cached
+        scoped = PairAttentionController(
+            output_root=controller.v3_output_root,
+            dataset=key[1],
+            data_roots_by_dataset=controller.data_roots_by_dataset,
+            device_arg=str(controller.device),
+            viser_host=controller.viser_host,
+            viser_port=controller.viser_port,
+            v3_backbone=key[0],
+        )
+        scoped.stage2_real_datasets = list(  # type: ignore[attr-defined]
+            getattr(controller, "stage2_real_datasets", [])
+        )
+        heatmaps_controller_cache[key] = scoped
+        return scoped
+
+    def _stage2_all_backbones_bundle(
+        selected_backbones: Sequence[str] | None,
+        scene_id: Optional[str],
+        value_mode: str,
+        pct_clip_percent: float,
+        filter_metric_rows: List[str] | None,
+        filter_token_rows: List[str] | None,
+        sim_gamma_value: float,
+        sim_cutoff_value: float,
+        show_colorbar_histogram: bool,
+        normalize_seven_metrics: bool,
+        show_remaining_pruning: bool,
+        *,
+        force_gallery_refresh: bool,
+    ) -> Tuple[Any, ...]:
+        available_backbones = list(controller.v3_backbones) or [
+            controller.v3_backbone
+        ]
+        selected = {str(backbone) for backbone in (selected_backbones or [])}
+        backbones = [
+            backbone
+            for backbone in available_backbones
+            if backbone in selected
+        ]
+        if not backbones:
+            return tuple(
+                [
+                    *[
+                        gr.update(value=[])
+                        for _ in range(n_stage2_galleries)
+                    ],
+                    *[
+                        gr.update(visible=False)
+                        for _ in range(n_stage2_galleries)
+                    ],
+                    "Select at least one backbone.",
+                    *[gr.update() for _ in range(6)],
+                ]
+            )
+        bundles: List[Tuple[str, Tuple[Any, ...]]] = []
+        notes: List[str] = []
+        for backbone in backbones:
+            scoped_controller = _heatmaps_controller(
+                backbone,
+                controller.dataset,
+            )
+            scoped_scene = (
+                "mean"
+                if _is_stage2_virtual_dataset(
+                    scoped_controller.dataset
+                )
+                else str(scene_id or "")
+            )
+            available_scenes = scoped_controller.stage2_scene_ids()
+            if scoped_scene not in available_scenes:
+                fallback = _preferred_stage2_scene(
+                    scoped_controller,
+                    available_scenes,
+                )
+                if fallback is None:
+                    notes.append(f"{backbone}: no scene data")
+                    continue
+                scoped_scene = fallback
+            bundle = _stage2_visual_bundle(
+                scoped_controller,
+                scoped_scene,
+                value_mode,
+                pct_clip_percent,
+                filter_metric_rows,
+                filter_token_rows,
+                sim_gamma_value,
+                sim_cutoff_value,
+                show_colorbar_histogram,
+                normalize_seven_metrics,
+                show_remaining_pruning,
+                request_seq=None,
+                # Always return complete gallery values to the all-backbone
+                # merger. Cached figures are reused by the scoped controller.
+                force_gallery_refresh=True,
+            )
+            bundles.append((backbone, bundle))
+
+        if not bundles:
+            return (
+                *_empty_stage2_visual_updates(),
+                *[gr.update() for _ in range(6)],
+            )
+
+        gallery_updates: List[Any] = []
+        for index in range(n_stage2_galleries):
+            # Only the third slot of each legacy nine-block group is visible.
+            # Similarity block values are consumed above to build that combined
+            # row and must not also be serialized to hidden galleries.
+            if index % 9 != 2:
+                gallery_updates.append(gr.update(value=[]))
+                continue
+            combined: List[Any] = []
+            for backbone, bundle in bundles:
+                update = bundle[index]
+                values = (
+                    update.get("value")
+                    if isinstance(update, dict)
+                    else None
+                )
+                if not isinstance(values, list):
+                    continue
+                for item in values:
+                    if (
+                        isinstance(item, tuple)
+                        and len(item) == 2
+                        and isinstance(item[1], str)
+                    ):
+                        image, score_caption = item
+                        caption = (
+                            f"{backbone} · {score_caption}"
+                            if score_caption
+                            else backbone
+                        )
+                    else:
+                        image = item
+                        caption = backbone
+                    combined.append((image, caption))
+            gallery_updates.append(
+                gr.update(value=combined, columns=5)
+                if combined
+                else gr.update(value=[])
+            )
+
+        visibility_updates: List[Any] = []
+        for index in range(n_stage2_galleries):
+            visible = any(
+                bool(bundle[n_stage2_galleries + index].get("visible"))
+                for _backbone, bundle in bundles
+                if isinstance(
+                    bundle[n_stage2_galleries + index],
+                    dict,
+                )
+            )
+            visibility_updates.append(gr.update(visible=visible))
+
+        details = " | ".join(
+            f"{backbone}: {bundle[-7]}"
+            for backbone, bundle in bundles
+        )
+        if notes:
+            details += " | " + " ; ".join(notes)
+        controls = bundles[0][1][-6:]
+        return tuple(
+            [
+                *gallery_updates,
+                *visibility_updates,
+                details,
+                *controls,
+            ]
+        )
+
+    def _brute_force_controller(
+        backbone: str,
+        dataset: str,
+        *,
+        skip_stage: str = "pruning",
+    ) -> PairAttentionController:
+        stage = str(skip_stage or "pruning")
+        key = (str(backbone), str(dataset), stage)
+        cached = brute_force_controller_cache.get(key)
+        if cached is not None:
+            return cached
+        scoped = PairAttentionController(
+            output_root=controller.v3_output_root,
+            dataset=key[1],
+            data_roots_by_dataset=controller.data_roots_by_dataset,
+            device_arg=str(controller.device),
+            viser_host=controller.viser_host,
+            viser_port=controller.viser_port,
+            v3_backbone=key[0],
+        )
+        if stage != "pruning":
+            legacy_skip_dir = (
+                controller.v3_output_root
+                / key[0]
+                / key[1]
+                / "eval"
+                / stage
+            )
+            skip_dir = legacy_skip_dir
+            if stage == "remaining_pruning":
+                pruning_dir = (
+                    controller.v3_output_root
+                    / key[0]
+                    / key[1]
+                    / "eval"
+                    / "pruning"
+                )
+                index_path = pruning_dir / REMAINING_INDEX_FILENAME
+                if index_path.is_file():
+                    index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+                    active = str(
+                        index_payload.get("active_base_selector", "")
+                    ).strip()
+                    candidate = pruning_dir / REMAINING_INTERNAL_DIR / active
+                    if active and candidate.is_dir():
+                        skip_dir = candidate
+            scoped.skip_reports = scoped._discover_v3_skip_reports(skip_dir)
+            scoped.stage2_render_cache = {}
+        brute_force_controller_cache[key] = scoped
+        return scoped
+
+    def _refresh_brute_force_overview(
+        selected_backbones: List[str] | None,
+        value_mode: str,
+        show_colorbar_histogram: bool,
+        normalize_metrics: bool,
+    ) -> Tuple[Any, ...]:
+        selected_backbone_set = {str(x) for x in (selected_backbones or [])}
+        mode = str(brute_force_modes[0] if brute_force_modes else "mixed_units")
+        vm = str(value_mode or "absolute")
+        clip = 100.0
+        indoor_datasets = [
+            dataset
+            for dataset in brute_force_datasets
+            if any(token in dataset.lower() for token in ("scannet", "scans_", "7scenes"))
+        ]
+        outdoor_datasets = [
+            dataset
+            for dataset in brute_force_datasets
+            if any(token in dataset.lower() for token in ("nuscenes", "waymo"))
+        ]
+        overview_items: Dict[str, List[np.ndarray]] = {
+            backbone: [] for backbone in brute_force_backbones
+        }
+        notes: List[str] = []
+        included_by_backbone_domain: Dict[Tuple[str, str], List[str]] = {}
+
+        for backbone in brute_force_backbones:
+            if backbone not in selected_backbone_set:
+                continue
+            maps_by_dataset: Dict[str, Dict[str, List[float]]] = {}
+            layers_by_dataset: Dict[str, int] = {}
+            for dataset in brute_force_datasets:
+                try:
+                    scoped = _brute_force_controller(backbone, dataset)
+                    skip_by_mode, _source = _build_stage2_skip_maps(
+                        scoped,
+                        "mean",
+                        vm,
+                        clip,
+                    )
+                    mode_maps = skip_by_mode.get(mode)
+                    num_layers = int(scoped.resolve_stage2_num_layers("mean"))
+                    if mode_maps and num_layers > 0:
+                        maps_by_dataset[dataset] = mode_maps
+                        layers_by_dataset[dataset] = num_layers
+                        missing_metrics = [
+                            metric
+                            for metric in SKIP_SEVEN_METRIC_KEYS
+                            if metric not in mode_maps
+                        ]
+                        if missing_metrics:
+                            notes.append(
+                                f"{backbone} · {dataset}: incomplete metrics "
+                                f"({', '.join(sorted(missing_metrics))})"
+                            )
+                    else:
+                        notes.append(
+                            f"{backbone} · {dataset}: {mode} mean skip result missing"
+                        )
+                except Exception as exc:
+                    if len(notes) < 8:
+                        notes.append(f"{backbone} · {dataset}: {exc}")
+
+            for domain_label, domain_datasets in (
+                ("Indoor", indoor_datasets),
+                ("Outdoor", outdoor_datasets),
+            ):
+                available = [
+                    dataset for dataset in domain_datasets if dataset in maps_by_dataset
+                ]
+                if not available:
+                    notes.append(f"{backbone} · {domain_label.lower()}: skip data missing")
+                    continue
+                num_layers = layers_by_dataset[available[0]]
+                compatible = [
+                    dataset
+                    for dataset in available
+                    if layers_by_dataset[dataset] == num_layers
+                ]
+                included_by_backbone_domain[(backbone, domain_label)] = compatible
+                incompatible = [
+                    dataset for dataset in available if dataset not in compatible
+                ]
+                if incompatible:
+                    notes.append(
+                        f"{backbone} · {domain_label.lower()}: layer count mismatch "
+                        f"({', '.join(incompatible)})"
+                    )
+                common_metrics = set(maps_by_dataset[compatible[0]])
+                for dataset in compatible[1:]:
+                    common_metrics.intersection_update(maps_by_dataset[dataset])
+                aggregate_maps = {
+                    metric: _packed_elementwise_mean(
+                        [maps_by_dataset[dataset][metric] for dataset in compatible]
+                    )
+                    for metric in common_metrics
+                }
+                for family_label, metrics, cmap in (
+                    ("Pose", SKIP_MAIN_METRICS, "viridis"),
+                    ("Point cloud", SKIP_POINT_METRICS[:3], "coolwarm"),
+                ):
+                    cache_key = (
+                        backbone,
+                        "overview",
+                        domain_label,
+                        tuple(compatible),
+                        family_label,
+                        mode,
+                        vm,
+                        int(round(clip)),
+                        bool(show_colorbar_histogram),
+                        bool(normalize_metrics),
+                    )
+                    cached = brute_force_render_cache.get(cache_key)
+                    if cached is None:
+                        image = _render_skip_metric_mean(
+                            aggregate_maps,
+                            num_layers,
+                            metrics,
+                            title=f"{domain_label} {family_label}",
+                            cmap=cmap,
+                            value_mode=vm,
+                            show_colorbar_histogram=bool(show_colorbar_histogram),
+                            normalize_metrics=bool(normalize_metrics),
+                            percentile_clip=clip,
+                        )
+                        cached = [] if image is None else [image]
+                        brute_force_render_cache[cache_key] = cached
+                    overview_items[backbone].extend(cached)
+
+        gallery_updates: List[Any] = []
+        row_updates: List[Any] = []
+        rendered = 0
+        for backbone in brute_force_backbones:
+            items = overview_items[backbone]
+            gallery_updates.append(gr.update(value=items, columns=4))
+            visible = bool(items) and backbone in selected_backbone_set
+            row_updates.append(gr.update(visible=visible))
+            if visible:
+                rendered += len(items)
+        info_lines = [
+            "Overview",
+            "scene=mean",
+            f"mode={mode}",
+            f"rendered={rendered}/{4 * len(selected_backbone_set)} heatmaps",
+            "",
+            "Mean metric sources",
+            "pose mean: mean(ARE, APE, RPE_rot, RPE_trans)",
+            "point-cloud mean: mean(Accuracy, Completeness, Chamfer)",
+        ]
+        included_parts: List[str] = []
+        for backbone in brute_force_backbones:
+            if backbone not in selected_backbone_set:
+                continue
+            indoor = included_by_backbone_domain.get((backbone, "Indoor"), [])
+            outdoor = included_by_backbone_domain.get((backbone, "Outdoor"), [])
+            included_parts.append(
+                f"{backbone}\n"
+                f"  indoor: {', '.join(indoor) or 'none'}\n"
+                f"  outdoor: {', '.join(outdoor) or 'none'}"
+            )
+        if included_parts:
+            info_lines.extend(["", "Averaged datasets", *included_parts])
+        if not selected_backbone_set:
+            info_lines.extend(["", "Select at least one backbone."])
+        if notes:
+            info_lines.extend(["", "Notes", *[f"- {note}" for note in notes[:4]]])
+            if len(notes) > 4:
+                info_lines.append(f"- +{len(notes) - 4} more")
+        info = "\n".join(info_lines)
+        return tuple([*gallery_updates, *row_updates, info])
+
+    def _remaining_similarity_metric_maps(
+        backbone: str,
+        dataset: str,
+    ) -> Tuple[Dict[str, List[float]], int, List[str]]:
+        graph_dir = (
+            controller.v3_output_root
+            / str(backbone)
+            / str(dataset)
+            / "remaining_redundancy"
+        )
+        regions = list_redundancy_graph_regions(graph_dir)
+        if not regions:
+            return {}, 0, []
+        output: Dict[str, List[float]] = {}
+        num_layers = 0
+        for metric_key, _metric_label in SIMILARITY_METRICS:
+            matrices: List[np.ndarray] = []
+            for region in regions:
+                try:
+                    unit_ids, matrix, _provenance = load_similarity(
+                        experiment=str(backbone),
+                        dataset=str(dataset),
+                        token_region=str(region),
+                        metric=metric_key,
+                        artifact_stage="remaining_redundancy",
+                        output_root=controller.v3_output_root,
+                        align_dropped_units=True,
+                    )
+                except (FileNotFoundError, KeyError, ValueError):
+                    continue
+                matrices.append(np.asarray(matrix, dtype=np.float64))
+                num_layers = max(num_layers, len(unit_ids))
+            if not matrices:
+                continue
+            stack = np.stack(matrices, axis=0)
+            finite = np.isfinite(stack)
+            counts = finite.sum(axis=0)
+            sums = np.where(finite, stack, 0.0).sum(axis=0)
+            aggregate = np.divide(
+                sums,
+                counts,
+                out=np.full(stack.shape[1:], np.nan, dtype=np.float64),
+                where=counts > 0,
+            )
+            output[metric_key] = upper_triangle_pack(
+                torch.from_numpy(aggregate)
+            )
+        return output, num_layers, list(regions)
+
+    def _heatmaps_remaining_images(
+        *,
+        backbone: str,
+        dataset: str,
+        scene_id: str,
+        mode: str,
+        token_rows: Sequence[str],
+        value_mode: str,
+        percentile_clip: float,
+        sim_gamma: float,
+        sim_cutoff: float,
+        show_colorbar_histogram: bool,
+        normalize_seven_metrics: bool,
+        expected_columns: int,
+    ) -> Tuple[List[np.ndarray], str]:
+        """Render only aggregate skip/similarity remaining rows for Heatmaps."""
+        if str(scene_id) != "mean":
+            return [], "remaining visualization is available for scene=mean"
+
+        dataset_key = str(dataset).strip().lower()
+        source_datasets = (
+            list(getattr(controller, "stage2_real_datasets", []))
+            if _is_stage2_virtual_dataset(dataset_key)
+            else [dataset_key]
+        )
+        reducer = (
+            _packed_elementwise_mean
+            if dataset_key == STAGE2_MEAN_DATASET
+            else _packed_elementwise_min
+            if dataset_key == STAGE2_MIN_DATASET
+            else _packed_elementwise_mean
+        )
+        cache_key = (
+            "heatmaps_remaining_aggregate_v4_clipped_independent_redundancy",
+            str(backbone),
+            dataset_key,
+            tuple(source_datasets),
+            str(mode),
+            tuple(str(row) for row in token_rows),
+            str(value_mode),
+            int(round(float(percentile_clip))),
+            _sim_gamma_key(sim_gamma),
+            _sim_cutoff_key(sim_cutoff),
+            bool(show_colorbar_histogram),
+            bool(normalize_seven_metrics),
+            int(expected_columns),
+        )
+        cached = brute_force_render_cache.get(cache_key)
+        if cached is not None:
+            return cached, ""
+
+        original_mode_maps: List[Dict[str, List[float]]] = []
+        remaining_mode_maps: List[Dict[str, List[float]]] = []
+        marginal_mode_maps: List[Dict[str, List[float]]] = []
+        original_similarity_by_dataset: Dict[
+            str, Dict[str, Dict[str, List[float]]]
+        ] = {}
+        remaining_similarity_by_dataset: Dict[
+            str, Dict[str, Dict[str, List[float]]]
+        ] = {}
+        base_interval_by_dataset: Dict[str, Tuple[int, int]] = {}
+        num_layers = 0
+        notes: List[str] = []
+
+        for source_dataset in source_datasets:
+            try:
+                original_scoped = _brute_force_controller(
+                    backbone,
+                    source_dataset,
+                )
+                remaining_scoped = _brute_force_controller(
+                    backbone,
+                    source_dataset,
+                    skip_stage="remaining_pruning",
+                )
+                original_report = original_scoped.get_skip_report("mean")
+                remaining_report = remaining_scoped.get_skip_report("mean")
+                if original_report is None or remaining_report is None:
+                    notes.append(
+                        f"{source_dataset}: remaining 7-metric mean missing"
+                    )
+                else:
+                    original_by_mode, _source = _build_stage2_skip_maps(
+                        original_scoped,
+                        "mean",
+                        value_mode,
+                        percentile_clip,
+                    )
+                    if original_by_mode.get(mode):
+                        original_mode_maps.append(original_by_mode[mode])
+                    full_unit_ids = [
+                        str(unit_id)
+                        for unit_id in original_report.report.get("unit_ids", [])
+                    ]
+                    remaining_unit_ids = [
+                        str(unit_id)
+                        for unit_id in remaining_report.report.get("unit_ids", [])
+                    ]
+                    remaining_by_mode, _source = _build_stage2_skip_maps(
+                        remaining_scoped,
+                        "mean",
+                        value_mode,
+                        percentile_clip,
+                    )
+                    remaining_by_mode = _align_skip_maps_to_full_unit_catalog(
+                        remaining_by_mode,
+                        remaining_unit_ids=remaining_unit_ids,
+                        full_unit_ids=full_unit_ids,
+                    )
+                    if remaining_by_mode.get(mode):
+                        remaining_mode_maps.append(remaining_by_mode[mode])
+                    marginal_by_mode, _selector = _build_remaining_marginal_maps(
+                        original_report=dict(original_report.report),
+                        remaining_report=dict(remaining_report.report),
+                        value_mode=value_mode,
+                    )
+                    if marginal_by_mode.get(mode):
+                        marginal_mode_maps.append(marginal_by_mode[mode])
+                    num_layers = max(
+                        num_layers,
+                        len(full_unit_ids)
+                        or int(remaining_report.report.get("num_layers", 0)),
+                    )
+                    provenance = remaining_report.report.get(
+                        "base_prune_plan"
+                    )
+                    if isinstance(provenance, dict):
+                        plan_root = str(
+                            provenance.get("prune_plan_root", "")
+                        ).strip()
+                        plan_name = str(
+                            provenance.get("prune_plan_name", "")
+                        ).strip()
+                        if plan_root and plan_name:
+                            plan = load_named_prune_plan(
+                                Path(plan_root),
+                                plan_name,
+                            )
+                            start, end, _selector = resolve_plan_interval(
+                                plan,
+                                full_unit_ids=full_unit_ids,
+                                expected_dropped_unit_ids=[
+                                    str(unit_id)
+                                    for unit_id in provenance.get(
+                                        "dropped_unit_ids",
+                                        [],
+                                    )
+                                ],
+                            )
+                            base_interval_by_dataset[source_dataset] = (
+                                start,
+                                end,
+                            )
+            except Exception as exc:
+                notes.append(f"{source_dataset} remaining skip: {exc}")
+
+            try:
+                original_similarity_report = _brute_force_controller(
+                    backbone,
+                    source_dataset,
+                ).get_similarity_report("mean")
+                if original_similarity_report is not None:
+                    original_similarity_by_mode = (
+                        _similarity_maps_with_token_aggregations(
+                            _extract_similarity_metric_maps_by_mode(
+                                original_similarity_report.report
+                            )
+                        )
+                    )
+                    original_regions = _similarity_maps_for_skip_mode(
+                        original_similarity_by_mode,
+                        mode,
+                    )
+                    if original_regions:
+                        original_similarity_by_dataset[
+                            source_dataset
+                        ] = original_regions
+            except Exception as exc:
+                notes.append(
+                    f"{source_dataset} original similarity: {exc}"
+                )
+
+            raw_regions: Dict[str, Dict[str, List[float]]] = {}
+            graph_full_unit_ids: List[str] = []
+            graph_dir = (
+                controller.v3_output_root
+                / str(backbone)
+                / str(source_dataset)
+                / "remaining_redundancy"
+            )
+            for region in list_redundancy_graph_regions(graph_dir):
+                metric_map: Dict[str, List[float]] = {}
+                for metric_key, _metric_label in SIMILARITY_METRICS:
+                    try:
+                        unit_ids, matrix, _provenance = load_similarity(
+                            experiment=str(backbone),
+                            dataset=str(source_dataset),
+                            token_region=str(region),
+                            metric=metric_key,
+                            artifact_stage="remaining_redundancy",
+                            output_root=controller.v3_output_root,
+                            align_dropped_units=True,
+                        )
+                    except (FileNotFoundError, KeyError, ValueError):
+                        continue
+                    metric_map[metric_key] = upper_triangle_pack(
+                        torch.from_numpy(np.asarray(matrix, dtype=np.float64))
+                    )
+                    graph_full_unit_ids = [
+                        str(unit_id) for unit_id in unit_ids
+                    ]
+                    num_layers = max(num_layers, len(unit_ids))
+                if metric_map:
+                    raw_regions[str(region)] = metric_map
+            if raw_regions:
+                aggregated = _similarity_maps_with_token_aggregations(
+                    {"remaining": raw_regions}
+                )
+                remaining_similarity_by_dataset[source_dataset] = (
+                    aggregated.get("remaining", raw_regions)
+                )
+                if source_dataset not in base_interval_by_dataset:
+                    try:
+                        manifest_path = graph_dir / "manifest.json"
+                        provenance = json.loads(
+                            manifest_path.read_text(encoding="utf-8")
+                        )
+                        plan_root = str(
+                            provenance.get("prune_plan_root", "")
+                        ).strip()
+                        plan_name = str(
+                            provenance.get("prune_plan_name", "")
+                        ).strip()
+                        if (
+                            not plan_root
+                            or not plan_name
+                            or not graph_full_unit_ids
+                        ):
+                            raise ValueError(
+                                "remaining redundancy provenance is incomplete"
+                            )
+                        plan = load_named_prune_plan(
+                            Path(plan_root),
+                            plan_name,
+                        )
+                        start, end, _selector = resolve_plan_interval(
+                            plan,
+                            full_unit_ids=graph_full_unit_ids,
+                            expected_dropped_unit_ids=[
+                                str(unit_id)
+                                for unit_id in provenance.get(
+                                    "dropped_unit_ids",
+                                    [],
+                                )
+                            ],
+                        )
+                        base_interval_by_dataset[source_dataset] = (
+                            start,
+                            end,
+                        )
+                    except Exception as exc:
+                        notes.append(
+                            f"{source_dataset} remaining similarity provenance: "
+                            f"{exc}"
+                        )
+            else:
+                notes.append(
+                    f"{source_dataset}: remaining similarity missing"
+                )
+
+        def _aggregate_metric_maps(
+            maps: Sequence[Dict[str, List[float]]],
+        ) -> Dict[str, List[float]]:
+            if not maps:
+                return {}
+            common_metrics = set(maps[0])
+            for metric_map in maps[1:]:
+                common_metrics.intersection_update(metric_map)
+            return {
+                metric: reducer([metric_map[metric] for metric_map in maps])
+                for metric in common_metrics
+            }
+
+        original_skip = _aggregate_metric_maps(original_mode_maps)
+        remaining_skip = _aggregate_metric_maps(remaining_mode_maps)
+        marginal_skip = _aggregate_metric_maps(marginal_mode_maps)
+        original_retention = (
+            _skip_seven_metric_display_packed(
+                original_skip,
+                value_mode=value_mode,
+                normalize_seven_metrics=True,
+                percentile_clip=percentile_clip,
+            )
+            if normalize_seven_metrics
+            else None
+        )
+        remaining_retention = (
+            _skip_seven_metric_display_packed(
+                remaining_skip,
+                value_mode=value_mode,
+                normalize_seven_metrics=True,
+                percentile_clip=percentile_clip,
+            )
+            if normalize_seven_metrics
+            else None
+        )
+        marginal_retention = (
+            _skip_seven_metric_display_packed(
+                marginal_skip,
+                value_mode=value_mode,
+                normalize_seven_metrics=True,
+                percentile_clip=percentile_clip,
+            )
+            if normalize_seven_metrics
+            else None
+        )
+        skip_vertical_score = (
+            _packed_strict_upper_pearson(
+                original_retention,
+                remaining_retention,
+                num_layers,
+            )
+            if original_retention is not None
+            and remaining_retention is not None
+            else None
+        )
+        marginal_skip_vertical_score = (
+            _packed_strict_upper_pearson(
+                original_retention,
+                marginal_retention,
+                num_layers,
+            )
+            if original_retention is not None
+            and marginal_retention is not None
+            else None
+        )
+        remaining_row: List[np.ndarray] = []
+        if remaining_skip and num_layers > 0:
+            remaining_row.append(
+                _render_skip_seven_metric_mean(
+                    remaining_skip,
+                    num_layers,
+                    value_mode=value_mode,
+                    show_colorbar_histogram=show_colorbar_histogram,
+                    normalize_seven_metrics=normalize_seven_metrics,
+                    percentile_clip=percentile_clip,
+                    title_prefix="Remaining",
+                    title_suffix=_score_title_suffix(
+                        vertical=skip_vertical_score
+                    ),
+                )
+            )
+        else:
+            remaining_row.append(
+                _message_heatmap_rgb(
+                    "Remaining · 7-metric mean",
+                    "Remaining result unavailable",
+                )
+            )
+
+        for region in token_rows:
+            region_key = str(region)
+            region_maps = [
+                remaining_similarity_by_dataset[source_dataset][region_key]
+                for source_dataset in source_datasets
+                if region_key
+                in remaining_similarity_by_dataset.get(source_dataset, {})
+            ]
+            if len(region_maps) != len(remaining_similarity_by_dataset):
+                continue
+            aggregate_region = _aggregate_metric_maps(region_maps)
+            original_region_maps = [
+                original_similarity_by_dataset[source_dataset][region_key]
+                for source_dataset in source_datasets
+                if source_dataset in remaining_similarity_by_dataset
+                and region_key
+                in original_similarity_by_dataset.get(source_dataset, {})
+            ]
+            aggregate_original_region = (
+                _aggregate_metric_maps(original_region_maps)
+                if len(original_region_maps) == len(region_maps)
+                else {}
+            )
+            remaining_row.extend(
+                _render_similarity_gallery(
+                    aggregate_region,
+                    num_layers,
+                    role_short="R",
+                    sim_gamma=sim_gamma,
+                    sim_cutoff=sim_cutoff,
+                    show_colorbar_histogram=show_colorbar_histogram,
+                    normalize_similarity=False,
+                    title_suffix_by_metric=_similarity_score_suffixes(
+                        aggregate_region,
+                        num_layers,
+                        horizontal_reference=remaining_retention,
+                        vertical_reference=aggregate_original_region,
+                        sim_gamma=sim_gamma,
+                        sim_cutoff=sim_cutoff,
+                    ),
+                )
+            )
+
+        column_count = max(1, int(expected_columns))
+        while len(remaining_row) < column_count:
+            remaining_row.append(
+                _message_heatmap_rgb(
+                    "Remaining · similarity",
+                    "Remaining result unavailable",
+                )
+            )
+        remaining_row = remaining_row[:column_count]
+
+        marginal_row: List[np.ndarray] = []
+        if marginal_skip and num_layers > 0:
+            marginal_row.append(
+                _render_skip_seven_metric_mean(
+                    marginal_skip,
+                    num_layers,
+                    value_mode=value_mode,
+                    show_colorbar_histogram=show_colorbar_histogram,
+                    normalize_seven_metrics=normalize_seven_metrics,
+                    percentile_clip=percentile_clip,
+                    title_prefix="Marginal vs base-pruned",
+                    title_suffix=_score_title_suffix(
+                        vertical=marginal_skip_vertical_score
+                    ),
+                )
+            )
+        else:
+            marginal_row.append(
+                _message_heatmap_rgb(
+                    "Marginal · 7-metric mean",
+                    "Marginal result unavailable",
+                )
+            )
+        for region in token_rows:
+            region_key = str(region)
+            marginal_region_maps: List[Dict[str, List[float]]] = []
+            marginal_source_datasets: List[str] = []
+            for source_dataset in source_datasets:
+                original_regions = original_similarity_by_dataset.get(
+                    source_dataset,
+                    {},
+                )
+                remaining_regions = remaining_similarity_by_dataset.get(
+                    source_dataset,
+                    {},
+                )
+                base_interval = base_interval_by_dataset.get(source_dataset)
+                original_region = original_regions.get(region_key, {})
+                remaining_region = remaining_regions.get(region_key, {})
+                if (
+                    base_interval is None
+                    or not original_region
+                    or not remaining_region
+                ):
+                    continue
+                start, end = base_interval
+                rebased_metrics: Dict[str, List[float]] = {}
+                for metric_key in set(original_region).intersection(
+                    remaining_region
+                ):
+                    original_packed = _coerce_packed(
+                        original_region.get(metric_key)
+                    )
+                    remaining_packed = _coerce_packed(
+                        remaining_region.get(metric_key)
+                    )
+                    if original_packed is None or remaining_packed is None:
+                        continue
+                    try:
+                        rebased_metrics[metric_key] = (
+                            _rebase_similarity_packed(
+                                remaining_packed,
+                                original_packed,
+                                num_layers=num_layers,
+                                base_interval=(start, end),
+                                apply_similarity_controls=metric_key
+                                in {"cka", "cosine"},
+                                sim_gamma=sim_gamma,
+                                sim_cutoff=sim_cutoff,
+                            )
+                        )
+                    except ValueError:
+                        continue
+                if rebased_metrics:
+                    marginal_region_maps.append(rebased_metrics)
+                    marginal_source_datasets.append(source_dataset)
+            aggregate_marginal_region = _aggregate_metric_maps(
+                marginal_region_maps
+            )
+            marginal_original_region_maps = [
+                original_similarity_by_dataset[source_dataset][region_key]
+                for source_dataset in marginal_source_datasets
+                if region_key
+                in original_similarity_by_dataset.get(source_dataset, {})
+            ]
+            aggregate_marginal_original_region = (
+                _aggregate_metric_maps(marginal_original_region_maps)
+                if len(marginal_original_region_maps)
+                == len(marginal_region_maps)
+                else {}
+            )
+            marginal_row.extend(
+                _render_similarity_marginal_gallery(
+                    aggregate_marginal_region,
+                    num_layers,
+                    show_colorbar_histogram=show_colorbar_histogram,
+                    title_suffix_by_metric=_similarity_score_suffixes(
+                        aggregate_marginal_region,
+                        num_layers,
+                        horizontal_reference=marginal_retention,
+                        vertical_reference=aggregate_marginal_original_region,
+                        sim_gamma=sim_gamma,
+                        sim_cutoff=sim_cutoff,
+                        current_is_displayed=True,
+                    ),
+                )
+            )
+        while len(marginal_row) < column_count:
+            marginal_row.append(
+                _message_heatmap_rgb("", "")
+            )
+        images = [*remaining_row, *marginal_row]
+        brute_force_render_cache[cache_key] = images
+        return images, " ; ".join(notes[:3])
+
+    def _refresh_brute_force(
+        selected_backbones: List[str] | None,
+        selected_skip_datasets: List[str] | None,
+        selected_similarity_datasets: List[str] | None,
+        value_mode: str,
+        show_colorbar_histogram: bool,
+        normalize_seven_metrics: bool,
+    ) -> Tuple[Any, ...]:
+        # Remaining visualization lives exclusively in the Heatmaps tab.
+        show_remaining_pruning = False
+        selected_backbone_set = {str(x) for x in (selected_backbones or [])}
+        dataset_scopes = [*brute_force_datasets, STAGE2_MEAN_DATASET]
+        valid_dataset_scopes = set(dataset_scopes)
+        selected_skip_dataset_set = {
+            str(x)
+            for x in (selected_skip_datasets or [])
+            if str(x) in valid_dataset_scopes
+        }
+        selected_similarity_dataset_set = {
+            str(x)
+            for x in (selected_similarity_datasets or [])
+            if str(x) in valid_dataset_scopes
+        }
+        vm = str(value_mode or "absolute")
+        row_items: Dict[Tuple[str, str, str, str], List[np.ndarray]] = {
+            (backbone, mode, dataset, row): []
+            for backbone in brute_force_backbones
+            for mode in brute_force_modes
+            for dataset in dataset_scopes
+            for row in ("pose", "point")
+        }
+        similarity_items: Dict[Tuple[str, str], List[np.ndarray]] = {
+            (backbone, dataset): []
+            for backbone in brute_force_backbones
+            for dataset in dataset_scopes
+        }
+        notes: List[str] = []
+        rendered_scope_keys: set[Tuple[str, str, str]] = set()
+        resolved_marginal_selectors: set[str] = set()
+
+        def _mean_mode_metric_maps(
+            per_dataset_maps: Sequence[Dict[str, Dict[str, List[float]]]],
+        ) -> Dict[str, Dict[str, List[float]]]:
+            if not per_dataset_maps:
+                return {}
+            output: Dict[str, Dict[str, List[float]]] = {}
+            common_modes = set(per_dataset_maps[0])
+            for maps in per_dataset_maps[1:]:
+                common_modes.intersection_update(maps)
+            for mode in common_modes:
+                common_metrics = set(per_dataset_maps[0].get(mode, {}))
+                for maps in per_dataset_maps[1:]:
+                    common_metrics.intersection_update(maps.get(mode, {}))
+                metric_output = {
+                    metric: _packed_elementwise_mean(
+                        [maps[mode][metric] for maps in per_dataset_maps]
+                    )
+                    for metric in common_metrics
+                }
+                if metric_output:
+                    output[mode] = metric_output
+            return output
+
+        for backbone in brute_force_backbones:
+            if backbone not in selected_backbone_set:
+                continue
+
+            skip_maps_by_dataset: Dict[
+                str, Dict[str, Dict[str, List[float]]]
+            ] = {}
+            skip_num_layers_by_dataset: Dict[str, int] = {}
+            remaining_maps_by_dataset: Dict[
+                str, Dict[str, Dict[str, List[float]]]
+            ] = {}
+            remaining_num_layers_by_dataset: Dict[str, int] = {}
+            marginal_maps_by_dataset: Dict[
+                str, Dict[str, Dict[str, List[float]]]
+            ] = {}
+            marginal_num_layers_by_dataset: Dict[str, int] = {}
+            need_all_skip_datasets = (
+                STAGE2_MEAN_DATASET in selected_skip_dataset_set
+            )
+            needed_skip_datasets = {
+                dataset
+                for dataset in brute_force_datasets
+                if need_all_skip_datasets or dataset in selected_skip_dataset_set
+            }
+            for dataset in brute_force_datasets:
+                if dataset not in needed_skip_datasets:
+                    continue
+                scope_label = f"{backbone} · {dataset}"
+                try:
+                    scoped = _brute_force_controller(backbone, dataset)
+                    report = scoped.get_skip_report("mean")
+                    if report is None:
+                        notes.append(f"{scope_label}: mean skip report missing")
+                        continue
+                    num_layers = int(scoped.resolve_stage2_num_layers("mean"))
+                    if num_layers <= 0:
+                        notes.append(f"{scope_label}: num_layers missing")
+                        continue
+                    skip_by_mode, _source = _build_stage2_skip_maps(
+                        scoped,
+                        "mean",
+                        vm,
+                        100.0,
+                    )
+                    if skip_by_mode:
+                        skip_maps_by_dataset[dataset] = skip_by_mode
+                        skip_num_layers_by_dataset[dataset] = num_layers
+                except Exception as exc:
+                    notes.append(f"{scope_label}: {exc}")
+                if show_remaining_pruning:
+                    try:
+                        remaining_scoped = _brute_force_controller(
+                            backbone,
+                            dataset,
+                            skip_stage="remaining_pruning",
+                        )
+                        remaining_report = remaining_scoped.get_skip_report("mean")
+                        if remaining_report is None:
+                            notes.append(
+                                f"{scope_label}: remaining_pruning mean report missing"
+                            )
+                            continue
+                        full_unit_ids = [
+                            str(unit_id)
+                            for unit_id in report.report.get("unit_ids", [])
+                        ]
+                        remaining_unit_ids = [
+                            str(unit_id)
+                            for unit_id in remaining_report.report.get(
+                                "unit_ids",
+                                [],
+                            )
+                        ]
+                        remaining_by_mode, _source = _build_stage2_skip_maps(
+                            remaining_scoped,
+                            "mean",
+                            vm,
+                            100.0,
+                        )
+                        remaining_by_mode = _align_skip_maps_to_full_unit_catalog(
+                            remaining_by_mode,
+                            remaining_unit_ids=remaining_unit_ids,
+                            full_unit_ids=full_unit_ids,
+                        )
+                        remaining_num_layers = (
+                            len(full_unit_ids)
+                            if full_unit_ids
+                            else int(
+                                remaining_report.report.get("num_layers", 0)
+                            )
+                        )
+                        if remaining_by_mode and remaining_num_layers > 0:
+                            remaining_maps_by_dataset[dataset] = remaining_by_mode
+                            remaining_num_layers_by_dataset[dataset] = remaining_num_layers
+                        marginal_by_mode, base_selector = (
+                            _build_remaining_marginal_maps(
+                                original_report=dict(report.report),
+                                remaining_report=dict(
+                                    remaining_report.report
+                                ),
+                                value_mode=vm,
+                            )
+                        )
+                        if marginal_by_mode and remaining_num_layers > 0:
+                            marginal_maps_by_dataset[dataset] = marginal_by_mode
+                            marginal_num_layers_by_dataset[dataset] = (
+                                remaining_num_layers
+                            )
+                            resolved_marginal_selectors.add(
+                                f"{backbone}:{dataset}={base_selector}"
+                            )
+                    except Exception as exc:
+                        notes.append(f"{scope_label} · remaining_pruning: {exc}")
+
+            skip_maps_by_scope = dict(skip_maps_by_dataset)
+            remaining_maps_by_scope = dict(remaining_maps_by_dataset)
+            marginal_maps_by_scope = dict(marginal_maps_by_dataset)
+            if STAGE2_MEAN_DATASET in selected_skip_dataset_set:
+                mean_sources = [
+                    skip_maps_by_dataset[dataset]
+                    for dataset in brute_force_datasets
+                    if dataset in skip_maps_by_dataset
+                ]
+                mean_maps = _mean_mode_metric_maps(mean_sources)
+                if mean_maps:
+                    skip_maps_by_scope[STAGE2_MEAN_DATASET] = mean_maps
+                else:
+                    notes.append(f"{backbone} · mean: skip data missing")
+                if show_remaining_pruning:
+                    remaining_mean_sources = [
+                        remaining_maps_by_dataset[dataset]
+                        for dataset in brute_force_datasets
+                        if dataset in remaining_maps_by_dataset
+                    ]
+                    remaining_mean_maps = _mean_mode_metric_maps(
+                        remaining_mean_sources
+                    )
+                    if remaining_mean_maps:
+                        remaining_maps_by_scope[STAGE2_MEAN_DATASET] = (
+                            remaining_mean_maps
+                        )
+                    else:
+                        notes.append(
+                            f"{backbone} · mean: remaining_pruning data missing"
+                        )
+                    marginal_mean_sources = [
+                        marginal_maps_by_dataset[dataset]
+                        for dataset in brute_force_datasets
+                        if dataset in marginal_maps_by_dataset
+                    ]
+                    marginal_mean_maps = _mean_mode_metric_maps(
+                        marginal_mean_sources
+                    )
+                    if marginal_mean_maps:
+                        marginal_maps_by_scope[STAGE2_MEAN_DATASET] = (
+                            marginal_mean_maps
+                        )
+                    else:
+                        notes.append(
+                            f"{backbone} · mean: remaining marginal data missing"
+                        )
+
+            for dataset_scope in dataset_scopes:
+                if dataset_scope not in selected_skip_dataset_set:
+                    continue
+                skip_by_mode = skip_maps_by_scope.get(dataset_scope, {})
+                source_datasets = (
+                    [
+                        dataset
+                        for dataset in brute_force_datasets
+                        if dataset in skip_maps_by_dataset
+                    ]
+                    if dataset_scope == STAGE2_MEAN_DATASET
+                    else [dataset_scope]
+                )
+                num_layers = next(
+                    (
+                        skip_num_layers_by_dataset[dataset]
+                        for dataset in source_datasets
+                        if dataset in skip_num_layers_by_dataset
+                    ),
+                    0,
+                )
+                remaining_source_datasets = (
+                    [
+                        dataset
+                        for dataset in brute_force_datasets
+                        if dataset in remaining_maps_by_dataset
+                    ]
+                    if dataset_scope == STAGE2_MEAN_DATASET
+                    else [dataset_scope]
+                )
+                remaining_num_layers = next(
+                    (
+                        remaining_num_layers_by_dataset[dataset]
+                        for dataset in remaining_source_datasets
+                        if dataset in remaining_num_layers_by_dataset
+                    ),
+                    0,
+                )
+                marginal_source_datasets = (
+                    [
+                        dataset
+                        for dataset in brute_force_datasets
+                        if dataset in marginal_maps_by_dataset
+                    ]
+                    if dataset_scope == STAGE2_MEAN_DATASET
+                    else [dataset_scope]
+                )
+                marginal_num_layers = next(
+                    (
+                        marginal_num_layers_by_dataset[dataset]
+                        for dataset in marginal_source_datasets
+                        if dataset in marginal_num_layers_by_dataset
+                    ),
+                    0,
+                )
+                for mode in brute_force_modes:
+                    mode_maps = skip_by_mode.get(mode)
+                    if not mode_maps or num_layers <= 0:
+                        continue
+                    try:
+                        cache_key = (
+                            backbone,
+                            dataset_scope,
+                            tuple(source_datasets),
+                            mode,
+                            "eight_metric_detail",
+                            vm,
+                            bool(show_colorbar_histogram),
+                            bool(normalize_seven_metrics),
+                            bool(show_remaining_pruning),
+                            "remaining_marginal_plan_rebased_v1",
+                        )
+                        images = brute_force_render_cache.get(cache_key)
+                        if images is None:
+                            pose_images = _render_skip_gallery(
+                                mode_maps,
+                                num_layers,
+                                SKIP_MAIN_METRICS,
+                                value_mode=vm,
+                                show_colorbar_histogram=bool(show_colorbar_histogram),
+                                normalize_seven_metrics=bool(normalize_seven_metrics),
+                                colorbar_decimals=1,
+                                title_prefix="Original",
+                            )
+                            point_images = _render_skip_gallery(
+                                mode_maps,
+                                num_layers,
+                                SKIP_POINT_METRICS[:3],
+                                value_mode=vm,
+                                show_colorbar_histogram=bool(show_colorbar_histogram),
+                                normalize_seven_metrics=bool(normalize_seven_metrics),
+                                colorbar_decimals=1,
+                                title_prefix="Original",
+                            )
+                            mean_image = _render_skip_seven_metric_mean(
+                                mode_maps,
+                                num_layers,
+                                value_mode=vm,
+                                show_colorbar_histogram=bool(show_colorbar_histogram),
+                                normalize_seven_metrics=bool(normalize_seven_metrics),
+                                title_prefix="Original",
+                            )
+                            images = [*pose_images, *point_images, mean_image]
+                            if show_remaining_pruning:
+                                remaining_mode_maps = (
+                                    remaining_maps_by_scope
+                                    .get(dataset_scope, {})
+                                    .get(mode)
+                                )
+                                if remaining_mode_maps and remaining_num_layers > 0:
+                                    remaining_pose = _render_skip_gallery(
+                                        remaining_mode_maps,
+                                        remaining_num_layers,
+                                        SKIP_MAIN_METRICS,
+                                        value_mode=vm,
+                                        show_colorbar_histogram=bool(show_colorbar_histogram),
+                                        normalize_seven_metrics=bool(normalize_seven_metrics),
+                                        colorbar_decimals=1,
+                                        title_prefix="Remaining",
+                                    )
+                                    remaining_point = _render_skip_gallery(
+                                        remaining_mode_maps,
+                                        remaining_num_layers,
+                                        SKIP_POINT_METRICS[:3],
+                                        value_mode=vm,
+                                        show_colorbar_histogram=bool(show_colorbar_histogram),
+                                        normalize_seven_metrics=bool(normalize_seven_metrics),
+                                        colorbar_decimals=1,
+                                        title_prefix="Remaining",
+                                    )
+                                    remaining_mean = _render_skip_seven_metric_mean(
+                                        remaining_mode_maps,
+                                        remaining_num_layers,
+                                        value_mode=vm,
+                                        show_colorbar_histogram=bool(show_colorbar_histogram),
+                                        normalize_seven_metrics=bool(normalize_seven_metrics),
+                                        title_prefix="Remaining",
+                                    )
+                                    images = [
+                                        *pose_images,
+                                        *remaining_pose,
+                                    ]
+                                    marginal_mode_maps = (
+                                        marginal_maps_by_scope
+                                        .get(dataset_scope, {})
+                                        .get(mode)
+                                    )
+                                    marginal_pose: List[np.ndarray] = []
+                                    marginal_point: List[np.ndarray] = []
+                                    marginal_mean: Optional[np.ndarray] = None
+                                    if (
+                                        marginal_mode_maps
+                                        and marginal_num_layers > 0
+                                    ):
+                                        marginal_pose = _render_skip_gallery(
+                                            marginal_mode_maps,
+                                            marginal_num_layers,
+                                            SKIP_MAIN_METRICS,
+                                            value_mode=vm,
+                                            show_colorbar_histogram=bool(
+                                                show_colorbar_histogram
+                                            ),
+                                            normalize_seven_metrics=bool(
+                                                normalize_seven_metrics
+                                            ),
+                                            colorbar_decimals=1,
+                                            title_prefix=(
+                                                "Marginal vs base-pruned"
+                                            ),
+                                        )
+                                        marginal_point = _render_skip_gallery(
+                                            marginal_mode_maps,
+                                            marginal_num_layers,
+                                            SKIP_POINT_METRICS[:3],
+                                            value_mode=vm,
+                                            show_colorbar_histogram=bool(
+                                                show_colorbar_histogram
+                                            ),
+                                            normalize_seven_metrics=bool(
+                                                normalize_seven_metrics
+                                            ),
+                                            colorbar_decimals=1,
+                                            title_prefix=(
+                                                "Marginal vs base-pruned"
+                                            ),
+                                        )
+                                        marginal_mean = (
+                                            _render_skip_seven_metric_mean(
+                                                marginal_mode_maps,
+                                                marginal_num_layers,
+                                                value_mode=vm,
+                                                show_colorbar_histogram=bool(
+                                                    show_colorbar_histogram
+                                                ),
+                                                normalize_seven_metrics=bool(
+                                                    normalize_seven_metrics
+                                                ),
+                                                title_prefix=(
+                                                    "Marginal vs base-pruned"
+                                                ),
+                                            )
+                                        )
+                                    if (
+                                        len(marginal_pose) == 4
+                                        and len(marginal_point) == 3
+                                        and marginal_mean is not None
+                                    ):
+                                        images = [
+                                            *pose_images,
+                                            *remaining_pose,
+                                            *marginal_pose,
+                                            *point_images,
+                                            mean_image,
+                                            *remaining_point,
+                                            remaining_mean,
+                                            *marginal_point,
+                                            marginal_mean,
+                                        ]
+                                    else:
+                                        images.extend(
+                                            [
+                                                *point_images,
+                                                mean_image,
+                                                *remaining_point,
+                                                remaining_mean,
+                                            ]
+                                        )
+                            brute_force_render_cache[cache_key] = images
+                        if show_remaining_pruning and len(images) == 24:
+                            row_items[(backbone, mode, dataset_scope, "pose")] = images[:12]
+                            row_items[(backbone, mode, dataset_scope, "point")] = images[12:]
+                        elif show_remaining_pruning and len(images) == 16:
+                            row_items[(backbone, mode, dataset_scope, "pose")] = images[:8]
+                            row_items[(backbone, mode, dataset_scope, "point")] = images[8:]
+                        else:
+                            row_items[(backbone, mode, dataset_scope, "pose")] = images[:4]
+                            row_items[(backbone, mode, dataset_scope, "point")] = images[4:8]
+                        if images:
+                            rendered_scope_keys.add(
+                                ("skip", backbone, dataset_scope)
+                            )
+                    except Exception as exc:
+                        notes.append(
+                            f"{backbone} · {dataset_scope} · {mode}: {exc}"
+                        )
+
+            need_all_similarity_datasets = (
+                STAGE2_MEAN_DATASET in selected_similarity_dataset_set
+            )
+            needed_similarity_datasets = {
+                dataset
+                for dataset in brute_force_datasets
+                if need_all_similarity_datasets
+                or dataset in selected_similarity_dataset_set
+            }
+            similarity_by_dataset: Dict[str, Dict[str, List[float]]] = {}
+            similarity_num_layers_by_dataset: Dict[str, int] = {}
+            remaining_similarity_by_dataset: Dict[
+                str, Dict[str, List[float]]
+            ] = {}
+            remaining_similarity_num_layers_by_dataset: Dict[str, int] = {}
+            for dataset in brute_force_datasets:
+                if dataset not in needed_similarity_datasets:
+                    continue
+                try:
+                    scoped = _brute_force_controller(backbone, dataset)
+                    report_entry = scoped.get_similarity_report("mean")
+                    if report_entry is None:
+                        notes.append(
+                            f"{backbone} · {dataset}: mean similarity report missing"
+                        )
+                        continue
+                    by_mode = _similarity_maps_with_token_aggregations(
+                        _extract_similarity_metric_maps_by_mode(report_entry.report)
+                    )
+                    mode_entry = by_mode.get("v3_units")
+                    if mode_entry is None and by_mode:
+                        mode_entry = next(iter(by_mode.values()))
+                    token_mean = (
+                        mode_entry.get(STAGE2_TOKEN_ROW_MEAN, {})
+                        if mode_entry
+                        else {}
+                    )
+                    if not token_mean:
+                        notes.append(
+                            f"{backbone} · {dataset}: token-mean similarity missing"
+                        )
+                        continue
+                    similarity_by_dataset[dataset] = token_mean
+                    try:
+                        similarity_num_layers_by_dataset[dataset] = int(
+                            report_entry.report.get("num_layers", 0)
+                        )
+                    except (TypeError, ValueError):
+                        similarity_num_layers_by_dataset[dataset] = 0
+                except Exception as exc:
+                    notes.append(f"{backbone} · {dataset}: {exc}")
+                if show_remaining_pruning:
+                    try:
+                        (
+                            remaining_similarity,
+                            remaining_similarity_layers,
+                            remaining_regions,
+                        ) = _remaining_similarity_metric_maps(
+                            backbone,
+                            dataset,
+                        )
+                        if remaining_similarity and remaining_similarity_layers > 0:
+                            remaining_similarity_by_dataset[dataset] = (
+                                remaining_similarity
+                            )
+                            remaining_similarity_num_layers_by_dataset[dataset] = (
+                                remaining_similarity_layers
+                            )
+                        else:
+                            notes.append(
+                                f"{backbone} · {dataset}: remaining similarity missing"
+                            )
+                    except Exception as exc:
+                        notes.append(
+                            f"{backbone} · {dataset} · remaining similarity: {exc}"
+                        )
+
+            similarity_by_scope = dict(similarity_by_dataset)
+            remaining_similarity_by_scope = dict(
+                remaining_similarity_by_dataset
+            )
+            if STAGE2_MEAN_DATASET in selected_similarity_dataset_set:
+                mean_sources = [
+                    similarity_by_dataset[dataset]
+                    for dataset in brute_force_datasets
+                    if dataset in similarity_by_dataset
+                ]
+                aggregate_similarity: Dict[str, List[float]] = {}
+                if mean_sources:
+                    available_metrics = {
+                        metric
+                        for metric_map in mean_sources
+                        for metric in metric_map
+                    }
+                    aggregate_similarity = {
+                        metric: _packed_elementwise_mean(
+                            [
+                                metric_map[metric]
+                                for metric_map in mean_sources
+                                if metric in metric_map
+                            ]
+                        )
+                        for metric in available_metrics
+                    }
+                if aggregate_similarity:
+                    similarity_by_scope[STAGE2_MEAN_DATASET] = (
+                        aggregate_similarity
+                    )
+                else:
+                    notes.append(f"{backbone} · mean: similarity data missing")
+                if show_remaining_pruning:
+                    remaining_mean_sources = [
+                        remaining_similarity_by_dataset[dataset]
+                        for dataset in brute_force_datasets
+                        if dataset in remaining_similarity_by_dataset
+                    ]
+                    remaining_aggregate: Dict[str, List[float]] = {}
+                    if remaining_mean_sources:
+                        remaining_available_metrics = {
+                            metric
+                            for metric_map in remaining_mean_sources
+                            for metric in metric_map
+                        }
+                        remaining_aggregate = {
+                            metric: _packed_elementwise_mean(
+                                [
+                                    metric_map[metric]
+                                    for metric_map in remaining_mean_sources
+                                    if metric in metric_map
+                                ]
+                            )
+                            for metric in remaining_available_metrics
+                        }
+                    if remaining_aggregate:
+                        remaining_similarity_by_scope[
+                            STAGE2_MEAN_DATASET
+                        ] = remaining_aggregate
+                    else:
+                        notes.append(
+                            f"{backbone} · mean: remaining similarity data missing"
+                        )
+
+            for dataset_scope in dataset_scopes:
+                if dataset_scope not in selected_similarity_dataset_set:
+                    continue
+                similarity_upper = similarity_by_scope.get(dataset_scope, {})
+                source_datasets = (
+                    [
+                        dataset
+                        for dataset in brute_force_datasets
+                        if dataset in similarity_by_dataset
+                    ]
+                    if dataset_scope == STAGE2_MEAN_DATASET
+                    else [dataset_scope]
+                )
+                similarity_num_layers = next(
+                    (
+                        similarity_num_layers_by_dataset[dataset]
+                        for dataset in source_datasets
+                        if dataset in similarity_num_layers_by_dataset
+                    ),
+                    0,
+                )
+                remaining_similarity_source_datasets = (
+                    [
+                        dataset
+                        for dataset in brute_force_datasets
+                        if dataset in remaining_similarity_by_dataset
+                    ]
+                    if dataset_scope == STAGE2_MEAN_DATASET
+                    else [dataset_scope]
+                )
+                remaining_similarity_num_layers = next(
+                    (
+                        remaining_similarity_num_layers_by_dataset[dataset]
+                        for dataset in remaining_similarity_source_datasets
+                        if dataset
+                        in remaining_similarity_num_layers_by_dataset
+                    ),
+                    0,
+                )
+                similarity_cache_key = (
+                    backbone,
+                    "dataset_token_mean_similarity",
+                    dataset_scope,
+                    tuple(source_datasets),
+                    bool(show_colorbar_histogram),
+                    bool(show_remaining_pruning),
+                    "raw_all_similarity_coolwarm_available_metric_mean_cbar_5segments_1dp",
+                )
+                cached_similarity = brute_force_render_cache.get(similarity_cache_key)
+                if cached_similarity is not None:
+                    similarity_items[(backbone, dataset_scope)] = cached_similarity
+                    if cached_similarity:
+                        rendered_scope_keys.add(
+                            ("similarity", backbone, dataset_scope)
+                        )
+                elif similarity_upper and similarity_num_layers > 0:
+                    try:
+                        rendered_similarity = _render_similarity_gallery(
+                            similarity_upper,
+                            similarity_num_layers,
+                            role_short="μ",
+                            sim_gamma=1.0,
+                            sim_cutoff=0.0,
+                            metric_entries=_metric_entries_for_similarity_maps(
+                                similarity_upper
+                            ),
+                            show_colorbar_histogram=bool(show_colorbar_histogram),
+                            normalize_similarity=False,
+                        )
+                        if show_remaining_pruning:
+                            remaining_similarity_upper = (
+                                remaining_similarity_by_scope.get(
+                                    dataset_scope,
+                                    {},
+                                )
+                            )
+                            original_entries = (
+                                _metric_entries_for_similarity_maps(
+                                    similarity_upper
+                                )
+                            )
+                            remaining_rendered_by_metric: Dict[
+                                str, np.ndarray
+                            ] = {}
+                            if (
+                                remaining_similarity_upper
+                                and remaining_similarity_num_layers > 0
+                            ):
+                                for metric_key, metric_label in original_entries:
+                                    metric_images = _render_similarity_gallery(
+                                        remaining_similarity_upper,
+                                        remaining_similarity_num_layers,
+                                        role_short="R",
+                                        sim_gamma=1.0,
+                                        sim_cutoff=0.0,
+                                        metric_entries=[
+                                            (metric_key, metric_label)
+                                        ],
+                                        show_colorbar_histogram=bool(
+                                            show_colorbar_histogram
+                                        ),
+                                        normalize_similarity=False,
+                                    )
+                                    if metric_images:
+                                        remaining_rendered_by_metric[
+                                            metric_key
+                                        ] = metric_images[0]
+                            remaining_row: List[np.ndarray] = []
+                            for metric_key, metric_label in original_entries:
+                                remaining_image = (
+                                    remaining_rendered_by_metric.get(
+                                        metric_key
+                                    )
+                                )
+                                if remaining_image is None:
+                                    remaining_image = _message_heatmap_rgb(
+                                        f"R·{metric_label}",
+                                        "Remaining result unavailable",
+                                    )
+                                remaining_row.append(remaining_image)
+                            rendered_similarity.extend(remaining_row)
+                        if rendered_similarity:
+                            similarity_items[(backbone, dataset_scope)] = rendered_similarity
+                            rendered_scope_keys.add(
+                                ("similarity", backbone, dataset_scope)
+                            )
+                        brute_force_render_cache[similarity_cache_key] = (
+                            similarity_items[(backbone, dataset_scope)]
+                        )
+                    except Exception as exc:
+                        notes.append(
+                            f"{backbone} · {dataset_scope} similarity: {exc}"
+                        )
+
+        gallery_updates: List[Any] = []
+        visibility_updates: List[Any] = []
+        backbone_visibility_updates: List[Any] = []
+        for backbone in brute_force_backbones:
+            backbone_has_rows = False
+            for mode in brute_force_modes:
+                for dataset in dataset_scopes:
+                    for row in ("pose", "point"):
+                        items = row_items[(backbone, mode, dataset, row)]
+                        gallery_updates.append(gr.update(value=items, columns=4))
+                        visible = bool(items)
+                        visibility_updates.append(gr.update(visible=visible))
+                        backbone_has_rows = backbone_has_rows or visible
+            for dataset in dataset_scopes:
+                similarity_images = similarity_items[(backbone, dataset)]
+                gallery_updates.append(
+                    gr.update(
+                        value=similarity_images,
+                        columns=4,
+                        rows=2 if len(similarity_images) > 4 else 1,
+                    )
+                )
+                similarity_visible = bool(similarity_images)
+                visibility_updates.append(gr.update(visible=similarity_visible))
+                backbone_has_rows = backbone_has_rows or similarity_visible
+            backbone_visibility_updates.append(gr.update(visible=backbone_has_rows))
+
+        requested_scopes = len(selected_backbone_set) * (
+            len(selected_skip_dataset_set)
+            + len(selected_similarity_dataset_set)
+        )
+        info = (
+            f"scene=mean | rendered scopes="
+            f"{len(rendered_scope_keys)}/{requested_scopes}"
+        )
+        if show_remaining_pruning:
+            info += (
+                " | rows=original / remaining-vs-full / marginal-vs-base-pruned"
+            )
+            resolved_base_selectors = sorted(resolved_marginal_selectors)
+            if resolved_base_selectors:
+                info += " | base pruning: " + ", ".join(
+                    resolved_base_selectors
+                )
+        if not selected_backbone_set:
+            info += " | select at least one backbone"
+        if not selected_skip_dataset_set and not selected_similarity_dataset_set:
+            info += " | select at least one skip or similarity dataset"
+        if notes:
+            info += " | " + " ; ".join(notes[:4])
+            if len(notes) > 4:
+                info += f" ; +{len(notes) - 4} more"
+        return tuple(
+            [*gallery_updates, *visibility_updates, *backbone_visibility_updates, info]
+        )
 
     def _refresh_outputs(
         scene_id: str,
@@ -3497,20 +6342,18 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
 
     def _heatmaps_scope_changed(
         dataset: str,
-        backbone: str | None,
+        selected_backbones: List[str] | None,
         cur_value_mode: str,
         pct_clip: float,
         filter_metric_rows: List[str] | None,
         filter_token_rows: List[str] | None,
         sim_gamma: float,
         sim_cutoff: float,
-        prune_overlay: bool,
-        prune_metric_key: str,
-        prune_n: float,
+        show_colorbar_histogram: bool,
+        normalize_seven_metrics: bool,
+        show_remaining_pruning: bool,
     ):
         controller.stage2_request_seq += 1
-        if backbone:
-            controller.switch_backbone(backbone)
         ds_key = str(dataset).strip().lower()
         if ds_key != controller.dataset:
             controller.switch_dataset(dataset)
@@ -3521,7 +6364,8 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         else:
             stage2_scene_ids_new = controller.stage2_scene_ids()
             initial_stage2_scene_new = _preferred_stage2_scene(controller, stage2_scene_ids_new)
-        tup_hm = _stage2_visual_bundle(
+        tup_hm = _stage2_all_backbones_bundle(
+            selected_backbones,
             initial_stage2_scene_new,
             str(cur_value_mode or "absolute"),
             float(pct_clip),
@@ -3529,34 +6373,32 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             list(filter_token_rows) if filter_token_rows is not None else None,
             float(sim_gamma),
             float(sim_cutoff),
-            bool(prune_overlay),
-            str(prune_metric_key or "cka"),
-            float(prune_n),
-            request_seq=None,
+            bool(show_colorbar_histogram),
+            bool(normalize_seven_metrics),
+            bool(show_remaining_pruning),
             force_gallery_refresh=True,
         )
-        # tup_hm tail: prune_status, info, then 6 filter controls
-        hm_main = tup_hm[:-8]
-        hm_prune_status = tup_hm[-8]
+        # tup_hm tail: info, then 6 filter controls
+        hm_main = tup_hm[:-7]
         hm_info = tup_hm[-7]
         hm_ctrl = tup_hm[-6:]
 
         updates: List[Any] = [
             gr.update(value=controller.dataset),
+            gr.update(value=list(selected_backbones or [])),
             gr.update(
                 choices=stage2_scene_ids_new,
                 value=initial_stage2_scene_new,
                 interactive=not virtual_view,
             ),
             *hm_main,
-            hm_prune_status,
             hm_info,
             *hm_ctrl,
         ]
-        updates.insert(1, gr.update(value=controller.v3_backbone))
         return tuple(updates)
 
     def _refresh_stage2_full(
+        selected_backbones: List[str] | None,
         scene_id: str,
         value_mode: str,
         pct_clip_percent: float,
@@ -3564,13 +6406,13 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         filter_token_rows: List[str] | None,
         sim_gamma: float,
         sim_cutoff: float,
-        prune_overlay: bool,
-        prune_metric_key: str,
-        prune_n: float,
+        show_colorbar_histogram: bool,
+        normalize_seven_metrics: bool,
+        show_remaining_pruning: bool,
     ):
         controller.stage2_request_seq += 1
-        request_seq = int(controller.stage2_request_seq)
-        return _stage2_visual_bundle(
+        return _stage2_all_backbones_bundle(
+            selected_backbones,
             scene_id,
             str(value_mode or "absolute"),
             float(pct_clip_percent),
@@ -3578,20 +6420,25 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             filter_token_rows,
             float(sim_gamma),
             float(sim_cutoff),
-            bool(prune_overlay),
-            str(prune_metric_key or "cka"),
-            float(prune_n),
-            request_seq=request_seq,
+            bool(show_colorbar_histogram),
+            bool(normalize_seven_metrics),
+            bool(show_remaining_pruning),
             force_gallery_refresh=False,
         )
 
     def _refresh_cka_heatmaps(
         token_region: str,
         sim_cutoff_value: float,
+        *,
+        datasets: Sequence[str] = cka_datasets,
+        models: Sequence[str] = cka_models,
+        token_regions: Sequence[str] = cka_token_regions,
+        artifact_stage: str = "redundancy",
+        render_cache: Dict[Tuple[Any, ...], Optional[np.ndarray]] = cka_render_cache,
     ) -> Tuple[Any, ...]:
         region = str(token_region or "").strip().lower()
-        if region not in set(cka_token_regions):
-            region = cka_token_regions[0] if cka_token_regions else "special"
+        if region not in set(token_regions):
+            region = token_regions[0] if token_regions else "special"
         try:
             sim_cutoff = float(sim_cutoff_value)
         except (TypeError, ValueError):
@@ -3604,14 +6451,20 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         images: List[Any] = []
         notes: List[str] = []
         rendered = 0
-        dataset_total = len(cka_datasets) * len(cka_models)
-        row_mean_total = len(cka_models)
+        dataset_total = len(datasets) * len(models)
+        row_mean_total = len(models)
         display_total = dataset_total + row_mean_total
-        for backbone in cka_models:
-            for dataset in cka_datasets:
-                cache_key = (str(dataset), str(backbone), region, cutoff_key)
-                if cache_key in cka_render_cache:
-                    image = cka_render_cache[cache_key]
+        for backbone in models:
+            for dataset in datasets:
+                cache_key = (
+                    artifact_stage,
+                    str(dataset),
+                    str(backbone),
+                    region,
+                    cutoff_key,
+                )
+                if cache_key in render_cache:
+                    image = render_cache[cache_key]
                     detail = "cached" if image is not None else "missing"
                 else:
                     image, detail = _render_cka_heatmap_for_backbone(
@@ -3619,26 +6472,40 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         backbone=str(backbone),
                         token_region=region,
                         sim_cutoff=sim_cutoff,
+                        artifact_stage=artifact_stage,
+                        output_root=controller.v3_output_root,
                     )
-                    cka_render_cache[cache_key] = image
+                    render_cache[cache_key] = image
                 if image is not None:
                     rendered += 1
                 elif len(notes) < 6:
                     notes.append(f"{dataset}/{backbone}: {detail}")
                 images.append(image)
 
-            row_mean_cache_key = ("mean", str(backbone), region, cutoff_key)
-            if row_mean_cache_key in cka_render_cache:
-                row_mean_image = cka_render_cache[row_mean_cache_key]
+            row_mean_cache_key = (
+                artifact_stage,
+                "mean",
+                str(backbone),
+                region,
+                cutoff_key,
+            )
+            if row_mean_cache_key in render_cache:
+                row_mean_image = render_cache[row_mean_cache_key]
                 row_mean_detail = "cached" if row_mean_image is not None else "missing"
             else:
-                row_mean_image, row_mean_detail = _render_cka_heatmap_for_backbone(
-                    dataset="mean",
-                    backbone=str(backbone),
-                    token_region=region,
-                    sim_cutoff=sim_cutoff,
-                )
-                cka_render_cache[row_mean_cache_key] = row_mean_image
+                try:
+                    row_mean_dataset = ",".join(str(dataset) for dataset in datasets)
+                    row_mean_image, row_mean_detail = _render_cka_heatmap_for_backbone(
+                        dataset=row_mean_dataset,
+                        backbone=str(backbone),
+                        token_region=region,
+                        sim_cutoff=sim_cutoff,
+                        artifact_stage=artifact_stage,
+                        output_root=controller.v3_output_root,
+                    )
+                except ValueError as exc:
+                    row_mean_image, row_mean_detail = None, str(exc)
+                render_cache[row_mean_cache_key] = row_mean_image
             if row_mean_image is not None:
                 rendered += 1
             elif len(notes) < 6:
@@ -3656,6 +6523,41 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             if missing_more > 0:
                 info += f" ; +{missing_more} more missing cells"
         return tuple([*images, info])
+
+    def _refresh_remaining_cka_heatmaps(
+        token_region: str,
+        sim_cutoff_value: float,
+    ) -> Tuple[Any, ...]:
+        before = _refresh_cka_heatmaps(
+            token_region,
+            sim_cutoff_value,
+            datasets=remaining_cka_datasets,
+            models=remaining_cka_models,
+            token_regions=remaining_cka_token_regions,
+            artifact_stage="redundancy",
+            render_cache=cka_render_cache,
+        )
+        after = _refresh_cka_heatmaps(
+            token_region,
+            sim_cutoff_value,
+            datasets=remaining_cka_datasets,
+            models=remaining_cka_models,
+            token_regions=remaining_cka_token_regions,
+            artifact_stage=remaining_cka_stage,
+            render_cache=remaining_cka_render_cache,
+        )
+        cell_count = len(remaining_cka_models) * (len(remaining_cka_datasets) + 1)
+        before_images = list(before[:cell_count])
+        after_images = list(after[:cell_count])
+        comparison_images: List[Any] = []
+        for cell_index in range(cell_count):
+            comparison_images.extend(
+                [before_images[cell_index], after_images[cell_index]]
+            )
+        before_info = str(before[cell_count]) if len(before) > cell_count else ""
+        after_info = str(after[cell_count]) if len(after) > cell_count else ""
+        info = f"Before pruning: {before_info} | After pruning: {after_info}"
+        return tuple([*comparison_images, info])
 
     with gr.Blocks(
         title="Results Panel",
@@ -3724,6 +6626,41 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         .results-gallery .thumbnail-item,
         .results-gallery .gallery-item {
             width: 100% !important;
+        }
+        .pruning-plan-gallery.wrap,
+        .pruning-plan-gallery .grid-wrap,
+        .pruning-plan-gallery [class*="grid"] {
+            height: auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            overflow: visible !important;
+            overflow-y: visible !important;
+        }
+        .pruning-plan-gallery .grid-wrap,
+        .pruning-plan-gallery [class*="grid"] {
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+            grid-auto-flow: row !important;
+            align-content: start !important;
+        }
+        .pruning-plan-gallery button,
+        .pruning-plan-gallery .thumbnail-item,
+        .pruning-plan-gallery .gallery-item,
+        .pruning-plan-gallery [class*="thumbnail"],
+        .pruning-plan-gallery [class*="gallery-item"],
+        .pruning-plan-gallery [class*="image"],
+        .pruning-plan-gallery [class*="preview"] {
+            height: auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            aspect-ratio: auto !important;
+            overflow: visible !important;
+        }
+        .pruning-plan-gallery img {
+            display: block !important;
+            width: 100% !important;
+            height: auto !important;
+            max-height: none !important;
+            object-fit: contain !important;
         }
         .recovery-eval-gallery.wrap,
         .lora-eval-gallery.wrap,
@@ -3814,11 +6751,16 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         .stage2-heatmap-gallery.wrap {
             min-height: 0 !important;
             height: auto !important;
+            max-height: none !important;
+            overflow: visible !important;
         }
         .stage2-heatmap-gallery .grid-wrap,
         .stage2-heatmap-gallery [class*="grid"] {
             min-height: 0 !important;
             height: auto !important;
+            max-height: none !important;
+            overflow: visible !important;
+            overflow-y: visible !important;
             align-content: start !important;
         }
         .stage2-heatmap-gallery .thumbnail-item,
@@ -3833,6 +6775,44 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             height: auto !important;
             max-height: none !important;
             vertical-align: bottom !important;
+        }
+        .brute-force-detail-gallery.wrap,
+        .brute-force-detail-gallery .grid-wrap,
+        .brute-force-detail-gallery [class*="grid"] {
+            min-height: 0 !important;
+            height: auto !important;
+            max-height: none !important;
+            overflow: visible !important;
+        }
+        .brute-force-detail-gallery .thumbnail-item,
+        .brute-force-detail-gallery .thumbnail-small,
+        .brute-force-detail-gallery button.thumbnail-item,
+        .brute-force-detail-gallery button {
+            height: auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            aspect-ratio: auto !important;
+        }
+        .brute-force-detail-gallery .thumbnail-item > div,
+        .brute-force-detail-gallery button > div,
+        .brute-force-detail-gallery [class*="image"],
+        .brute-force-detail-gallery [class*="preview"] {
+            height: auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            aspect-ratio: auto !important;
+            overflow: visible !important;
+        }
+        .brute-force-unavailable-dataset {
+            opacity: 0.48 !important;
+            filter: grayscale(1);
+            pointer-events: none !important;
+        }
+        .brute-force-similarity-gallery .grid-wrap,
+        .brute-force-similarity-gallery [class*="grid"] {
+            grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+            grid-auto-flow: row !important;
+            width: 100% !important;
         }
         .cka-heatmap-matrix {
             gap: 8px !important;
@@ -4005,14 +6985,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         }
         """,
     ) as demo:
-        with gr.Tabs(selected="recovery_results"):
-            build_cka_heatmaps_tab(
-                datasets=cka_datasets,
-                models=cka_models,
-                token_regions=cka_token_regions,
-                refresh_cka_heatmaps_cb=_refresh_cka_heatmaps,
-            )
-
+        with gr.Tabs():
             # pair_ui = build_pair_tab(
             #     controller=controller,
             #     dataset_choices=dataset_choices,
@@ -4027,6 +7000,15 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             #     scene_changed_cb=_scene_changed,
             #     refresh_outputs_cb=_refresh_outputs,
             # )
+
+            build_brute_force_tab(
+                backbone_choices=brute_force_backbones,
+                dataset_choices=brute_force_datasets,
+                initial_skip_datasets=brute_force_skip_default_datasets,
+                stage2_modes=brute_force_modes,
+                refresh_overview_cb=_refresh_brute_force_overview,
+                refresh_detail_cb=_refresh_brute_force,
+            )
 
             stage2_scene_ids = controller.stage2_scene_ids()
             initial_stage2_scene = _preferred_stage2_scene(controller, stage2_scene_ids)
@@ -4051,6 +7033,24 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 refresh_stage2_full_cb=_refresh_stage2_full,
             )
 
+            build_pruning_plan_tab(
+                blocks=demo,
+                output_root=controller.v3_output_root,
+            )
+
+            build_recovery_overview_tab(
+                blocks=demo,
+                output_root=Path(lora_root),
+            )
+
+            build_cka_heatmaps_tab(
+                datasets=cka_datasets,
+                models=cka_models,
+                token_regions=cka_token_regions,
+                refresh_cka_heatmaps_cb=_refresh_cka_heatmaps,
+                tab_id="cka_heatmaps",
+            )
+
             build_summary_tab(blocks=demo, output_root=OUTPUT_ROOT_DEFAULT, tab_id="eval_summary")
 
             build_recovery_tab(
@@ -4070,15 +7070,13 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
 
         dataset_switch_outputs: List[Any] = [
             heatmaps_ui["stage2_dataset_dd"],
+            heatmaps_ui["stage2_backbone_filter"],
         ]
-        if heatmaps_ui.get("stage2_backbone_dd") is not None:
-            dataset_switch_outputs.append(heatmaps_ui["stage2_backbone_dd"])
         dataset_switch_outputs.extend(
             [
             heatmaps_ui["stage2_scene_dd"],
             *heatmaps_ui["stage2_mode_galleries"],
             *heatmaps_ui["stage2_row_body_cols"],
-            heatmaps_ui["stage2_prune_status"],
             heatmaps_ui["stage2_info"],
             heatmaps_ui["stage2_value_mode"],
             heatmaps_ui["stage2_pct_clip_slider"],
@@ -4091,24 +7089,17 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         dataset_switch_output_len["count"] = len(dataset_switch_outputs)
         scope_switch_inputs: List[Any] = [
             heatmaps_ui["stage2_dataset_dd"],
+            heatmaps_ui["stage2_backbone_filter"],
             heatmaps_ui["stage2_value_mode"],
             heatmaps_ui["stage2_pct_clip_slider"],
             heatmaps_ui["stage2_metric_rows_filter"],
             heatmaps_ui["stage2_token_rows_filter"],
             heatmaps_ui["stage2_sim_gamma_slider"],
             heatmaps_ui["stage2_sim_cutoff_slider"],
-            heatmaps_ui["stage2_prune_show"],
-            heatmaps_ui["stage2_prune_metric"],
-            heatmaps_ui["stage2_prune_n"],
+            heatmaps_ui["stage2_colorbar_histogram"],
+            heatmaps_ui["stage2_normalize_skip_metrics"],
+            heatmaps_ui["stage2_show_remaining"],
         ]
-        if heatmaps_ui.get("stage2_backbone_dd") is not None:
-            scope_switch_inputs = [
-                heatmaps_ui["stage2_dataset_dd"],
-                heatmaps_ui["stage2_backbone_dd"],
-                *scope_switch_inputs[1:],
-            ]
-        else:
-            scope_switch_inputs = [heatmaps_ui["stage2_dataset_dd"], gr.State(None), *scope_switch_inputs[1:]]
 
         # pair_ui["dataset_dd"].change(...)  # Pair Attention tab disabled
         heatmaps_ui["stage2_dataset_dd"].change(
@@ -4118,163 +7109,12 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             show_progress="minimal",
             trigger_mode="always_last",
         )
-        if heatmaps_ui.get("stage2_backbone_dd") is not None:
-            heatmaps_ui["stage2_backbone_dd"].change(
-                _heatmaps_scope_changed,
-                inputs=scope_switch_inputs,
-                outputs=dataset_switch_outputs,
-                show_progress="minimal",
-                trigger_mode="always_last",
-            )
-
-        def _save_prune_plan(
-            scene_id: str,
-            value_mode: str,
-            pct_clip_percent: float,
-            filter_metric_rows: List[str] | None,
-            filter_token_rows: List[str] | None,
-            sim_gamma: float,
-            sim_cutoff: float,
-            prune_overlay: bool,
-            prune_metric_key: str,
-            prune_n: float,
-        ) -> str:
-            # Save uses the *same* settings as current visualization.
-            if not prune_overlay:
-                raise gr.Error("Enable 'Show dense-triangle markers' before saving.")
-            metric = str(prune_metric_key or "cka").strip().lower()
-            if metric not in {"cka", "cosine"}:
-                raise gr.Error(f"Unsupported prune metric: {metric}")
-            n_tri = _normalize_prune_n(prune_n)
-            if n_tri <= 0:
-                raise gr.Error("n must be > 0 to save a prune plan.")
-            cutoff = float(np.clip(float(sim_cutoff), 0.0, 1.0))
-            if cutoff <= 0.0:
-                raise gr.Error("Cutoff must be > 0 to generate a prune plan.")
-
-            allowed_modes = _stage2_modes_for_controller(controller)
-            mode = allowed_modes[0] if allowed_modes else ""
-            if not mode:
-                raise gr.Error("No Stage2 mode available to save prune plan.")
-
-            rep = controller.get_similarity_report(str(scene_id))
-            if _is_stage2_virtual_dataset(controller.dataset):
-                virtual_dataset = str(controller.dataset).strip().lower()
-                # Build virtual-dataset similarity maps as displayed (already includes gamma/cutoff in builder).
-                maps_by_mode = _build_cross_dataset_similarity_all(
-                    controller,
-                    [mode],
-                    sim_gamma=float(sim_gamma),
-                    sim_cutoff=cutoff,
-                    aggregate=virtual_dataset,
-                )
-                all_map = maps_by_mode.get(mode, {})
-                packed = _coerce_packed(all_map.get(metric))
-                unit_ids = [f"u{i}" for i in range(int(controller.resolve_stage2_num_layers('mean')))]
-            else:
-                if rep is None:
-                    raise gr.Error("Missing similarity report for this scene.")
-                unit_ids = [str(u) for u in list(rep.report.get("unit_ids", []))]
-                by_mode = _extract_similarity_metric_maps_by_mode(rep.report)
-                sim_entry = _similarity_maps_for_skip_mode(by_mode, mode)
-                packed = _coerce_packed(sim_entry.get("all", {}).get(metric))
-            if packed is None:
-                raise gr.Error(f"Missing packed similarity for metric={metric}")
-            num_layers = len(unit_ids) if unit_ids else int(rep.report.get("num_layers", 0)) if rep else 0
-            if num_layers <= 0:
-                raise gr.Error("Cannot resolve num_layers for prune plan.")
-
-            # Apply gamma/cutoff exactly as in rendering.
-            processed = list(packed)
-            if metric in {"cka", "cosine"}:
-                if abs(float(sim_gamma) - 1.0) > 1e-12:
-                    processed = _similarity_packed_gamma_01(processed, float(sim_gamma))
-                processed = _similarity_packed_cutoff_01(processed, cutoff)
-
-            grid = upper_triangle_unpack_for_heatmap(processed, num_layers, float("nan"))
-            sim_mat = np.zeros((num_layers, num_layers), dtype=np.float64)
-            for i in range(num_layers):
-                sim_mat[i, i] = 1.0
-                for j in range(i + 1, num_layers):
-                    v = grid[i][j]
-                    if v == v:
-                        sim_mat[i, j] = float(v)
-
-            from analysis.prune_plan import UnitLoraSpec, UnitPrunePlan, default_prune_plan_root
-            from analysis.prune_plan.triangle_prune import build_triangle_prune_actions
-
-            actions, extra, picks = build_triangle_prune_actions(
-                sim_mat,
-                unit_ids,
-                threshold=cutoff,
-                max_triangles=n_tri,
-                lora_rank=32,
-                lora_alpha=64.0,
-            )
-            extra = dict(extra)
-            extra.setdefault("view_save", {})
-            extra["view_save"].update(
-                {
-                    "scene_id": str(scene_id),
-                    "mode": str(mode),
-                    "metric": metric,
-                    "sim_cutoff": cutoff,
-                    "sim_gamma": float(sim_gamma),
-                    "n": int(n_tri),
-                }
-            )
-
-            drop_indices: set[int] = set()
-            lora_specs: dict[str, UnitLoraSpec] = {}
-            for p in picks:
-                for idx in range(int(p.i) + 1, int(p.j) + 1):
-                    drop_indices.add(int(idx))
-                lora_specs[str(int(p.i))] = UnitLoraSpec(
-                    rank=32,
-                    alpha=64.0,
-                    dropout=0.0,
-                    target_submodules=("qkv", "proj"),
-                    alignment_teacher_unit_index=int(p.j),
-                )
-            drop_sorted = sorted(drop_indices)
-            plan = UnitPrunePlan(
-                backbone=str(controller.v3_backbone or controller.backbone or ""),
-                dataset=str(controller.dataset),
-                num_units=int(num_layers),
-                drop=drop_sorted,
-                drop_length=len(drop_sorted),
-                lora=lora_specs,
-                source_cache=str(controller.v3_output_root / str(controller.v3_backbone) / str(controller.dataset) / "cache"),
-                extra=extra,
-            )
-            out_root = default_prune_plan_root()
-            json_path = out_root / f"{str(controller.v3_backbone).strip().lower()}.json"
-            plan.save(json_path)
-
-            # Render and save the exact image shown (with markers).
-            markers = [(p.i, p.j, str(k)) for k, p in enumerate(picks)]
-            img = _heatmap_rgb_from_packed(
-                processed,
-                num_layers,
-                f"A·{metric.upper()} (saved)",
-                vmin=0.0,
-                vmax=1.0,
-                markers=markers,
-            )
-            png_path = out_root / f"{str(controller.v3_backbone).strip().lower()}_{controller.dataset}_{metric}_triangles.png"
-            png_path.parent.mkdir(parents=True, exist_ok=True)
-            plt.imsave(png_path, img)
-
-            return (
-                f"Saved plan={json_path.name} (drop_length={plan.drop_length}) "
-                f"and viz={png_path.name} (scene={scene_id}, mode={mode})."
-            )
-
-        heatmaps_ui["stage2_prune_save_btn"].click(
-            _save_prune_plan,
-            inputs=heatmaps_ui["stage2_inputs"],
-            outputs=[heatmaps_ui["stage2_prune_status"]],
+        heatmaps_ui["stage2_backbone_filter"].change(
+            _heatmaps_scope_changed,
+            inputs=scope_switch_inputs,
+            outputs=dataset_switch_outputs,
             show_progress="minimal",
+            trigger_mode="always_last",
         )
 
     return demo

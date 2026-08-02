@@ -21,7 +21,7 @@ def launch_cache_replay_training(backbone: str, args: TrainFromCacheArgs) -> Non
     train_argv = [
         sys.executable,
         "-m",
-        "analysis.recover.train.train_lora_skip_baseline",
+        "analysis.recovery.train.train_lora_skip_baseline",
         "--backbone",
         name,
         "--hf-model",
@@ -53,12 +53,12 @@ def launch_cache_replay_training(backbone: str, args: TrainFromCacheArgs) -> Non
     ]
     for cache_dir in cache_dirs:
         train_argv.extend(["--cache-dir", cache_dir])
-    training_plan_root = str(getattr(args, "training_plan_root", "") or "")
-    training_plan_name = str(getattr(args, "training_plan_name", "") or "")
-    if training_plan_root:
-        train_argv.extend(["--training-plan-root", training_plan_root])
-    if training_plan_name:
-        train_argv.extend(["--training-plan-name", training_plan_name])
+    recovery_plan_root = str(getattr(args, "recovery_plan_root", "") or "")
+    recovery_plan_name = str(getattr(args, "recovery_plan_name", "") or "")
+    if recovery_plan_root:
+        train_argv.extend(["--recovery-plan-root", recovery_plan_root])
+    if recovery_plan_name:
+        train_argv.extend(["--recovery-plan-name", recovery_plan_name])
     if bool(args.eval_at_start):
         train_argv.append("--eval-at-start")
     else:

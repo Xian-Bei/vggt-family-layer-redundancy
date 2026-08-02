@@ -66,12 +66,14 @@ def _timing_enabled(explicit: Optional[bool] = None) -> bool:
 
 
 def _timing_log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
+        print(msg, file=sys.stderr, flush=True)
 
 
 def _latency_log(msg: str) -> None:
     """Always-on milestone log for long-running skip_gt_eval phases."""
-    print(msg, file=sys.stderr, flush=True)
+    if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
+        print(msg, file=sys.stderr, flush=True)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -593,8 +595,40 @@ def _finalize_skip_outputs_from_disk(
     fusion_mode: str,
     elapsed_seconds: float,
     ensure_scene_reports: bool = False,
+    supplemental_span_metrics_by_scene: Optional[
+        Dict[str, Dict[Tuple[int, int], Dict[str, float]]]
+    ] = None,
+    materialize_intervals: bool = True,
 ) -> Path:
     staging_rows = _load_all_checkpoint_rows(out_root)
+    if supplemental_span_metrics_by_scene:
+        rows_by_scene = {
+            str(row.get("scene_id", "")): row
+            for row in staging_rows
+            if str(row.get("scene_id", "")).strip()
+        }
+        for scene_id, supplemental in supplemental_span_metrics_by_scene.items():
+            row = rows_by_scene.get(str(scene_id))
+            if row is None:
+                row = {
+                    "scene_id": str(scene_id),
+                    "upper_average": {},
+                    "span_raw_metrics": {},
+                }
+                staging_rows.append(row)
+                rows_by_scene[str(scene_id)] = row
+            span_raw = _deserialize_span_raw(row.get("span_raw_metrics", {}))
+            for span, metrics_row in supplemental.items():
+                logical_span = (int(span[0]), int(span[1]))
+                existing = span_raw.get(logical_span)
+                normalized = normalize_metrics(metrics_row)
+                if existing is not None and existing != normalized:
+                    raise ValueError(
+                        "Supplemental skip metrics conflict with checkpoint data for "
+                        f"scene={scene_id}, span={logical_span}"
+                    )
+                span_raw[logical_span] = normalized
+            row["span_raw_metrics"] = _serialize_span_raw(span_raw)
     for row in staging_rows:
         sid = str(row.get("scene_id", ""))
         row["upper_average"] = dict((upper_scene_metrics or {}).get(sid, {}))
@@ -679,21 +713,23 @@ def _finalize_skip_outputs_from_disk(
     }
     summary_path = out_root / "skip_eval_summary_v3.json"
     _atomic_write_json(summary_path, summary)
-    try:
-        from analysis.redundancy.convert_skip_eval_to_intervals import (
-            materialize_skip_eval_intervals,
-        )
+    if materialize_intervals:
+        try:
+            from analysis.redundancy.convert_skip_eval_to_intervals import (
+                materialize_skip_eval_intervals,
+            )
 
-        materialize_skip_eval_intervals(out_root, commit=True)
-    except Exception as exc:
+            materialize_skip_eval_intervals(out_root, commit=True)
+        except Exception as exc:
+            print(
+                f"[warn] Could not materialize skip_eval interval layout under {out_root}: {exc}",
+                file=sys.stderr,
+            )
+    if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
         print(
-            f"[warn] Could not materialize skip_eval interval layout under {out_root}: {exc}",
+            f"Wrote {report_path} ({len(spans)} spans, {n_units} units, {len(complete_rows)} scenes)",
             file=sys.stderr,
         )
-    print(
-        f"Wrote {report_path} ({len(spans)} spans, {n_units} units, {len(complete_rows)} scenes)",
-        file=sys.stderr,
-    )
     return report_path
 
 
@@ -739,7 +775,7 @@ def run_skip_gt_eval(
     hf = str(hf_model or adapter.default_hf_model())
     _latency_log(f"[skip_gt_eval] init adapter+dataset {time.perf_counter() - t_phase:.2f}s")
 
-    out_root = output_dir or stage_dir(experiment, tagged_dataset, "skip_eval")
+    out_root = output_dir or stage_dir(experiment, tagged_dataset, "eval/pruning")
     out_root.mkdir(parents=True, exist_ok=True)
 
     t_phase = time.perf_counter()
@@ -820,7 +856,11 @@ def run_skip_gt_eval(
     scene_iter = tqdm(
         scene_source,
         total=total_scenes,
-        desc=f"skip_eval {adapter.name} ({tagged_dataset})",
+        desc=(
+            "    scenes"
+            if os.environ.get("COMPACT_LOG", "").lower() in {"1", "true", "yes"}
+            else f"skip_eval {adapter.name} ({tagged_dataset})"
+        ),
         unit="scene",
         file=sys.stderr,
         dynamic_ncols=True,
@@ -858,7 +898,11 @@ def run_skip_gt_eval(
             span_iter = tqdm(
                 prediction_iter,
                 total=len(missing),
-                desc=f"  spans {sid}",
+                desc=(
+                    f"      spans ({sid})"
+                    if os.environ.get("COMPACT_LOG", "").lower() in {"1", "true", "yes"}
+                    else f"  spans {sid}"
+                ),
                 unit="span",
                 file=sys.stderr,
                 dynamic_ncols=True,

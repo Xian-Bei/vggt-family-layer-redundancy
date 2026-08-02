@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -19,6 +20,7 @@ from analysis.backbones.registry import get_backbone
 from analysis.datasets.batch_frames import count_eval_frames
 from analysis.datasets.registry import dataset_names, get_dataset
 from analysis.eval.metrics_core import average_metrics
+from analysis.eval.interval_results import materialize_eval_interval_result
 from analysis.inference_compression.contracts import InferenceCompressionConfig
 from analysis.inference_compression.registry import get_inference_compression
 from analysis.prune_plan import (
@@ -27,11 +29,20 @@ from analysis.prune_plan import (
     load_named_prune_plan,
     resolve_prune_plan_path,
 )
-from analysis.prune_plan.recovery_plan import compose_training_unit_prune_plan
+from analysis.prune_plan.recovery_plan import compose_recovery_unit_prune_plan
 from analysis.schema.v3 import EvalRecordV3, stage_dir
-from analysis.recover.train.checkpoint_v3 import EvalMode, apply_eval_model_structure
+from analysis.recovery.train.checkpoint_v3 import EvalMode, apply_eval_model_structure
 
 _EVAL_MODES = ("upper", "lower", "model")
+
+
+def _result_selector_from_prune_plan(prune_plan: UnitPrunePlan, fallback: str) -> str:
+    extra = prune_plan.extra if isinstance(prune_plan.extra, dict) else {}
+    for key in ("eval_selector", "interval_selector", "selector", "plan_group"):
+        value = str(extra.get(key, "")).strip()
+        if value:
+            return value
+    return str(fallback or "").strip()
 
 
 def _eval_scene_count(
@@ -97,16 +108,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--recovery-plan-root",
-        "--training-plan-root",
-        dest="training_plan_root",
         type=Path,
         default=None,
         help="Recovery plan root for model mode. Defaults to prune-plan-root.",
     )
     p.add_argument(
         "--recovery-plan-name",
-        "--training-plan-name",
-        dest="training_plan_name",
         type=str,
         default="",
         help="Recovery plan name for model mode (e.g. recovery_lora_l1_r32).",
@@ -199,7 +206,8 @@ def evaluate_model_v3(
         split=split,
     )
 
-    desc = f"eval {model_name}/{backbone} ({tagged_dataset})"
+    compact_log = os.environ.get("COMPACT_LOG", "").lower() in {"1", "true", "yes"}
+    desc = "    scenes" if compact_log else f"eval {model_name}/{backbone} ({tagged_dataset})"
     scene_source = ds_plugin.iter_scenes(
         data_root,
         max_scenes=max_scenes_i,
@@ -272,11 +280,12 @@ def evaluate_model_v3(
         },
     )
     record.save(out_dir / "eval_record_v3.json")
-    done_msg = f"Wrote {out_dir / 'eval_record_v3.json'}"
-    if progress:
-        tqdm.write(done_msg, file=sys.stderr)
-    else:
-        print(done_msg, file=sys.stderr)
+    if not compact_log:
+        done_msg = f"Wrote {out_dir / 'eval_record_v3.json'}"
+        if progress:
+            tqdm.write(done_msg, file=sys.stderr)
+        else:
+            print(done_msg, file=sys.stderr)
     return out_dir
 
 
@@ -312,13 +321,13 @@ def main() -> None:
         plan_root = args.prune_plan_root or default_prune_plan_root()
         prune_plan_name = str(args.prune_plan_name or "").strip()
         if prune_plan_name:
-            training_plan_name = str(args.training_plan_name or "").strip()
-            if eval_mode == "model" and training_plan_name:
-                prune_plan = compose_training_unit_prune_plan(
+            recovery_plan_name = str(args.recovery_plan_name or "").strip()
+            if eval_mode == "model" and recovery_plan_name:
+                prune_plan = compose_recovery_unit_prune_plan(
                     prune_plan_root=plan_root,
-                    training_plan_root=args.training_plan_root or plan_root,
+                    recovery_plan_root=args.recovery_plan_root or plan_root,
                     prune_selector=prune_plan_name,
-                    training_plan=training_plan_name,
+                    recovery_plan=recovery_plan_name,
                 )
             else:
                 prune_plan = load_named_prune_plan(plan_root, prune_plan_name)
@@ -351,7 +360,7 @@ def main() -> None:
             f"checkpoint={args.checkpoint} inference_compression={compression_config.name}",
             flush=True,
         )
-    evaluate_model_v3(
+    out_dir = evaluate_model_v3(
         adapter=adapter,
         model=model,
         ds_plugin=ds_plugin,
@@ -371,6 +380,17 @@ def main() -> None:
         split=split,
         progress=not bool(args.no_progress),
     )
+    if eval_mode in ("lower", "model") and prune_plan is not None:
+        selector = _result_selector_from_prune_plan(prune_plan, args.prune_plan_name)
+        summary_path = materialize_eval_interval_result(
+            out_dir,
+            selector=selector,
+            drop=list(prune_plan.drop),
+            source_eval_mode=str(eval_mode),
+            recovery_plan_name=str(args.recovery_plan_name or ""),
+        )
+        if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
+            print(f"Wrote {summary_path}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

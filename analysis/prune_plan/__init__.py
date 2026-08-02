@@ -16,18 +16,17 @@ _BUDGET_FULL_SELECTOR_RE = re.compile(r"^plan_budget(?P<budget>\d+)_l(?P<lora>\d
 _BUDGET_GROUP_SELECTOR_RE = re.compile(r"^plan_budget(?P<budget>\d+)$")
 _SPAN_SELECTOR_RE = re.compile(r"^prune_span(?P<span>\d+)$")
 _INTERVAL_SELECTOR_RE = re.compile(r"^i(?P<i>\d+)_j(?P<j>\d+)$")
+_PHYSICAL_PRUNING_SELECTOR_RE = re.compile(
+    r"^i\d+_j\d+(?:_i\d+_j\d+)*$"
+)
+_PHYSICAL_PRUNING_INTERVAL_RE = re.compile(r"i(?P<i>\d+)_j(?P<j>\d+)")
+_GENERIC_SET_SELECTOR_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*_k\d+$")
 
 BUDGET_PLAN_BUNDLE_FILENAME = "plan_budget_all.json"
 BUDGET_PLAN_BUNDLE_SCHEMA_VERSION = "budget_plan_bundle_v1"
 PRUNE_PLAN_BUNDLE_FILENAME = "prune_plan_all.json"
-PRUNE_PLAN_BUNDLE_SCHEMA_VERSION = "closed_interval_prune_plan_bundle_v3"
-PRUNE_PLAN_BUNDLE_SCHEMA_V1 = "span_prune_plan_bundle_v1"
-PRUNE_PLAN_BUNDLE_SCHEMA_V2 = "span_prune_plan_bundle_v2"
-PRUNE_PLAN_BUNDLE_SCHEMA_VERSIONS = {
-    PRUNE_PLAN_BUNDLE_SCHEMA_V1,
-    PRUNE_PLAN_BUNDLE_SCHEMA_V2,
-    PRUNE_PLAN_BUNDLE_SCHEMA_VERSION,
-}
+PRUNE_PLAN_BUNDLE_SCHEMA_VERSION = "closed_interval_prune_plan_bundle_v4"
+PRUNE_PLAN_BUNDLE_SCHEMA_VERSIONS = {PRUNE_PLAN_BUNDLE_SCHEMA_VERSION}
 
 
 def _repo_root() -> Path:
@@ -75,6 +74,15 @@ def load_prune_plan_bundle(root: Path) -> Dict[str, Any]:
             f"Invalid prune plan bundle schema at {path}: {schema!r} "
             f"(expected one of {sorted(PRUNE_PLAN_BUNDLE_SCHEMA_VERSIONS)!r})"
         )
+    for section in ("intervals", "sets", "spans"):
+        records = raw.get(section, {})
+        if not isinstance(records, dict):
+            continue
+        for key, record in records.items():
+            if isinstance(record, dict) and 0 in {int(x) for x in record.get("drop", [])}:
+                raise ValueError(
+                    f"Invalid prune plan bundle at {path}: {section}.{key} deletes protected unit 0"
+                )
     return raw
 
 
@@ -97,19 +105,132 @@ def is_interval_selector(selector: str) -> bool:
     return bool(_INTERVAL_SELECTOR_RE.match(str(selector or "").strip()))
 
 
+def pruning_intervals_from_drop(
+    drop: Sequence[int],
+    *,
+    protect_unit_zero: bool = True,
+) -> List[Tuple[int, int]]:
+    """Return all maximal closed intervals for a physical drop set."""
+    values = sorted({int(x) for x in drop})
+    if not values:
+        raise ValueError("pruning drop set must be non-empty")
+    if values[0] < 0:
+        raise ValueError(f"pruning drop indices must be non-negative: {values}")
+    if protect_unit_zero and 0 in values:
+        raise ValueError("pruning drop set deletes protected unit 0")
+    intervals: List[Tuple[int, int]] = []
+    start = end = values[0]
+    for value in values[1:]:
+        if value == end + 1:
+            end = value
+            continue
+        intervals.append((start, end))
+        start = end = value
+    intervals.append((start, end))
+    return intervals
+
+
+def physical_pruning_selector_from_drop(
+    drop: Sequence[int],
+    *,
+    protect_unit_zero: bool = True,
+) -> str:
+    intervals = pruning_intervals_from_drop(
+        drop, protect_unit_zero=protect_unit_zero
+    )
+    return "_".join(f"i{start}_j{end}" for start, end in intervals)
+
+
+def drop_from_physical_pruning_selector(
+    selector: str,
+    *,
+    protect_unit_zero: bool = True,
+) -> List[int]:
+    key = str(selector or "").strip()
+    match = _PHYSICAL_PRUNING_SELECTOR_RE.match(key)
+    if not match:
+        raise ValueError(f"invalid physical pruning selector: {selector!r}")
+    bounds = [
+        (int(part.group("i")), int(part.group("j")))
+        for part in _PHYSICAL_PRUNING_INTERVAL_RE.finditer(key)
+    ]
+    drop: List[int] = []
+    for start, end in bounds:
+        if end < start:
+            raise ValueError(f"invalid physical pruning selector: {selector!r}")
+        drop.extend(range(start, end + 1))
+    # Re-extracting intervals canonicalizes reversed, adjacent, and overlapping
+    # multi-interval spellings by their physical union.
+    intervals = pruning_intervals_from_drop(
+        drop, protect_unit_zero=protect_unit_zero
+    )
+    return [
+        value
+        for start, end in intervals
+        for value in range(int(start), int(end) + 1)
+    ]
+
+
+def canonical_physical_pruning_selector(
+    selector: str,
+    *,
+    protect_unit_zero: bool = True,
+) -> str:
+    return physical_pruning_selector_from_drop(
+        drop_from_physical_pruning_selector(
+            selector, protect_unit_zero=protect_unit_zero
+        ),
+        protect_unit_zero=protect_unit_zero,
+    )
+
+
+def is_physical_pruning_selector(selector: str) -> bool:
+    try:
+        canonical_physical_pruning_selector(selector)
+    except ValueError:
+        return False
+    return True
+
+
+def physical_pruning_selector_aliases(selector: str) -> List[str]:
+    """Return canonical spelling first, then the historical reversed spelling."""
+    canonical = canonical_physical_pruning_selector(selector)
+    intervals = pruning_intervals_from_drop(
+        drop_from_physical_pruning_selector(canonical)
+    )
+    aliases = [canonical]
+    if len(intervals) >= 2:
+        reversed_key = "_".join(
+            f"i{start}_j{end}" for start, end in reversed(intervals)
+        )
+        aliases.append(reversed_key)
+    return aliases
+
+
+def physical_pruning_selector_from_record(record: Dict[str, Any]) -> str:
+    explicit = str(record.get("eval_selector", "")).strip()
+    if explicit:
+        return canonical_physical_pruning_selector(explicit)
+    return physical_pruning_selector_from_drop(
+        [int(x) for x in list(record.get("drop", []))]
+    )
+
+
 def interval_bounds_from_record(record: Dict[str, Any]) -> Tuple[int, int]:
     """Return closed drop bounds for a bundle interval record.
 
-    v3 records store ``start/end`` directly.  Older span bundles used ``i/j``
-    as an open-left corner, but most converted records also carry an explicit
-    ``drop`` list, which is the least ambiguous source of truth.
+    Closed-interval records store ``start/end`` directly. An explicit contiguous
+    ``drop`` list is accepted as an unambiguous equivalent representation.
     """
     if "start" in record and "end" in record:
         return int(record.get("start")), int(record.get("end"))
     drop = [int(x) for x in list(record.get("drop", []))]
     if drop:
-        return min(drop), max(drop)
-    return int(record.get("i", 0)) + 1, int(record.get("j", 0))
+        start, end = min(drop), max(drop)
+        if sorted(set(drop)) != list(range(start, end + 1)):
+            raise ValueError(f"interval record has non-contiguous drop indices: {drop}")
+        return start, end
+    raise ValueError("closed-interval record must contain start/end or a non-empty drop list")
 
 
 def interval_selector_from_record(record: Dict[str, Any]) -> str:
@@ -126,7 +247,7 @@ def _record_drop_count(record: Dict[str, Any]) -> int:
 
 
 def bundle_interval_records(bundle: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Return interval-keyed prune records, accepting v1 span bundles as input."""
+    """Return closed-interval prune records keyed by ``iS_jE`` selector."""
     raw_intervals = bundle.get("intervals", {})
     out: Dict[str, Dict[str, Any]] = {}
     if isinstance(raw_intervals, dict):
@@ -140,44 +261,94 @@ def bundle_interval_records(bundle: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
                 except Exception:
                     continue
             out[interval_key] = dict(record, selector=interval_key)
-    if out:
+    return out
+
+
+def bundle_set_records(bundle: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Return non-contiguous/set prune records keyed by selector."""
+    raw_sets = bundle.get("sets", {})
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(raw_sets, dict):
         return out
-    spans = bundle.get("spans", {})
-    if isinstance(spans, dict):
-        for record in spans.values():
-            if not isinstance(record, dict):
-                continue
-            try:
-                key = interval_selector_from_record(record)
-            except Exception:
-                continue
-            out[key] = dict(record, selector=key)
+    for key, record in raw_sets.items():
+        if not isinstance(record, dict):
+            continue
+        selector = str(record.get("selector") or key).strip()
+        if not selector:
+            continue
+        out[selector] = dict(record, selector=selector)
+    return out
+
+
+def bundle_plan_records(bundle: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Return all plan records addressable by strategy points."""
+    records = bundle_interval_records(bundle)
+    records.update(bundle_set_records(bundle))
+    return records
+
+
+def bundle_physical_plan_records(
+    bundle: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Return plan records keyed by canonical one/two-interval eval selector."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for record in bundle_plan_records(bundle).values():
+        try:
+            selector = physical_pruning_selector_from_record(record)
+        except ValueError:
+            continue
+        existing = out.get(selector)
+        if existing is not None:
+            existing_drop = sorted({int(x) for x in existing.get("drop", [])})
+            record_drop = sorted({int(x) for x in record.get("drop", [])})
+            if existing_drop != record_drop:
+                raise ValueError(
+                    f"physical selector collision for {selector}: "
+                    f"{existing_drop} vs {record_drop}"
+                )
+            continue
+        out[selector] = record
     return out
 
 
 def bundle_strategy_records(bundle: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     strategies = bundle.get("strategies", {})
-    if isinstance(strategies, dict) and strategies:
-        return {str(k): dict(v) for k, v in strategies.items() if isinstance(v, dict)}
-    spans = bundle.get("spans", {})
-    points: Dict[str, str] = {}
-    if isinstance(spans, dict):
-        for span_key, record in spans.items():
-            if not isinstance(record, dict):
-                continue
-            try:
-                points[str(int(span_key))] = interval_selector_from_record(record)
-            except Exception:
-                continue
-    if not points:
+    if not isinstance(strategies, dict):
         return {}
-    return {
-        "ours": {
-            "display_name": "Ours",
-            "points": points,
-            "source": "legacy_spans",
-        }
+    return {str(k): dict(v) for k, v in strategies.items() if isinstance(v, dict)}
+
+
+def expand_pruning_strategy_keys(
+    strategies: Sequence[str],
+    *,
+    available: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Expand legacy family names to explicit Single/Double strategy keys."""
+    available_keys = (
+        None
+        if available is None
+        else {str(key).strip().lower() for key in available}
+    )
+    family_aliases = {
+        "gt": ("gt_single", "gt_double"),
+        "ours": ("ours_single", "ours_double"),
+        "cosine": ("cosine_single", "cosine_double"),
+        "inv_mse": ("inv_mse_single", "inv_mse_double"),
+        "replaceme": ("replaceme_single", "replaceme_double"),
     }
+    out: List[str] = []
+    for raw in strategies:
+        key = str(raw).strip().lower()
+        if not key:
+            continue
+        if available_keys is not None and key in available_keys:
+            expanded = (key,)
+        else:
+            expanded = family_aliases.get(key, (key,))
+        for candidate in expanded:
+            if candidate not in out:
+                out.append(candidate)
+    return out
 
 
 def strategy_interval_selectors(
@@ -189,15 +360,19 @@ def strategy_interval_selectors(
     drop_step: Optional[int] = None,
 ) -> List[str]:
     bundle = load_prune_plan_bundle(root)
-    intervals = bundle_interval_records(bundle)
+    plan_records = bundle_plan_records(bundle)
     strategy_records = bundle_strategy_records(bundle)
-    requested = [str(s).strip() for s in list(strategies or []) if str(s).strip()]
+    requested = expand_pruning_strategy_keys(
+        [str(s).strip() for s in list(strategies or []) if str(s).strip()],
+        available=strategy_records.keys(),
+    )
     if not requested:
         requested = list(strategy_records.keys())
     selected: List[str] = []
     seen: set[str] = set()
     for strategy in requested:
-        record = strategy_records.get(strategy)
+        strategy_key = str(strategy).strip().lower()
+        record = strategy_records.get(strategy_key)
         if not isinstance(record, dict):
             raise FileNotFoundError(f"Strategy {strategy!r} is not present in prune plan bundle")
         points = record.get("points", {})
@@ -218,14 +393,17 @@ def strategy_interval_selectors(
                 base = int(min_drop or 0)
                 if (drop_count - base) % int(drop_step) != 0:
                     continue
-            interval_key = str(selector)
-            if interval_key not in intervals:
+            plan_key = str(selector)
+            if plan_key not in plan_records:
                 raise FileNotFoundError(
-                    f"Strategy {strategy!r} references missing interval {interval_key!r}"
+                    f"Strategy {strategy!r} references missing plan selector {plan_key!r}"
                 )
-            if interval_key not in seen:
-                seen.add(interval_key)
-                selected.append(interval_key)
+            eval_selector = physical_pruning_selector_from_record(
+                plan_records[plan_key]
+            )
+            if eval_selector not in seen:
+                seen.add(eval_selector)
+                selected.append(eval_selector)
     return selected
 
 
@@ -285,7 +463,8 @@ def is_full_plan_name(name: str) -> bool:
         _FULL_PLAN_NAME_RE.match(key)
         or _BUDGET_FULL_PLAN_NAME_RE.match(key)
         or _SPAN_SELECTOR_RE.match(key)
-        or _INTERVAL_SELECTOR_RE.match(key)
+        or _PHYSICAL_PRUNING_SELECTOR_RE.match(key)
+        or _GENERIC_SET_SELECTOR_RE.match(key)
     )
 
 
@@ -295,7 +474,8 @@ def is_plan_group_name(name: str) -> bool:
         _PLAN_GROUP_RE.match(key)
         or _BUDGET_PLAN_RE.match(key)
         or _SPAN_SELECTOR_RE.match(key)
-        or _INTERVAL_SELECTOR_RE.match(key)
+        or _PHYSICAL_PRUNING_SELECTOR_RE.match(key)
+        or _GENERIC_SET_SELECTOR_RE.match(key)
     )
 
 
@@ -312,7 +492,9 @@ def plan_group_from_name(name: str) -> str:
         return m.group(1)
     if _SPAN_SELECTOR_RE.match(key):
         return key
-    if _INTERVAL_SELECTOR_RE.match(key):
+    if _PHYSICAL_PRUNING_SELECTOR_RE.match(key):
+        return key
+    if _GENERIC_SET_SELECTOR_RE.match(key):
         return key
     if _PLAN_GROUP_RE.match(key) or _BUDGET_PLAN_RE.match(key):
         return key
@@ -333,9 +515,17 @@ def resolve_prune_plan_path_for_group(root: Path, plan_group: str) -> Path:
     ``load_group_canonical_prune_plan`` or ``canonical_plan_name_for_group``.
     """
     group = plan_group_from_name(plan_group)
+    root = Path(root)
+    if prune_plan_bundle_path(root).is_file():
+        bundle = load_prune_plan_bundle(root)
+        if group in bundle_plan_records(bundle):
+            return prune_plan_bundle_path(root)
+        if _PHYSICAL_PRUNING_SELECTOR_RE.match(group):
+            canonical = canonical_physical_pruning_selector(group)
+            if canonical in bundle_physical_plan_records(bundle):
+                return prune_plan_bundle_path(root)
     if not is_plan_group_name(group):
         raise ValueError(f"invalid plan group: {plan_group!r}")
-    root = Path(root)
     if _SPAN_SELECTOR_RE.match(group):
         bundle = load_prune_plan_bundle(root)
         _span_record_from_bundle(bundle, group)
@@ -363,15 +553,15 @@ def list_plan_groups(root: Path) -> List[str]:
     root = Path(root)
     if prune_plan_bundle_path(root).is_file():
         bundle = load_prune_plan_bundle(root)
-        intervals = bundle_interval_records(bundle)
+        records = bundle_plan_records(bundle)
         return [
             key
             for key, record in sorted(
-                intervals.items(),
+                records.items(),
                 key=lambda item: (
                     _record_drop_count(item[1]),
-                    int(item[1].get("i", 0)),
-                    int(item[1].get("j", 0)),
+                    int(item[1].get("i", item[1].get("start", 0))),
+                    int(item[1].get("j", item[1].get("end", 0))),
                     item[0],
                 ),
             )
@@ -410,12 +600,19 @@ def canonical_plan_name_for_group(root: Path, plan_group: str) -> str:
     """Return the canonical virtual selector for a prune/span group."""
     group = plan_group_from_name(plan_group)
     if _SPAN_SELECTOR_RE.match(group):
-        return interval_selector_from_record(
+        return physical_pruning_selector_from_record(
             _span_record_from_bundle(load_prune_plan_bundle(root), group)
         )
-    if _INTERVAL_SELECTOR_RE.match(group):
+    if _PHYSICAL_PRUNING_SELECTOR_RE.match(group):
+        group = canonical_physical_pruning_selector(group)
         resolve_prune_plan_path_for_group(root, group)
         return group
+    if prune_plan_bundle_path(root).is_file():
+        bundle = load_prune_plan_bundle(root)
+        if group in bundle_plan_records(bundle):
+            return physical_pruning_selector_from_record(
+                bundle_plan_records(bundle)[group]
+            )
     if not _BUDGET_PLAN_RE.match(group):
         path = resolve_prune_plan_path_for_group(root, group)
         return path.stem
@@ -469,6 +666,8 @@ class UnitPrunePlan:
         bad_drop = [int(x) for x in self.drop if int(x) < 0 or int(x) >= n]
         if bad_drop:
             raise ValueError(f"drop indices out of range [0,{n}): {bad_drop}")
+        if 0 in self.drop:
+            raise ValueError("pruning unit 0 is forbidden; recovery requires a retained left anchor")
         for key, spec in self.lora.items():
             idx = int(key)
             if idx < 0 or idx >= n:
@@ -668,13 +867,12 @@ def _span_record_from_bundle(bundle: Dict[str, Any], selector: str) -> Dict[str,
         raise ValueError(f"invalid prune span selector: {selector!r}")
     span = int(m.group("span"))
     strategies = bundle_strategy_records(bundle)
-    ours = strategies.get("ours", {})
+    ours = strategies.get("ours_double", strategies.get("ours", {}))
     points = ours.get("points", {}) if isinstance(ours, dict) else {}
     if isinstance(points, dict):
-        interval_key = points.get(str(span))
-        if isinstance(interval_key, str):
-            intervals = bundle_interval_records(bundle)
-            record = intervals.get(interval_key)
+        plan_key = points.get(str(span))
+        if isinstance(plan_key, str):
+            record = bundle_plan_records(bundle).get(plan_key)
             if isinstance(record, dict):
                 return record
     spans = bundle.get("spans", {})
@@ -723,6 +921,7 @@ def _unit_prune_plan_from_interval_record(
             **base_extra,
             "schema_version": str(bundle.get("schema_version", "")),
             "selector": str(selector),
+            "eval_selector": interval_key,
             "plan_group": interval_key,
             "interval_selector": interval_key,
             "closed_interval": True,
@@ -737,12 +936,63 @@ def _unit_prune_plan_from_interval_record(
     return plan
 
 
+def _unit_prune_plan_from_set_record(
+    *,
+    bundle: Dict[str, Any],
+    selector: str,
+    record: Dict[str, Any],
+) -> UnitPrunePlan:
+    base_extra = dict(bundle.get("extra", {})) if isinstance(bundle.get("extra", {}), dict) else {}
+    drop = sorted({int(x) for x in list(record.get("drop", []))})
+    drop_count = len(drop)
+    eval_selector = physical_pruning_selector_from_record(record)
+    plan = UnitPrunePlan(
+        backbone=str(bundle.get("backbone", "")),
+        dataset=str(bundle.get("dataset", "")),
+        num_units=int(bundle.get("num_units", 0)),
+        drop=drop,
+        drop_length=drop_count,
+        lora={},
+        source_cache=str(bundle.get("source_cache", "")),
+        extra={
+            **base_extra,
+            "schema_version": str(bundle.get("schema_version", "")),
+            "selector": str(selector),
+            "eval_selector": eval_selector,
+            "plan_group": eval_selector,
+            "selector_kind": "set",
+            "requested_drop_count": int(record.get("drop_count", drop_count)),
+            "source_strategy": str(record.get("source_strategy", "")),
+        },
+    )
+    for key in (
+        "score",
+        "score_name",
+        "ranking",
+        "dropped_unit_ids",
+        "component_intervals",
+        "num_intervals",
+        "joint_score_aggregation",
+        "scores_recomputed_after_first_drop",
+        "block_influence",
+    ):
+        if key in record:
+            plan.extra[key] = record[key]
+    plan.validate()
+    return plan
+
+
 def _load_named_span_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan:
     bundle = load_prune_plan_bundle(root)
+    record = _span_record_from_bundle(bundle, plan_name)
+    if str(record.get("selector_kind", "")).strip().lower() == "set":
+        return _unit_prune_plan_from_set_record(
+            bundle=bundle,
+            selector=plan_name,
+            record=record,
+        )
     return _unit_prune_plan_from_interval_record(
-        bundle=bundle,
-        selector=plan_name,
-        record=_span_record_from_bundle(bundle, plan_name),
+        bundle=bundle, selector=plan_name, record=record
     )
 
 
@@ -758,6 +1008,16 @@ def _load_named_interval_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan
     return _unit_prune_plan_from_interval_record(bundle=bundle, selector=key, record=record)
 
 
+def _load_named_set_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan:
+    key = str(plan_name or "").strip()
+    bundle = load_prune_plan_bundle(root)
+    sets = bundle_set_records(bundle)
+    record = sets.get(key)
+    if not isinstance(record, dict):
+        raise FileNotFoundError(f"Prune set selector {plan_name!r} is not present in bundle")
+    return _unit_prune_plan_from_set_record(bundle=bundle, selector=key, record=record)
+
+
 def load_named_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan:
     """Load a virtual budget selector from ``plan_budget_all.json``.
 
@@ -767,10 +1027,36 @@ def load_named_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan:
     key = str(plan_name or "").strip()
     if not key:
         raise ValueError("plan_name must be non-empty")
-    if _INTERVAL_SELECTOR_RE.match(key):
-        return _load_named_interval_prune_plan(root, key)
     if _SPAN_SELECTOR_RE.match(key):
         return _load_named_span_prune_plan(root, key)
+    try:
+        bundle = load_prune_plan_bundle(root)
+    except FileNotFoundError:
+        bundle = {}
+    if bundle and _PHYSICAL_PRUNING_SELECTOR_RE.match(key):
+        canonical = canonical_physical_pruning_selector(key)
+        record = bundle_physical_plan_records(bundle).get(canonical)
+        if not isinstance(record, dict):
+            raise FileNotFoundError(
+                f"Physical prune selector {canonical!r} is not present in bundle"
+            )
+        if str(record.get("selector_kind", "")).strip().lower() == "set":
+            return _unit_prune_plan_from_set_record(
+                bundle=bundle,
+                selector=canonical,
+                record=record,
+            )
+        return _unit_prune_plan_from_interval_record(
+            bundle=bundle,
+            selector=canonical,
+            record=record,
+        )
+    if bundle and key in bundle_set_records(bundle):
+        return _unit_prune_plan_from_set_record(
+            bundle=bundle,
+            selector=key,
+            record=bundle_set_records(bundle)[key],
+        )
     if _BUDGET_PLAN_RE.match(key):
         key = canonical_plan_name_for_group(root, key)
     if _BUDGET_FULL_SELECTOR_RE.match(key):
@@ -840,14 +1126,11 @@ def drop_intervals_from_plan(
 
 
 def triangles_from_plan_extra(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Read triangle metadata from plan extra (new or legacy schema)."""
+    """Read closed-interval selection metadata from a plan."""
     if not isinstance(extra, dict):
         return []
     if isinstance(extra.get("triangles"), list):
         return [dict(x) for x in extra["triangles"] if isinstance(x, dict)]
-    legacy = extra.get("triangle_prune")
-    if isinstance(legacy, dict) and isinstance(legacy.get("triangles"), list):
-        return [dict(x) for x in legacy["triangles"] if isinstance(x, dict)]
     return []
 
 

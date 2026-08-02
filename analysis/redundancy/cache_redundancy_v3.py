@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from tqdm import tqdm
@@ -61,7 +62,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only forward (+ optional --save-cache); skip similarity matrices and redundancy npz.",
     )
-    p.add_argument("--metrics", type=str, default="cka,cosine,neg_mse")
+    p.add_argument("--metrics", type=str, default="cka,cosine,angular,inv_mse")
     p.add_argument("--max-span", type=int, default=8)
     p.add_argument("--max-tokens", type=int, default=4096, help="Per-layer token subsample for similarity (0=all).")
     p.add_argument("--token-regions", type=str, default="all")
@@ -81,19 +82,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--recovery-plan-root",
-        "--training-plan-root",
-        dest="training_plan_root",
         type=Path,
         default=None,
         help="Directory with recovery plan bundles. Defaults to --prune-plan-root.",
     )
     p.add_argument(
         "--recovery-plan-name",
-        "--training-plan-name",
-        dest="training_plan_name",
         type=str,
         default="",
-        help="Optional recovery plan name. If omitted, use all recovery_*.json bundles.",
+        help="Optional recovery method names. If omitted, use all entries in recovery_plan_all.json.",
     )
     return p
 
@@ -141,6 +138,85 @@ def _cache_unit_ids_from_plan_extra(plan: Any, unit_ids_all: List[str]) -> Optio
     return parsed
 
 
+def _auxiliary_ids_from_plan_extra(plan: Any) -> Set[str]:
+    extra = getattr(plan, "extra", None)
+    if not isinstance(extra, dict):
+        return set()
+    raw = extra.get("recovery_auxiliary_ids", [])
+    if not isinstance(raw, list):
+        raise ValueError("Plan recovery_auxiliary_ids must be a list")
+    out = {str(x) for x in raw}
+    bad = sorted(x for x in out if not x.startswith("replaceme_residual:"))
+    if bad:
+        raise ValueError(f"Unsupported recovery auxiliary cache ids: {bad}")
+    return out
+
+
+def _install_auxiliary_capture_hooks(adapter, model, auxiliary_ids: Set[str], images: torch.Tensor):
+    captures: Dict[str, torch.Tensor] = {}
+    handles = []
+    if images.dim() == 4:
+        bsz, seq_len = 1, int(images.shape[0])
+    elif images.dim() == 5:
+        bsz, seq_len = int(images.shape[0]), int(images.shape[1])
+    else:
+        raise ValueError(f"Expected cache images with 4/5 dims, got {tuple(images.shape)}")
+
+    for auxiliary_id in sorted(auxiliary_ids):
+        prefix, unit_id = auxiliary_id.split(":", 1)
+        if prefix != "replaceme_residual":
+            raise ValueError(f"Unsupported auxiliary capture {auxiliary_id!r}")
+        block = adapter.block_for_unit(model, unit_id)
+        residual_module = getattr(block, "ls2", None)
+        if residual_module is None:
+            raise AttributeError(f"{adapter.name} {unit_id} has no ls2 module for ReplaceMe capture")
+
+        def make_hook(key: str, uid: str):
+            def hook(_module, _args, output):
+                tensor = output[0] if isinstance(output, (tuple, list)) else output
+                if not torch.is_tensor(tensor):
+                    raise TypeError(f"ReplaceMe residual hook {key} returned {type(tensor)}")
+                captures[key] = adapter.normalize_unit_activation(
+                    uid,
+                    tensor,
+                    batch_size=bsz,
+                    num_frames=seq_len,
+                ).detach()
+
+            return hook
+
+        handles.append(residual_module.register_forward_hook(make_hook(auxiliary_id, unit_id)))
+    return captures, handles
+
+
+def forward_cache_with_auxiliaries(
+    *,
+    adapter: Any,
+    model: Any,
+    images: torch.Tensor,
+    device: torch.device,
+    auxiliary_ids: Set[str],
+) -> Tuple[Any, Dict[str, torch.Tensor]]:
+    """Run the common cache forward path and capture requested auxiliaries.
+
+    Both the persistent full-model cache and progressive recovery cache use
+    this function so hook lifetime, autocast, activation normalization, and
+    missing-capture validation cannot drift apart.
+    """
+    auxiliary_map, handles = _install_auxiliary_capture_hooks(
+        adapter, model, auxiliary_ids, images
+    )
+    try:
+        forward = adapter.forward_cache_batch(model, images, device)
+    finally:
+        for handle in handles:
+            handle.remove()
+    missing = sorted(set(auxiliary_ids) - set(auxiliary_map))
+    if missing:
+        raise RuntimeError(f"Cache forward missed recovery auxiliary activations {missing}")
+    return forward, auxiliary_map
+
+
 def _save_scene_cache(
     *,
     cache_root: Path,
@@ -157,6 +233,7 @@ def _save_scene_cache(
     model,
     initial_tokens: Optional[torch.Tensor] = None,
     unit_ids_filter: Optional[Set[str]] = None,
+    auxiliary_map: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, Any]:
     out = _scene_out(cache_root, scene_id)
     layers_dir = out / "layers"
@@ -165,6 +242,7 @@ def _save_scene_cache(
     bsz, seq_len = int(images.shape[0]), int(images.shape[1])
     image_hw = (int(images.shape[-2]), int(images.shape[-1]))
     layer_files: Dict[str, str] = {}
+    auxiliary_files: Dict[str, str] = {}
 
     items = unit_map.items()
     need_initial_tokens = unit_ids_filter is not None and "layer_-1" in unit_ids_filter
@@ -198,6 +276,13 @@ def _save_scene_cache(
         torch.save(init_t, lp)
         layer_files["layer_-1"] = str(lp.relative_to(cache_root))
 
+    for auxiliary_id, tensor in sorted((auxiliary_map or {}).items()):
+        prefix, unit_id = auxiliary_id.split(":", 1)
+        aux_path = out / "aux" / prefix / f"{unit_id}.pt"
+        aux_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(tensor.detach().contiguous(), aux_path)
+        auxiliary_files[auxiliary_id] = str(aux_path.relative_to(cache_root))
+
     pred_path = out / "pred_v3.pt"
     pred_payload: Dict[str, Any] = {}
     for key in ("pose_enc", "depth", "depth_conf", "points", "camera_poses", "conf"):
@@ -209,6 +294,7 @@ def _save_scene_cache(
     meta_payload = {
         "scene_id": scene_id,
         "layer_files": layer_files,
+        "auxiliary_files": auxiliary_files,
         "num_frames": seq_len,
         "image_hw": list(image_hw),
         "patch_start_idx": int(meta.get("patch_start_idx", 0)),
@@ -242,15 +328,15 @@ def run_cache_redundancy(
     max_frames: int = 50,
     seed: int = 0,
     save_cache: bool = False,
-    metrics: str = "cka,cosine,neg_mse",
+    metrics: str = "cka,cosine,angular,inv_mse",
     max_span: int = 8,
     max_tokens: int = 4096,
     token_regions: str = "all",
     progress: bool = True,
     prune_plan_root: Optional[Path] = None,
     plan_name: str = "",
-    training_plan_root: Optional[Path] = None,
-    training_plan_name: str = "",
+    recovery_plan_root: Optional[Path] = None,
+    recovery_plan_name: str = "",
     skip_redundancy: bool = False,
     split: str | None = None,
     output_dataset: str = "",
@@ -288,6 +374,7 @@ def run_cache_redundancy(
     unit_ids = [u.unit_id for u in units]
 
     unit_ids_filter: Optional[Set[str]] = None
+    auxiliary_ids_filter: Set[str] = set()
     cache_save_policy: Optional[Dict[str, Any]] = None
     if save_cache and prune_plan_root is not None:
         from analysis.prune_plan import (
@@ -295,21 +382,21 @@ def run_cache_redundancy(
             required_cache_unit_ids,
         )
         from analysis.prune_plan.recovery_plan import (
-            compose_training_unit_prune_plan,
-            list_training_plan_names,
+            compose_recovery_unit_prune_plan,
+            list_recovery_plan_names,
         )
 
         plan_refs = _resolve_prune_plan_refs(Path(prune_plan_root), adapter.name, plan_name)
         missing = [str(p) for p in plan_refs if isinstance(p, Path) and not p.is_file()]
         if missing:
             raise FileNotFoundError(f"Missing prune plan for minimal cache save: {', '.join(missing)}")
-        training_root = Path(training_plan_root) if training_plan_root is not None else Path(prune_plan_root)
-        requested_training = [x for x in str(training_plan_name or "").replace(",", " ").split() if x.strip()]
-        training_names = requested_training or list_training_plan_names(training_root)
-        if not training_names and any(not isinstance(p, Path) for p in plan_refs):
+        recovery_root = Path(recovery_plan_root) if recovery_plan_root is not None else Path(prune_plan_root)
+        requested_recovery = [x for x in str(recovery_plan_name or "").replace(",", " ").split() if x.strip()]
+        recovery_names = requested_recovery or list_recovery_plan_names(recovery_root)
+        if not recovery_names and any(not isinstance(p, Path) for p in plan_refs):
             raise FileNotFoundError(
-                f"No training plan bundles found under {training_root}; "
-                "cache minimal mode requires both prune and training plans."
+                f"No recovery plan bundles found under {recovery_root}; "
+                "cache minimal mode requires both prune and recovery plans."
             )
         unit_ids_filter = set()
         explicit_cache_units_used = 0
@@ -324,36 +411,40 @@ def run_cache_redundancy(
                     explicit_cache_units_used += 1
                 else:
                     unit_ids_filter.update(required_cache_unit_ids(plan, model))
+                auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
             else:
-                for train_name in training_names:
-                    plan = compose_training_unit_prune_plan(
+                for recovery_name in recovery_names:
+                    plan = compose_recovery_unit_prune_plan(
                         prune_plan_root=Path(prune_plan_root),
-                        training_plan_root=training_root,
+                        recovery_plan_root=recovery_root,
                         prune_selector=str(plan_ref),
-                        training_plan=str(train_name),
+                        recovery_plan=str(recovery_name),
                     )
-                    plan_labels.append(f"{plan_ref}+{train_name}")
+                    plan_labels.append(f"{plan_ref}+{recovery_name}")
                     explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
                     if explicit_ids is not None:
                         unit_ids_filter.update(explicit_ids)
                         explicit_cache_units_used += 1
                     else:
                         unit_ids_filter.update(required_cache_unit_ids(plan, model))
+                    auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
 
         cache_save_policy = {
             "mode": "prune_plan_minimal_union" if len(plan_refs) > 1 else "prune_plan_minimal",
             "prune_plan_root": str(Path(prune_plan_root).resolve()),
-            "training_plan_root": str(training_root.resolve()),
+            "recovery_plan_root": str(recovery_root.resolve()),
             "prune_plan_selectors": plan_labels,
             "units_saved": len(unit_ids_filter),
             "units_total": len(unit_ids),
             "explicit_cache_unit_ids_plans": int(explicit_cache_units_used),
+            "auxiliary_ids": sorted(auxiliary_ids_filter),
         }
-        print(
-            f"[cache+redundancy] minimal cache save: {len(unit_ids_filter)}/{len(unit_ids)} units "
-            f"from {len(plan_refs)} plan(s)",
-            file=sys.stderr,
-        )
+        if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
+            print(
+                f"[cache+redundancy] minimal cache save: {len(unit_ids_filter)}/{len(unit_ids)} units "
+                f"from {len(plan_refs)} plan(s)",
+                file=sys.stderr,
+            )
 
     manifest_extra: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -395,6 +486,8 @@ def run_cache_redundancy(
     iter_label = (
         f"cache ({output_dataset})" if skip_redundancy else f"cache+redundancy ({output_dataset})"
     )
+    if os.environ.get("COMPACT_LOG", "").lower() in {"1", "true", "yes"}:
+        iter_label = "    scenes"
     scene_iter = tqdm(scene_list, desc=iter_label, unit="scene", file=sys.stderr) if progress else scene_list
     for batch in scene_iter:
         scene_id = batch.scene_id
@@ -409,7 +502,13 @@ def run_cache_redundancy(
         if torch_device.type == "cuda":
             torch.cuda.synchronize(torch_device)
         t_infer0 = time.perf_counter()
-        fwd = adapter.forward_cache_batch(model, images, torch_device)
+        fwd, auxiliary_map = forward_cache_with_auxiliaries(
+            adapter=adapter,
+            model=model,
+            images=images,
+            device=torch_device,
+            auxiliary_ids=auxiliary_ids_filter,
+        )
         infer_s = time.perf_counter() - t_infer0
         sum_infer_s += infer_s
         unit_map, meta, pred = fwd.unit_map, fwd.meta, fwd.pred
@@ -465,11 +564,12 @@ def run_cache_redundancy(
                 model=model,
                 initial_tokens=fwd_initial_tokens,
                 unit_ids_filter=unit_ids_filter,
+                auxiliary_map=auxiliary_map,
             )
             sum_disk_s += time.perf_counter() - t_disk0
             scene_rows.append(row)
 
-        del unit_map, meta, pred, fwd, fwd_initial_tokens, images
+        del unit_map, meta, pred, fwd, fwd_initial_tokens, auxiliary_map, images
         if torch_device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -504,14 +604,16 @@ def run_cache_redundancy(
             "total": float(total_s),
         }
         manifest.save(cache_root / "cache_manifest_v3.json")
-        print(f"Wrote {cache_root / 'cache_manifest_v3.json'}", file=sys.stderr)
+        if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
+            print(f"Wrote {cache_root / 'cache_manifest_v3.json'}", file=sys.stderr)
 
     mode = "cache-only" if skip_redundancy else "cache+redundancy"
-    print(
-        f"[{mode}] scenes={len(scene_list)} load={load_s:.1f}s infer={sum_infer_s:.1f}s "
-        f"disk={sum_disk_s:.1f}s total={total_s:.1f}s save_cache={save_cache} redundancy={compute_redundancy}",
-        file=sys.stderr,
-    )
+    if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
+        print(
+            f"[{mode}] scenes={len(scene_list)} load={load_s:.1f}s infer={sum_infer_s:.1f}s "
+            f"disk={sum_disk_s:.1f}s total={total_s:.1f}s save_cache={save_cache} redundancy={compute_redundancy}",
+            file=sys.stderr,
+        )
     return out_path
 
 
@@ -535,8 +637,8 @@ def main() -> None:
         progress=True,
         prune_plan_root=args.prune_plan_root,
         plan_name=str(args.prune_plan_name),
-        training_plan_root=args.training_plan_root,
-        training_plan_name=str(args.training_plan_name),
+        recovery_plan_root=args.recovery_plan_root,
+        recovery_plan_name=str(args.recovery_plan_name),
         skip_redundancy=bool(args.skip_redundancy),
         split=args.split,
         output_dataset=str(args.output_dataset),

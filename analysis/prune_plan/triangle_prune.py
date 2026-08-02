@@ -1,120 +1,24 @@
-"""Dense upper-triangle greedy selection for prune plans from CKA similarity."""
+"""Closed-interval selection for pruning score matrices."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-
-from analysis.schema.v3 import PruneAction
 
 
 CORNER_RANKING_TOLERANCE = 0.0
 REQUIRE_ENDPOINT_LINKED_SPANS = True
 
 
-def triangle_span(i: int, j: int) -> int:
-    """Edge length of T(i,j): number of unit indices from i through j (j - i)."""
-    return max(0, int(j) - int(i))
-
-
-def triangle_area(i: int, j: int) -> int:
-    """Number of strict upper-tri cells in T(i,j); monotone in ``triangle_span``."""
-    span = triangle_span(i, j)
-    if span <= 0:
-        return 0
-    return span * (span + 1) // 2
-
-
-def build_strict_upper_mask(sim: np.ndarray, threshold: float) -> np.ndarray:
-    """Bool mask for i < j where sim[i,j] > threshold."""
-    n = int(sim.shape[0])
-    mask = np.zeros((n, n), dtype=bool)
-    for i in range(n):
-        for j in range(i + 1, n):
-            mask[i, j] = float(sim[i, j]) > float(threshold)
-    return mask
-
-
-def clear_triangle_mask(mask: np.ndarray, i: int, j: int) -> None:
-    for a in range(i, j + 1):
-        for b in range(a + 1, j + 1):
-            mask[a, b] = False
-
-
-def is_dense_triangle(mask: np.ndarray, i: int, j: int) -> bool:
-    if j <= i:
-        return False
-    for a in range(i, j + 1):
-        for b in range(a + 1, j + 1):
-            if not mask[a, b]:
-                return False
-    return True
-
-
-def find_largest_dense_triangle(
-    mask: np.ndarray,
-    sim: np.ndarray,
-) -> Optional[Tuple[int, int, int]]:
-    """Return (i, j, span) for the largest dense triangle, or None.
-
-    Primary key: maximum span ``j - i``. Tie-break: largest ``sim[i, j]`` (corner).
-    """
-    n = int(mask.shape[0])
-    if sim.shape != (n, n):
-        raise ValueError(f"sim shape {sim.shape} != mask shape {(n, n)}")
-    best: Optional[Tuple[int, int, int]] = None
-    best_span = 0
-    best_corner = -float("inf")
-
-    for i in range(n):
-        dense = True
-        for j in range(i + 1, n):
-            if dense:
-                for a in range(i, j):
-                    if not mask[a, j]:
-                        dense = False
-                        break
-            if not dense:
-                break
-            span = j - i
-            corner = float(sim[i, j])
-            if span > best_span or (span == best_span and corner > best_corner):
-                best_span = span
-                best_corner = corner
-                best = (i, j, span)
-    return best
-
-
-def find_dense_triangle_for_span(
-    mask: np.ndarray,
-    sim: np.ndarray,
-    span: int,
-) -> Optional[Tuple[int, int, int]]:
-    """Return the dense triangle of exactly ``span`` with the largest corner value."""
-    n = int(mask.shape[0])
-    if sim.shape != (n, n):
-        raise ValueError(f"sim shape {sim.shape} != mask shape {(n, n)}")
-    target_span = int(span)
-    if target_span <= 0 or target_span >= n:
-        return None
-
-    best: Optional[Tuple[int, int, int]] = None
-    best_corner = -float("inf")
-    for i in range(0, n - target_span):
-        j = i + target_span
-        if not is_dense_triangle(mask, i, j):
-            continue
-        corner = float(sim[i, j])
-        if corner > best_corner:
-            best_corner = corner
-            best = (i, j, target_span)
-    return best
-
-
 @dataclass(frozen=True)
 class TrianglePick:
+    """One zero-based closed interval ``[i, j]`` selected for pruning.
+
+    ``span`` is always the number of dropped units, ``j - i + 1``.
+    """
+
     i: int
     j: int
     span: int
@@ -122,252 +26,43 @@ class TrianglePick:
     unit_j: str
     dropped_unit_ids: Tuple[str, ...]
 
-    @property
-    def area(self) -> int:
-        return triangle_area(self.i, self.j)
-
-
-def dense_triangle_for_span(
-    sim: np.ndarray,
-    unit_ids: Sequence[str],
-    *,
-    threshold: float,
-    span: int,
-) -> Optional[TrianglePick]:
-    """Select one exact-span dense triangle, breaking ties by corner similarity."""
-    n = len(unit_ids)
-    if sim.shape != (n, n):
-        raise ValueError(f"sim shape {sim.shape} != ({n}, {n}) for {n} unit_ids")
-    mask = build_strict_upper_mask(np.asarray(sim, dtype=np.float64), threshold)
-    found = find_dense_triangle_for_span(mask, sim, span)
-    if found is None:
-        return None
-    i, j, actual_span = found
-    return TrianglePick(
-        i=i,
-        j=j,
-        span=actual_span,
-        unit_i=str(unit_ids[i]),
-        unit_j=str(unit_ids[j]),
-        dropped_unit_ids=tuple(unit_ids[k] for k in range(i + 1, j + 1)),
-    )
-
-
-def scan_best_dense_triangles(
-    sim: np.ndarray,
-    unit_ids: Sequence[str],
-    *,
-    threshold: float,
-) -> List[TrianglePick]:
-    """Return the best dense triangle for each consecutive valid span.
-
-    The scan reuses the dense state for span ``s - 1`` and precomputes whether
-    each new right-boundary column is entirely above ``threshold``.  This keeps
-    the full scan quadratic in the number of units.  Once a span has no dense
-    candidate, no larger dense triangle can exist, so the scan stops.
-    """
-    n = len(unit_ids)
-    if sim.shape != (n, n):
-        raise ValueError(f"sim shape {sim.shape} != ({n}, {n}) for {n} unit_ids")
-    values = np.asarray(sim, dtype=np.float64)
-    mask = build_strict_upper_mask(values, threshold)
-
-    # column_all[i, j] means mask[i:j, j] is entirely true.
-    column_all = np.zeros((n, n), dtype=bool)
-    for j in range(1, n):
-        running = True
-        for i in range(j - 1, -1, -1):
-            running = running and bool(mask[i, j])
-            column_all[i, j] = running
-
-    dense = np.zeros((n, n), dtype=bool)
-    picks: List[TrianglePick] = []
-    for span in range(1, n):
-        best_i: Optional[int] = None
-        best_corner = -float("inf")
-        for i in range(0, n - span):
-            j = i + span
-            previous_dense = span == 1 or bool(dense[i, j - 1])
-            dense[i, j] = previous_dense and bool(column_all[i, j])
-            if not dense[i, j]:
-                continue
-            corner = float(values[i, j])
-            if corner > best_corner:
-                best_i = i
-                best_corner = corner
-        if best_i is None:
-            break
-        j = best_i + span
-        picks.append(
-            TrianglePick(
-                i=best_i,
-                j=j,
-                span=span,
-                unit_i=str(unit_ids[best_i]),
-                unit_j=str(unit_ids[j]),
-                dropped_unit_ids=tuple(unit_ids[k] for k in range(best_i + 1, j + 1)),
+    def __post_init__(self) -> None:
+        start = int(self.i)
+        end = int(self.j)
+        expected_span = end - start + 1
+        if start < 0 or end < start:
+            raise ValueError(f"invalid closed interval [{start}, {end}]")
+        if int(self.span) != expected_span:
+            raise ValueError(
+                f"closed interval [{start}, {end}] has span={self.span}; "
+                f"expected drop_count={expected_span}"
             )
-        )
-    return picks
+        if len(self.dropped_unit_ids) != expected_span:
+            raise ValueError(
+                f"closed interval [{start}, {end}] has {len(self.dropped_unit_ids)} "
+                f"dropped_unit_ids; expected {expected_span}"
+            )
 
 
-def _triangle_pick_from_indices(
-    unit_ids: Sequence[str],
-    i: int,
-    j: int,
-) -> TrianglePick:
-    return TrianglePick(
-        i=int(i),
-        j=int(j),
-        span=int(j) - int(i),
-        unit_i=str(unit_ids[int(i)]),
-        unit_j=str(unit_ids[int(j)]),
-        dropped_unit_ids=tuple(unit_ids[k] for k in range(int(i) + 1, int(j) + 1)),
-    )
-
-
-def _closed_interval_pick_from_bounds(
+def interval_pick_from_bounds(
     unit_ids: Sequence[str],
     start: int,
     end: int,
 ) -> TrianglePick:
+    """Build a validated pick for the closed interval ``[start, end]``."""
     start_i = int(start)
     end_i = int(end)
+    n = len(unit_ids)
+    if start_i < 0 or end_i < start_i or end_i >= n:
+        raise ValueError(f"invalid closed interval [{start_i}, {end_i}] for {n} units")
     return TrianglePick(
         i=start_i,
         j=end_i,
         span=end_i - start_i + 1,
         unit_i=str(unit_ids[start_i]),
         unit_j=str(unit_ids[end_i]),
-        dropped_unit_ids=tuple(unit_ids[k] for k in range(start_i, end_i + 1)),
+        dropped_unit_ids=tuple(str(unit_ids[k]) for k in range(start_i, end_i + 1)),
     )
-
-
-def scan_nested_dense_triangles_from_max(
-    sim: np.ndarray,
-    unit_ids: Sequence[str],
-    *,
-    threshold: float,
-) -> List[TrianglePick]:
-    """Return one nested dense-triangle chain for spans 1..max-valid-span.
-
-    The largest valid span is selected with the same rule as
-    :func:`scan_best_dense_triangles`: among all dense triangles of that maximum
-    span, use the one with the largest upper-right corner similarity.  Smaller
-    spans are then obtained by shrinking that interval from right to left: for
-    each span ``s - 1``, compare the two dense sub-triangles ``[i + 1, j]`` and
-    ``[i, j - 1]`` and keep the one with the larger corner similarity.
-
-    This guarantees every smaller selected interval is a subset of every larger
-    selected interval, so budget choices on the resulting curve are nested.
-    """
-    n = len(unit_ids)
-    if sim.shape != (n, n):
-        raise ValueError(f"sim shape {sim.shape} != ({n}, {n}) for {n} unit_ids")
-    values = np.asarray(sim, dtype=np.float64)
-    independent = scan_best_dense_triangles(values, unit_ids, threshold=threshold)
-    if not independent:
-        return []
-
-    current_i = int(independent[-1].i)
-    current_j = int(independent[-1].j)
-    by_span: dict[int, TrianglePick] = {
-        int(independent[-1].span): _triangle_pick_from_indices(unit_ids, current_i, current_j)
-    }
-
-    while current_j - current_i > 1:
-        left_i = current_i + 1
-        left_j = current_j
-        right_i = current_i
-        right_j = current_j - 1
-        left_corner = float(values[left_i, left_j])
-        right_corner = float(values[right_i, right_j])
-        if left_corner > right_corner:
-            current_i, current_j = left_i, left_j
-        else:
-            current_i, current_j = right_i, right_j
-        by_span[current_j - current_i] = _triangle_pick_from_indices(
-            unit_ids,
-            current_i,
-            current_j,
-        )
-
-    return [by_span[span] for span in sorted(by_span)]
-
-
-def scan_endpoint_linked_triangles_with_candidates(
-    sim: np.ndarray,
-    unit_ids: Sequence[str],
-    *,
-    ranking_tolerance: float = CORNER_RANKING_TOLERANCE,
-    require_endpoint_linked_spans: bool = REQUIRE_ENDPOINT_LINKED_SPANS,
-) -> Tuple[
-    List[TrianglePick],
-    Dict[int, Tuple[TrianglePick, ...]],
-]:
-    """Return span-wise picks and the candidates that survived optional linking.
-
-    For every span ``n`` every diagonal point ``(i, i+n)`` is a valid candidate.
-    If ``require_endpoint_linked_spans`` is true, the largest span is initialized
-    with the candidate whose corner value is largest, then spans are processed
-    from large to small: the next selected interval must have at least one
-    endpoint inside the previously selected interval.  If it is false, every
-    span is selected independently from all candidates.  Among eligible
-    candidates of the same span, the largest corner value wins; values within
-    ``ranking_tolerance`` are considered equal, and the earlier candidate is
-    kept.
-    """
-    n = len(unit_ids)
-    if sim.shape != (n, n):
-        raise ValueError(f"sim shape {sim.shape} != ({n}, {n}) for {n} unit_ids")
-    values = np.asarray(sim, dtype=np.float64)
-    rank_tol = float(ranking_tolerance)
-    candidates_by_span: dict[int, List[TrianglePick]] = {}
-    for span in range(1, n):
-        candidates: List[TrianglePick] = []
-        for i in range(0, n - span):
-            j = i + span
-            candidates.append(_triangle_pick_from_indices(unit_ids, i, j))
-        if candidates:
-            candidates_by_span[span] = candidates
-    if not candidates_by_span:
-        return [], {}
-
-    def best_by_corner(candidates: Sequence[TrianglePick]) -> TrianglePick:
-        best = candidates[0]
-        best_corner = float(values[int(best.i), int(best.j)])
-        for candidate in candidates[1:]:
-            corner = float(values[int(candidate.i), int(candidate.j)])
-            if corner > best_corner + rank_tol:
-                best = candidate
-                best_corner = corner
-        return best
-
-    selected_by_span: dict[int, TrianglePick] = {}
-    eligible_by_span: dict[int, Tuple[TrianglePick, ...]] = {}
-    current: Optional[TrianglePick] = None
-    for span in sorted(candidates_by_span, reverse=True):
-        candidates = candidates_by_span[span]
-        if current is None or not bool(require_endpoint_linked_spans):
-            eligible = candidates
-        else:
-            current_i = int(current.i)
-            current_j = int(current.j)
-            eligible = [
-                candidate
-                for candidate in candidates
-                if current_i <= int(candidate.i) <= current_j
-                or current_i <= int(candidate.j) <= current_j
-            ]
-            if not eligible:
-                continue
-        selected = best_by_corner(eligible)
-        selected_by_span[span] = selected
-        eligible_by_span[span] = tuple(eligible)
-        current = selected
-
-    picks = [selected_by_span[span] for span in sorted(selected_by_span)]
-    return picks, eligible_by_span
 
 
 def scan_endpoint_linked_closed_intervals_with_candidates(
@@ -380,29 +75,33 @@ def scan_endpoint_linked_closed_intervals_with_candidates(
     List[TrianglePick],
     Dict[int, Tuple[TrianglePick, ...]],
 ]:
-    """Return closed-interval drop picks for an interval score matrix.
+    """Select one closed interval per available drop count.
 
-    ``score[start, end]`` is interpreted as the score for deleting the closed
-    interval ``[start, end]``.  The returned ``TrianglePick`` keeps the legacy
-    field names but uses ``i=start``, ``j=end``, and ``span=drop_count``.
+    ``score[start, end]`` is the score for deleting every unit in the closed
+    interval ``[start, end]``. Candidates are grouped by
+    ``drop_count = end - start + 1``. When endpoint linking is enabled, each
+    smaller selected interval must have at least one endpoint inside the
+    previously selected larger interval.
     """
     n = len(unit_ids)
     if score.shape != (n, n):
         raise ValueError(f"score shape {score.shape} != ({n}, {n}) for {n} unit_ids")
     values = np.asarray(score, dtype=np.float64)
     rank_tol = float(ranking_tolerance)
-    candidates_by_span: dict[int, List[TrianglePick]] = {}
+    candidates_by_drop_count: dict[int, List[TrianglePick]] = {}
+    # Legality comes entirely from finite score cells.  Pairwise similarity
+    # conversion leaves C[0, :] as NaN because unit zero has no prior unit
+    # output, so intervals deleting unit zero are excluded structurally.
     for drop_count in range(1, n + 1):
         candidates: List[TrianglePick] = []
         for start in range(0, n - drop_count + 1):
             end = start + drop_count - 1
-            val = float(values[start, end])
-            if not np.isfinite(val):
+            if not np.isfinite(float(values[start, end])):
                 continue
-            candidates.append(_closed_interval_pick_from_bounds(unit_ids, start, end))
+            candidates.append(interval_pick_from_bounds(unit_ids, start, end))
         if candidates:
-            candidates_by_span[drop_count] = candidates
-    if not candidates_by_span:
+            candidates_by_drop_count[drop_count] = candidates
+    if not candidates_by_drop_count:
         return [], {}
 
     def best_by_score(candidates: Sequence[TrianglePick]) -> TrianglePick:
@@ -415,11 +114,11 @@ def scan_endpoint_linked_closed_intervals_with_candidates(
                 best_score = score_value
         return best
 
-    selected_by_span: dict[int, TrianglePick] = {}
-    eligible_by_span: dict[int, Tuple[TrianglePick, ...]] = {}
+    selected_by_drop_count: dict[int, TrianglePick] = {}
+    eligible_by_drop_count: dict[int, Tuple[TrianglePick, ...]] = {}
     current: Optional[TrianglePick] = None
-    for drop_count in sorted(candidates_by_span, reverse=True):
-        candidates = candidates_by_span[drop_count]
+    for drop_count in sorted(candidates_by_drop_count, reverse=True):
+        candidates = candidates_by_drop_count[drop_count]
         if current is None or not bool(require_endpoint_linked_spans):
             eligible = candidates
         else:
@@ -434,124 +133,12 @@ def scan_endpoint_linked_closed_intervals_with_candidates(
             if not eligible:
                 continue
         selected = best_by_score(eligible)
-        selected_by_span[drop_count] = selected
-        eligible_by_span[drop_count] = tuple(eligible)
+        selected_by_drop_count[drop_count] = selected
+        eligible_by_drop_count[drop_count] = tuple(eligible)
         current = selected
 
-    picks = [selected_by_span[span] for span in sorted(selected_by_span)]
-    return picks, eligible_by_span
-
-
-def scan_endpoint_linked_triangles(
-    sim: np.ndarray,
-    unit_ids: Sequence[str],
-    *,
-    ranking_tolerance: float = CORNER_RANKING_TOLERANCE,
-    require_endpoint_linked_spans: bool = REQUIRE_ENDPOINT_LINKED_SPANS,
-) -> List[TrianglePick]:
-    """Return a triangle path from large spans to small, optionally endpoint-linked."""
-    picks, _eligible_by_span = (
-        scan_endpoint_linked_triangles_with_candidates(
-            sim,
-            unit_ids,
-            ranking_tolerance=ranking_tolerance,
-            require_endpoint_linked_spans=require_endpoint_linked_spans,
-        )
-    )
-    return picks
-
-
-def greedy_dense_triangles(
-    sim: np.ndarray,
-    unit_ids: Sequence[str],
-    *,
-    threshold: float,
-    max_triangles: int,
-) -> Tuple[List[TrianglePick], np.ndarray]:
-    """Select up to ``max_triangles`` dense triangles on CKA strict upper triangle."""
-    n = len(unit_ids)
-    if sim.shape != (n, n):
-        raise ValueError(f"sim shape {sim.shape} != ({n}, {n}) for {n} unit_ids")
-
-    mask = build_strict_upper_mask(np.asarray(sim, dtype=np.float64), threshold)
-    picks: List[TrianglePick] = []
-
-    for _ in range(max(0, int(max_triangles))):
-        found = find_largest_dense_triangle(mask, sim)
-        if found is None:
-            break
-        i, j, span = found
-        dropped = tuple(unit_ids[k] for k in range(i + 1, j + 1))
-        picks.append(
-            TrianglePick(
-                i=i,
-                j=j,
-                span=span,
-                unit_i=str(unit_ids[i]),
-                unit_j=str(unit_ids[j]),
-                dropped_unit_ids=dropped,
-            )
-        )
-        clear_triangle_mask(mask, i, j)
-
-    return picks, mask
-
-
-def picks_to_actions(
-    picks: Sequence[TrianglePick],
-    *,
-    lora_rank: int,
-    lora_alpha: float,
-) -> List[PruneAction]:
-    actions: List[PruneAction] = []
-    lora_units: set[str] = set()
-
-    for pick in picks:
-        for uid in pick.dropped_unit_ids:
-            actions.append(PruneAction(action="drop_unit", unit_id=uid))
-        if pick.unit_i not in lora_units:
-            lora_units.add(pick.unit_i)
-            actions.append(
-                PruneAction(
-                    action="lora_unit",
-                    unit_id=pick.unit_i,
-                    rank=int(lora_rank),
-                    alpha=float(lora_alpha),
-                )
-            )
-    return actions
-
-
-def picks_to_extra(picks: Sequence[TrianglePick]) -> Dict[str, Any]:
-    return {
-        "triangle_prune": {
-            "triangles": [
-                {
-                    "i": p.i,
-                    "j": p.j,
-                    "span": p.span,
-                    "area": p.area,
-                    "unit_i": p.unit_i,
-                    "unit_j": p.unit_j,
-                    "dropped_unit_ids": list(p.dropped_unit_ids),
-                }
-                for p in picks
-            ]
-        }
-    }
-
-
-def build_triangle_prune_actions(
-    sim: np.ndarray,
-    unit_ids: Sequence[str],
-    *,
-    threshold: float,
-    max_triangles: int,
-    lora_rank: int = 32,
-    lora_alpha: float = 64.0,
-) -> Tuple[List[PruneAction], Dict[str, Any], List[TrianglePick]]:
-    picks, _ = greedy_dense_triangles(
-        sim, unit_ids, threshold=threshold, max_triangles=max_triangles
-    )
-    actions = picks_to_actions(picks, lora_rank=lora_rank, lora_alpha=lora_alpha)
-    return actions, picks_to_extra(picks), picks
+    picks = [
+        selected_by_drop_count[drop_count]
+        for drop_count in sorted(selected_by_drop_count)
+    ]
+    return picks, eligible_by_drop_count

@@ -35,7 +35,7 @@ def _parameter_log_line(*, backbone: str, plan_path: Path) -> str:
     from analysis.backbones.cache_replay import get_cache_replay_engine
     from analysis.backbones.registry import get_backbone
     from analysis.prune_plan import UnitPrunePlan, drop_intervals_from_plan, prune_actions_from_plan
-    from analysis.recover.train.model import build_skipped_layer_indices
+    from analysis.recovery.train.model import build_skipped_layer_indices
 
     adapter = get_backbone(backbone)
     engine = get_cache_replay_engine(backbone)

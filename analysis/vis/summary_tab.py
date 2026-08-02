@@ -42,9 +42,27 @@ _RECOVERY_MODE_RE = re.compile(r"(?:^|/)prune_span\d+[_/](?P<plan>[^/+]+)")
 _MODE_KIND_ORDER: Tuple[str, ...] = (
     "upper",
     "lower",
-    "diag",
+    "linearpatch",
     "ghost",
-    "rotate",
+    "ghost_interval",
+    "ghost_interval_sequential",
+    "ghost_cos",
+    "ghost_mse_more",
+    "ghost_mse_cos_more",
+    "ghost_mse_cka_more",
+    "ghost_mse_cos_cka_more",
+    "ghost_mse_cos_balanced_more",
+    "ghost_mse_cka_balanced_more",
+    "ghost_mse_cos_cka_balanced_more",
+    "ghost_mse_cka_ema_more",
+    "ghost_mse_cos_cka_ema_half_more",
+    "ghost_mse_cos_cka_ema_one_more",
+    "ghost_mse_cka",
+    "ghost_cka_only",
+    "ghost_cka_ridge",
+    "replaceme_ls",
+    "replaceme_cos",
+    "prunecomp",
     "lora",
     "train",
     "model",
@@ -245,6 +263,8 @@ def _load_per_backbone_summaries(output_root: Path) -> Tuple[List[str], List[Sum
                     metric_headers.append(metric_header)
             source_paths.append(summary_path)
             for row in parsed_rows:
+                if _mode_kind_for_row(row.mode) in {"diag", "rotate"}:
+                    continue
                 if not row.backbone:
                     row = SummaryRow(
                         dataset=row.dataset,

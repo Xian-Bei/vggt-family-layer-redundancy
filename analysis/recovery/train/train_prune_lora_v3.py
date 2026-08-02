@@ -13,14 +13,13 @@ from analysis.prune_plan import (
     default_prune_plan_root,
     prune_plan_bundle_path,
     resolve_named_prune_plan_path,
-    resolve_prune_plan_path,
 )
-from analysis.prune_plan.recovery_plan import compose_training_unit_prune_plan, training_plan_path
+from analysis.prune_plan.recovery_plan import compose_recovery_unit_prune_plan
 from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT, stage_dir
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Recover prune+LoRA (v3) via adapter.train_from_cache.")
+    p = argparse.ArgumentParser(description="Recovery prune+LoRA (v3) via adapter.train_from_cache.")
     p.add_argument("--experiment", type=str, default="default")
     p.add_argument(
         "--dataset",
@@ -41,7 +40,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prune-plan-root",
         type=Path,
         default=None,
-        help="Directory with prune plans (legacy default: analysis/prune_plan).",
+        help="Directory with prune plans (default: analysis/prune_plan).",
     )
     p.add_argument(
         "--prune-plan-name",
@@ -52,16 +51,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--recovery-plan-root",
-        "--training-plan-root",
-        dest="training_plan_root",
         type=Path,
         default=None,
         help="Directory with recovery plan bundles (default: prune-plan-root).",
     )
     p.add_argument(
         "--recovery-plan-name",
-        "--training-plan-name",
-        dest="training_plan_name",
         type=str,
         default="",
         help="Required recovery plan name (e.g. recovery_lora_l1_r32).",
@@ -187,36 +182,25 @@ def main() -> None:
         raise SystemExit("--prune-plan-name is required")
     plan_root = args.prune_plan_root or (Path("analysis_outputs_v3") / adapter.name)
     prune_plan_name = str(args.prune_plan_name).strip()
-    training_root = args.training_plan_root or plan_root
-    training_plan_name = str(args.training_plan_name or "").strip()
-    if not training_plan_name:
+    recovery_root = args.recovery_plan_root or plan_root
+    recovery_plan_name = str(args.recovery_plan_name or "").strip()
+    if not recovery_plan_name:
         raise SystemExit("--recovery-plan-name is required")
-    try:
-        compose_training_unit_prune_plan(
-            prune_plan_root=plan_root,
-            training_plan_root=training_root,
-            prune_selector=prune_plan_name,
-            training_plan=training_plan_name,
-        )
-        prune_path = (
-            prune_plan_bundle_path(plan_root)
-            if prune_plan_name.startswith("prune_span")
-            else resolve_named_prune_plan_path(plan_root, prune_plan_name)
-        )
-    except FileNotFoundError:
-        # Backward-compatible fallback if caller still passes legacy root/name-by-backbone.
-        legacy = resolve_prune_plan_path(plan_root, adapter.name)
-        if legacy.is_file() and prune_plan_name.lower() in ("legacy", adapter.name):
-            prune_path = legacy
-        else:
-            raise SystemExit(
-                f"Missing prune/training plan selector: prune={prune_plan_name} under {plan_root}, "
-                f"training={training_plan_path(training_root, training_plan_name)}"
-            )
+    compose_recovery_unit_prune_plan(
+        prune_plan_root=plan_root,
+        recovery_plan_root=recovery_root,
+        prune_selector=prune_plan_name,
+        recovery_plan=recovery_plan_name,
+    )
+    prune_path = (
+        prune_plan_bundle_path(plan_root)
+        if prune_plan_name.startswith("prune_span")
+        else resolve_named_prune_plan_path(plan_root, prune_plan_name)
+    )
     default_output_root = Path(os.environ.get("OUTPUT_ROOT", str(OUTPUT_ROOT_DEFAULT)))
     output_kind = str(os.environ.get("OUTPUT_KIND", "train") or "train").strip() or "train"
     out_dir = args.output_dir or (
-        default_output_root / str(args.experiment) / output_kind / prune_plan_name / training_plan_name
+        default_output_root / str(args.experiment) / output_kind / prune_plan_name / recovery_plan_name
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     hf_model = str(args.hf_model or adapter.default_hf_model())
@@ -255,8 +239,8 @@ def main() -> None:
         root_nuscenes=Path(args.root_nuscenes),
         root_waymo=Path(args.root_waymo),
         prune_plan_name=prune_plan_name,
-        training_plan_root=Path(training_root),
-        training_plan_name=training_plan_name,
+        recovery_plan_root=Path(recovery_root),
+        recovery_plan_name=recovery_plan_name,
         cache_dirs=tuple(cache_dirs),
     )
     print(

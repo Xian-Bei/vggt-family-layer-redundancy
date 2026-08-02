@@ -14,7 +14,7 @@ PRUNE="${PRUNE:-0,1}"
 PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-${REPO_ROOT}/analysis/prune_plan}"
 # Pruned eval selectors use the split plan layout:
 #   PLAN_GROUP / PRUNE_PLAN_NAME: explicit physical interval selectors such as "i9_j19 i8_j20".
-#   PLAN_STRATEGY: strategy keys from prune_plan_all.json, such as "ours gt cosine".
+#   PLAN_STRATEGY: strategy keys from prune_plan_all.json, such as "ours gt replaceme shortgpt simpler".
 #   PLAN_MIN_DROP + PLAN_MAX_DROP + PLAN_DROP_STEP: select interval union from strategies by range.
 # For model-mode eval, RECOVERY_PLAN_NAME optionally composes
 # the prune selector with a recovery plan bundle such as "recovery_lora_l1_r32".
@@ -26,6 +26,9 @@ PLAN_MAX_DROP="${PLAN_MAX_DROP:-}"
 PLAN_DROP_STEP="${PLAN_DROP_STEP:-}"
 RECOVERY_PLAN_ROOT="${RECOVERY_PLAN_ROOT:-}"
 RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
+# Optional output-only alias for evaluating multiple checkpoints from one
+# recovery plan (for example CKA-only epoch snapshots).
+RECOVERY_OUTPUT_NAME="${RECOVERY_OUTPUT_NAME:-${RECOVERY_PLAN_NAME}}"
 MAX_SCENES="${MAX_SCENES:-0}"
 WRITE_SUMMARY="${WRITE_SUMMARY:-1}"
 
@@ -157,6 +160,14 @@ truthy() {
   [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
 }
 
+run_progress_command() {
+  if truthy "${COMPACT_LOG:-0}"; then
+    "$@" >/dev/null
+  else
+    "$@"
+  fi
+}
+
 python_plan_group_from_name() {
   local name="$1"
   PRUNE_PLAN_NAME_FOR_PY="${name}" conda run --no-capture-output -n "${CONDA_ENV}" python -c "
@@ -223,17 +234,17 @@ selected = strategy_interval_selectors(
     drop_step=step,
 )
 if not selected:
-    raise SystemExit(f'no available prune intervals in [{min_drop}, {max_drop}] step {step} under {root}')
+    raise SystemExit(f'no available prune plan selectors in [{min_drop}, {max_drop}] step {step} under {root}')
 for selector in selected:
     print(selector)
 "
 }
 
-# upper: full pretrained; lower: apply one physical interval only; model: apply prune plan plus finetuned checkpoint.
+# upper: full pretrained; lower: apply an interval or set prune plan; model: apply prune plan plus finetuned checkpoint.
 resolve_eval_mode() {
   local prune_flag="$1"
   if truthy "${prune_flag}"; then
-    if [[ -n "${CHECKPOINT}" ]]; then
+    if [[ -n "${CHECKPOINT}" || -n "${RECOVERY_PLAN_NAME}" ]]; then
       echo "model"
     else
       echo "lower"
@@ -252,11 +263,11 @@ checkpoint_for_model_mode() {
     return
   fi
   if [[ -n "${prune_plan_name}" && -n "${RECOVERY_PLAN_NAME}" ]]; then
-    local recover_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/recover/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
+    local recovery_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/recovery/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
     local new_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/train/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
     local legacy_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${scannet_tag}/train/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
-    if [[ -f "${recover_ckpt}" ]]; then
-      echo "${recover_ckpt}"
+    if [[ -f "${recovery_ckpt}" ]]; then
+      echo "${recovery_ckpt}"
     elif [[ -f "${new_ckpt}" || ! -f "${legacy_ckpt}" ]]; then
       echo "${new_ckpt}"
     else
@@ -291,14 +302,15 @@ run_eval_dataset() {
   if [[ -n "${compression_tag}" ]]; then
     effective_model_name="${model_name}_${compression_tag}"
   fi
+  local output_plan_name="${plan_group:-${prune_plan_name}}"
   local out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/${effective_model_name}"
-  if [[ "${mode}" == "lower" && -n "${plan_group}" ]]; then
-    out_dir="${out_dir}/${plan_group}"
+  if [[ "${mode}" == "lower" && -n "${output_plan_name}" ]]; then
+    out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/pruning/${output_plan_name}"
   elif [[ "${mode}" == "model" && -n "${prune_plan_name}" ]]; then
     if [[ -n "${RECOVERY_PLAN_NAME}" ]]; then
-      out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/recover/${RECOVERY_PLAN_NAME}/${prune_plan_name}"
+      out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/recovery/${RECOVERY_OUTPUT_NAME}/${output_plan_name}"
     else
-      out_dir="${out_dir}/${prune_plan_name}"
+      out_dir="${out_dir}/${output_plan_name}"
     fi
   fi
   local extra=(
@@ -360,14 +372,25 @@ run_eval_dataset() {
       if [[ -f "${ckpt}" ]]; then
         extra+=(--checkpoint "${ckpt}")
       else
-        echo "error: model mode requires checkpoint (set CHECKPOINT or recover first): ${ckpt}" >&2
+        echo "error: model mode requires checkpoint (set CHECKPOINT or recovery first): ${ckpt}" >&2
         return 1
       fi
       ;;
   esac
 
-  echo "   [eval/${output_dataset}] ${effective_model_name}/${backbone} mode=${mode} compression=${INFERENCE_COMPRESSION}"
-  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.eval_v3 \
+  if truthy "${COMPACT_LOG:-0}"; then
+    printf '\n  eval\n    model: %s\n' "${backbone}"
+    if [[ -n "${prune_plan_name}" ]]; then
+      printf '    span: %s\n' "${prune_plan_name#prune_span}"
+    fi
+    if [[ -n "${RECOVERY_PLAN_NAME}" ]]; then
+      printf '    recovery: %s\n' "${RECOVERY_PLAN_NAME#recovery_}"
+    fi
+    printf '    dataset: %s\n\n' "${output_dataset}"
+  else
+    echo "   [eval/${output_dataset}] ${effective_model_name}/${backbone} mode=${mode} compression=${INFERENCE_COMPRESSION}"
+  fi
+  run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.eval_v3 \
     --experiment "${backbone}" \
     --dataset "${dataset}" \
     --data-root "${data_root}" \
@@ -425,8 +448,10 @@ run_datasets_for_backbone() {
   mode="$(resolve_eval_mode "${prune_flag}")"
   local model_name="${MODEL_NAME:-${mode}}"
 
-  echo "   [eval] ${backbone} PRUNE=${prune_flag} -> ${mode}/${model_name}${plan_group:+ group=${plan_group}}${prune_plan_name:+ prune_plan_name=${prune_plan_name}}"
-  if truthy "${prune_flag}"; then
+  if ! truthy "${COMPACT_LOG:-0}"; then
+    echo "   [eval] ${backbone} PRUNE=${prune_flag} -> ${mode}/${model_name}${plan_group:+ group=${plan_group}}${prune_plan_name:+ prune_plan_name=${prune_plan_name}}"
+  fi
+  if truthy "${prune_flag}" && ! truthy "${COMPACT_LOG:-0}"; then
     if [[ -n "${prune_plan_name}" ]]; then
       echo "   [prune] ${prune_plan_name} from ${PRUNE_PLAN_ROOT}/prune_plan_all.json"
     else
@@ -477,8 +502,17 @@ run_eval_for_prune_variants() {
   if [[ "${#PRUNE_PLAN_NAME_LIST[@]}" -gt 0 ]]; then
     local requested_name
     if [[ -n "${CHECKPOINT}" ]]; then
+      local group
+      local canonical
       for requested_name in "${PRUNE_PLAN_NAME_LIST[@]}"; do
-        run_datasets_for_backbone "${bb}" "1" "${requested_name}" ""
+        group="$(python_plan_group_from_name "${requested_name}")"
+        canonical="$(python_resolve_canonical_plan "${PRUNE_PLAN_ROOT}" "${group}")"
+        canonical="${canonical//[[:space:]]/}"
+        if [[ -z "${canonical}" ]]; then
+          echo "warning: skip missing prune-span selector for ${bb}: ${requested_name} under ${PRUNE_PLAN_ROOT}" >&2
+          continue
+        fi
+        run_datasets_for_backbone "${bb}" "1" "${requested_name}" "${canonical}"
       done
       return
     fi
@@ -528,7 +562,9 @@ run_eval_for_prune_variants() {
   done
 }
 
-echo "== eval v3 backbones=${BACKBONES} (n=${BB_N}) RUN=${RUN:-<none>} PRUNE=${PRUNE} (n=${PRUNE_N}) MAX_FRAMES=${MAX_FRAMES} COMPRESSION=${INFERENCE_COMPRESSION} VIS_2D=${EXPORT_VIS_2D} VIS_3D=${EXPORT_VIS_3D} =="
+if ! truthy "${COMPACT_LOG:-0}"; then
+  echo "== eval v3 backbones=${BACKBONES} (n=${BB_N}) RUN=${RUN:-<none>} PRUNE=${PRUNE} (n=${PRUNE_N}) MAX_FRAMES=${MAX_FRAMES} COMPRESSION=${INFERENCE_COMPRESSION} VIS_2D=${EXPORT_VIS_2D} VIS_3D=${EXPORT_VIS_3D} =="
+fi
 
 for bb in "${BB_LIST[@]}"; do
   bb="${bb//[[:space:]]/}"
@@ -543,12 +579,16 @@ for bb in "${BB_LIST[@]}"; do
     fi
   done
   if truthy "${WRITE_SUMMARY}"; then
-    echo "   [summary] ${OUTPUT_ROOT}/${bb}/summary_comparison.md"
-    conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.summary_v3 \
+    if ! truthy "${COMPACT_LOG:-0}"; then
+      echo "   [summary] ${OUTPUT_ROOT}/${bb}/summary_comparison.md"
+    fi
+    run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.summary_v3 \
       --experiment "${bb}" \
       --prune-plan-root "${PRUNE_PLAN_ROOT}"
   fi
 done
 
-echo "== done =="
-experiment_output_hint "Eval outputs"
+if ! truthy "${COMPACT_LOG:-0}"; then
+  echo "== done =="
+  experiment_output_hint "Eval outputs"
+fi

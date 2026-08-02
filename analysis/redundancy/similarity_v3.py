@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -17,6 +18,8 @@ from analysis.schema.v3 import SCHEMA_VERSION, stage_dir
 
 REDUNDANCY_GRAPH_REGIONS = ("special", "camera", "patch", "all")
 LEGACY_REDUNDANCY_GRAPH_V3 = "redundancy_graph_v3.npz"
+CLOSED_INTERVAL_GRAPH_SEMANTICS = "closed_interval_boundary_endpoint_v1"
+UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS = "unit_output_pairwise_v1"
 
 
 def redundancy_graph_filename(region: str) -> str:
@@ -47,6 +50,28 @@ def list_redundancy_graph_regions(redundancy_dir: Path) -> List[str]:
 
 def redundancy_dir_has_graphs(redundancy_dir: Path) -> bool:
     return bool(list_redundancy_graph_regions(redundancy_dir))
+
+
+def unit_similarity_to_interval_score(
+    sim: np.ndarray,
+) -> np.ndarray:
+    """Convert unit-to-unit similarity to closed-interval pruning scores.
+
+    ``score[start, end]`` is the score for dropping the closed interval
+    ``[start, end]``.  For ``start > 0`` it uses the similarity between the
+    left boundary unit ``start - 1`` and the interval endpoint ``end``.  The
+    missing input boundary row is left as ``NaN``.  This makes every interval
+    starting at unit zero structurally unavailable without a separate policy.
+    """
+    values = np.asarray(sim, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] != values.shape[1]:
+        raise ValueError(f"expected square similarity matrix, got shape={values.shape}")
+    n = int(values.shape[0])
+    out = np.full((n, n), np.nan, dtype=np.float64)
+    for start in range(1, n):
+        for end in range(start, n):
+            out[start, end] = float(values[start - 1, end])
+    return out
 
 
 def parse_token_regions(spec: str) -> List[str]:
@@ -218,7 +243,19 @@ def compute_scene_similarity(
         if m not in sims:
             continue
         mat = sims[m]
-        out[m] = mat.numpy() if hasattr(mat, "numpy") else np.asarray(mat)
+        values = np.asarray(
+            mat.numpy() if hasattr(mat, "numpy") else mat,
+            dtype=np.float64,
+        )
+        if values.shape != (len(flat_layers), len(flat_layers)):
+            raise RuntimeError(
+                f"Unexpected pairwise {m} shape {values.shape}; "
+                f"expected {(len(flat_layers), len(flat_layers))}"
+            )
+        upper = np.triu(values, k=1)
+        unit_sim = upper + upper.T
+        np.fill_diagonal(unit_sim, 0.0 if m == "angular" else 1.0)
+        out[m] = unit_sim
     return out
 
 
@@ -282,6 +319,7 @@ class RedundancyAccumulator:
             "schema_version": np.array([SCHEMA_VERSION]),
             "token_region": np.array([self.token_region]),
             "scene_ids": np.array(self.scene_ids_processed, dtype=object),
+            "graph_semantics": np.array([UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS]),
         }
         for m, mats in self.accum.items():
             if mats:
@@ -315,7 +353,8 @@ def write_redundancy_outputs(
         np.savez(tmp_path, **merged_npz)
         tmp_path.replace(out_npz_path)
         written.append(out_npz_path)
-        print(f"Wrote {out_npz_path} ({timing_total_s:.1f}s)", file=sys.stderr)
+        if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
+            print(f"Wrote {out_npz_path} ({timing_total_s:.1f}s)", file=sys.stderr)
 
     if not written:
         raise RuntimeError("No redundancy graphs were written (no scenes accumulated).")
@@ -341,6 +380,20 @@ def _merge_existing_redundancy_npz(
 
     with np.load(path, allow_pickle=True) as existing_npz:
         existing: Dict[str, np.ndarray] = {key: existing_npz[key] for key in existing_npz.files}
+
+    old_semantics = _scalar_object_str(existing.get("graph_semantics", np.array([""])))
+    new_semantics = _scalar_object_str(new_payload.get("graph_semantics", np.array([""])))
+    if old_semantics and new_semantics and old_semantics != new_semantics:
+        raise ValueError(
+            f"Refusing to merge redundancy metrics into {path}: graph_semantics changed "
+            f"from {old_semantics!r} to {new_semantics!r}."
+        )
+    if not old_semantics and new_semantics:
+        raise ValueError(
+            f"Refusing to merge {new_semantics!r} redundancy metrics into a graph "
+            f"without explicit semantics at {path}. Migrate it first or write to "
+            "a separate output directory."
+        )
 
     for key in ("unit_ids", "scene_ids"):
         if key in existing and key in new_payload:

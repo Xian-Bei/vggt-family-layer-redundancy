@@ -135,7 +135,7 @@ def convert_bundle_open_left_to_closed(bundle: dict[str, Any]) -> dict[str, Any]
                 if int(record.get("start", 0)) < int(existing_record.get("start", 10**9)):
                     points_out[str(drop_count)] = selector
         strategies_out["ours"] = {
-            "display_name": "Ours",
+            "display_name": "Ours_CKA",
             "x_axis": "drop_count",
             "points": {
                 str(k): points_out[str(k)]

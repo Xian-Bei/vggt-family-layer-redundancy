@@ -6,8 +6,10 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-SUPPORTED_SIMILARITY_METRICS = frozenset({"cosine", "cka", "neg_mse", "cca", "pwcca"})
-DEFAULT_SIMILARITY_METRICS = ("cosine", "cka", "neg_mse")
+SUPPORTED_SIMILARITY_METRICS = frozenset(
+    {"cosine", "angular", "cka", "inv_mse", "cca", "pwcca"}
+)
+DEFAULT_SIMILARITY_METRICS = ("cosine", "angular", "cka", "inv_mse")
 
 
 def upper_triangle_length(num_layers: int) -> int:
@@ -104,6 +106,23 @@ def sample_cosine_similarity(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8
     return float(sample_cosine_similarity_tensor(x, y, eps=eps).item())
 
 
+def sample_angular_distance_tensor(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """ReplaceMe angular distance: mean row-wise ``acos(cosine) / pi``."""
+    x, y = _flatten_tokens_pair(x, y)
+    x = x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
+    y = y / y.norm(dim=-1, keepdim=True).clamp_min(eps)
+    cosine = (x * y).sum(dim=-1).clamp(min=-1.0, max=1.0)
+    return (torch.acos(cosine) / torch.pi).mean()
+
+
+def sample_angular_distance(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
+    return float(sample_angular_distance_tensor(x, y, eps=eps).item())
+
+
 def linear_cka_value_tensor(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
     Linear CKA similarity in ``(0,1]`` (differentiable).
@@ -129,7 +148,7 @@ def linear_cka(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
 
 
 def token_mean_squared_error_tensor(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Scalar MSE after token flatten to ``[N,C]`` (same reduction as :func:`neg_mean_squared_error`)."""
+    """Scalar MSE after token flatten to ``[N,C]``."""
     x, y = _flatten_tokens_pair(x, y)
     return F.mse_loss(x, y)
 
@@ -206,13 +225,10 @@ def _cca_singular_values(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-5) ->
     return corr
 
 
-def neg_mean_squared_error(x: torch.Tensor, y: torch.Tensor) -> float:
-    """
-    Negative mean squared error between token rows (same ``(N,C)`` as cosine / CKA).
-
-    Closer activations → smaller MSE → **larger** (less negative) ``-MSE`` → higher redundancy.
-    """
-    return float((-token_mean_squared_error_tensor(x, y)).item())
+def inverse_mean_squared_error(x: torch.Tensor, y: torch.Tensor) -> float:
+    """Map activation MSE to a higher-is-more-similar score in ``(0, 1]``."""
+    mse = token_mean_squared_error_tensor(x, y)
+    return float((1.0 / (1.0 + mse)).item())
 
 
 def cca_similarity(x: torch.Tensor, y: torch.Tensor, keep_components: int = 64) -> float:
@@ -260,8 +276,8 @@ def pairwise_similarity_matrices(
     If ``device`` is set (e.g. ``cuda``), layer tensors are moved to that device once for
     all pairs; metric matrices are returned on **CPU** float64.
 
-    ``metric_names`` selects from cosine, cka, neg_mse, cca, pwcca.  If omitted,
-    the historical default is cosine / CKA / neg-MSE, plus PWCCA when
+    ``metric_names`` selects from cosine, angular, cka, inv_mse, cca, pwcca. If omitted,
+    the default is cosine / angular / CKA / INV_MSE, plus PWCCA when
     ``compute_pwcca=True``.
 
     If ``metric_seconds`` is a dict, accumulate wall seconds per metric over all pairs.
@@ -314,6 +330,12 @@ def pairwise_similarity_matrices(
                     _acc("cosine", t0)
 
                 t0 = time.perf_counter()
+                if "angular" in mats:
+                    angular_v = sample_angular_distance(layer_tokens[i], layer_tokens[j])
+                    mats["angular"][i, j] = mats["angular"][j, i] = angular_v
+                    _acc("angular", t0)
+
+                t0 = time.perf_counter()
                 if "cka" in mats:
                     cka_v = linear_cka(layer_tokens[i], layer_tokens[j])
                     mats["cka"][i, j] = mats["cka"][j, i] = cka_v
@@ -332,10 +354,11 @@ def pairwise_similarity_matrices(
                     mats["pwcca"][i, j] = mats["pwcca"][j, i] = pw_v
 
                 t0 = time.perf_counter()
-                if "neg_mse" in mats:
-                    nm_v = neg_mean_squared_error(layer_tokens[i], layer_tokens[j])
-                    _acc("neg_mse", t0)
-                    mats["neg_mse"][i, j] = mats["neg_mse"][j, i] = nm_v
+                if "inv_mse" in mats:
+                    im_v = inverse_mean_squared_error(layer_tokens[i], layer_tokens[j])
+                    _acc("inv_mse", t0)
+                    mats["inv_mse"][i, j] = mats["inv_mse"][j, i] = im_v
+
                 if pbar is not None:
                     pbar.update(1)
     finally:
@@ -414,10 +437,10 @@ def paired_layer_similarity_matrices(
             mats["pwcca"][i, i] = pw_v
 
         t0 = time.perf_counter()
-        if "neg_mse" in mats:
-            nm_v = neg_mean_squared_error(x_layers[i], y_layers[i])
-            _acc("neg_mse", t0)
-            mats["neg_mse"][i, i] = nm_v
+        if "inv_mse" in mats:
+            im_v = inverse_mean_squared_error(x_layers[i], y_layers[i])
+            _acc("inv_mse", t0)
+            mats["inv_mse"][i, i] = im_v
 
     return {name: mat.cpu() for name, mat in mats.items()}
 

@@ -56,10 +56,10 @@ from analysis.prune_plan import (
     unit_index_to_kind_layer,
     unit_index_to_unit_id,
 )
-from analysis.prune_plan.recovery_plan import compose_training_unit_prune_plan
+from analysis.prune_plan.recovery_plan import compose_recovery_unit_prune_plan
 from analysis.schema.v3 import dataset_output_tag, parse_dataset_plugin_args
 from analysis.backbones.cache_replay.vggt_family import mask_from_depth
-from analysis.recover.train.model import build_skipped_layer_indices
+from analysis.recovery.train.model import build_skipped_layer_indices
 from analysis.redundancy.cache_layout import (
     _replay_layer_files,
     load_scene_metadata,
@@ -77,8 +77,8 @@ from analysis.eval.scannet_eval import (
 def _load_unit_prune_plan(
     path: Path,
     plan_name: str = "",
-    training_plan_root: Optional[Path] = None,
-    training_plan_name: str = "",
+    recovery_plan_root: Optional[Path] = None,
+    recovery_plan_name: str = "",
 ) -> UnitPrunePlan:
     if not path.exists():
         raise SystemExit(f"Missing --prune-plan-file: {path}")
@@ -93,17 +93,17 @@ def _load_unit_prune_plan(
         return load_named_prune_plan(path.parent, selector)
     if isinstance(raw, dict) and str(raw.get("schema_version", "")) == PRUNE_PLAN_BUNDLE_SCHEMA_VERSION:
         selector = str(plan_name or "").strip()
-        train_name = str(training_plan_name or "").strip()
-        if not selector or not train_name:
+        recovery_name = str(recovery_plan_name or "").strip()
+        if not selector or not recovery_name:
             raise SystemExit(
-                "--prune-plan-name and --training-plan-name are required when "
+                "--prune-plan-name and --recovery-plan-name are required when "
                 "--prune-plan-file is prune_plan_all.json"
             )
-        return compose_training_unit_prune_plan(
+        return compose_recovery_unit_prune_plan(
             prune_plan_root=path.parent,
-            training_plan_root=training_plan_root or path.parent,
+            recovery_plan_root=recovery_plan_root or path.parent,
             prune_selector=selector,
-            training_plan=train_name,
+            recovery_plan=recovery_name,
         )
     return UnitPrunePlan.load(path)
 
@@ -903,7 +903,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prune-plan-file",
         type=Path,
         required=True,
-        help="Unit prune plan JSON, or prune_plan_all.json with --prune-plan-name + --training-plan-name selectors.",
+        help="Unit prune plan JSON, or prune_plan_all.json with --prune-plan-name + --recovery-plan-name selectors.",
     )
     p.add_argument(
         "--prune-plan-name",
@@ -913,16 +913,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Prune selector for resolving split prune/training bundles (e.g. prune_span10).",
     )
     p.add_argument(
-        "--training-plan-root",
+        "--recovery-plan-root",
         type=Path,
         default=None,
-        help="Directory with training plan bundles. Defaults to --prune-plan-file parent.",
+        help="Directory with recovery plan bundles. Defaults to --prune-plan-file parent.",
     )
     p.add_argument(
-        "--training-plan-name",
+        "--recovery-plan-name",
         type=str,
         default="",
-        help="Training plan name (e.g. training_lora_l1_r32).",
+        help="Recovery plan name (e.g. recovery_lora_l1_r32).",
     )
     p.add_argument("--variant", type=str, default="unit_prune_plan", choices=("unit_prune_plan",))
     p.add_argument("--device", type=str, default="cuda")
@@ -1098,8 +1098,8 @@ def main() -> None:
     prune_plan = _load_unit_prune_plan(
         args.prune_plan_file,
         args.prune_plan_name,
-        args.training_plan_root,
-        args.training_plan_name,
+        args.recovery_plan_root,
+        args.recovery_plan_name,
     )
     training_method = str(
         prune_plan.extra.get("training_method", "lora_prune")
@@ -1189,8 +1189,8 @@ def main() -> None:
                 "resume_from": str(args.resume_from) if args.resume_from else None,
                 "prune_plan_file": str(args.prune_plan_file),
                 "prune_plan_name": str(args.prune_plan_name),
-                "training_plan_root": str(args.training_plan_root) if args.training_plan_root else None,
-                "training_plan_name": str(args.training_plan_name),
+                "recovery_plan_root": str(args.recovery_plan_root) if args.recovery_plan_root else None,
+                "recovery_plan_name": str(args.recovery_plan_name),
                 "device": str(device),
                 "dtype": str(args.dtype),
                 "training_config": {
@@ -1338,7 +1338,12 @@ def main() -> None:
     t0_train = time.perf_counter()
     remaining_epochs = max(0, int(args.epochs) - int(start_epoch))
     total_steps = _compute_total_steps(len(scenes), remaining_epochs, int(args.max_steps))
-    pbar = tqdm(total=total_steps if total_steps > 0 else None, desc="train", dynamic_ncols=True)
+    train_desc = (
+        "    train"
+        if os.environ.get("COMPACT_LOG", "").lower() in {"1", "true", "yes"}
+        else "train"
+    )
+    pbar = tqdm(total=total_steps if total_steps > 0 else None, desc=train_desc, dynamic_ncols=True)
     def _save_checkpoint(ckpt_path: Path, epoch_idx: int) -> None:
         torch.save(
             {
@@ -1666,7 +1671,7 @@ def main() -> None:
         "training_method": training_method,
         "prune_plan_file": str(args.prune_plan_file),
         "prune_plan_name": str(args.prune_plan_name),
-        "training_plan_name": str(args.training_plan_name),
+        "recovery_plan_name": str(args.recovery_plan_name),
         "variant": args.variant,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

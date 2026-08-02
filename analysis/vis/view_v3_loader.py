@@ -11,6 +11,7 @@ import torch
 
 from analysis.prune_plan import UnitPrunePlan
 from analysis.redundancy.similarity_v3 import (
+    UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS,
     list_redundancy_graph_regions,
     redundancy_dir_has_graphs,
     resolve_redundancy_graph_path,
@@ -23,7 +24,7 @@ from analysis.schema.v3 import (
     TrainRecordV3,
 )
 
-_V3_SIM_METRIC_CANDIDATES = ("cka", "cosine", "pwcca", "neg_mse")
+_V3_SIM_METRIC_CANDIDATES = ("cka", "cosine", "cca", "pwcca", "inv_mse")
 
 
 def _backbone_dir_has_v3_artifacts(backbone_dir: Path) -> bool:
@@ -123,6 +124,14 @@ def load_v3_bundle(experiment_root: Path, dataset: str) -> Dict[str, Any]:
             continue
         z = np.load(npz_path, allow_pickle=True)
         try:
+            semantics = str(
+                np.asarray(z.get("graph_semantics", np.array([""])), dtype=object).reshape(-1)[0]
+            )
+            if semantics != UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS:
+                raise ValueError(
+                    f"Redundancy graph {npz_path} uses graph_semantics={semantics!r}; "
+                    f"expected {UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS!r}"
+                )
             bundle.setdefault("redundancy_by_region", {})[region] = dict(z)
             if not unit_ids_npz:
                 unit_ids_npz = [str(u) for u in list(z.get("unit_ids", [])) if str(u)]
@@ -242,6 +251,14 @@ def _load_redundancy_npz_metric_packs(
     """Return unit ids, metrics, scene ids, per-scene packs, and mean packs for one region npz."""
     z = np.load(npz_path, allow_pickle=True)
     try:
+        semantics = str(
+            np.asarray(z.get("graph_semantics", np.array([""])), dtype=object).reshape(-1)[0]
+        )
+        if semantics != UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS:
+            raise ValueError(
+                f"Redundancy graph {npz_path} uses graph_semantics={semantics!r}; "
+                f"expected {UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS!r}"
+            )
         unit_ids = [str(u) for u in list(z.get("unit_ids", []))]
         n = len(unit_ids)
         if n <= 0:
@@ -421,7 +438,10 @@ def discover_v3_skip_reports(skip_eval_dir: Path) -> Dict[str, Any]:
         return reports
 
     upper_by_scene: Dict[str, Dict[str, float]] = {}
-    upper_path = skip_eval_dir.parent / "eval" / "upper" / "eval_record_v3.json"
+    if skip_eval_dir.name == "pruning" and skip_eval_dir.parent.name == "eval":
+        upper_path = skip_eval_dir.parent / "upper" / "eval_record_v3.json"
+    else:
+        upper_path = skip_eval_dir.parent / "eval" / "upper" / "eval_record_v3.json"
     if upper_path.is_file():
         try:
             upper_raw = json.loads(upper_path.read_text(encoding="utf-8"))

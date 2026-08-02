@@ -64,6 +64,7 @@ def manifest_scenes_for_training(manifest: CacheManifestV3) -> List[Dict[str, An
                 "scene_id": sid,
                 "dir": sid,
                 "layer_files": dict(row.get("layer_files", {})),
+                "auxiliary_files": dict(row.get("auxiliary_files", {})),
             }
         )
     return out

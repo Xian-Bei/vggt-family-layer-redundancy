@@ -80,3 +80,82 @@ def configure_triangle_axes(
     if bold_tick_labels:
         for label in ax.get_xticklabels() + ax.get_yticklabels():
             label.set_fontweight("bold")
+
+
+def draw_symmetric_heatmap_panel(
+    ax: Any,
+    values: np.ndarray,
+    *,
+    title: str = "",
+    colorbar_label: str = "",
+    cmap: str = "coolwarm_r",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    diagonal_only: bool = False,
+    index_name: str = "unit",
+    xlabel: Optional[str] = None,
+    ylabel: Optional[str] = None,
+    title_fontsize: float = 12,
+    tick_fontsize: float = 6,
+    colorbar_tick_fontsize: float = 7,
+) -> Tuple[Any, Any]:
+    """Draw an upper-stored matrix as the project-standard symmetric heatmap."""
+    upper = np.asarray(values, dtype=np.float64).copy()
+    if upper.ndim != 2 or upper.shape[0] != upper.shape[1]:
+        raise ValueError(
+            f"expected square upper-stored heatmap, got {upper.shape}"
+        )
+    n = int(upper.shape[0])
+    upper[np.tril_indices(n, k=-1)] = np.nan
+    displayed = upper.copy()
+    for row in range(n):
+        for col in range(row + 1, n):
+            displayed[col, row] = upper[row, col]
+    if bool(diagonal_only):
+        displayed[~np.eye(n, dtype=bool)] = np.nan
+
+    finite = displayed[np.isfinite(displayed)]
+    resolved_vmin = (
+        float(vmin)
+        if vmin is not None
+        else float(np.min(finite))
+        if finite.size
+        else 0.0
+    )
+    resolved_vmax = (
+        float(vmax)
+        if vmax is not None
+        else float(np.max(finite))
+        if finite.size
+        else 1.0
+    )
+    if not np.isfinite(resolved_vmax) or resolved_vmax <= resolved_vmin:
+        resolved_vmax = resolved_vmin + 1.0
+
+    image = imshow_upper_triangle(
+        ax,
+        np.ma.masked_invalid(displayed),
+        n,
+        cmap=str(cmap),
+        vmin=resolved_vmin,
+        vmax=resolved_vmax,
+    )
+    configure_triangle_axes(
+        ax,
+        n,
+        index_name=str(index_name),
+        xlabel=xlabel,
+        ylabel=ylabel,
+        tick_fontsize=float(tick_fontsize),
+    )
+    if str(title).strip():
+        ax.set_title(
+            str(title),
+            fontsize=float(title_fontsize),
+            fontweight="bold",
+        )
+    colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    if str(colorbar_label).strip():
+        colorbar.set_label(str(colorbar_label), fontsize=8)
+    colorbar.ax.tick_params(labelsize=float(colorbar_tick_fontsize))
+    return image, colorbar

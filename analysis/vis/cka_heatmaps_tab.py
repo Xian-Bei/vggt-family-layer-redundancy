@@ -101,13 +101,32 @@ def build_cka_heatmaps_tab(
     models: Sequence[str],
     token_regions: Sequence[str],
     refresh_cka_heatmaps_cb: Any,
+    tab_title: str = "CKA Heatmaps",
+    heading: str = "CKA Heatmaps",
+    empty_message: str = "No v3 redundancy outputs found for CKA heatmaps.",
+    tab_id: str | None = None,
+    default_token_region: str | None = None,
+    comparison_labels: Sequence[str] | None = None,
 ) -> Dict[str, Any]:
     source_dataset_names = [str(x) for x in datasets]
     source_model_names = [str(x) for x in models]
     dataset_names = sorted(source_dataset_names, key=_dataset_sort_key)
     model_names = sorted(source_model_names, key=_backbone_sort_key)
     token_region_names = sorted({str(x).strip().lower() for x in token_regions if str(x).strip()}, key=_token_region_sort_key)
-    default_token_region = token_region_names[0] if token_region_names else "special"
+    comparison_names = [
+        str(label).strip() for label in (comparison_labels or []) if str(label).strip()
+    ]
+    images_per_cell = len(comparison_names) if comparison_names else 1
+    requested_default = str(default_token_region or "").strip().lower()
+    selected_default_region = (
+        requested_default
+        if requested_default in token_region_names
+        else (
+            "mean"
+            if "mean" in token_region_names
+            else (token_region_names[0] if token_region_names else "special")
+        )
+    )
 
     def _refresh_sorted(
         token_region: str,
@@ -115,40 +134,48 @@ def build_cka_heatmaps_tab(
     ) -> Tuple[Any, ...]:
         raw = tuple(refresh_cka_heatmaps_cb(token_region, sim_cutoff_value))
         cells_per_model = len(source_dataset_names) + 1
-        total = len(source_model_names) * cells_per_model
+        total = len(source_model_names) * cells_per_model * images_per_cell
         if len(raw) < total + 1:
             return raw
         images = list(raw[:total])
         info = raw[total:]
         source_index = {
-            (model, dataset): model_i * cells_per_model + ds_i
+            (model, dataset): (
+                model_i * cells_per_model * images_per_cell
+                + ds_i * images_per_cell
+            )
             for model_i, model in enumerate(source_model_names)
             for ds_i, dataset in enumerate(source_dataset_names)
         }
         for model_i, model in enumerate(source_model_names):
-            source_index[(model, "__mean__")] = model_i * cells_per_model + len(source_dataset_names)
+            source_index[(model, "__mean__")] = (
+                model_i * cells_per_model * images_per_cell
+                + len(source_dataset_names) * images_per_cell
+            )
         sorted_images: List[Any] = []
         for model in model_names:
             for dataset in dataset_names:
                 key = (model, dataset)
                 if key not in source_index:
                     continue
-                sorted_images.append(images[source_index[key]])
+                start = source_index[key]
+                sorted_images.extend(images[start : start + images_per_cell])
             mean_key = (model, "__mean__")
             if mean_key in source_index:
-                sorted_images.append(images[source_index[mean_key]])
-        if len(sorted_images) != len(model_names) * cells_per_model:
+                start = source_index[mean_key]
+                sorted_images.extend(images[start : start + images_per_cell])
+        if len(sorted_images) != len(model_names) * cells_per_model * images_per_cell:
             return raw
         return tuple([*sorted_images, *info])
 
-    with gr.Tab("CKA Heatmaps") as tab_cka:
-        gr.Markdown("## CKA Heatmaps")
+    with gr.Tab(tab_title, id=tab_id) as tab_cka:
+        gr.Markdown(f"## {heading}")
         with gr.Row():
             with gr.Column(scale=1, min_width=220):
                 cka_token_region = gr.Radio(
                     label="Token",
                     choices=token_region_names or ["special"],
-                    value=default_token_region,
+                    value=selected_default_region,
                     interactive=bool(token_region_names),
                 )
                 cka_sim_cutoff_slider = gr.Slider(
@@ -177,23 +204,55 @@ def build_cka_heatmaps_tab(
                                 gr.Markdown(f"**{_backbone_display_name(model)}**")
                             for dataset in dataset_names:
                                 with gr.Column(scale=1, min_width=0, elem_classes=["cka-grid-cell"]):
+                                    if comparison_names:
+                                        with gr.Row(equal_height=True):
+                                            for comparison_label in comparison_names:
+                                                with gr.Column(scale=1, min_width=0):
+                                                    gr.Markdown(f"**{comparison_label}**")
+                                                    img = gr.Image(
+                                                        show_label=False,
+                                                        type="numpy",
+                                                        interactive=False,
+                                                        elem_classes=[
+                                                            "results-media",
+                                                            "cka-heatmap-image",
+                                                        ],
+                                                    )
+                                                cka_images.append(img)
+                                    else:
+                                        img = gr.Image(
+                                            show_label=False,
+                                            type="numpy",
+                                            interactive=False,
+                                            elem_classes=["results-media", "cka-heatmap-image"],
+                                        )
+                                        cka_images.append(img)
+                            with gr.Column(scale=1, min_width=0, elem_classes=["cka-grid-cell"]):
+                                if comparison_names:
+                                    with gr.Row(equal_height=True):
+                                        for comparison_label in comparison_names:
+                                            with gr.Column(scale=1, min_width=0):
+                                                gr.Markdown(f"**{comparison_label}**")
+                                                img = gr.Image(
+                                                    show_label=False,
+                                                    type="numpy",
+                                                    interactive=False,
+                                                    elem_classes=[
+                                                        "results-media",
+                                                        "cka-heatmap-image",
+                                                    ],
+                                                )
+                                            cka_images.append(img)
+                                else:
                                     img = gr.Image(
                                         show_label=False,
                                         type="numpy",
                                         interactive=False,
                                         elem_classes=["results-media", "cka-heatmap-image"],
                                     )
-                                cka_images.append(img)
-                            with gr.Column(scale=1, min_width=0, elem_classes=["cka-grid-cell"]):
-                                img = gr.Image(
-                                    show_label=False,
-                                    type="numpy",
-                                    interactive=False,
-                                    elem_classes=["results-media", "cka-heatmap-image"],
-                                )
-                            cka_images.append(img)
+                                    cka_images.append(img)
                 else:
-                    gr.Markdown("No v3 redundancy outputs found for CKA heatmaps.")
+                    gr.Markdown(empty_message)
 
         cka_inputs = [cka_token_region, cka_sim_cutoff_slider]
         cka_outputs = [*cka_images, cka_info]
@@ -225,7 +284,7 @@ def build_cka_heatmaps_tab(
             _bind_refresh(cka_sim_cutoff_slider.release)
             _bind_refresh(tab_cka.select, with_trigger_mode=False)
         else:
-            cka_info.value = "No v3 redundancy outputs found for CKA heatmaps."
+            cka_info.value = empty_message
 
     return {
         "tab": tab_cka,

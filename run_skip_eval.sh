@@ -41,6 +41,14 @@ truthy() {
   [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
 }
 
+run_progress_command() {
+  if truthy "${COMPACT_LOG:-0}"; then
+    "$@" >/dev/null
+  else
+    "$@"
+  fi
+}
+
 run_skip_eval_dataset() {
   local dataset="$1"
   local data_root="$2"
@@ -71,8 +79,17 @@ run_skip_eval_dataset() {
     extra+=(--split "${split}")
   fi
 
-  echo "== skip_gt_eval dataset=${output_dataset} backbone=${backbone} max_span=${SKIP_GT_EVAL_MAX_SPAN} resume=${SKIP_GT_EVAL_RESUME} =="
-  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.redundancy.skip_gt_eval_v3 \
+  if truthy "${COMPACT_LOG:-0}"; then
+    local span_scope="1-${SKIP_GT_EVAL_MAX_SPAN}"
+    if [[ "${SKIP_GT_EVAL_MAX_SPAN}" == "0" ]]; then
+      span_scope="all"
+    fi
+    printf '\n  skip evaluation\n    model: %s\n    spans: %s\n    dataset: %s\n\n' \
+      "${backbone}" "${span_scope}" "${output_dataset}"
+  else
+    echo "== skip_gt_eval dataset=${output_dataset} backbone=${backbone} max_span=${SKIP_GT_EVAL_MAX_SPAN} resume=${SKIP_GT_EVAL_RESUME} =="
+  fi
+  run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.redundancy.skip_gt_eval_v3 \
     "${extra[@]}"
 }
 
@@ -108,7 +125,9 @@ run_datasets_for_backbone() {
   fi
 }
 
-echo "== skip_gt_eval v3 backbones=${BACKBONES} (n=${BB_N}) MAX_FRAMES=${MAX_FRAMES} MAX_SPAN=${SKIP_GT_EVAL_MAX_SPAN} =="
+if ! truthy "${COMPACT_LOG:-0}"; then
+  echo "== skip_gt_eval v3 backbones=${BACKBONES} (n=${BB_N}) MAX_FRAMES=${MAX_FRAMES} MAX_SPAN=${SKIP_GT_EVAL_MAX_SPAN} =="
+fi
 
 for bb in "${BB_LIST[@]}"; do
   bb="${bb//[[:space:]]/}"
@@ -116,5 +135,7 @@ for bb in "${BB_LIST[@]}"; do
   run_datasets_for_backbone "${bb}"
 done
 
-echo "== done =="
-experiment_output_hint "Skip GT eval"
+if ! truthy "${COMPACT_LOG:-0}"; then
+  echo "== done =="
+  experiment_output_hint "Skip GT eval"
+fi

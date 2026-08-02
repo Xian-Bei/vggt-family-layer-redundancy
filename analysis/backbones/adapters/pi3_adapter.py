@@ -19,7 +19,7 @@ from analysis.backbones.contracts import (
 )
 from analysis.backbones.registry import register
 from analysis.schema.v3 import LayerUnitSpec, PruneAction
-from analysis.recover.train.model import inject_lora_attn
+from analysis.recovery.train.model import inject_lora_attn
 
 
 def _pi3_root() -> Path:
@@ -627,6 +627,7 @@ class Pi3Adapter(BackboneAdapter):
         images: torch.Tensor,
     ) -> Optional[CacheForwardResult]:
         captures: Dict[str, torch.Tensor] = {}
+        initial_tokens: Optional[torch.Tensor] = None
         handles = []
 
         catalog = {u.unit_id: u for u in self.layer_unit_catalog(model)}
@@ -644,10 +645,23 @@ class Pi3Adapter(BackboneAdapter):
         if images.dim() == 4:
             images = images.unsqueeze(0)
         bsz, seq_len = int(images.shape[0]), int(images.shape[1])
+
+        def _capture_initial(_mod, args):
+            nonlocal initial_tokens
+            value = args[0] if args else None
+            while isinstance(value, (tuple, list)) and value:
+                value = value[0]
+            if isinstance(value, torch.Tensor):
+                initial_tokens = self._normalize_decoder_capture(
+                    "frame_0", value, bsz=bsz, seq_len=seq_len
+                ).detach().contiguous()
+
         for uid in want:
             idx = self._decoder_index(uid)
             if idx < len(model.decoder):
                 handles.append(model.decoder[idx].register_forward_hook(_make_hook(uid)))
+        if len(model.decoder) > 0:
+            handles.append(model.decoder[0].register_forward_pre_hook(_capture_initial))
 
         device = self._forward_device(model, images)
         restore_encoder_cpu = self._prepare_full_forward(model, device)
@@ -659,17 +673,22 @@ class Pi3Adapter(BackboneAdapter):
                 out = model(images)
         finally:
             self._restore_full_forward(model, restore_encoder_cpu)
-
-        for h in handles:
-            h.remove()
+            for h in handles:
+                h.remove()
 
         pred = self.prediction_bundle_from_raw(dict(out), images)
-        init_tokens = self.build_initial_tokens(model, images)
+        if initial_tokens is None:
+            raise RuntimeError("Pi3 forward did not expose the layer_-1 input to decoder[0]")
         meta = {
             "patch_start_idx": int(getattr(model, "patch_start_idx", 0)),
             "camera_token_count": 0,
         }
-        return CacheForwardResult(unit_map=captures, meta=meta, pred=pred, initial_tokens=init_tokens)
+        return CacheForwardResult(
+            unit_map=captures,
+            meta=meta,
+            pred=pred,
+            initial_tokens=initial_tokens,
+        )
 
     def apply_prune_plan(self, model: nn.Module, actions: Sequence[PruneAction]) -> nn.Module:
         for act in actions:

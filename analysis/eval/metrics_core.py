@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
+import warnings
 
 import numpy as np
 
 from analysis.schema.v3 import DepthEvalProfile, GeometryEvalProfile, UNIFIED_METRIC_KEYS
+
+_POINT_METRIC_KEYS = ("acc", "comp", "cd", "nc")
+
+
+def _nan_point_metrics() -> Dict[str, float]:
+    return {k: float("nan") for k in _POINT_METRIC_KEYS}
 
 
 def require_depth_stack_shapes(
@@ -134,6 +141,33 @@ def compute_point_metrics(
     use_icp: Optional[bool] = None,
 ) -> Dict[str, float]:
     """Acc, Comp, CD (=(acc+comp)/2), NC using shared geometry profile."""
+    try:
+        return _compute_point_metrics_impl(
+            pred_pts,
+            gt_pts,
+            profile,
+            pred_normals=pred_normals,
+            gt_normals=gt_normals,
+            use_icp=use_icp,
+        )
+    except Exception as exc:
+        warnings.warn(
+            f"Point metric computation failed; returning NaN point metrics: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _nan_point_metrics()
+
+
+def _compute_point_metrics_impl(
+    pred_pts: np.ndarray,
+    gt_pts: np.ndarray,
+    profile: GeometryEvalProfile,
+    pred_normals: Optional[np.ndarray] = None,
+    gt_normals: Optional[np.ndarray] = None,
+    *,
+    use_icp: Optional[bool] = None,
+) -> Dict[str, float]:
     import open3d as o3d
     from scipy.spatial import cKDTree as KDTree
 
@@ -142,7 +176,7 @@ def compute_point_metrics(
     pred = pred[np.isfinite(pred).all(axis=-1)]
     gt = gt[np.isfinite(gt).all(axis=-1)]
     if pred.shape[0] == 0 or gt.shape[0] == 0:
-        return {k: float("nan") for k in ("acc", "comp", "cd", "nc")}
+        return _nan_point_metrics()
 
     mp = int(profile.max_points)
     if pred.shape[0] > mp:

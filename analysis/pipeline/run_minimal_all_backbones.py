@@ -118,7 +118,7 @@ def run_backbone(
                     conda_env,
                     py,
                     "-m",
-                    "analysis.recover.train.train_prune_lora_v3",
+                    "analysis.recovery.train.train_prune_lora_v3",
                     "--experiment",
                     exp,
                     "--dataset",

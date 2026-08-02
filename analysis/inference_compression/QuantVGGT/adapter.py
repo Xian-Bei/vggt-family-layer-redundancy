@@ -15,7 +15,7 @@ from analysis.inference_compression.contracts import (
     InferenceCompressionConfig,
 )
 from analysis.inference_compression.lora import merge_lora_linears
-from analysis.recover.train.model import SkipIdentityBlock
+from analysis.recovery.train.model import SkipIdentityBlock
 
 _DTYPE_BITS = {"w4a4": (4, 4), "w6a6": (6, 6), "w8a8": (8, 8)}
 

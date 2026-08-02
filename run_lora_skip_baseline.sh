@@ -35,6 +35,18 @@ parse_backbones_list
 parse_dataset_list "${EVAL}" "EVAL" "${DATASET_KEYS[@]}"
 EVAL_LIST=("${PARSED_DATASETS[@]}")
 
+truthy() {
+  [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
+}
+
+run_progress_command() {
+  if truthy "${COMPACT_LOG:-0}"; then
+    "$@" >/dev/null
+  else
+    "$@"
+  fi
+}
+
 PRUNE_PLAN_NAME_LIST=()
 read -r -a _PRUNE_PLAN_NAME_RAW <<< "${PRUNE_PLAN_NAME//,/ }"
 for _prune_plan_name in "${_PRUNE_PLAN_NAME_RAW[@]}"; do
@@ -193,8 +205,14 @@ run_one_backbone() {
     extra+=(--no-eval-at-start)
   fi
 
-  echo "== ${OUTPUT_KIND} v3 datasets=${DATASETS_FOR_PY} backbone=${backbone} prune_plan_name=${prune_plan_name} recovery_plan_name=${recovery_plan_name} prune_plan_root=${plan_root} eval_at_start=${EVAL_AT_START} save_every_epoch=${SAVE_EVERY_EPOCH} =="
-  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.recover.train.train_prune_lora_v3 \
+  if truthy "${COMPACT_LOG:-0}"; then
+    printf '\n  recovery training\n    model: %s\n    span: %s\n    dataset: %s\n    method: %s\n\n' \
+      "${backbone}" "${prune_plan_name#prune_span}" "${DATASETS_FOR_PY}" \
+      "${recovery_plan_name#recovery_}"
+  else
+    echo "== ${OUTPUT_KIND} v3 datasets=${DATASETS_FOR_PY} backbone=${backbone} prune_plan_name=${prune_plan_name} recovery_plan_name=${recovery_plan_name} prune_plan_root=${plan_root} eval_at_start=${EVAL_AT_START} save_every_epoch=${SAVE_EVERY_EPOCH} =="
+  fi
+  run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.recovery.train.train_prune_lora_v3 \
     --experiment "${backbone}" \
     --dataset "${DATASETS_FOR_PY}" \
     --backbone "${backbone}" \
@@ -210,7 +228,9 @@ run_one_backbone() {
     "${extra[@]}"
 }
 
-echo "== ${OUTPUT_KIND} v3 backbones=${BACKBONES} (n=${BB_N}) =="
+if ! truthy "${COMPACT_LOG:-0}"; then
+  echo "== ${OUTPUT_KIND} v3 backbones=${BACKBONES} (n=${BB_N}) =="
+fi
 
 for bb in "${BB_LIST[@]}"; do
   bb="${bb//[[:space:]]/}"
@@ -222,9 +242,11 @@ for bb in "${BB_LIST[@]}"; do
   done
 done
 
-echo "== done =="
-if [[ "${OUTPUT_KIND}" == "recover" ]]; then
-  experiment_output_hint "Recover"
-else
-  experiment_output_hint "Train"
+if ! truthy "${COMPACT_LOG:-0}"; then
+  echo "== done =="
+  if [[ "${OUTPUT_KIND}" == "recovery" ]]; then
+    experiment_output_hint "Recover"
+  else
+    experiment_output_hint "Train"
+  fi
 fi

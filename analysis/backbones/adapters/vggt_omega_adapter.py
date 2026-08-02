@@ -23,7 +23,7 @@ from analysis.backbones.contracts import (
 )
 from analysis.backbones.registry import register
 from analysis.schema.v3 import LayerUnitSpec, PruneAction
-from analysis.recover.train.model import inject_lora_attn
+from analysis.recovery.train.model import inject_lora_attn
 
 
 def _repo_root() -> Path:
@@ -599,6 +599,23 @@ class VGGTOmegaAdapter(BackboneAdapter):
 
         agg = model.aggregator
         depth = len(agg.frame_blocks)
+        bsz, seq_len = int(x.shape[0]), int(x.shape[1])
+        initial_tokens: Optional[torch.Tensor] = None
+
+        def _capture_initial(_mod, args):
+            nonlocal initial_tokens
+            value = args[0] if args else None
+            while isinstance(value, (tuple, list)) and value:
+                value = value[0]
+            if isinstance(value, torch.Tensor):
+                initial_tokens = self.normalize_unit_activation(
+                    "frame_0",
+                    value,
+                    batch_size=bsz,
+                    num_frames=seq_len,
+                ).detach().contiguous()
+
+        initial_handle = agg.frame_blocks[0].register_forward_pre_hook(_capture_initial)
         prev_cached = set(getattr(agg, "cached_layer_indices", set()))
         try:
             agg.cached_layer_indices = set(range(depth))
@@ -607,6 +624,7 @@ class VGGTOmegaAdapter(BackboneAdapter):
                 tokens_list, patch_start = agg(x)
         finally:
             agg.cached_layer_indices = prev_cached
+            initial_handle.remove()
 
         out: Dict[str, torch.Tensor] = {}
         concat_list: List[torch.Tensor] = []
@@ -660,14 +678,14 @@ class VGGTOmegaAdapter(BackboneAdapter):
             "camera_token_count": 1,
             "aggregated_concat": concat_list,
         }
-        # Reuse first cached concat frame half as layer_-1 seed to avoid a second
-        # patch-embed forward (which can spike GPU memory on large scenes).
-        init_tokens = out.get("frame_0")
-        if isinstance(init_tokens, torch.Tensor):
-            init_tokens = init_tokens.detach().contiguous()
-        else:
-            init_tokens = None
-        return CacheForwardResult(unit_map=out, meta=meta, pred=pred, initial_tokens=init_tokens)
+        if initial_tokens is None:
+            raise RuntimeError("VGGT-Omega forward did not expose the layer_-1 input to frame_0")
+        return CacheForwardResult(
+            unit_map=out,
+            meta=meta,
+            pred=pred,
+            initial_tokens=initial_tokens,
+        )
 
     def apply_prune_plan(self, model: nn.Module, actions: Sequence[PruneAction]) -> nn.Module:
         for act in actions:

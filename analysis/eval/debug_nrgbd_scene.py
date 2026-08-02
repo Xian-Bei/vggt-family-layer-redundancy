@@ -158,7 +158,7 @@ def main() -> None:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(dev)
 
-    from analysis.recover.train.model import build_model  # noqa: E402
+    from analysis.recovery.train.model import build_model  # noqa: E402
 
     model = build_model(
         model_name="Baseline",

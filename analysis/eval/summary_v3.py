@@ -9,13 +9,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from analysis.prune_plan import (
-    bundle_interval_records,
+    bundle_plan_records,
     bundle_strategy_records,
     is_interval_selector,
     is_plan_group_name,
     load_prune_plan_bundle,
     plan_group_from_name,
     prune_plan_bundle_path,
+)
+from analysis.prune_plan.eval_plots import (
+    RECOVERY_METHOD_ORDER,
+    add_recovery_comparison_strategies,
+    collect_pruning_eval_payload,
+    collect_recovery_eval_payload,
+    write_recovery_eval_plots,
 )
 from analysis.schema.v3 import EvalRecordV3, OUTPUT_ROOT_DEFAULT, UNIFIED_METRIC_KEYS
 
@@ -62,7 +69,10 @@ _PLAN_GROUP_SORT_RE = re.compile(r"^(?:prune_span(\d+)|plan_budget(\d+)|plan_t(\
 _PRUNE_SPAN_RE = re.compile(r"^prune_span(\d+)$")
 _PRUNE_SPAN_PREFIX_RE = re.compile(r"^(prune_span\d+)(?:[_/].*)?$")
 _INTERVAL_LABEL_RE = re.compile(r"^i(?P<i>\d+)_j(?P<j>\d+)$")
-_RECOVER_LABEL_RE = re.compile(r"^(prune_span\d+)_(recovery_.+)$")
+_GENERIC_DROP_LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*_k(?P<k>\d+)$")
+_RECOVERY_LABEL_RE = re.compile(
+    r"^(?P<prune>prune_span\d+|i\d+_j\d+|[A-Za-z][A-Za-z0-9_]*_k\d+)_(?P<recovery>recovery_.+)$"
+)
 
 
 def _lower_label_sort_key(label: str) -> Tuple[int, int, int, str]:
@@ -79,14 +89,20 @@ def _lower_label_sort_key(label: str) -> Tuple[int, int, int, str]:
     if interval_span is not None:
         i, j, span_value = interval_span
         return (0, int(span_value), 0, f"{i:04d}_{j:04d}_{label}")
+    generic_drop = _generic_drop_from_label(label)
+    if generic_drop is not None:
+        return (0, int(generic_drop), 1, label)
     return (2, 0, 0, label)
 
 
 def _label_base(label: str) -> str:
     base = str(label or "").split("+", 1)[0]
+    recovery_match = _RECOVERY_LABEL_RE.match(base)
+    if recovery_match:
+        return recovery_match.group("prune")
     if base.startswith("model/"):
         base = base.split("/", 1)[1]
-    if base.startswith("recover/"):
+    if base.startswith("recovery/"):
         parts = base.split("/")
         base = parts[2] if len(parts) >= 3 else base
     if "/" in base:
@@ -111,9 +127,18 @@ def _interval_span_from_label(label: str) -> Optional[Tuple[int, int, int]]:
     return i, j, j - i + 1
 
 
+def _generic_drop_from_label(label: str) -> Optional[int]:
+    m = _GENERIC_DROP_LABEL_RE.match(_label_base(label))
+    return int(m.group("k")) if m else None
+
+
 def _plain_lower_span_label(label: str) -> bool:
     base = str(label or "").split("+", 1)[0]
-    return bool(_PLAN_GROUP_SORT_RE.match(base) or _INTERVAL_LABEL_RE.match(base))
+    return bool(
+        _PLAN_GROUP_SORT_RE.match(base)
+        or _INTERVAL_LABEL_RE.match(base)
+        or _GENERIC_DROP_LABEL_RE.match(base)
+    )
 
 
 def _drop_count_from_lower_label(label: str) -> Optional[int]:
@@ -121,18 +146,20 @@ def _drop_count_from_lower_label(label: str) -> Optional[int]:
     if span is not None:
         return int(span)
     interval = _interval_span_from_label(label)
-    return int(interval[2]) if interval is not None else None
+    if interval is not None:
+        return int(interval[2])
+    return _generic_drop_from_label(label)
 
 
-def _recover_label_parts(label: str) -> Optional[Tuple[str, str]]:
+def _recovery_label_parts(label: str) -> Optional[Tuple[str, str]]:
     base = str(label or "").split("+", 1)[0]
-    m = _RECOVER_LABEL_RE.match(base)
+    m = _RECOVERY_LABEL_RE.match(base)
     if not m:
         return None
-    return m.group(1), m.group(2)
+    return m.group("prune"), m.group("recovery")
 
 
-def _recover_label(prune_plan: str, recovery_plan: str) -> str:
+def _recovery_label(prune_plan: str, recovery_plan: str) -> str:
     prune = str(prune_plan or "").strip()
     recovery = str(recovery_plan or "").strip()
     return f"{prune}_{recovery}" if prune and recovery else prune or recovery
@@ -201,7 +228,7 @@ def _read_aggregator_param_counts_from_bundle(
         print("[warn] Invalid prune plan param_accounting.total_params; Block params omitted.", flush=True)
         return None, {}
 
-    intervals = bundle_interval_records(bundle)
+    plan_records = bundle_plan_records(bundle)
     spans = bundle.get("spans", {})
     if not isinstance(spans, dict):
         spans = {}
@@ -210,14 +237,14 @@ def _read_aggregator_param_counts_from_bundle(
     for label in labels:
         raw: Any = None
         base = _label_base(label)
-        if is_interval_selector(base):
-            raw = intervals.get(base)
+        if is_interval_selector(base) or _GENERIC_DROP_LABEL_RE.match(base):
+            raw = plan_records.get(base)
         if raw is None:
             span = _span_from_label(label)
             if span is not None:
                 raw = spans.get(str(int(span)))
         if not isinstance(raw, dict):
-            print(f"[warn] Missing interval/span in prune plan bundle for label {label!r}.", flush=True)
+            print(f"[warn] Missing plan record in prune plan bundle for label {label!r}.", flush=True)
             continue
         value: Any = raw.get("aggregator_params")
         if value is None:
@@ -296,13 +323,17 @@ def _record_label(rec: EvalRecordV3, rel_run_dir: Path) -> tuple[str, str, str]:
     extra = rec.extra if isinstance(rec.extra, dict) else {}
     parts = rel_run_dir.parts
     compression = _compression_tag(rec)
-    if parts and parts[0] == "recover":
+    if parts and parts[0] == "recovery":
         recovery_plan = parts[1] if len(parts) >= 2 else ""
         raw_plan = parts[2] if len(parts) >= 3 else ""
-        base = _recover_label(raw_plan, recovery_plan)
-        return "recover", f"{base}+{compression}" if compression else base, raw_plan
+        base = _recovery_label(raw_plan, recovery_plan)
+        return "recovery", f"{base}+{compression}" if compression else base, raw_plan
 
     mode = str(extra.get("eval_mode", "")).strip().lower()
+    if parts and parts[0] == "pruning" and mode == "lower":
+        raw_plan = parts[1] if len(parts) >= 2 else "lower"
+        base = _normalize_lower_label(raw_plan)
+        return mode, f"{base}+{compression}" if compression else base, raw_plan
     if mode not in ("upper", "lower", "model"):
         mode = str(rec.model_name).strip().lower().split("_", 1)[0]
     if mode not in ("upper", "lower", "model"):
@@ -315,7 +346,7 @@ def _record_label(rec: EvalRecordV3, rel_run_dir: Path) -> tuple[str, str, str]:
             base = _normalize_lower_label(raw_plan)
         else:
             recovery_plan = parts[2] if len(parts) >= 3 else ""
-            base = _recover_label(raw_plan, recovery_plan) if recovery_plan else _recover_label(raw_plan, "model")
+            base = _recovery_label(raw_plan, recovery_plan) if recovery_plan else _recovery_label(raw_plan, "model")
     else:
         base = "upper"
     return mode, f"{base}+{compression}" if compression else base, raw_plan
@@ -335,8 +366,14 @@ def _collect_by_dataset(root: Path) -> Dict[str, Dict[str, EvalRecordV3]]:
         ds_name = dataset_dir.name
         for rec_path in eval_root.rglob("eval_record_v3.json"):
             run_dir = rec_path.parent
-            rec = EvalRecordV3.load(rec_path)
             rel_run_dir = run_dir.relative_to(eval_root)
+            if (
+                rel_run_dir.parts
+                and rel_run_dir.parts[0] == "recovery"
+                and (len(rel_run_dir.parts) < 2 or rel_run_dir.parts[1] not in RECOVERY_METHOD_ORDER)
+            ):
+                continue
+            rec = EvalRecordV3.load(rec_path)
             mode, label, raw_plan = _record_label(rec, rel_run_dir)
             score = _mode_candidate_score(mode, rel_run_dir, raw_plan)
             best = picked_scores.setdefault(ds_name, {}).get(label, -1)
@@ -355,10 +392,10 @@ def _filter_to_current_prune_spans(
         if not prune_plan_bundle_path(prune_plan_root).is_file():
             return grouped
         bundle = load_prune_plan_bundle(prune_plan_root)
-        valid_intervals = set(bundle_interval_records(bundle).keys())
+        valid_selectors = set(bundle_plan_records(bundle).keys())
     except Exception:
         return grouped
-    if not valid_intervals:
+    if not valid_selectors:
         return grouped
 
     filtered: Dict[str, Dict[str, EvalRecordV3]] = {}
@@ -366,7 +403,7 @@ def _filter_to_current_prune_spans(
         keep: Dict[str, EvalRecordV3] = {}
         for label, rec in modes.items():
             base = _label_base(label)
-            if label == "upper" or label.startswith("upper+") or base in valid_intervals:
+            if label == "upper" or label.startswith("upper+") or base in valid_selectors:
                 keep[label] = rec
         if keep:
             filtered[ds_name] = keep
@@ -436,7 +473,7 @@ def _strategy_items_for_dataset(
     except Exception as exc:
         print(f"[warn] Could not load prune strategy bundle for plots: {exc}", flush=True)
         return {}
-    intervals = bundle_interval_records(bundle)
+    plan_records = bundle_plan_records(bundle)
     strategies = bundle_strategy_records(bundle)
     out: Dict[str, List[Tuple[int, str, str, EvalRecordV3]]] = {}
     for strategy_key, strategy_record in strategies.items():
@@ -452,9 +489,9 @@ def _strategy_items_for_dataset(
             if not str(drop_key).isdigit():
                 continue
             interval_label = str(interval_key)
-            if interval_label not in intervals:
+            if interval_label not in plan_records:
                 print(
-                    f"[warn] Strategy {strategy_key!r} references missing interval "
+                    f"[warn] Strategy {strategy_key!r} references missing plan selector "
                     f"{interval_label!r}; skipping point.",
                     flush=True,
                 )
@@ -557,17 +594,17 @@ def _write_strategy_metric_curve_grid(
     return out_path
 
 
-def _write_recover_strategy_comparison_grid(
+def _write_recovery_strategy_comparison_grid(
     *,
     root: Path,
     ds_name: str,
     upper_rec: EvalRecordV3,
     lower_span_items: List[Tuple[int, str, EvalRecordV3]],
-    recover_items_by_plan: Dict[str, List[Tuple[int, str, EvalRecordV3]]],
+    recovery_items_by_plan: Dict[str, List[Tuple[int, str, EvalRecordV3]]],
 ) -> Optional[Path]:
     import matplotlib.pyplot as plt  # type: ignore
 
-    if not recover_items_by_plan and not lower_span_items:
+    if not recovery_items_by_plan and not lower_span_items:
         return None
 
     metric_grid: List[List[Optional[str]]] = [
@@ -584,8 +621,8 @@ def _write_recover_strategy_comparison_grid(
         }
         | {
             int(span)
-            for recover_items in recover_items_by_plan.values()
-            for span, _label, _rec in recover_items
+            for recovery_items in recovery_items_by_plan.values()
+            for span, _label, _rec in recovery_items
         }
     )
     if not all_spans:
@@ -638,15 +675,15 @@ def _write_recover_strategy_comparison_grid(
                     label="lower",
                 )
 
-            for recovery_plan in sorted(recover_items_by_plan.keys()):
-                recover_items = sorted(recover_items_by_plan[recovery_plan], key=lambda item: item[0])
+            for recovery_plan in sorted(recovery_items_by_plan.keys()):
+                recovery_items = sorted(recovery_items_by_plan[recovery_plan], key=lambda item: item[0])
                 xs: List[int] = []
                 ys: List[float] = []
                 plan_has_values = False
                 if math.isfinite(upper_value):
                     xs.append(0)
                     ys.append(upper_value)
-                for span, _label, rec in recover_items:
+                for span, _label, rec in recovery_items:
                     value = float(rec.average.get(key, float("nan")))
                     if not math.isfinite(value):
                         continue
@@ -676,15 +713,15 @@ def _write_recover_strategy_comparison_grid(
             ax.legend(loc="best", fontsize=8)
 
     fig.suptitle(
-        f"{root.name} / {ds_name}: lower and recover strategies vs upper",
+        f"{root.name} / {ds_name}: lower and recovery strategies vs upper",
         fontsize=14,
         fontweight="bold",
     )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     safe_ds = str(ds_name).replace("/", "_").replace(" ", "_")
-    out_dir = root / ds_name / "eval" / "recover"
+    out_dir = root / ds_name / "eval" / "recovery"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{safe_ds}_recover_strategies_by_span.png"
+    out_path = out_dir / f"{safe_ds}_recovery_strategies_by_span.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return out_path
@@ -743,36 +780,36 @@ def _plot_metric_curves_by_span(
             if out_path is not None:
                 written.append(out_path)
 
-        recover_items_by_plan: Dict[str, List[Tuple[int, str, EvalRecordV3]]] = {}
+        recovery_items_by_plan: Dict[str, List[Tuple[int, str, EvalRecordV3]]] = {}
         for label, rec in modes.items():
-            parts = _recover_label_parts(label)
+            parts = _recovery_label_parts(label)
             if parts is None:
                 continue
             _prune_plan, recovery_plan = parts
             span = _span_from_label(label)
             if span is None:
                 continue
-            recover_items_by_plan.setdefault(recovery_plan, []).append((int(span), label, rec))
-        for recovery_plan in sorted(recover_items_by_plan.keys()):
-            recover_items = sorted(recover_items_by_plan[recovery_plan], key=lambda item: item[0])
-            if not recover_items:
+            recovery_items_by_plan.setdefault(recovery_plan, []).append((int(span), label, rec))
+        for recovery_plan in sorted(recovery_items_by_plan.keys()):
+            recovery_items = sorted(recovery_items_by_plan[recovery_plan], key=lambda item: item[0])
+            if not recovery_items:
                 continue
             out_path = _write_metric_curve_grid(
                 root=root,
                 ds_name=ds_name,
                 upper_rec=upper_rec,
-                span_items=recover_items,
-                out_dir=root / ds_name / "eval" / "recover" / recovery_plan,
+                span_items=recovery_items,
+                out_dir=root / ds_name / "eval" / "recovery" / recovery_plan,
                 title_suffix=f" ({recovery_plan})",
             )
             if out_path is not None:
                 written.append(out_path)
-        out_path = _write_recover_strategy_comparison_grid(
+        out_path = _write_recovery_strategy_comparison_grid(
             root=root,
             ds_name=ds_name,
             upper_rec=upper_rec,
             lower_span_items=span_items,
-            recover_items_by_plan=recover_items_by_plan,
+            recovery_items_by_plan=recovery_items_by_plan,
         )
         if out_path is not None:
             written.append(out_path)
@@ -895,8 +932,29 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content, encoding="utf-8")
     print(f"Wrote {out}")
-    for plot_path in _plot_metric_curves_by_span(root, grouped, Path(args.prune_plan_root)):
-        print(f"Wrote {plot_path}", flush=True)
+    pruning_payload = None
+    try:
+        pruning_payload = collect_pruning_eval_payload(
+            experiment_root=root,
+            prune_plan_root=Path(args.prune_plan_root),
+        )
+    except Exception as exc:
+        print(f"[warn] Could not collect pruning comparisons: {exc}", flush=True)
+    try:
+        recovery_payload = collect_recovery_eval_payload(experiment_root=root)
+        if pruning_payload is not None:
+            recovery_payload = add_recovery_comparison_strategies(
+                recovery_payload,
+                pruning_payload,
+            )
+        for plot_path in write_recovery_eval_plots(
+            experiment_root=root,
+            backbone=str(args.experiment),
+            payload=recovery_payload,
+        ):
+            print(f"Wrote {plot_path}", flush=True)
+    except Exception as exc:
+        print(f"[warn] Could not write recovery plots: {exc}", flush=True)
 
 
 if __name__ == "__main__":

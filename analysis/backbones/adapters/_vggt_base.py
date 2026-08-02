@@ -11,7 +11,7 @@ import torch.nn as nn
 
 from analysis.prune_plan import UnitPrunePlan, prune_actions_from_plan
 from analysis.schema.v3 import LayerUnitSpec, PruneAction
-from analysis.recover.train.model import (
+from analysis.recovery.train.model import (
     SkipIdentityBlock,
     inject_lora_attn,
 )
@@ -268,6 +268,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         """Capture VGGT frame/global blocks with forward hooks."""
         if images.dim() == 4:
             images = images.unsqueeze(0)
+        bsz, seq_len = int(images.shape[0]), int(images.shape[1])
         catalog = {u.unit_id: u for u in self.layer_unit_catalog(model)}
         want = unit_ids or set(catalog.keys())
         captures: Dict[str, torch.Tensor] = {}
@@ -276,8 +277,12 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         def _make_hook(uid: str):
             def hook(_mod, _inp, out):
                 t = out[0] if isinstance(out, tuple) else out
-                if t.dim() == 3:
-                    t = t.unsqueeze(0)
+                t = self.normalize_unit_activation(
+                    uid,
+                    t,
+                    batch_size=bsz,
+                    num_frames=seq_len,
+                )
                 captures[uid] = t.detach()
                 if layer_callback is not None:
                     layer_callback(uid, t.detach())
@@ -438,7 +443,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         if recovery_weights is not None and not (isinstance(recovery_specs, list) and recovery_specs):
             raise ValueError("Compact recovery checkpoint is missing recovery_specs")
         if isinstance(recovery_specs, list) and recovery_specs:
-            from analysis.recover.operators import apply_recovery_weights, install_recovery_modules
+            from analysis.recovery.operators import apply_recovery_weights, install_recovery_modules
 
             device = next(model.parameters()).device
             install_recovery_modules(model, self, recovery_specs, device=device)
@@ -661,16 +666,35 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
             return None
         if images.dim() == 4:
             images = images.unsqueeze(0)
+        bsz, seq_len = int(images.shape[0]), int(images.shape[1])
         catalog = {u.unit_id: u for u in self.layer_unit_catalog(model)}
         want = set(catalog.keys())
         captures: Dict[str, torch.Tensor] = {}
+        initial_tokens: Optional[torch.Tensor] = None
         handles = []
+
+        def _capture_initial(_mod, args):
+            nonlocal initial_tokens
+            value = args[0] if args else None
+            while isinstance(value, (tuple, list)) and value:
+                value = value[0]
+            if isinstance(value, torch.Tensor):
+                initial_tokens = self.normalize_unit_activation(
+                    "frame_0",
+                    value,
+                    batch_size=bsz,
+                    num_frames=seq_len,
+                ).detach().contiguous()
 
         def _make_hook(uid: str):
             def hook(_mod, _inp, out):
                 t = out[0] if isinstance(out, tuple) else out
-                if t.dim() == 3:
-                    t = t.unsqueeze(0)
+                t = self.normalize_unit_activation(
+                    uid,
+                    t,
+                    batch_size=bsz,
+                    num_frames=seq_len,
+                )
                 captures[uid] = t.detach()
 
             return hook
@@ -679,6 +703,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
             if uid not in catalog:
                 continue
             handles.append(self._block_for_unit(model, uid).register_forward_hook(_make_hook(uid)))
+        handles.append(self._block_for_unit(model, "frame_0").register_forward_pre_hook(_capture_initial))
 
         try:
             aggregated_tokens_list, patch_start_idx = model.aggregator(images)
@@ -698,7 +723,14 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
             "aggregated_concat": concat_list,
         }
         pred = self._prediction_bundle_from_preds(preds, images)
-        return CacheForwardResult(unit_map=unit_map, meta=meta, pred=pred, initial_tokens=None)
+        if initial_tokens is None:
+            raise RuntimeError("VGGT forward did not expose the layer_-1 input to frame_0")
+        return CacheForwardResult(
+            unit_map=unit_map,
+            meta=meta,
+            pred=pred,
+            initial_tokens=initial_tokens,
+        )
 
     def apply_prune_plan(self, model: nn.Module, actions: Sequence[PruneAction]) -> nn.Module:
         for act in actions:

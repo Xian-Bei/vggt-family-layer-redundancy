@@ -20,7 +20,7 @@ from analysis.backbones.cache_replay.common import ReplayResult, is_skipped, spl
 from analysis.backbones.contracts import PredictionLossWeights, TrainingHyperparams
 from analysis.backbones.registry import get_backbone
 from analysis.schema.v3 import PruneAction
-from analysis.recover.train.model import (
+from analysis.recovery.train.model import (
     count_unique_params,
 )
 VGGT_OFFICIAL_CAMERA_WEIGHT = 5.0

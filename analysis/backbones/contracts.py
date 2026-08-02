@@ -103,8 +103,8 @@ class TrainFromCacheArgs:
     root_nuscenes: Path = Path("data/nuscenes")
     root_waymo: Path = Path("data/waymo")
     prune_plan_name: str = ""
-    training_plan_root: Path = Path("")
-    training_plan_name: str = ""
+    recovery_plan_root: Path = Path("")
+    recovery_plan_name: str = ""
     cache_dirs: Sequence[Path] = field(default_factory=tuple)
 
 
@@ -233,6 +233,49 @@ class BackboneAdapter(ABC):
     def block_for_unit(self, model: nn.Module, unit_id: str) -> nn.Module:
         """Return the concrete module for a public unit id."""
         raise NotImplementedError(f"{self.name} does not map unit ids to blocks")
+
+    def normalize_unit_activation(
+        self,
+        unit_id: str,
+        tensor: torch.Tensor,
+        *,
+        batch_size: int,
+        num_frames: int,
+    ) -> torch.Tensor:
+        """Normalize a block-internal activation to public ``[B,S,P,C]`` layout."""
+        kind, _ = str(unit_id).split("_", 1)
+        t = tensor
+        if t.dim() == 4:
+            if int(t.shape[0]) == int(batch_size) and int(t.shape[1]) == int(num_frames):
+                return t.contiguous()
+            if (
+                kind == "global"
+                and int(t.shape[0]) == int(batch_size)
+                and int(t.shape[1]) == 1
+                and int(t.shape[2]) % int(num_frames) == 0
+            ):
+                return t.reshape(
+                    batch_size,
+                    num_frames,
+                    int(t.shape[2]) // int(num_frames),
+                    int(t.shape[3]),
+                ).contiguous()
+            if int(t.shape[0]) == 1 and int(t.shape[1]) == int(batch_size) * int(num_frames):
+                return t.reshape(batch_size, num_frames, int(t.shape[2]), int(t.shape[3])).contiguous()
+        if t.dim() == 3 and kind == "frame" and int(t.shape[0]) == int(batch_size) * int(num_frames):
+            return t.reshape(batch_size, num_frames, int(t.shape[1]), int(t.shape[2])).contiguous()
+        if t.dim() == 3 and kind == "global" and int(t.shape[0]) == int(batch_size):
+            if int(t.shape[1]) % int(num_frames) == 0:
+                return t.reshape(
+                    batch_size,
+                    num_frames,
+                    int(t.shape[1]) // int(num_frames),
+                    int(t.shape[2]),
+                ).contiguous()
+        raise ValueError(
+            f"Cannot normalize {self.name} {unit_id} activation {tuple(t.shape)} "
+            f"to [B={batch_size},S={num_frames},P,C]"
+        )
 
     def apply_unit_operation(
         self,
@@ -441,7 +484,7 @@ class BackboneAdapter(ABC):
         if recovery_weights is not None and not (isinstance(recovery_specs, list) and recovery_specs):
             raise ValueError("Compact recovery checkpoint is missing recovery_specs")
         if isinstance(recovery_specs, list) and recovery_specs:
-            from analysis.recover.operators import apply_recovery_weights, install_recovery_modules
+            from analysis.recovery.operators import apply_recovery_weights, install_recovery_modules
 
             device = next(model.parameters()).device
             install_recovery_modules(model, self, recovery_specs, device=device)

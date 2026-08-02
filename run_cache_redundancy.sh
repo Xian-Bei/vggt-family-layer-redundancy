@@ -20,7 +20,7 @@ MAX_SCENES="${MAX_SCENES:-0}"
 CONDA_ENV="${CONDA_ENV:-vggt}"
 DEVICE="${DEVICE:-cuda}"
 MAX_TOKENS="${MAX_TOKENS:-0}"
-METRICS="${METRICS:-cka,cosine,neg_mse}"
+METRICS="${METRICS:-cka,cosine,angular,inv_mse}"
 MAX_SPAN="${MAX_SPAN:-0}"
 SIM_TOKEN_REGIONS="${SIM_TOKEN_REGIONS:-special,patch,all}"
 REDUNDANCY_SEED="${REDUNDANCY_SEED:-0}"
@@ -31,6 +31,14 @@ parse_backbones_list
 
 truthy() {
   [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
+}
+
+run_progress_command() {
+  if truthy "${COMPACT_LOG:-0}"; then
+    "$@" >/dev/null
+  else
+    "$@"
+  fi
 }
 
 parse_dataset_list "${RUN}" "RUN" "${DATASET_KEYS[@]}"
@@ -51,7 +59,6 @@ run_one_dataset() {
   local save_cache="$4"
   local split="${5:-}"
   local output_dataset="${6:-}"
-
   set_backend_pythonpath "${backbone}"
   local save_flag=()
   if truthy "${save_cache}"; then
@@ -84,8 +91,22 @@ run_one_dataset() {
     output_dataset_args=(--output-dataset "${output_dataset}")
   fi
 
-  echo "== cache v3 dataset=${dataset}${split:+_${split}}${output_dataset:+ -> ${output_dataset}} backbone=${backbone} save_cache=${save_cache} skip_redundancy=${SKIP_REDUNDANCY} prune_plan_root=${PRUNE_PLAN_ROOT:-<off>} prune_plan_name=${PRUNE_PLAN_NAME:-<auto>} recovery_plan_name=${RECOVERY_PLAN_NAME:-<auto>} =="
-  conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.redundancy.cache_redundancy_v3 \
+  if truthy "${COMPACT_LOG:-0}"; then
+    if truthy "${SKIP_REDUNDANCY}"; then
+      local compact_spans="${PRUNE_PLAN_NAME//prune_span/}"
+      local compact_methods="${RECOVERY_PLAN_NAME//recovery_/}"
+      printf '\n  cache\n    model: %s\n    spans: %s\n    recovery methods: %s\n    dataset: %s\n\n' \
+        "${backbone}" "${compact_spans:-all}" "${compact_methods:-all}" \
+        "${output_dataset:-${dataset}${split:+_${split}}}"
+    else
+      printf '\n  redundancy\n    model: %s\n    metrics: %s\n    token regions: %s\n    dataset: %s\n\n' \
+        "${backbone}" "${METRICS}" "${SIM_TOKEN_REGIONS}" \
+        "${output_dataset:-${dataset}${split:+_${split}}}"
+    fi
+  else
+    echo "== cache v3 dataset=${dataset}${split:+_${split}}${output_dataset:+ -> ${output_dataset}} backbone=${backbone} save_cache=${save_cache} skip_redundancy=${SKIP_REDUNDANCY} prune_plan_root=${PRUNE_PLAN_ROOT:-<off>} prune_plan_name=${PRUNE_PLAN_NAME:-<auto>} recovery_plan_name=${RECOVERY_PLAN_NAME:-<auto>} =="
+  fi
+  run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.redundancy.cache_redundancy_v3 \
     --experiment "${backbone}" \
     --dataset "${dataset}" \
     "${output_dataset_args[@]}" \
@@ -154,7 +175,9 @@ run_dataset_key() {
   esac
 }
 
-echo "== cache+redundancy v3 backbones=${BACKBONES} (n=${BB_N}) RUN=${RUN:-<none>} CACHE=${CACHE:-<none>} MAX_FRAMES=${MAX_FRAMES} =="
+if ! truthy "${COMPACT_LOG:-0}"; then
+  echo "== cache+redundancy v3 backbones=${BACKBONES} (n=${BB_N}) RUN=${RUN:-<none>} CACHE=${CACHE:-<none>} MAX_FRAMES=${MAX_FRAMES} =="
+fi
 
 for bb in "${BB_LIST[@]}"; do
   bb="${bb//[[:space:]]/}"
@@ -164,5 +187,7 @@ for bb in "${BB_LIST[@]}"; do
   done
 done
 
-echo "== done =="
-experiment_output_hint "Cache + redundancy"
+if ! truthy "${COMPACT_LOG:-0}"; then
+  echo "== done =="
+  experiment_output_hint "Cache + redundancy"
+fi

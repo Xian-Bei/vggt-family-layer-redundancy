@@ -42,6 +42,21 @@ class _Aggregator(nn.Module):
         self.patch_start_idx = 0
         self.rope = None
 
+    def forward(self, images: torch.Tensor):
+        batch_size, frames = int(images.shape[0]), int(images.shape[1])
+        patches, channels = 5, 4
+        tokens = torch.zeros(
+            (batch_size, frames, patches, channels),
+            device=images.device,
+        )
+        outputs = []
+        for frame_block, global_block in zip(self.frame_blocks, self.global_blocks):
+            frame = frame_block(tokens.reshape(batch_size * frames, patches, channels))
+            global_ = global_block(frame.reshape(batch_size, frames * patches, channels))
+            tokens = global_.reshape(batch_size, frames, patches, channels)
+            outputs.append(tokens)
+        return outputs, 2
+
 
 class _Model(nn.Module):
     def __init__(self) -> None:
@@ -76,6 +91,18 @@ class _TestAdapter(VGGTFamilyAdapterMixin):
 
 
 class IncrementalSkipReplayTest(unittest.TestCase):
+    def test_hook_normalizes_isolated_surviving_global_unit(self) -> None:
+        adapter = _TestAdapter()
+        model = _Model().eval()
+        images = torch.zeros((1, 30, 3, 4, 4))
+        unit_map, meta = adapter.extract_layer_units(
+            model,
+            images,
+            unit_ids={"global_1"},
+        )
+        self.assertEqual(tuple(unit_map["global_1"].shape), (1, 30, 5, 4))
+        self.assertEqual(meta["patch_start_idx"], 2)
+
     def test_incremental_matches_direct_skips(self) -> None:
         adapter = _TestAdapter()
         model = _Model().eval()

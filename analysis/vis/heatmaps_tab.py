@@ -4,6 +4,11 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import gradio as gr
 
+HEATMAP_REAL_DATASETS: Tuple[str, ...] = (
+    "nuscenes_train",
+    "scannet_dev50",
+)
+
 _BACKBONE_ORDER: Tuple[str, ...] = (
     "vggt",
     "pi3",
@@ -68,33 +73,43 @@ def build_heatmaps_tab(
     refresh_stage2_full_cb: Any,
 ) -> Dict[str, Any]:
     sorted_backbone_choices = sorted([str(x) for x in backbone_choices], key=_backbone_sort_key)
-    sorted_dataset_choices = sorted([str(x) for x in dataset_choices], key=_dataset_sort_key)
+    allowed_datasets = {"min", "mean", *HEATMAP_REAL_DATASETS}
+    sorted_dataset_choices = sorted(
+        [str(x) for x in dataset_choices if str(x) in allowed_datasets],
+        key=_dataset_sort_key,
+    )
 
-    with gr.Tab("Heatmaps") as tab_stage2:
-        gr.Markdown("## Heatmaps")
+    with gr.Tab("Metrics & Remaining") as tab_stage2:
+        gr.Markdown("## Metrics & Remaining")
         gr.Markdown(
-            "Choose `mean` or a scene. Per skip mode: pose/depth/point-cloud degradation plus the token-similarity "
-            "regions actually present in the saved redundancy graphs. "
+            "Choose `mean` or a scene. Each skip mode shows one row containing the "
+            "**7-metric mean** followed by the four similarity heatmaps for each "
+            "selected token region and backbone. "
             "Dataset **`min`**: virtual cross-dataset view (element-wise min of each dataset's `mean` "
-            "all-token similarity; Scene locked to `mean`). "
+            "similarity; Scene locked to `mean`). "
             "Dataset **`mean`**: virtual cross-dataset view (element-wise mean of each dataset's `mean` "
-            "all-token similarity; Scene locked to `mean`). "
-            "Use the **left filters** for skip row groups. "
-            "Skip value/pct applies only to skip rows; darker means worse degradation."
+            "similarity; Scene locked to `mean`). "
+            "Skip absolute/multiple applies only to the 7-metric mean. "
+            "**Show remaining** adds remaining-vs-full versions of only the "
+            "7-metric mean and similarity maps, plus marginal 7-metric mean "
+            "and similarity maps rebased by the first prune interval's "
+            "`1 - similarity` degradation, clipped to `[0,1]`. "
+            "Heatmap titles report strict-upper Pearson scores: **H r** compares "
+            "each non-first column with the first column in the same row; "
+            "**V r** compares each non-first row with the first row in the same column. "
+            "Diagonal and NaN entries are excluded."
         )
         with gr.Row():
             with gr.Column(scale=1):
-                stage2_backbone_dd = None
-                if sorted_backbone_choices:
-                    stage2_backbone_dd = gr.Dropdown(
-                        label="Backbone",
-                        choices=sorted_backbone_choices,
-                        value=(
-                            initial_backbone
-                            if initial_backbone in sorted_backbone_choices
-                            else sorted_backbone_choices[0]
-                        ),
-                    )
+                stage2_backbone_filter = gr.CheckboxGroup(
+                    label="Backbones",
+                    choices=sorted_backbone_choices,
+                    value=(
+                        ["vggt"]
+                        if "vggt" in sorted_backbone_choices
+                        else sorted_backbone_choices[:1]
+                    ),
+                )
                 stage2_dataset_dd = gr.Dropdown(
                     label="Dataset",
                     choices=sorted_dataset_choices,
@@ -105,113 +120,86 @@ def build_heatmaps_tab(
                     controller, initial_stage2_scene, "absolute", None, None
                 )
                 stage2_metric_rows_filter = gr.CheckboxGroup(
-                    label="Skip Δ rows",
-                    choices=[
-                        stage2_metric_row_pose,
-                        stage2_metric_row_depth,
-                        stage2_metric_row_point,
-                    ],
-                    value=_hm_m,
-                    interactive=_hm_hs,
+                    choices=[],
+                    value=[],
+                    visible=False,
                 )
                 stage2_value_mode = gr.Radio(
                     label="Skip heatmap value",
-                    choices=["absolute", "pct"],
+                    choices=["absolute", "multiple"],
                     value=_hm_vm,
                     elem_classes=["hm-value-mode"] + (["hm-value-mode-pct-locked"] if not _hm_po else []),
                 )
                 stage2_pct_clip_slider = gr.Slider(
-                    label="Pct clip threshold (%)",
                     minimum=0,
                     maximum=100,
                     value=100,
-                    step=1,
-                    interactive=_hm_po and _hm_vm == "pct",
+                    visible=False,
                 )
                 stage2_token_rows_filter = gr.CheckboxGroup(
-                    label="Token similarity rows",
+                    label="Token similarity regions",
                     choices=_hm_tc,
                     value=_hm_t,
                     interactive=_hm_hi,
                 )
-                stage2_sim_gamma_slider = gr.Slider(
-                    label="gamma (1 disables)",
-                    minimum=0.1,
-                    maximum=3.0,
-                    value=1.0,
-                    step=0.05,
-                    interactive=_hm_hi,
-                )
-                stage2_sim_cutoff_slider = gr.Slider(
-                    label="cutoff (0 disables)",
-                    minimum=0.0,
-                    maximum=1.0,
-                    value=0.0,
-                    step=0.01,
-                    interactive=_hm_hi or _hm_hs,
-                )
-                gr.Markdown("### Prune plan (dense triangles)")
-                stage2_prune_show = gr.Checkbox(
-                    label="Show dense-triangle markers",
+                stage2_colorbar_histogram = gr.Checkbox(
+                    label="Show row/column mean plots",
                     value=False,
-                    interactive=_hm_hi,
                 )
-                stage2_prune_metric = gr.Radio(
-                    label="Prune metric",
-                    choices=["cka", "cosine"],
-                    value="cka",
-                    interactive=_hm_hi,
+                stage2_normalize_skip_metrics = gr.Checkbox(
+                    label="Normalize 7-metric mean to [0,1]",
+                    value=True,
                 )
-                stage2_prune_n = gr.Number(
-                    label="n (triangles)",
-                    value=2,
-                    precision=0,
-                    minimum=0,
-                    maximum=20,
-                    interactive=_hm_hi,
+                stage2_show_remaining = gr.Checkbox(
+                    label="Show remaining",
+                    value=False,
+                    info=(
+                        "For scene=mean, append remaining 7-metric mean and "
+                        "similarity maps, then marginal mean and similarity."
+                    ),
                 )
-                with gr.Row():
-                    stage2_prune_save_btn = gr.Button(
-                        value="Save prune plan",
-                        variant="primary",
-                        interactive=_hm_hi,
-                    )
-                stage2_prune_status = gr.Textbox(
-                    label="Prune status",
-                    interactive=False,
-                    value="",
-                    lines=4,
-                )
+                stage2_sim_gamma_slider = gr.State(1.0)
+                stage2_sim_cutoff_slider = gr.State(0.0)
                 stage2_info = gr.Textbox(label="Displayed counts", interactive=False)
             with gr.Column(scale=5, elem_classes=["stage2-right"]):
                 stage2_mode_galleries: List[gr.Gallery] = []
                 stage2_row_body_cols: List[gr.Column] = []
                 for mode in stage2_modes:
-                    for label, n_columns in (
-                        (f"{mode}: pose", 4),
-                        (f"{mode}: depth", 2),
-                        (f"{mode}: point cloud", 4),
-                        (f"{mode}: sim · special", 4),
-                        (f"{mode}: sim · camera", 4),
-                        (f"{mode}: sim · patch", 4),
-                        (f"{mode}: sim · all tokens", 4),
-                        (f"{mode}: sim · token mean", 4),
-                        (f"{mode}: sim · token min", 4),
-                    ):
+                    for index, label in enumerate((
+                        f"{mode}: hidden pose",
+                        f"{mode}: hidden depth",
+                        (
+                            f"{mode}: 7-metric mean · selected similarity maps "
+                            "· original / remaining / marginal"
+                        ),
+                        f"{mode}: hidden sim special",
+                        f"{mode}: hidden sim camera",
+                        f"{mode}: hidden sim patch",
+                        f"{mode}: hidden sim all",
+                        f"{mode}: hidden sim mean",
+                        f"{mode}: hidden sim min",
+                    )):
+                        visible = index == 2
                         gallery_classes = ["results-gallery", "stage2-heatmap-gallery"]
-                        with gr.Row(elem_classes=["stage2-gallery-row"], equal_height=False):
+                        with gr.Row(
+                            elem_classes=["stage2-gallery-row"],
+                            equal_height=False,
+                            visible=visible,
+                        ):
                             with gr.Column(scale=1, min_width=280) as row_body:
                                 gal = gr.Gallery(
                                     label=label,
-                                    columns=n_columns,
+                                    columns=5 if visible else 4,
                                     height="auto",
                                     object_fit="contain",
+                                    visible=visible,
                                     elem_classes=gallery_classes,
                                 )
                             stage2_row_body_cols.append(row_body)
                             stage2_mode_galleries.append(gal)
 
         stage2_inputs = [
+            stage2_backbone_filter,
             stage2_scene_dd,
             stage2_value_mode,
             stage2_pct_clip_slider,
@@ -219,14 +207,13 @@ def build_heatmaps_tab(
             stage2_token_rows_filter,
             stage2_sim_gamma_slider,
             stage2_sim_cutoff_slider,
-            stage2_prune_show,
-            stage2_prune_metric,
-            stage2_prune_n,
+            stage2_colorbar_histogram,
+            stage2_normalize_skip_metrics,
+            stage2_show_remaining,
         ]
         stage2_outputs = [
             *stage2_mode_galleries,
             *stage2_row_body_cols,
-            stage2_prune_status,
             stage2_info,
             stage2_value_mode,
             stage2_pct_clip_slider,
@@ -261,15 +248,10 @@ def build_heatmaps_tab(
 
             _bind_refresh(stage2_scene_dd.change)
             _bind_refresh(stage2_value_mode.change)
-            _bind_refresh(stage2_pct_clip_slider.release)
-            _bind_refresh(stage2_metric_rows_filter.change)
             _bind_refresh(stage2_token_rows_filter.change)
-            _bind_refresh(stage2_sim_gamma_slider.release)
-            _bind_refresh(stage2_sim_cutoff_slider.release)
-            _bind_refresh(stage2_prune_show.change)
-            _bind_refresh(stage2_prune_metric.change)
-            # Number has no stable .input; binding it + cancels aborts SSE and spams 404.
-            _bind_refresh(stage2_prune_n.change, use_cancels=False, track_event=False)
+            _bind_refresh(stage2_colorbar_histogram.change)
+            _bind_refresh(stage2_normalize_skip_metrics.change)
+            _bind_refresh(stage2_show_remaining.change)
             _bind_refresh(tab_stage2.select, with_trigger_mode=False)
         else:
             stage2_info.value = (
@@ -279,7 +261,7 @@ def build_heatmaps_tab(
 
     return {
         "tab": tab_stage2,
-        "stage2_backbone_dd": stage2_backbone_dd,
+        "stage2_backbone_filter": stage2_backbone_filter,
         "stage2_dataset_dd": stage2_dataset_dd,
         "stage2_scene_dd": stage2_scene_dd,
         "stage2_mode_galleries": stage2_mode_galleries,
@@ -291,11 +273,9 @@ def build_heatmaps_tab(
         "stage2_token_rows_filter": stage2_token_rows_filter,
         "stage2_sim_gamma_slider": stage2_sim_gamma_slider,
         "stage2_sim_cutoff_slider": stage2_sim_cutoff_slider,
-        "stage2_prune_show": stage2_prune_show,
-        "stage2_prune_metric": stage2_prune_metric,
-        "stage2_prune_n": stage2_prune_n,
-        "stage2_prune_save_btn": stage2_prune_save_btn,
-        "stage2_prune_status": stage2_prune_status,
+        "stage2_colorbar_histogram": stage2_colorbar_histogram,
+        "stage2_normalize_skip_metrics": stage2_normalize_skip_metrics,
+        "stage2_show_remaining": stage2_show_remaining,
         "stage2_inputs": stage2_inputs,
         "stage2_outputs": stage2_outputs,
     }

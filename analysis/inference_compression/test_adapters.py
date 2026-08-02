@@ -14,7 +14,7 @@ from analysis.inference_compression.QuantVGGT.adapter import QuantVGGTInferenceA
 from analysis.inference_compression.contracts import InferenceCompressionConfig
 from analysis.inference_compression.lora import merge_lora_linears
 from analysis.inference_compression.registry import list_inference_compressions
-from analysis.recover.train.model import LoRALinear, SkipIdentityBlock
+from analysis.recovery.train.model import LoRALinear, SkipIdentityBlock
 
 
 class _Attention(nn.Module):

@@ -81,9 +81,9 @@ def _discover_dataset_specs(recovery_root: Path, backbones: Sequence[str]) -> Li
         backbone_dir = root / str(backbone)
         if not backbone_dir.is_dir():
             continue
-        for path in backbone_dir.glob("*/eval/recover/*_recover_strategies_by_span.png"):
+        for path in backbone_dir.glob("*/eval/recovery/*_recovery_strategies_by_span.png"):
             dataset_tag = path.parent.parent.parent.name
-            expected = f"{dataset_tag}_recover_strategies_by_span.png"
+            expected = f"{dataset_tag}_recovery_strategies_by_span.png"
             if path.name == expected:
                 discovered.add(dataset_tag)
     datasets = sorted(discovered, key=_dataset_sort_key)
@@ -98,16 +98,16 @@ def _plot_path(recovery_root: Path, backbone_name: str, dataset_tag: str) -> Pat
             Path(recovery_root)
             / str(backbone_name)
             / "eval"
-            / "recover"
-            / "mean_recover_strategies_by_span.png"
+            / "recovery"
+            / "mean_recovery_strategies_by_span.png"
         )
     return (
         Path(recovery_root)
         / str(backbone_name)
         / str(dataset_tag)
         / "eval"
-        / "recover"
-        / f"{dataset_tag}_recover_strategies_by_span.png"
+        / "recovery"
+        / f"{dataset_tag}_recovery_strategies_by_span.png"
     )
 
 

@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import unittest
+import torch
+import torch.nn as nn
+
+from analysis.recovery.compact_recovery_checkpoints import _compact_payload
+from analysis.recovery.operators import apply_recovery_weights, install_recovery_modules
+
+
+class _Block(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+class _Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+        self.block = _Block()
+
+
+class _Adapter:
+    name = "dummy"
+
+    def block_for_unit(self, model: _Model, unit_id: str) -> nn.Module:
+        assert unit_id == "frame_1"
+        return model.block
+
+
+class _ChainModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+        self.blocks = nn.ModuleDict({"global_0": _Block(), "frame_1": _Block()})
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.blocks["frame_1"](self.blocks["global_0"](x))
+
+
+class _ChainAdapter:
+    name = "dummy"
+
+    def block_for_unit(self, model: _ChainModel, unit_id: str) -> nn.Module:
+        return model.blocks[unit_id]
+
+
+def test_compact_payload_extracts_recovery_weight() -> None:
+    weight = torch.eye(4)
+    payload = {
+        "variant": "training_free_recovery",
+        "model_state_dict": {"block.recovery_patch_frame_1.weight": weight},
+        "recovery_specs": [
+            {
+                "source_unit_id": "frame_1",
+                "module_name": "recovery_patch_frame_1",
+                "weight_shape": [4, 4],
+            }
+        ],
+        "optimizer_state_dict": {"unused": True},
+    }
+
+    compact = _compact_payload(payload)
+
+    assert compact["variant"] == "training_free_recovery_delta"
+    assert "model_state_dict" not in compact
+    assert compact["optimizer_state_dict"] == {}
+    assert torch.equal(compact["recovery_weights"][0]["weight"], weight)
+
+
+def test_apply_recovery_weights_loads_installed_patch() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = _Model().to(device)
+    adapter = _Adapter()
+    spec = {
+        "source_unit_id": "frame_1",
+        "module_name": "recovery_patch_frame_1",
+        "weight_shape": [4, 4],
+    }
+    weight = torch.eye(4) * 2
+
+    install_recovery_modules(model, adapter, [spec], device=device)
+    apply_recovery_weights(
+        model,
+        adapter,
+        [spec],
+        [{"source_unit_id": "frame_1", "module_name": "recovery_patch_frame_1", "weight": weight}],
+        device=device,
+    )
+
+    patch_weight = model.block.recovery_patch_frame_1.weight.detach().cpu()
+    assert torch.equal(patch_weight, weight)
+
+
+def test_adjacent_dropped_unit_recovery_patches_compose_in_model_order() -> None:
+    device = torch.device("cuda")
+    model = _ChainModel().to(device)
+    adapter = _ChainAdapter()
+    specs = [
+        {
+            "type": "recovery_ghost",
+            "source_unit_id": "global_0",
+            "module_name": "recovery_patch_global_0",
+            "weight_shape": [2, 2],
+        },
+        {
+            "type": "recovery_ghost",
+            "source_unit_id": "frame_1",
+            "module_name": "recovery_patch_frame_1",
+            "weight_shape": [2, 2],
+        },
+    ]
+    weights = [
+        {"source_unit_id": "global_0", "weight": torch.eye(2) * 2.0},
+        {"source_unit_id": "frame_1", "weight": torch.eye(2) * 3.0},
+    ]
+    install_recovery_modules(model, adapter, specs, device=device)
+    apply_recovery_weights(model, adapter, specs, weights, device=device)
+
+    actual = model(torch.ones(1, 2, device=device))
+    assert torch.equal(actual, torch.full((1, 2), 6.0, device=device))
+
+
+def load_tests(_loader, tests, _pattern):
+    tests.addTest(unittest.FunctionTestCase(test_compact_payload_extracts_recovery_weight))
+    tests.addTest(unittest.FunctionTestCase(test_apply_recovery_weights_loads_installed_patch))
+    tests.addTest(
+        unittest.FunctionTestCase(
+            test_adjacent_dropped_unit_recovery_patches_compose_in_model_order
+        )
+    )
+    return tests

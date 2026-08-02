@@ -1,10 +1,10 @@
-"""Visualize CKA heatmap with greedy dense-triangle corner markers."""
+"""Visualize closed-interval pruning score heatmaps and selected intervals."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Mapping, Optional, Sequence, Union
+from typing import Any, List, Mapping, Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -14,10 +14,18 @@ import numpy as np
 import torch
 
 from analysis.redundancy.metrics import upper_triangle_pack, upper_triangle_unpack_for_heatmap
-from analysis.prune_plan.triangle_prune import TrianglePick, greedy_dense_triangles
+from analysis.prune_plan.triangle_prune import (
+    TrianglePick,
+    scan_endpoint_linked_closed_intervals_with_candidates,
+)
+from analysis.redundancy.similarity_v3 import (
+    UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS,
+    unit_similarity_to_interval_score,
+)
 from analysis.triangular_heatmap import (
     TRIANGLE_EMPTY_LEGEND_LOC,
     configure_triangle_axes,
+    draw_symmetric_heatmap_panel,
     imshow_upper_triangle,
     triangle_xy,
 )
@@ -133,6 +141,7 @@ def render_gt_trajectory_score_plot(
     backbone: str,
     relative_degradation_cap_multiple: float = 10.0,
     tag: Optional[str] = None,
+    extra_series: Optional[Sequence[tuple[str, Sequence[tuple[int, float]]]]] = None,
 ) -> Optional[Path]:
     """Plot GT aggregate relative-degradation score along each selected trajectory."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -147,6 +156,19 @@ def render_gt_trajectory_score_plot(
         avg = _path_span_average_score(score_arr, picks, span_step=span_step)
         if points:
             prepared.append((str(name), points, avg))
+    for name, series in list(extra_series or []):
+        points = sorted(
+            [
+                (int(drop), float(value))
+                for drop, value in list(series)
+                if np.isfinite(float(value))
+            ],
+            key=lambda item: item[0],
+        )
+        if not points:
+            continue
+        avg = float(np.mean([value for _drop, value in points]))
+        prepared.append((str(name), points, avg))
     if not prepared:
         return None
 
@@ -206,6 +228,216 @@ def render_gt_trajectory_score_plot(
     out_path = out_dir / f"{safe_tag}.png"
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def render_method_corner_overlay_heatmap(
+    heatmap: np.ndarray,
+    method_picks: Sequence[TrianglePick],
+    *,
+    out_dir: Path,
+    backbone: str,
+    method_name: str,
+    heatmap_title: str,
+    heatmap_label: str,
+    gt_picks: Optional[Sequence[TrianglePick]] = None,
+    gt_score: Optional[np.ndarray] = None,
+    cmap: str = "viridis",
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    draw_candidates: bool = True,
+    tag: Optional[str] = None,
+) -> Path:
+    """Render one method path over the heatmap used by that method plus GT path."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    heatmap_arr = np.asarray(heatmap, dtype=np.float64)
+    n = int(heatmap_arr.shape[0])
+    finite = np.isfinite(heatmap_arr)
+    if vmin is None:
+        vmin = float(np.nanmin(heatmap_arr[finite])) if np.any(finite) else 0.0
+    if vmax is None:
+        vmax = float(np.nanmax(heatmap_arr[finite])) if np.any(finite) else 1.0
+    if not np.isfinite(float(vmin)):
+        vmin = 0.0
+    if not np.isfinite(float(vmax)) or float(vmax) <= float(vmin):
+        vmax = float(vmin) + 1.0
+
+    grid = _sim_to_heatmap_grid(heatmap_arr)
+    masked = np.ma.masked_invalid(grid)
+    fig, ax = plt.subplots(figsize=(10, 9))
+    im = imshow_upper_triangle(ax, masked, n, cmap=cmap, vmin=float(vmin), vmax=float(vmax))
+    ax.set_title(
+        f"{backbone}: {method_name} path on {heatmap_title}",
+        fontsize=13,
+        fontweight="bold",
+    )
+    configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
+    ax.tick_params(axis="both", labelsize=8)
+    if draw_candidates:
+        _draw_finite_score_candidate_segments(ax, heatmap_arr)
+    drew_gt = False
+    if gt_picks:
+        drew_gt = _draw_gt_path(
+            ax,
+            gt_score if gt_score is not None else heatmap_arr,
+            list(gt_picks),
+        )
+    method_is_gt = str(method_name).strip().lower().startswith("gt")
+    drew_method = False
+    if method_picks and not method_is_gt:
+        drew_method = _draw_selected_path(
+            ax,
+            heatmap_arr,
+            list(method_picks),
+            label=str(method_name),
+            color="#c000ff",
+        )
+    elif method_picks and not drew_gt:
+        drew_method = _draw_selected_path(
+            ax,
+            heatmap_arr,
+            list(method_picks),
+            label=str(method_name),
+            color="red",
+            marker="o",
+        )
+    if drew_gt or drew_method:
+        ax.legend(loc=TRIANGLE_EMPTY_LEGEND_LOC, fontsize=7.5)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(str(heatmap_label), fontsize=10)
+    cbar.ax.tick_params(labelsize=8)
+
+    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    safe_method = str(method_name).strip().lower().replace("/", "_").replace(" ", "_")
+    safe_tag = (
+        str(tag).replace("/", "_").replace(" ", "_")
+        if tag
+        else f"prune_plan_{safe_backbone}_{safe_method}_corner_overview_single"
+    )
+    out_path = out_dir / f"{safe_tag}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def render_method_corner_overlay_grid(
+    methods: Sequence[Mapping[str, Any]],
+    *,
+    out_dir: Path,
+    backbone: str,
+    gt_picks: Optional[Sequence[TrianglePick]] = None,
+    gt_score: Optional[np.ndarray] = None,
+    tag: Optional[str] = None,
+) -> Path:
+    """Render several method-specific heatmap/path panels into one overview."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    panels = [dict(method) for method in methods if list(method.get("picks", []) or [])]
+    if not panels:
+        raise ValueError("Need at least one method panel")
+
+    cols = 2
+    rows = int(np.ceil(len(panels) / cols))
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=(15.5, max(6.6, rows * 6.2)),
+        squeeze=False,
+    )
+
+    for panel_index, spec in enumerate(panels):
+        row = panel_index // cols
+        col = panel_index % cols
+        ax = axes[row][col]
+        heatmap_arr = np.asarray(spec["heatmap"], dtype=np.float64)
+        n = int(heatmap_arr.shape[0])
+        finite = np.isfinite(heatmap_arr)
+        vmin = spec.get("vmin")
+        vmax = spec.get("vmax")
+        if vmin is None:
+            vmin = float(np.nanmin(heatmap_arr[finite])) if np.any(finite) else 0.0
+        if vmax is None:
+            vmax = float(np.nanmax(heatmap_arr[finite])) if np.any(finite) else 1.0
+        if not np.isfinite(float(vmin)):
+            vmin = 0.0
+        if not np.isfinite(float(vmax)) or float(vmax) <= float(vmin):
+            vmax = float(vmin) + 1.0
+
+        grid = _sim_to_heatmap_grid(heatmap_arr)
+        masked = np.ma.masked_invalid(grid)
+        im = imshow_upper_triangle(
+            ax,
+            masked,
+            n,
+            cmap=str(spec.get("cmap", "viridis")),
+            vmin=float(vmin),
+            vmax=float(vmax),
+        )
+        method_name = str(spec.get("name", "Method"))
+        heatmap_title = str(spec.get("title", "method heatmap"))
+        ax.set_title(
+            f"{method_name}\n{heatmap_title}",
+            fontsize=12,
+            fontweight="bold",
+        )
+        configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
+        ax.tick_params(axis="both", labelsize=7)
+        if bool(spec.get("draw_candidates", True)):
+            _draw_finite_score_candidate_segments(ax, heatmap_arr)
+
+        method_picks = list(spec.get("picks", []) or [])
+        method_is_gt = method_name.strip().lower().startswith("gt")
+        drew_gt = False
+        if gt_picks:
+            drew_gt = _draw_gt_path(
+                ax,
+                gt_score if gt_score is not None else heatmap_arr,
+                list(gt_picks),
+            )
+        drew_method = False
+        if method_picks and not method_is_gt:
+            drew_method = _draw_selected_path(
+                ax,
+                heatmap_arr,
+                method_picks,
+                label=method_name,
+                color="#c000ff",
+            )
+        elif method_picks and not drew_gt:
+            drew_method = _draw_selected_path(
+                ax,
+                heatmap_arr,
+                method_picks,
+                label=method_name,
+                color="red",
+                marker="o",
+            )
+        if drew_gt or drew_method:
+            ax.legend(loc=TRIANGLE_EMPTY_LEGEND_LOC, fontsize=6.5)
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(str(spec.get("label", "score")), fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+
+    for empty_index in range(len(panels), rows * cols):
+        row = empty_index // cols
+        col = empty_index % cols
+        axes[row][col].axis("off")
+
+    fig.suptitle(
+        f"{backbone}: method paths on their own scoring heatmaps",
+        fontsize=16,
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
+    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    safe_tag = (
+        str(tag).replace("/", "_").replace(" ", "_")
+        if tag
+        else f"prune_plan_{safe_backbone}_method_corner_overview"
+    )
+    out_path = out_dir / f"{safe_tag}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -363,14 +595,14 @@ def render_budget_similarity_curve(
         )
 
     if threshold is None:
-        title = f"{backbone}: endpoint-linked triangle corner similarity"
+        title = f"{backbone}: endpoint-linked closed-interval similarity"
     else:
         title = (
-            f"{backbone}: dense-triangle corner similarity "
-            f"(threshold > {float(threshold):g})"
+            f"{backbone}: endpoint-linked closed-interval similarity "
+            f"(score >= {float(threshold):g})"
         )
     ax.set_title(title, fontsize=16, fontweight="bold")
-    ax.set_xlabel("Dropped units / triangle span", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Dropped units (end - start + 1)", fontsize=14, fontweight="bold")
     ax.set_ylabel("Selected corner similarity", fontsize=14, fontweight="bold")
     ax.tick_params(axis="both", labelsize=12)
     for tick_label in (*ax.get_xticklabels(), *ax.get_yticklabels()):
@@ -389,6 +621,296 @@ def render_budget_similarity_curve(
     )
     out_path = out_dir / f"{safe_tag}.png"
     fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def max_similarity_by_drop_count(
+    interval_score: np.ndarray,
+) -> list[tuple[int, float, int, int]]:
+    """Return ``(drop_count, max_similarity, start, end)`` for closed intervals.
+
+    Closed-interval row zero is NaN because it has no physical ``start-1``
+    unit output.
+    Ties keep the smaller ``start``.
+    """
+    score = np.asarray(interval_score, dtype=np.float64)
+    if score.ndim != 2 or score.shape[0] != score.shape[1]:
+        raise ValueError(f"expected square interval score matrix, got {score.shape}")
+    n = int(score.shape[0])
+    series: list[tuple[int, float, int, int]] = []
+    for drop_count in range(1, n + 1):
+        best: Optional[tuple[float, int, int]] = None
+        for start in range(1, n - drop_count + 1):
+            end = start + drop_count - 1
+            value = float(score[start, end])
+            if not np.isfinite(value):
+                continue
+            if best is None or value > best[0]:
+                best = (value, start, end)
+        if best is not None:
+            value, start, end = best
+            series.append((drop_count, value, start, end))
+    return series
+
+
+def render_max_similarity_by_drop_count(
+    similarity_matrices: Mapping[str, np.ndarray],
+    *,
+    out_dir: Path,
+    backbone: str,
+    gt_degradation_series: Optional[Sequence[tuple[int, float]]] = None,
+    tag: Optional[str] = None,
+) -> Path:
+    """Plot maximum interval similarity and the optional GT degradation curve."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    display_names = {
+        "cka": "CKA",
+        "cosine": "Ours_Cosine",
+        "inv_mse": "Ours_INV_MSE",
+        "cca": "CCA",
+    }
+    fig, ax = plt.subplots(figsize=(10, 6))
+    drawn = False
+    for metric, matrix in similarity_matrices.items():
+        series = max_similarity_by_drop_count(matrix)
+        if not series:
+            continue
+        ax.plot(
+            [row[0] for row in series],
+            [row[1] for row in series],
+            marker="o",
+            markersize=3.5,
+            linewidth=1.8,
+            label=display_names.get(str(metric).lower(), str(metric)),
+        )
+        drawn = True
+    gt_series = list(gt_degradation_series or ())
+    if gt_series:
+        ax.plot(
+            [int(row[0]) for row in gt_series],
+            [float(row[1]) for row in gt_series],
+            color="#111111",
+            linestyle="--",
+            marker="s",
+            markersize=4.0,
+            linewidth=2.2,
+            label="GT (7-metric mean degradation)",
+        )
+        drawn = True
+    if not drawn:
+        plt.close(fig)
+        raise ValueError("similarity_matrices contain no finite i>0 interval scores")
+    ax.set_title(
+        f"{backbone}: maximum similarity and GT degradation by dropped-layer count",
+        fontsize=14,
+        fontweight="bold",
+    )
+    ax.set_xlabel("Dropped layers (end - start + 1)")
+    ax.set_ylabel("Similarity / normalized degradation")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlim(left=0)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    safe_tag = (
+        str(tag).replace("/", "_").replace(" ", "_")
+        if tag
+        else f"prune_plan_{safe_backbone}_max_similarity_by_drop_count"
+    )
+    out_path = out_dir / f"{safe_tag}.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def largest_adjacent_similarity_gaps(
+    interval_score: np.ndarray,
+) -> dict[str, dict[str, Any]]:
+    """Find maximum absolute changes between adjacent valid rows and columns."""
+    score = np.asarray(interval_score, dtype=np.float64)
+    if score.ndim != 2 or score.shape[0] != score.shape[1]:
+        raise ValueError(f"expected square interval score matrix, got {score.shape}")
+    n = int(score.shape[0])
+    best_row: Optional[tuple[float, int, int]] = None
+    best_column: Optional[tuple[float, int, int]] = None
+
+    # Row gap at (i,j) compares C[i,j] with C[i+1,j].  Both cells must remain
+    # in the valid upper triangle, and row zero is a placeholder.
+    for i in range(1, n - 1):
+        for j in range(i + 1, n):
+            first = float(score[i, j])
+            second = float(score[i + 1, j])
+            if not np.isfinite(first) or not np.isfinite(second):
+                continue
+            delta = abs(second - first)
+            if best_row is None or delta > best_row[0]:
+                best_row = (delta, i, j)
+
+    # Column gap at (i,j) compares C[i,j] with C[i,j+1].
+    for i in range(1, n):
+        for j in range(i, n - 1):
+            first = float(score[i, j])
+            second = float(score[i, j + 1])
+            if not np.isfinite(first) or not np.isfinite(second):
+                continue
+            delta = abs(second - first)
+            if best_column is None or delta > best_column[0]:
+                best_column = (delta, i, j)
+
+    out: dict[str, dict[str, Any]] = {}
+    if best_row is not None:
+        delta, i, j = best_row
+        out["row"] = {
+            "delta": float(delta),
+            "first": (int(i), int(j)),
+            "second": (int(i + 1), int(j)),
+        }
+    if best_column is not None:
+        delta, i, j = best_column
+        out["column"] = {
+            "delta": float(delta),
+            "first": (int(i), int(j)),
+            "second": (int(i), int(j + 1)),
+        }
+    return out
+
+
+def render_similarity_gap_heatmaps(
+    similarity_matrices: Mapping[str, np.ndarray],
+    *,
+    out_dir: Path,
+    backbone: str,
+    tag: Optional[str] = None,
+) -> Path:
+    """Render all similarity heatmaps in one row with max row/column gaps."""
+    if not similarity_matrices:
+        raise ValueError("similarity_matrices must not be empty")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    display_names = {
+        "cka": "CKA",
+        "cosine": "Ours_Cosine",
+        "inv_mse": "Ours_INV_MSE",
+        "cca": "CCA",
+    }
+    items = list(similarity_matrices.items())
+    fig, axes = plt.subplots(
+        1,
+        len(items),
+        figsize=(6.2 * len(items), 6.4),
+        squeeze=False,
+    )
+    for panel_index, (ax, (metric, matrix)) in enumerate(zip(axes[0], items)):
+        score = np.asarray(matrix, dtype=np.float64)
+        if score.ndim != 2 or score.shape[0] != score.shape[1]:
+            raise ValueError(f"expected square {metric} matrix, got {score.shape}")
+        n = int(score.shape[0])
+        grid = _sim_to_heatmap_grid(score)
+        masked = np.ma.masked_invalid(grid)
+        image = imshow_upper_triangle(
+            ax,
+            masked,
+            n,
+            cmap="viridis",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        configure_triangle_axes(
+            ax,
+            n,
+            index_name="unit",
+            xlabel="drop start i",
+            ylabel="drop end j",
+        )
+        ax.tick_params(axis="both", labelsize=7)
+        _draw_finite_score_candidate_segments(ax, score)
+        gaps = largest_adjacent_similarity_gaps(score)
+        row_gap = gaps.get("row")
+        if row_gap is not None:
+            (i0, j0), (i1, j1) = row_gap["first"], row_gap["second"]
+            x0, y0 = triangle_xy(i0, j0)
+            x1, y1 = triangle_xy(i1, j1)
+            ax.plot(
+                [x0, x1],
+                [y0, y1],
+                color="#ff3030",
+                marker="o",
+                markersize=4,
+                linewidth=2.2,
+                label="Max adjacent-row gap" if panel_index == 0 else None,
+            )
+            ax.scatter(
+                [(x0 + x1) / 2.0],
+                [(y0 + y1) / 2.0],
+                color="#ff3030",
+                marker="X",
+                s=90,
+                edgecolors="white",
+                linewidths=0.8,
+                zorder=5,
+            )
+        column_gap = gaps.get("column")
+        if column_gap is not None:
+            (i0, j0), (i1, j1) = column_gap["first"], column_gap["second"]
+            x0, y0 = triangle_xy(i0, j0)
+            x1, y1 = triangle_xy(i1, j1)
+            ax.plot(
+                [x0, x1],
+                [y0, y1],
+                color="#00e5ff",
+                marker="o",
+                markersize=4,
+                linewidth=2.2,
+                label="Max adjacent-column gap" if panel_index == 0 else None,
+            )
+            ax.scatter(
+                [(x0 + x1) / 2.0],
+                [(y0 + y1) / 2.0],
+                color="#00e5ff",
+                marker="P",
+                s=90,
+                edgecolors="black",
+                linewidths=0.6,
+                zorder=5,
+            )
+        detail_lines: list[str] = []
+        if row_gap is not None:
+            detail_lines.append(
+                f"row {row_gap['first']}→{row_gap['second']}: Δ={row_gap['delta']:.4f}"
+            )
+        if column_gap is not None:
+            detail_lines.append(
+                f"col {column_gap['first']}→{column_gap['second']}: Δ={column_gap['delta']:.4f}"
+            )
+        title = display_names.get(str(metric).lower(), str(metric))
+        if detail_lines:
+            title += "\n" + "\n".join(detail_lines)
+        ax.set_title(title, fontsize=10, fontweight="bold")
+        colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        colorbar.set_label(
+            f"{display_names.get(str(metric).lower(), str(metric))} interval similarity",
+            fontsize=8,
+        )
+        colorbar.ax.tick_params(labelsize=7)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=2, fontsize=10)
+    fig.suptitle(
+        f"{backbone}: similarity heatmaps with largest adjacent gaps",
+        fontsize=15,
+        fontweight="bold",
+    )
+    fig.subplots_adjust(left=0.04, right=0.985, top=0.84, bottom=0.13, wspace=0.34)
+    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    safe_tag = (
+        str(tag).replace("/", "_").replace(" ", "_")
+        if tag
+        else f"prune_plan_{safe_backbone}_similarity_gap_heatmaps"
+    )
+    out_path = out_dir / f"{safe_tag}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -629,7 +1151,7 @@ def _draw_selected_path(
     score: Optional[np.ndarray],
     picks: Sequence[TrianglePick],
     *,
-    label: str = "CKA selected path",
+    label: str = "Ours_CKA",
     color: str = "#c000ff",
     marker: str = "s",
     marker_label: Optional[str] = None,
@@ -724,7 +1246,7 @@ def render_token_region_corner_grid(
             ax,
             gt_score,
             picks,
-            label=f"CKA selected path ({display_region})",
+            label="Ours_CKA",
             color="#c000ff",
         )
 
@@ -742,7 +1264,7 @@ def render_token_region_corner_grid(
         legend_ax.axis("off")
         handles = [
             Line2D([0], [0], color="white", linewidth=1.9, label="Span candidates"),
-            Line2D([0], [0], color="#c000ff", marker="s", linewidth=1.7, label="CKA selected path"),
+            Line2D([0], [0], color="#c000ff", marker="s", linewidth=1.7, label="Ours_CKA"),
         ]
         if gt_picks:
             handles.insert(
@@ -858,7 +1380,7 @@ def render_gt_aggregate_corner_heatmap(
     if cka_trajectories is not None:
         cka_items.extend((str(name), picks) for name, picks in cka_trajectories)
     elif cka_picks:
-        cka_items.append(("CKA selected path", cka_picks))
+        cka_items.append(("Ours_CKA", cka_picks))
     drew_cka = _draw_cka_trajectories(ax, score_arr, cka_items)
 
     if metric_names:
@@ -903,12 +1425,15 @@ def render_gt_component_heatmaps(
     out_dir: Path,
     backbone: str,
     relative_degradation_cap_multiple: float = 10.0,
+    aggregate_heatmap: Optional[np.ndarray] = None,
+    tag: Optional[str] = None,
+    title: Optional[str] = None,
 ) -> Optional[Path]:
-    """Render per-metric 1..10 relative-degradation heatmaps B used for aggregate C."""
+    """Render per-metric min-max normalized heatmaps used for GT selection."""
     out_dir.mkdir(parents=True, exist_ok=True)
     metric_grid: list[list[Optional[str]]] = [
         ["ape", "are", "rpe_trans", "rpe_rot"],
-        ["acc", "comp", "chamfer_distance", "nc"],
+        ["acc", "comp", "chamfer_distance", "mean"],
     ]
     if not component_heatmaps:
         return None
@@ -918,30 +1443,38 @@ def render_gt_component_heatmaps(
     for row_idx, row in enumerate(metric_grid):
         for col_idx, metric in enumerate(row):
             ax = axes[row_idx][col_idx]
-            if metric is None or metric not in component_heatmaps:
+            component_source = (
+                aggregate_heatmap if metric == "mean" else component_heatmaps.get(metric)
+            )
+            if metric is None or component_source is None:
                 ax.axis("off")
                 continue
-            component = np.asarray(component_heatmaps[metric], dtype=np.float64)
-            vmax = _relative_degradation_vmax(
-                [component],
-                relative_degradation_cap_multiple,
-            )
+            component = np.asarray(component_source, dtype=np.float64)
             arr = _sim_to_heatmap_grid(component)
             masked = np.ma.masked_invalid(arr)
-            im = imshow_upper_triangle(ax, masked, n, cmap="viridis_r", vmin=1.0, vmax=vmax)
-            ax.set_title(str(metric), fontsize=11, fontweight="bold")
+            im = imshow_upper_triangle(ax, masked, n, cmap="viridis_r", vmin=0.0, vmax=1.0)
+            ax.set_title(
+                "7-metric mean" if metric == "mean" else str(metric),
+                fontsize=11,
+                fontweight="bold",
+            )
             configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
             ax.tick_params(axis="both", labelsize=6)
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            _format_relative_degradation_colorbar(cbar)
             cbar.ax.tick_params(labelsize=6)
     fig.suptitle(
-        f"{backbone}: skip-eval component relative-degradation heatmaps (B, lower is better)",
+        title
+        or f"{backbone}: per-metric min-max normalized degradation (lower is better)",
         fontsize=15,
         fontweight="bold",
     )
     safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
-    out_path = out_dir / f"prune_plan_{safe_backbone}_gt_components.png"
+    safe_tag = (
+        str(tag).replace("/", "_").replace(" ", "_")
+        if tag
+        else f"prune_plan_{safe_backbone}_gt_components"
+    )
+    out_path = out_dir / f"{safe_tag}.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
@@ -1030,7 +1563,7 @@ def render_gt_ranked_candidate_heatmap(
     if cka_trajectories is not None:
         cka_items.extend((str(name), picks) for name, picks in cka_trajectories)
     elif cka_picks:
-        cka_items.append(("CKA selected path", cka_picks))
+        cka_items.append(("Ours_CKA", cka_picks))
     drew_cka = _draw_cka_trajectories(ax, values, cka_items)
     if gt_xs or drew_cka:
         ax.legend(loc=TRIANGLE_EMPTY_LEGEND_LOC, fontsize=9)
@@ -1266,15 +1799,30 @@ def render_corner_overview_heatmap(
                 picks=picks,
                 span_to_candidate_picks=candidates_by_span,
             )
-            if score_arr is not None and gt_pick_list:
+            drew_gt = (
                 _draw_gt_path(ax, score_arr, gt_pick_list)
-            _draw_selected_path(
+                if score_arr is not None and gt_pick_list
+                else False
+            )
+            drew_selected = _draw_selected_path(
                 ax,
                 score_arr,
                 picks,
-                label=f"CKA selected path ({display_region})",
+                label="Ours_CKA",
                 color="#c000ff",
             )
+            extra_token_trajectories = [
+                (name, trajectory_picks)
+                for name, trajectory_picks in cka_items
+                if str(name) != "Ours_CKA"
+            ]
+            drew_extra = _draw_cka_trajectories(
+                ax,
+                score_arr if score_arr is not None else sim_arr,
+                extra_token_trajectories,
+            )
+            if drew_gt or drew_selected or drew_extra:
+                ax.legend(loc=TRIANGLE_EMPTY_LEGEND_LOC, fontsize=6.5)
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label("CKA similarity", fontsize=8)
             cbar.ax.tick_params(labelsize=7)
@@ -1651,6 +2199,239 @@ def render_prune_span_drop_grid(
     )
 
 
+def _draw_drop_grid_panel(
+    ax,
+    *,
+    num_units: int,
+    span_to_drop_indices: Mapping[int, Sequence[int]],
+    title: str,
+) -> None:
+    n = int(num_units)
+    drop_cells: set[tuple[int, int]] = set()
+    for span, indices in span_to_drop_indices.items():
+        row = int(span)
+        if row < 0 or row >= n:
+            continue
+        for idx in indices:
+            col = int(idx)
+            if 0 <= col < n:
+                drop_cells.add((row, col))
+
+    ax.set_facecolor("white")
+    drop_color = "#ffb3b3"
+    grid_edge = "#d0d0d0"
+    for row in range(n):
+        for col in range(n):
+            ax.add_patch(
+                Rectangle(
+                    (col - 0.5, row - 0.5),
+                    1.0,
+                    1.0,
+                    facecolor=drop_color if (row, col) in drop_cells else "white",
+                    edgecolor=grid_edge,
+                    linewidth=0.35,
+                )
+            )
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("unit index")
+    ax.set_ylabel("dropped units")
+    ticks = list(range(n))
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
+    ax.tick_params(axis="both", labelsize=6)
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_ylim(-0.5, n - 0.5)
+    ax.set_aspect("equal", adjustable="box")
+
+
+def _group_drop_grid_items_by_method(
+    items: Sequence[tuple[str, Mapping[int, Sequence[int]]]],
+) -> list[
+    tuple[
+        Optional[tuple[str, Mapping[int, Sequence[int]]]],
+        Optional[tuple[str, Mapping[int, Sequence[int]]]],
+    ]
+]:
+    """Group Single/Double variants into fixed left/right slots by method."""
+    rows: list[
+        list[Optional[tuple[str, Mapping[int, Sequence[int]]]]]
+    ] = []
+    paired_row_by_method: dict[str, int] = {}
+    compact_prior_row: Optional[int] = None
+    for name, drops in items:
+        display_name = str(name).strip()
+        lower_name = display_name.casefold()
+        variant: Optional[str] = None
+        method_name = display_name
+        for suffix, candidate_variant in (
+            (" single", "single"),
+            (" double", "double"),
+            ("_single", "single"),
+            ("_double", "double"),
+        ):
+            if lower_name.endswith(suffix):
+                method_name = display_name[: -len(suffix)].rstrip()
+                variant = candidate_variant
+                break
+
+        item = (display_name, drops)
+        if variant is None:
+            if lower_name in {"shortgpt", "simpler"}:
+                column = 0 if lower_name == "shortgpt" else 1
+                if compact_prior_row is None or rows[compact_prior_row][column] is not None:
+                    compact_prior_row = len(rows)
+                    rows.append([None, None])
+                rows[compact_prior_row][column] = item
+                continue
+            rows.append([item, None])
+            continue
+
+        method_key = method_name.casefold()
+        column = 0 if variant == "single" else 1
+        row_index = paired_row_by_method.get(method_key)
+        if row_index is None or rows[row_index][column] is not None:
+            row_index = len(rows)
+            rows.append([None, None])
+            paired_row_by_method[method_key] = row_index
+        rows[row_index][column] = item
+
+    return [(row[0], row[1]) for row in rows]
+
+
+def _drop_grid_method_name(
+    row: tuple[
+        Optional[tuple[str, Mapping[int, Sequence[int]]]],
+        Optional[tuple[str, Mapping[int, Sequence[int]]]],
+    ],
+) -> str:
+    item = row[0] if row[0] is not None else row[1]
+    if item is None:
+        return ""
+    display_name = str(item[0]).strip()
+    lower_name = display_name.casefold()
+    for suffix in (" single", " double", "_single", "_double"):
+        if lower_name.endswith(suffix):
+            return display_name[: -len(suffix)].rstrip()
+    return display_name
+
+
+def _draw_drop_grid_evidence_panel(
+    ax,
+    *,
+    evidence: Mapping[str, Any],
+    num_units: int,
+) -> None:
+    values = np.asarray(evidence.get("values"), dtype=np.float64)
+    n = int(num_units)
+    if values.shape != (n, n):
+        raise ValueError(
+            f"drop-grid evidence must have shape {(n, n)}, got {values.shape}"
+        )
+    mode = str(evidence.get("mode", "full")).strip().lower()
+    if mode not in {"full", "diagonal"}:
+        raise ValueError(f"unsupported drop-grid evidence mode {mode!r}")
+    vmin_raw = evidence.get("vmin")
+    vmax_raw = evidence.get("vmax")
+    draw_symmetric_heatmap_panel(
+        ax,
+        values,
+        title=str(evidence.get("title", "Selection evidence")),
+        colorbar_label=str(evidence.get("colorbar_label", "")).strip(),
+        cmap="coolwarm_r",
+        vmin=(
+            float(vmin_raw)
+            if isinstance(vmin_raw, (int, float))
+            else None
+        ),
+        vmax=(
+            float(vmax_raw)
+            if isinstance(vmax_raw, (int, float))
+            else None
+        ),
+        diagonal_only=mode == "diagonal",
+        index_name="unit",
+        xlabel="interval start",
+        ylabel="interval end",
+    )
+
+
+def render_prune_strategy_drop_grids(
+    *,
+    num_units: int,
+    strategy_drop_indices: Sequence[tuple[str, Mapping[int, Sequence[int]]]],
+    out_dir: Path,
+    backbone: str,
+    tag: Optional[str] = None,
+    title: Optional[str] = None,
+    strategy_evidence: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> Path:
+    """Render Single/Double drop grids and optional raw evidence per method."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    items = [(str(name), drops) for name, drops in strategy_drop_indices if drops]
+    if not items:
+        raise ValueError("strategy_drop_indices must contain at least one non-empty grid")
+    method_rows = _group_drop_grid_items_by_method(items)
+    evidence_by_method = {
+        str(method).strip().casefold(): evidence
+        for method, evidence in (strategy_evidence or {}).items()
+    }
+    n = int(num_units)
+    panel_size = max(4.2, n * 0.16)
+    ncols = 3 if strategy_evidence is not None else 2
+    nrows = len(method_rows)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(panel_size * ncols, (panel_size + 0.8) * nrows),
+        squeeze=False,
+        gridspec_kw=(
+            {"width_ratios": [1.0, 1.0, 1.15]}
+            if ncols == 3
+            else None
+        ),
+    )
+    for row_index, row in enumerate(method_rows):
+        for column_index, item in enumerate(row[:2]):
+            ax = axes[row_index, column_index]
+            if item is None:
+                ax.axis("off")
+                continue
+            name, drops = item
+            _draw_drop_grid_panel(
+                ax,
+                num_units=n,
+                span_to_drop_indices=drops,
+                title=name,
+            )
+        if ncols == 3:
+            evidence_ax = axes[row_index, 2]
+            method_name = _drop_grid_method_name(row)
+            evidence = evidence_by_method.get(method_name.casefold())
+            if evidence is None:
+                evidence_ax.axis("off")
+            else:
+                _draw_drop_grid_evidence_panel(
+                    evidence_ax,
+                    evidence=evidence,
+                    num_units=n,
+                )
+    if title:
+        fig.suptitle(title, fontsize=14, fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+    else:
+        fig.tight_layout()
+    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    safe_tag = (
+        str(tag).replace("/", "_").replace(" ", "_")
+        if tag
+        else f"prune_plan_{safe_backbone}_drop_grid"
+    )
+    out_path = out_dir / f"{safe_tag}.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def _sim_to_heatmap_grid(sim: np.ndarray, fill_value: float = float("nan")) -> np.ndarray:
     n = int(sim.shape[0])
     packed = upper_triangle_pack(torch.from_numpy(sim.astype(np.float64)))
@@ -1691,9 +2472,9 @@ def render_triangle_prune_heatmap(
     im = imshow_upper_triangle(ax, masked, n, cmap="viridis", vmin=0.0, vmax=1.0)
     if title is None:
         if threshold is None:
-            title = f"CKA + legal triangles (n={len(picks)})"
+            title = f"CKA interval score + selected closed intervals (n={len(picks)})"
         else:
-            title = f"CKA + dense triangles (tau={threshold}, n={len(picks)})"
+            title = f"CKA interval score + selected closed intervals (score >= {threshold:g}, n={len(picks)})"
     ax.set_title(title)
     configure_triangle_axes(ax, n, index_name="unit", xlabel="drop start i", ylabel="drop end j")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -1763,16 +2544,13 @@ def _synthetic_unit_ids(depth: int = 24) -> List[str]:
     return ids
 
 
-def _synthetic_sim(n: int, seed: int = 0) -> np.ndarray:
+def _synthetic_interval_score(n: int, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
-    sim = rng.uniform(0.5, 1.0, size=(n, n)).astype(np.float64)
-    sim = (sim + sim.T) / 2.0
-    np.fill_diagonal(sim, 1.0)
-    # Dense block in upper triangle around units 10..20
-    for i in range(8, 18):
-        for j in range(i + 1, 22):
-            sim[i, j] = sim[j, i] = rng.uniform(0.92, 0.99)
-    return sim
+    score = np.full((n, n), np.nan, dtype=np.float64)
+    for start in range(1, n):
+        for end in range(start, n):
+            score[start, end] = rng.uniform(0.5, 1.0)
+    return score
 
 
 def _find_npz_under(root: Path) -> Optional[Path]:
@@ -1786,7 +2564,7 @@ def _find_npz_under(root: Path) -> Optional[Path]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    p = argparse.ArgumentParser(description="Visualize triangle greedy picks on CKA heatmap.")
+    p = argparse.ArgumentParser(description="Visualize closed-interval picks on a CKA interval-score heatmap.")
     p.add_argument(
         "--redundancy-root",
         type=Path,
@@ -1796,8 +2574,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p.add_argument("--npz", type=Path, default=None, help="Explicit redundancy npz path.")
     p.add_argument("--out-dir", type=Path, default=Path("tmp/triangle_prune_viz"))
     p.add_argument("--threshold", type=float, default=0.9)
-    p.add_argument("--max-triangles", type=int, default=2)
-    p.add_argument("--synthetic", action="store_true", help="Use synthetic 48x48 CKA if no npz.")
+    p.add_argument("--max-intervals", type=int, default=2)
+    p.add_argument("--synthetic", action="store_true", help="Use a synthetic 48x48 interval-score matrix if no npz.")
     args = p.parse_args(list(argv) if argv is not None else None)
 
     npz_path = args.npz
@@ -1806,22 +2584,40 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     if npz_path is not None and npz_path.is_file():
         z = np.load(npz_path, allow_pickle=True)
-        unit_ids = [str(u) for u in list(z["unit_ids"])]
-        sim = np.asarray(z["cka_mean"], dtype=np.float64)
-        tag = npz_path.parent.parent.name + "_" + npz_path.parent.name
+        try:
+            semantics = str(np.asarray(z.get("graph_semantics", np.array([""])), dtype=object).reshape(-1)[0])
+            if semantics != UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS:
+                raise ValueError(
+                    f"{npz_path} uses graph_semantics={semantics!r}; "
+                    f"expected {UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS!r}"
+                )
+            unit_ids = [str(u) for u in list(z["unit_ids"])]
+            unit_similarity = np.asarray(z["cka_mean"], dtype=np.float64)
+            interval_score = unit_similarity_to_interval_score(unit_similarity)
+            tag = npz_path.parent.parent.name + "_" + npz_path.parent.name
+        finally:
+            z.close()
     elif args.synthetic or npz_path is None:
         unit_ids = _synthetic_unit_ids(24)
-        sim = _synthetic_sim(len(unit_ids))
+        interval_score = _synthetic_interval_score(len(unit_ids))
         tag = "synthetic_vggt48"
-        print("No redundancy graph npz found; using synthetic CKA matrix.", flush=True)
+        print("No redundancy graph npz found; using a synthetic interval-score matrix.", flush=True)
     else:
         raise FileNotFoundError(f"Missing npz: {npz_path}")
 
-    picks, _ = greedy_dense_triangles(
-        sim, unit_ids, threshold=float(args.threshold), max_triangles=int(args.max_triangles)
+    filtered_score = np.array(interval_score, dtype=np.float64, copy=True)
+    filtered_score[np.isfinite(filtered_score) & (filtered_score < float(args.threshold))] = np.nan
+    picks, _ = scan_endpoint_linked_closed_intervals_with_candidates(
+        filtered_score,
+        unit_ids,
     )
+    max_intervals = max(0, int(args.max_intervals))
+    if max_intervals:
+        picks = picks[-max_intervals:]
+    else:
+        picks = []
     out = render_triangle_prune_heatmap(
-        sim,
+        interval_score,
         unit_ids,
         picks,
         out_dir=args.out_dir,
@@ -1830,7 +2626,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     print(f"Wrote {out} ({len(picks)} triangles)", flush=True)
     for k, pick in enumerate(picks):
-        print(f"  [{k}] (i,j)=({pick.i},{pick.j}) span={pick.span} anchor={pick.unit_i}", flush=True)
+        print(
+            f"  [{k}] closed=[{pick.i},{pick.j}] drop_count={pick.span} "
+            f"start_unit={pick.unit_i}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
