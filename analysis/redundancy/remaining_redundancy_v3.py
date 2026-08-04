@@ -131,7 +131,7 @@ def _load_base_prune_plan(
             "closed_interval": True,
             "start": start,
             "end": end,
-            "source": "first_skip_eval_gt_single_interval_knee",
+            "source": "first_skip_eval_gt_single_interval_at_point",
         },
     )
     plan.validate()

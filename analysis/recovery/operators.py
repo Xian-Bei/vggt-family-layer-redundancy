@@ -16,10 +16,12 @@ class BoundaryRecovery(nn.Module):
         super().__init__()
         if weight.dim() != 2 or int(weight.shape[0]) != int(weight.shape[1]):
             raise ValueError(f"recovery weight must be square [C,C], got {tuple(weight.shape)}")
-        self.weight = nn.Parameter(weight.detach().to(torch.float32))
+        # Fitted recovery matrices are inference constants.  A buffer keeps
+        # them in state_dict/device moves without exposing them to optimizers.
+        self.register_buffer("weight", weight.detach().to(torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.matmul(x.to(torch.float32), self.weight).to(dtype=x.dtype)
+        return torch.matmul(x, self.weight)
 
 
 def recovery_module_name(source_unit_id: str) -> str:
@@ -30,45 +32,53 @@ def recovery_module_name(source_unit_id: str) -> str:
 _REPLACEME_TYPES = {
     "recovery_replaceme_ls",
     "recovery_replaceme_cos",
-    "recovery_replaceme_cos_more",
-    "recovery_replaceme_cos_scale",
 }
-_FUSED_TYPES = _REPLACEME_TYPES | {"recovery_prunecomp"}
+_FUSED_TYPES = _REPLACEME_TYPES
+_COMPACTABLE_BOUNDARY_TYPES = {
+    "recovery_linearpatch",
+    "recovery_ghost",
+    "recovery_ghost_sequential",
+    "recovery_ghost_interval",
+    "recovery_ghost_interval_sequential",
+}
 
 
-def _scale_affine_output(module: nn.Module, scale: float) -> None:
-    weight = getattr(module, "weight", None)
-    if not isinstance(weight, torch.Tensor):
-        raise TypeError(f"Expected affine output module with weight, got {type(module).__name__}")
-    weight.mul_(float(scale))
-    bias = getattr(module, "bias", None)
-    if isinstance(bias, torch.Tensor):
-        bias.mul_(float(scale))
+def compact_recovery_operators(
+    recovery_specs: Sequence[Dict[str, Any]], recovery_weights: Any
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Merge consecutive boundary matrices into one minimal operator."""
+    specs = [dict(spec) for spec in recovery_specs]
+    if not isinstance(recovery_weights, Sequence) or torch.is_tensor(recovery_weights):
+        return specs, recovery_weights
+    entries = [dict(item) for item in recovery_weights if isinstance(item, dict)]
+    if len(entries) != len(specs):
+        return specs, entries
 
-
-def _scale_initial_token_sources(model: nn.Module, scale: float) -> None:
-    agg = getattr(model, "aggregator", None)
-    token_owner = agg if isinstance(agg, nn.Module) else model
-    for name in ("camera_token", "register_token"):
-        value = getattr(token_owner, name, None)
-        if isinstance(value, torch.Tensor):
-            value.mul_(float(scale))
-
-    patch_source = getattr(agg, "patch_embed", None) if agg is not None else getattr(model, "encoder", None)
-    if not isinstance(patch_source, nn.Module):
-        raise AttributeError("Model has no recognized patch-token source for Prune&Comp fusion")
-    norm = getattr(patch_source, "norm", None)
-    if isinstance(norm, nn.Module) and isinstance(getattr(norm, "weight", None), torch.Tensor):
-        _scale_affine_output(norm, scale)
-        return
-    proj = getattr(patch_source, "proj", None)
-    if isinstance(proj, nn.Module) and isinstance(getattr(proj, "weight", None), torch.Tensor):
-        _scale_affine_output(proj, scale)
-        return
-    raise AttributeError(
-        f"Cannot fuse Prune&Comp into patch-token source {type(patch_source).__name__}: "
-        "missing affine norm/proj"
-    )
+    compact_specs: List[Dict[str, Any]] = []
+    compact_entries: List[Dict[str, Any]] = []
+    for spec, entry in zip(specs, entries):
+        weight = entry.get("weight")
+        if not torch.is_tensor(weight):
+            return specs, entries
+        can_merge = bool(compact_specs) and (
+            str(spec.get("type", "")) in _COMPACTABLE_BOUNDARY_TYPES
+            and str(compact_specs[-1].get("type", "")) == str(spec.get("type", ""))
+            and int(compact_specs[-1].get("target_unit_index", -2))
+            == int(spec.get("source_unit_index", -1))
+        )
+        if not can_merge:
+            compact_specs.append(spec)
+            compact_entries.append(entry)
+            continue
+        previous_spec = compact_specs[-1]
+        previous_entry = compact_entries[-1]
+        previous_weight = previous_entry["weight"]
+        combined = previous_weight.to(torch.float32) @ weight.to(torch.float32)
+        previous_spec["target_unit_id"] = spec.get("target_unit_id")
+        previous_spec["target_unit_index"] = spec.get("target_unit_index")
+        previous_spec["weight_shape"] = [int(x) for x in combined.shape]
+        previous_entry["weight"] = combined
+    return compact_specs, compact_entries
 
 
 def fuse_replaceme_transform(
@@ -108,35 +118,6 @@ def fuse_replaceme_transform(
             fc2.bias.copy_((bias @ raw_transform).to(dtype=fc2.bias.dtype))
 
 
-def fuse_prunecomp_scale(
-    model: nn.Module,
-    adapter: BackboneAdapter,
-    source_unit_id: str,
-    scale: float,
-) -> None:
-    alpha = float(scale)
-    if not torch.isfinite(torch.tensor(alpha)) or alpha <= 0.0:
-        raise ValueError(f"Prune&Comp scale must be finite and positive, got {alpha}")
-    from analysis.prune_plan.build_prune_plan_common import unit_id_to_index
-
-    source_index = unit_id_to_index(source_unit_id)
-    with torch.no_grad():
-        _scale_initial_token_sources(model, alpha)
-        if source_index < 0:
-            return
-        catalog = adapter.layer_unit_catalog(model)
-        for unit_index, spec in enumerate(catalog):
-            if unit_index > source_index:
-                break
-            block = adapter.block_for_unit(model, spec.unit_id)
-            attn_proj = getattr(getattr(block, "attn", None), "proj", None)
-            mlp_fc2 = getattr(getattr(block, "mlp", None), "fc2", None)
-            if not isinstance(attn_proj, nn.Module) or not isinstance(mlp_fc2, nn.Module):
-                raise TypeError(f"{adapter.name} {spec.unit_id} lacks attn.proj/mlp.fc2 for Prune&Comp")
-            _scale_affine_output(attn_proj, alpha)
-            _scale_affine_output(mlp_fc2, alpha)
-
-
 def _patch_output(module: nn.Module, args: tuple[Any, ...], output: Any) -> Any:
     patch = getattr(module, "_lare_recovery_patch")
     if torch.is_tensor(output):
@@ -158,6 +139,40 @@ def _patch_output(module: nn.Module, args: tuple[Any, ...], output: Any) -> Any:
             out[0] = patch(out[0])
             return out
     return output
+
+
+def _make_patch_input(patch: BoundaryRecovery):
+    """Apply a recovery transform at a full-unit boundary before its consumer."""
+
+    def hook(_module: nn.Module, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
+        if not args or not torch.is_tensor(args[0]):
+            return None
+        return (patch(args[0]),) + args[1:]
+
+    return hook
+
+
+def _omega_register_boundary_consumer(
+    model: nn.Module,
+    adapter: BackboneAdapter,
+    source_unit_id: str,
+) -> nn.Module | None:
+    """Return the next full-token consumer for an Omega register-only global unit."""
+    if str(getattr(adapter, "name", "")).strip().lower() != "vggt_omega":
+        return None
+    kind, index_s = str(source_unit_id).split("_", 1)
+    if kind != "global":
+        return None
+    index = int(index_s)
+    agg = getattr(model, "aggregator", None)
+    attention_types = getattr(agg, "inter_frame_attention_types", None)
+    if not isinstance(attention_types, (list, tuple)):
+        return None
+    if index >= len(attention_types) or str(attention_types[index]) != "register":
+        return None
+    # Omega reassembles register and bypassed patch tokens after global_i.  The
+    # next frame block is the first module that receives that complete state.
+    return adapter.block_for_unit(model, f"frame_{index + 1}")
 
 
 def install_recovery_modules(
@@ -183,11 +198,23 @@ def install_recovery_modules(
             raise ValueError(f"recovery spec missing weight_shape: {spec}")
         module_name = str(spec.get("module_name") or recovery_module_name(source_unit_id))
         weight = torch.eye(int(shape[0]), int(shape[1]), dtype=torch.float32)
-        patch = BoundaryRecovery(weight).to(device=dev)
+        model_dtype = next(
+            (parameter.dtype for parameter in model.parameters() if parameter.is_floating_point()),
+            torch.float32,
+        )
+        patch = BoundaryRecovery(weight).to(device=dev, dtype=model_dtype)
         block = adapter.block_for_unit(model, source_unit_id)
         setattr(block, module_name, patch)
         setattr(block, "_lare_recovery_patch", patch)
-        handles.append(block.register_forward_hook(_patch_output))
+        boundary_consumer = _omega_register_boundary_consumer(
+            model, adapter, source_unit_id
+        )
+        if boundary_consumer is not None:
+            handles.append(
+                boundary_consumer.register_forward_pre_hook(_make_patch_input(patch))
+            )
+        else:
+            handles.append(block.register_forward_hook(_patch_output))
     return handles
 
 
@@ -245,12 +272,6 @@ def apply_recovery_weights(
         if recovery_type in _REPLACEME_TYPES:
             fuse_replaceme_transform(model, adapter, source_unit_id, weight)
             continue
-        if recovery_type == "recovery_prunecomp":
-            if int(weight.numel()) != 1:
-                raise ValueError(f"Prune&Comp checkpoint must contain one scalar, got {tuple(weight.shape)}")
-            fuse_prunecomp_scale(model, adapter, source_unit_id, float(weight.reshape(-1)[0].item()))
-            continue
-
         block = adapter.block_for_unit(model, source_unit_id)
         patch = getattr(block, module_name)
-        patch.weight.data.copy_(weight.to(device=dev, dtype=torch.float32))
+        patch.weight.data.copy_(weight.to(device=dev, dtype=patch.weight.dtype))

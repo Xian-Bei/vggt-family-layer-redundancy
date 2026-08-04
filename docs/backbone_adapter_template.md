@@ -82,7 +82,7 @@ align loss 属于公共训练路径，prediction loss 属于 adaptor。即使多
 
 `eval_scene()`
 
-用于四个数据集的统一 eval。推荐内部调用 `forward_predictions()` 得到 `PredictionBundle`，再复用公共 eval helper。`periodic_eval_skip_depth()` 用来声明是否跳过深度指标。
+用于四个数据集的统一 eval。推荐内部调用 `forward_predictions()` 得到 `PredictionBundle`，再复用公共 eval helper。
 
 ## 精度和 autocast 约定
 

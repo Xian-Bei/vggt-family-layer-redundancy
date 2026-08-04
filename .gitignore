@@ -215,6 +215,5 @@ tests/
 .cursorignore
 backbones/training_reference/
 tmp/
-scripts/
 submodules/
 paper/

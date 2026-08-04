@@ -61,7 +61,6 @@ def build_heatmaps_tab(
     stage2_scene_ids: List[str],
     initial_stage2_scene: str | None,
     stage2_metric_row_pose: str,
-    stage2_metric_row_depth: str,
     stage2_metric_row_point: str,
     stage2_token_row_special: str,
     stage2_token_row_camera: str,
@@ -94,10 +93,14 @@ def build_heatmaps_tab(
             "7-metric mean and similarity maps, plus marginal 7-metric mean "
             "and similarity maps rebased by the first prune interval's "
             "`1 - similarity` degradation, clipped to `[0,1]`. "
-            "Heatmap titles report strict-upper Pearson scores: **H r** compares "
+            "Heatmap captions report strict-upper **Soft IoU**, **Soft Dice**, "
+            "GPU **2D Sinkhorn distance**, and **Jensen–Shannon divergence (JS)**. "
+            "**H** compares "
             "each non-first column with the first column in the same row; "
-            "**V r** compares each non-first row with the first row in the same column. "
-            "Diagonal and NaN entries are excluded."
+            "**V** compares each non-first row with the first row in the same column. "
+            "Diagonal and NaN entries are excluded; Sinkhorn is measured in layer-grid cells. "
+            "IoU/Dice are similarities (higher is closer), while Sinkhorn/JS are distances "
+            "(lower is closer)."
         )
         with gr.Row():
             with gr.Column(scale=1):

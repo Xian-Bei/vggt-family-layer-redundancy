@@ -13,13 +13,11 @@ from analysis.backbones.contracts import EvalSceneContext
 from analysis.datasets.contracts import DatasetAdaptor, EvalSampleBatch, PreparedSkipEvalScene
 from analysis.datasets.frame_selection import cap_sequence
 from analysis.eval.metrics_core import (
-    compute_depth_metrics,
     compute_point_metrics,
     merge_scene_metrics,
-    require_depth_stack_shapes,
 )
 from analysis.eval.vis_export_v3 import export_7andn_points_3d, save_scene_plot_2d, scene_vis_dir
-from analysis.schema.v3 import DatasetEvalProfile, DepthEvalProfile, GeometryEvalProfile
+from analysis.schema.v3 import DatasetEvalProfile, GeometryEvalProfile
 
 _VALID_SPLITS = ("train", "val")
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
@@ -58,7 +56,6 @@ class NuScenesAdaptor(DatasetAdaptor):
         return DatasetEvalProfile(
             dataset=self.name,
             geometry=GeometryEvalProfile(dist_clip=1.0, use_icp=True, max_points=100_000),
-            depth=DepthEvalProfile(max_depth=80.0, conf_thresh=1.0, crop_mode="none"),
             kf_every=1,
             size=518,
         )
@@ -98,13 +95,6 @@ class NuScenesAdaptor(DatasetAdaptor):
         pose_paths = [scene_dir / "cam2world" / self.camera_name / f"{fid:03d}.txt" for fid in frame_ids]
         lidar_paths = [scene_dir / "lidar" / f"{fid:03d}.bin" for fid in frame_ids]
         intrinsic_path = scene_dir / "intrinsic" / f"{self.camera_name}.txt"
-        depth_paths = [scene_dir / "depth_points" / self.camera_name / f"{fid:03d}.npz" for fid in frame_ids]
-        missing_depth = [p for p in depth_paths if not p.is_file()]
-        if missing_depth:
-            raise FileNotFoundError(
-                f"Missing sparse camera-Z depth for {self.name} scene {scene_id}: {missing_depth[0]}. "
-                "Re-run the official dataset extractor."
-            )
 
         images = None
         return EvalSampleBatch(
@@ -119,7 +109,6 @@ class NuScenesAdaptor(DatasetAdaptor):
                 "pose_paths": [str(p) for p in pose_paths],
                 "lidar_paths": [str(p) for p in lidar_paths],
                 "intrinsic_path": str(intrinsic_path),
-                "depth_paths": [str(p) for p in depth_paths],
                 "max_frames": int(max_frames),
                 "camera_name": self.camera_name,
             },
@@ -166,31 +155,6 @@ class NuScenesAdaptor(DatasetAdaptor):
             "inference_time_ms": float(infer_ms),
             "infer_peak_vram_gb": float(peak_gb),
         }
-
-        if not ctx.skip_depth and isinstance(bundle.depth, torch.Tensor):
-            pred_depth = bundle.depth.detach().float()
-            if pred_depth.ndim == 5 and pred_depth.shape[-1] == 1:
-                pred_depth = pred_depth.squeeze(-1)
-            if pred_depth.ndim != 4 or pred_depth.shape[0] != 1:
-                raise ValueError(f"Unexpected {self.name} predicted depth shape: {tuple(pred_depth.shape)}")
-            pred_stack = pred_depth[0].cpu().numpy().astype(np.float32, copy=False)
-            depth_paths = [Path(p) for p in batch.meta.get("depth_paths", [])]
-            if len(depth_paths) != int(pred_stack.shape[0]):
-                raise ValueError(
-                    f"{self.name} {batch.scene_id}: prediction/GT frame count mismatch "
-                    f"{pred_stack.shape[0]} vs {len(depth_paths)}"
-                )
-            gt_stack, valid_frames = backbone_adaptor.load_driving_depth_stack(
-                depth_paths,
-                output_hw=(int(pred_stack.shape[1]), int(pred_stack.shape[2])),
-            )
-            require_depth_stack_shapes(
-                pred_stack,
-                gt_stack,
-                context=f"{self.name} {batch.scene_id}",
-            )
-            metrics.update(compute_depth_metrics(pred_stack, gt_stack, ctx.profile.depth))
-            metrics["depth_valid_frames"] = float(valid_frames)
 
         gt_c2w = _load_pose_stack(batch.meta.get("pose_paths", []))
         gt_w2c = np.linalg.inv(gt_c2w) if gt_c2w.shape[0] else np.zeros((0, 4, 4), dtype=np.float64)
@@ -280,22 +244,12 @@ class NuScenesAdaptor(DatasetAdaptor):
             raise ValueError(f"{self.name} {batch.scene_id}: missing image_paths in batch meta")
         images = backbone_adaptor.load_eval_images(image_paths)
         images_b = images.unsqueeze(0).float().to(ctx.device)
-        depth_paths = [Path(p) for p in batch.meta.get("depth_paths", [])]
-        gt_depth = None
-        valid_depth_frames = 0
-        if not ctx.skip_depth and depth_paths:
-            gt_depth, valid_depth_frames = backbone_adaptor.load_driving_depth_stack(
-                depth_paths,
-                output_hw=(int(images_b.shape[-2]), int(images_b.shape[-1])),
-            )
         gt_c2w = _load_pose_stack(batch.meta.get("pose_paths", []))
         gt_w2c = np.linalg.inv(gt_c2w) if gt_c2w.shape[0] else np.zeros((0, 4, 4), dtype=np.float64)
         return PreparedSkipEvalScene(
             scene_id=str(batch.scene_id),
             images=images_b,
             state={
-                "gt_depth": gt_depth,
-                "valid_depth_frames": int(valid_depth_frames),
                 "gt_c2w": gt_c2w,
                 "gt_w2c": gt_w2c,
                 "gt_points": _load_lidar_points(batch.meta.get("lidar_paths", [])),
@@ -314,23 +268,6 @@ class NuScenesAdaptor(DatasetAdaptor):
 
         del backbone_adaptor
         metrics: Dict[str, float] = {}
-        if not ctx.skip_depth and isinstance(prediction.depth, torch.Tensor):
-            pred_depth = prediction.depth.detach().float()
-            if pred_depth.ndim == 5 and pred_depth.shape[-1] == 1:
-                pred_depth = pred_depth.squeeze(-1)
-            if pred_depth.ndim != 4 or pred_depth.shape[0] != 1:
-                raise ValueError(f"Unexpected {self.name} predicted depth shape: {tuple(pred_depth.shape)}")
-            pred_stack = pred_depth[0].cpu().numpy().astype(np.float32, copy=False)
-            gt_stack = prepared.state.get("gt_depth")
-            if gt_stack is not None:
-                if tuple(gt_stack.shape) != tuple(pred_stack.shape):
-                    raise ValueError(
-                        f"{self.name} {prepared.scene_id}: prediction/GT depth shape mismatch "
-                        f"{pred_stack.shape} vs {gt_stack.shape}"
-                    )
-                metrics.update(compute_depth_metrics(pred_stack, gt_stack, ctx.profile.depth))
-                metrics["depth_valid_frames"] = float(prepared.state["valid_depth_frames"])
-
         gt_w2c = prepared.state["gt_w2c"]
         frame_ids = prepared.state["frame_ids"]
         sim3_eval = None

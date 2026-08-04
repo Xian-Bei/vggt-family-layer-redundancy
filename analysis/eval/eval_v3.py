@@ -8,7 +8,7 @@ import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 import torch
@@ -59,14 +59,20 @@ def _eval_scene_count(
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Unified eval (v3).")
     p.add_argument("--experiment", type=str, default="default")
-    p.add_argument("--dataset", type=str, required=True, choices=dataset_names())
+    p.add_argument("--dataset", type=str, default="", choices=("", *dataset_names()))
     p.add_argument(
         "--split",
         type=str,
         default=None,
         help="Optional dataset split, validated by the dataset adaptor.",
     )
-    p.add_argument("--data-root", type=Path, required=True)
+    p.add_argument("--data-root", type=Path, default=None)
+    p.add_argument(
+        "--jobs-manifest",
+        type=Path,
+        default=None,
+        help="JSON list of eval jobs sharing one model/checkpoint load.",
+    )
     p.add_argument("--backbone", type=str, default="vggt")
     p.add_argument(
         "--model-name",
@@ -86,7 +92,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-scenes", type=int, default=0)
     p.add_argument("--checkpoint", type=Path, default=None)
     p.add_argument("--output-dir", type=Path, default=None)
-    p.add_argument("--skip-depth", action="store_true")
     p.add_argument(
         "--max-frames",
         type=int,
@@ -168,7 +173,6 @@ def evaluate_model_v3(
     model_name: str,
     device: torch.device,
     output_dir: Path | None,
-    skip_depth: bool,
     max_scenes: int,
     max_frames: int,
     export_vis_2d: bool = False,
@@ -188,7 +192,6 @@ def evaluate_model_v3(
     ctx = EvalSceneContext(
         device=device,
         profile=profile,
-        skip_depth=bool(skip_depth),
         export_vis_2d=bool(export_vis_2d),
         export_vis_3d=bool(export_vis_3d),
         vis_save_root=out_dir,
@@ -266,7 +269,6 @@ def evaluate_model_v3(
         model_name=model_name,
         dataset_eval_profile={
             "geometry": asdict(profile.geometry),
-            "depth": asdict(profile.depth),
             "kf_every": int(profile.kf_every),
             "max_frames": int(max_frames),
         },
@@ -274,6 +276,9 @@ def evaluate_model_v3(
         average=avg,
         extra={
             "eval_mode": str(getattr(model, "_lare_eval_mode", "")),
+            "auto_merged_lora_linears": int(
+                getattr(model, "_lare_auto_merged_lora", 0)
+            ),
             "inference_compression": dict(
                 getattr(model, "_inference_compression", {"name": "none"})
             )
@@ -291,10 +296,39 @@ def evaluate_model_v3(
 
 def main() -> None:
     args = _build_parser().parse_args()
+    jobs: List[Dict[str, Any]] = []
+    if args.jobs_manifest is not None:
+        payload = json.loads(Path(args.jobs_manifest).read_text(encoding="utf-8"))
+        if not isinstance(payload, list) or not payload or not all(isinstance(x, dict) for x in payload):
+            raise ValueError("--jobs-manifest must contain a non-empty JSON object list")
+        jobs = [dict(x) for x in payload]
+        first = jobs[0]
+        common_fields = (
+            "experiment", "backbone", "hf_model", "device", "eval_mode",
+            "model_name", "checkpoint", "prune_plan_root", "prune_plan_name",
+            "recovery_plan_root", "recovery_plan_name", "inference_compression",
+            "fastvggt_merge_start", "fastvggt_merge_ratio", "quantvggt_dtype",
+            "quantvggt_params_dir",
+        )
+        for field in common_fields:
+            if field in first:
+                value = first[field]
+                if field in {"checkpoint", "prune_plan_root", "recovery_plan_root", "quantvggt_params_dir"}:
+                    value = Path(value) if value else None
+                setattr(args, field, value)
+        for index, job in enumerate(jobs[1:], start=1):
+            mismatched = [
+                field for field in common_fields
+                if field in job and job.get(field) != first.get(field)
+            ]
+            if mismatched:
+                raise ValueError(
+                    f"Eval job {index} changes shared model fields: {mismatched}"
+                )
+    elif not args.dataset or args.data_root is None:
+        raise ValueError("--dataset and --data-root are required without --jobs-manifest")
     adapter = get_backbone(args.backbone)
     apply_pythonpath(adapter.name)
-    ds_plugin = get_dataset(args.dataset)
-    split = ds_plugin.validate_split(args.split)
     device = torch.device(args.device)
     hf_model = str(args.hf_model or adapter.default_hf_model())
     eval_mode: EvalMode = args.eval_mode  # type: ignore[assignment]
@@ -343,6 +377,15 @@ def main() -> None:
         map_location=device,
     )
 
+    # This is an inference-only model. Fold LoRA branches by default so the
+    # measured latency and VRAM match the deployable transformer topology.
+    auto_merged_lora = 0
+    if eval_mode == "model":
+        from analysis.inference_compression.lora import merge_lora_linears
+
+        auto_merged_lora = merge_lora_linears(model)
+    model._lare_auto_merged_lora = int(auto_merged_lora)
+
     if compression_adapter is not None:
         model = compression_adapter.apply(
             model,
@@ -360,37 +403,50 @@ def main() -> None:
             f"checkpoint={args.checkpoint} inference_compression={compression_config.name}",
             flush=True,
         )
-    out_dir = evaluate_model_v3(
-        adapter=adapter,
-        model=model,
-        ds_plugin=ds_plugin,
-        experiment=str(args.experiment),
-        dataset=str(args.dataset),
-        data_root=Path(args.data_root),
-        backbone=str(args.backbone),
-        model_name=model_name,
-        device=device,
-        output_dir=Path(args.output_dir) if args.output_dir is not None else None,
-        skip_depth=bool(args.skip_depth),
-        max_scenes=int(args.max_scenes),
-        max_frames=int(args.max_frames),
-        export_vis_2d=bool(args.export_vis_2d),
-        export_vis_3d=bool(args.export_vis_3d),
-        vis_max_points=int(args.vis_max_points),
-        split=split,
-        progress=not bool(args.no_progress),
-    )
-    if eval_mode in ("lower", "model") and prune_plan is not None:
-        selector = _result_selector_from_prune_plan(prune_plan, args.prune_plan_name)
-        summary_path = materialize_eval_interval_result(
-            out_dir,
-            selector=selector,
-            drop=list(prune_plan.drop),
-            source_eval_mode=str(eval_mode),
-            recovery_plan_name=str(args.recovery_plan_name or ""),
+    eval_jobs = jobs or [
+        {
+            "dataset": args.dataset,
+            "data_root": str(args.data_root),
+            "output_dir": str(args.output_dir) if args.output_dir is not None else None,
+            "split": args.split,
+        }
+    ]
+    for job in eval_jobs:
+        ds_plugin = get_dataset(str(job["dataset"]))
+        split = ds_plugin.validate_split(job.get("split", args.split))
+        out_dir = evaluate_model_v3(
+            adapter=adapter,
+            model=model,
+            ds_plugin=ds_plugin,
+            experiment=str(args.experiment),
+            dataset=str(job["dataset"]),
+            data_root=Path(str(job["data_root"])),
+            backbone=str(args.backbone),
+            model_name=model_name,
+            device=device,
+            output_dir=Path(str(job["output_dir"])) if job.get("output_dir") else None,
+            max_scenes=int(job.get("max_scenes", args.max_scenes)),
+            max_frames=int(job.get("max_frames", args.max_frames)),
+            export_vis_2d=bool(job.get("export_vis_2d", args.export_vis_2d)),
+            export_vis_3d=bool(job.get("export_vis_3d", args.export_vis_3d)),
+            vis_max_points=int(job.get("vis_max_points", args.vis_max_points)),
+            split=split,
+            output_dataset=job.get("output_dataset"),
+            progress=not bool(job.get("no_progress", args.no_progress)),
         )
-        if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
-            print(f"Wrote {summary_path}", file=sys.stderr, flush=True)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        if eval_mode in ("lower", "model") and prune_plan is not None:
+            selector = _result_selector_from_prune_plan(prune_plan, args.prune_plan_name)
+            summary_path = materialize_eval_interval_result(
+                out_dir,
+                selector=selector,
+                drop=list(prune_plan.drop),
+                source_eval_mode=str(eval_mode),
+                recovery_plan_name=str(args.recovery_plan_name or ""),
+            )
+            if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
+                print(f"Wrote {summary_path}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

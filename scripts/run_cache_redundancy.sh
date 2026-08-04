@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -17,7 +17,6 @@ RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
 
 
 MAX_SCENES="${MAX_SCENES:-0}"
-CONDA_ENV="${CONDA_ENV:-vggt}"
 DEVICE="${DEVICE:-cuda}"
 MAX_TOKENS="${MAX_TOKENS:-0}"
 METRICS="${METRICS:-cka,cosine,angular,inv_mse}"
@@ -25,8 +24,8 @@ MAX_SPAN="${MAX_SPAN:-0}"
 SIM_TOKEN_REGIONS="${SIM_TOKEN_REGIONS:-special,patch,all}"
 REDUNDANCY_SEED="${REDUNDANCY_SEED:-0}"
 
-# shellcheck source=run_backbones_lib.sh
-source "${REPO_ROOT}/run_backbones_lib.sh"
+# shellcheck source=scripts/run_backbones_lib.sh
+source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 parse_backbones_list
 
 truthy() {
@@ -106,7 +105,7 @@ run_one_dataset() {
   else
     echo "== cache v3 dataset=${dataset}${split:+_${split}}${output_dataset:+ -> ${output_dataset}} backbone=${backbone} save_cache=${save_cache} skip_redundancy=${SKIP_REDUNDANCY} prune_plan_root=${PRUNE_PLAN_ROOT:-<off>} prune_plan_name=${PRUNE_PLAN_NAME:-<auto>} recovery_plan_name=${RECOVERY_PLAN_NAME:-<auto>} =="
   fi
-  run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.redundancy.cache_redundancy_v3 \
+  run_progress_command python -m analysis.redundancy.cache_redundancy_v3 \
     --experiment "${backbone}" \
     --dataset "${dataset}" \
     "${output_dataset_args[@]}" \

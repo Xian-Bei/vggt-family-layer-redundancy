@@ -16,63 +16,25 @@ RECOVERY_PLAN_METHODS = (
     "recovery_train",
     "recovery_linearpatch",
     "recovery_ghost",
+    "recovery_ghost_sequential",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
-    "recovery_ghost_cos",
-    "recovery_ghost_cos_more",
-    "recovery_ghost_cos_scale",
-    "recovery_ghost_mse_more",
-    "recovery_ghost_mse_cos_more",
-    "recovery_ghost_mse_cka_more",
-    "recovery_ghost_mse_cos_cka_more",
-    "recovery_ghost_mse_cos_balanced_more",
-    "recovery_ghost_mse_cka_balanced_more",
-    "recovery_ghost_mse_cos_cka_balanced_more",
-    "recovery_ghost_mse_cka_ema_more",
-    "recovery_ghost_mse_cos_cka_ema_half_more",
-    "recovery_ghost_mse_cos_cka_ema_one_more",
-    "recovery_ghost_mse_cka",
-    "recovery_ghost_cka_only",
-    "recovery_ghost_cka_ridge",
     "recovery_replaceme_ls",
     "recovery_replaceme_cos",
-    "recovery_replaceme_cos_more",
-    "recovery_replaceme_cos_scale",
-    "recovery_prunecomp",
 )
 TRAINABLE_RECOVERY_METHODS = ("recovery_lora", "recovery_train")
 TRAINING_FREE_RECOVERY_METHODS = (
     "recovery_linearpatch",
     "recovery_ghost",
+    "recovery_ghost_sequential",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
-    "recovery_ghost_cos",
-    "recovery_ghost_cos_more",
-    "recovery_ghost_cos_scale",
-    "recovery_ghost_mse_more",
-    "recovery_ghost_mse_cos_more",
-    "recovery_ghost_mse_cka_more",
-    "recovery_ghost_mse_cos_cka_more",
-    "recovery_ghost_mse_cos_balanced_more",
-    "recovery_ghost_mse_cka_balanced_more",
-    "recovery_ghost_mse_cos_cka_balanced_more",
-    "recovery_ghost_mse_cka_ema_more",
-    "recovery_ghost_mse_cos_cka_ema_half_more",
-    "recovery_ghost_mse_cos_cka_ema_one_more",
-    "recovery_ghost_mse_cka",
-    "recovery_ghost_cka_only",
-    "recovery_ghost_cka_ridge",
     "recovery_replaceme_ls",
     "recovery_replaceme_cos",
-    "recovery_replaceme_cos_more",
-    "recovery_replaceme_cos_scale",
-    "recovery_prunecomp",
 )
 REPLACEME_RECOVERY_METHODS = (
     "recovery_replaceme_ls",
     "recovery_replaceme_cos",
-    "recovery_replaceme_cos_more",
-    "recovery_replaceme_cos_scale",
 )
 GHOST_INTERVAL_RECOVERY_METHODS = (
     "recovery_ghost_interval",
@@ -226,9 +188,9 @@ def _one_boundary_record(start: int, end: int, method: str) -> Dict[str, Any]:
 def _boundary_records(prune_plan: UnitPrunePlan, method: str) -> List[Dict[str, Any]]:
     """Derive baseline-specific recovery boundaries from an arbitrary drop set.
 
-    The original Ghost and LinearPatch modes replace every removed unit when a
-    plan has multiple intervals. Interval Ghost variants and ReplaceMe Multi-LT
-    instead use one transform per maximal contiguous interval.
+    Ghost variants without ``interval`` replace every removed unit. Interval
+    Ghost variants and ReplaceMe Multi-LT instead use one transform per maximal
+    contiguous interval. LinearPatch retains its legacy single-interval shape.
     """
     drop = sorted({int(x) for x in prune_plan.drop})
     if not drop:
@@ -238,18 +200,16 @@ def _boundary_records(prune_plan: UnitPrunePlan, method: str) -> List[Dict[str, 
     intervals = _contiguous_drop_intervals(drop)
     if method in GHOST_INTERVAL_RECOVERY_METHODS:
         starts_and_ends = intervals
-    elif method == "recovery_linearpatch" or method.startswith("recovery_ghost"):
+    elif method in ("recovery_ghost", "recovery_ghost_sequential"):
+        # Ghost replaces each removed physical unit.  Consecutive replacements
+        # compose on the identity blocks installed by pruning.
+        starts_and_ends = [(index, index) for index in drop]
+    elif method == "recovery_linearpatch":
         if len(intervals) == 1:
             starts_and_ends = intervals
         else:
             starts_and_ends = [(index, index) for index in drop]
     elif method in REPLACEME_RECOVERY_METHODS:
-        starts_and_ends = intervals
-    elif method == "recovery_prunecomp":
-        if len(intervals) != 1:
-            raise ValueError(
-                "Prune&Comp multi-interval recovery is intentionally unsupported"
-            )
         starts_and_ends = intervals
     else:
         starts_and_ends = intervals

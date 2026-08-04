@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
@@ -27,10 +27,9 @@ EVAL_MAX_SCENES="${EVAL_MAX_SCENES:-0}"
 
 #############################################
 DEVICE="${DEVICE:-cuda}"
-CONDA_ENV="${CONDA_ENV:-vggt}"
 DTYPE="${DTYPE:-bfloat16}"
 
-source "${REPO_ROOT}/run_backbones_lib.sh"
+source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 parse_backbones_list
 parse_dataset_list "${EVAL}" "EVAL" "${DATASET_KEYS[@]}"
 EVAL_LIST=("${PARSED_DATASETS[@]}")
@@ -212,7 +211,7 @@ run_one_backbone() {
   else
     echo "== ${OUTPUT_KIND} v3 datasets=${DATASETS_FOR_PY} backbone=${backbone} prune_plan_name=${prune_plan_name} recovery_plan_name=${recovery_plan_name} prune_plan_root=${plan_root} eval_at_start=${EVAL_AT_START} save_every_epoch=${SAVE_EVERY_EPOCH} =="
   fi
-  run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.recovery.train.train_prune_lora_v3 \
+  run_progress_command python -m analysis.recovery.train.train_prune_lora_v3 \
     --experiment "${backbone}" \
     --dataset "${DATASETS_FOR_PY}" \
     --backbone "${backbone}" \

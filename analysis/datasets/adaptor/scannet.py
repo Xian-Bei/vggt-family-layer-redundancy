@@ -13,7 +13,7 @@ from analysis.eval.scannet_eval import (
     load_scene_images,
     select_scene_image_paths_fastvggt,
 )
-from analysis.schema.v3 import DatasetEvalProfile, DepthEvalProfile, GeometryEvalProfile
+from analysis.schema.v3 import DatasetEvalProfile, GeometryEvalProfile
 
 
 class ScanNetAdaptor(DatasetAdaptor):
@@ -34,7 +34,6 @@ class ScanNetAdaptor(DatasetAdaptor):
         return DatasetEvalProfile(
             dataset=self.name,
             geometry=GeometryEvalProfile(dist_clip=0.5, use_icp=True, max_points=100_000),
-            depth=DepthEvalProfile(max_depth=10.0, conf_thresh=1.0, crop_mode="none"),
             kf_every=1,
             size=518,
         )

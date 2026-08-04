@@ -121,7 +121,7 @@ def _load_base_prune_plan(
             "closed_interval": True,
             "start": start,
             "end": end,
-            "source": "first_skip_eval_gt_single_interval_knee",
+            "source": "first_skip_eval_gt_single_interval_at_point",
         },
     )
     plan.validate()
@@ -397,8 +397,6 @@ def run_remaining_skip_gt_eval(
     upper_metrics, upper_scene_metrics = base.load_upper_eval_or_fail(
         experiment=experiment,
         tagged_dataset=tagged_dataset,
-        require_depth=dataset in {"nuscenes", "waymo"}
-        and not adapter.periodic_eval_skip_depth(),
     )
     metrics = [metric for metric in base.SKIP_EVAL_METRICS if metric in upper_metrics]
     if not metrics:
@@ -435,7 +433,6 @@ def run_remaining_skip_gt_eval(
         "physical_spans": [
             [int(i), int(j)] for i, j in physical_to_logical
         ],
-        "skip_depth": bool(adapter.periodic_eval_skip_depth()),
         "base_prune_plan": provenance,
     }
     manifest_config = upgraded_manifest_config(
@@ -512,7 +509,6 @@ def run_remaining_skip_gt_eval(
     eval_context = EvalSceneContext(
         device=torch_device,
         profile=profile,
-        skip_depth=bool(adapter.periodic_eval_skip_depth()),
         export_vis_2d=False,
         export_vis_3d=False,
         vis_save_root=None,

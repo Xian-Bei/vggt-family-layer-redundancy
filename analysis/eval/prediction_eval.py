@@ -1,17 +1,4 @@
-"""FastVGGT-aligned ScanNet evaluation helpers for in-memory prediction payloads.
-
-Mainline GT eval now combines:
-- FastVGGT-style pose / geometry metrics
-- ScanNet dense-depth metrics (`depth_abs_rel`, `depth_delta1`)
-
-Depth GT handling follows the current redundancy pipeline protocol:
-- require raw ScanNet depth PNGs for every evaluated frame
-- align GT depth to the same RGB ``crop`` preprocessing used for VGGT input
-- derive valid pixels from GT depth values directly
-- ignore invalid / out-of-range depths outside ``(1e-3m, 10m)``
-- apply StreamVGGT-style scale-only alignment before computing depth metrics
-
-Scene aggregates are plain per-scene means (FastVGGT-style), not valid-pixel-weighted means.
+"""FastVGGT-aligned ScanNet pose and geometry evaluation helpers.
 
 This module lives under ``analysis.eval``; :class:`SceneData` and aggregation helpers come from
 ``analysis.eval.scannet_eval`` (dataset layout / scene discovery).
@@ -31,11 +18,11 @@ from PIL import Image
 from analysis.eval.scannet_eval import SceneData, aggregate_metric_dict
 
 from .metrics import (
-    STREAMVGGT_DEPTH_MAX,
-    evaluate_depth_metrics_streamvggt,
     evaluate_scene_metrics_fastvggt,
     merge_numeric_metrics_into,
 )
+
+SCANNET_DEPTH_MAX = 10.0
 
 
 def _squeeze_batch_to_ndim(arr: np.ndarray, target_ndim: int) -> np.ndarray:
@@ -124,8 +111,7 @@ def resolve_gt_ply_dir(data_root: Path, explicit: Optional[Path]) -> Optional[Pa
 class FastVggtSceneEvalContext:
     """Per-scene GT context reused across repeated metric calls.
 
-    Includes pose alignment inputs, GT mesh point cloud, and GT depth already aligned
-    to the model input coordinate system. Missing GT is treated as an error.
+    Includes pose alignment inputs and the GT mesh point cloud.
     """
 
     c2ws: np.ndarray
@@ -133,7 +119,6 @@ class FastVggtSceneEvalContext:
     frame_ids: List[int]
     gt_ply_dir: Path
     gt_point_cloud: Optional[np.ndarray]
-    gt_depth: Optional[np.ndarray]
 
 
 def _resize_depth_nearest(depth: np.ndarray, out_hw: Tuple[int, int]) -> np.ndarray:
@@ -210,7 +195,7 @@ def _read_scannet_depth_png(path: Path) -> np.ndarray:
     depth = np.nan_to_num(arr.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     depth[depth == 65535.0] = 0.0
     depth /= 1000.0
-    depth[(depth > STREAMVGGT_DEPTH_MAX) | (depth < 1e-3)] = 0.0
+    depth[(depth > SCANNET_DEPTH_MAX) | (depth < 1e-3)] = 0.0
     return depth
 
 
@@ -394,16 +379,13 @@ def build_fastvggt_scene_eval_context(
             f"Missing GT mesh for {scene.scene_id}: expected "
             f"{resolved_ply / scene.scene_id / (scene.scene_id + '_vh_clean_2.ply')}"
         )
-    gt_depth = _load_gt_depth_for_scene(scene, image_hw) if image_hw is not None else None
-    if image_hw is not None and gt_depth is None:
-        raise RuntimeError(f"Missing GT depth for {scene.scene_id}")
+    del image_hw
     return FastVggtSceneEvalContext(
         c2ws=c2ws,
         first_gt_pose=first_gt_pose,
         frame_ids=frame_ids,
         gt_ply_dir=resolved_ply,
         gt_point_cloud=gt_point_cloud,
-        gt_depth=gt_depth,
     )
 
 
@@ -418,7 +400,7 @@ def build_scannet_eval_row_from_payload_with_context(
 ) -> Dict[str, Any]:
     """Score one in-memory prediction payload against ScanNet GT.
 
-    Returns pose / geometry and dense-depth metrics. Missing GT is treated as an error.
+    Returns pose and geometry metrics. Missing GT is treated as an error.
     """
     row: Dict[str, Any] = {"scene_id": scene.scene_id}
     try:
@@ -431,9 +413,6 @@ def build_scannet_eval_row_from_payload_with_context(
             f"Frame count mismatch: pred S={extr.shape[0]} vs images={len(ctx.frame_ids)} ({scene.scene_id})"
         )
 
-    pred_depth = None
-    if ctx.gt_depth is not None and "depth" in payload:
-        pred_depth = _depth_or_conf_to_shw(payload["depth"].float().numpy(), "depth")
     m = evaluate_scene_metrics_fastvggt(
         scene.scene_id,
         ctx.c2ws,
@@ -447,8 +426,6 @@ def build_scannet_eval_row_from_payload_with_context(
         plot_trajectory=False,
         plot_path=None,
         gt_point_cloud=ctx.gt_point_cloud,
-        pred_depth=pred_depth,
-        gt_depth=ctx.gt_depth,
     )
     if m is None:
         raise RuntimeError(f"FastVGGT evaluate_scene_metrics_fastvggt returned None for {scene.scene_id}")
@@ -458,7 +435,7 @@ def build_scannet_eval_row_from_payload_with_context(
 
 
 def metrics_float_dict(row: Dict[str, Any]) -> Dict[str, float]:
-    skip = {"scene_id", "protocol", "infer_time_ms", "depth_valid_pixels"}
+    skip = {"scene_id", "protocol", "infer_time_ms"}
     out: Dict[str, float] = {}
     merge_numeric_metrics_into(out, {k: v for k, v in row.items() if k not in skip})
     return out

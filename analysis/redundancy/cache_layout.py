@@ -191,12 +191,34 @@ def load_scene_replay_layer(
     from analysis.redundancy.cache_layout_v3 import is_v3_cache_dir, load_scene_replay_layer_v3
 
     if not is_v3_cache_dir(cache_dir):
-        raise SystemExit(f"Expected v3 cache at {cache_dir}; re-run run_cache_redundancy.sh")
+        raise SystemExit(f"Expected v3 cache at {cache_dir}; re-run scripts/run_cache_redundancy.sh")
     return load_scene_replay_layer_v3(
         cache_dir,
         item,
         int(layer_idx),
         num_layers=expected_num_layers,
+        map_location=map_location,
+    )
+
+
+def load_scene_unit(
+    cache_dir: Path,
+    item: Dict[str, Any],
+    unit_id: str,
+    *,
+    mmap: bool = True,
+    map_location: Optional[str] = "cpu",
+) -> torch.Tensor:
+    """Load one v3 frame/global unit without loading or concatenating its partner."""
+    from analysis.redundancy.cache_layout_v3 import is_v3_cache_dir, load_scene_unit_v3
+
+    if not is_v3_cache_dir(cache_dir):
+        raise SystemExit(f"Expected v3 cache at {cache_dir}; re-run scripts/run_cache_redundancy.sh")
+    return load_scene_unit_v3(
+        cache_dir,
+        item,
+        str(unit_id),
+        mmap=bool(mmap),
         map_location=map_location,
     )
 
@@ -217,4 +239,3 @@ def build_scene_row_compat(
     if include_pred:
         row["pred"] = load_scene_pred(cache_dir, item)
     return row
-

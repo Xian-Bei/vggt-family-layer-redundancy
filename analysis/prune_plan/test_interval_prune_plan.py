@@ -23,15 +23,18 @@ from analysis.prune_plan.build_prune_plan_v3 import _load_gt_aggregate_from_prun
 from analysis.prune_plan.build_prune_plan_v3 import _shortgpt_drop_sets_from_unit_similarity
 from analysis.prune_plan.build_prune_plan_v3 import _simpler_cutoff_scores
 from analysis.prune_plan.build_prune_plan_v3 import (
+    GT_TWO_INTERVAL_SCORE_AGGREGATION,
     GT_OURS_COMPARISON_TOLERANCE,
+    GT_OURS_DOUBLE_GAP_COMPARISON_TOLERANCE,
     GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP,
     GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE,
-    OURS_GT_TWO_INTERVAL_SCORE_AGGREGATION,
+    OURS_TWO_INTERVAL_SCORE_AGGREGATION,
     _build_ours_metric_strategy_pair,
     _each_interval_overlaps_previous_plan,
     _official_replaceme_drop_sets_from_distance,
     _one_or_two_interval_drop_sets_from_score,
     _parse_pruning_strategies,
+    _similarity_proxy_evidence,
     _similarity_to_proxy_drop_score,
     _strategy_from_drop_sets,
     _strategy_from_picks,
@@ -153,6 +156,10 @@ def _bundle() -> dict:
 
 
 class IntervalPrunePlanTest(unittest.TestCase):
+    def test_gt_and_ours_use_separate_two_interval_aggregations(self) -> None:
+        self.assertEqual(GT_TWO_INTERVAL_SCORE_AGGREGATION, "sum")
+        self.assertEqual(OURS_TWO_INTERVAL_SCORE_AGGREGATION, "max")
+
     def test_ours_metric_families_share_identical_single_double_selection(self) -> None:
         score = np.full((6, 6), np.nan, dtype=np.float64)
         for start in range(1, 6):
@@ -213,11 +220,15 @@ class IntervalPrunePlanTest(unittest.TestCase):
             self.assertEqual(double_source["max_num_intervals"], 2)
             self.assertEqual(
                 double_source["two_interval_score_aggregation"],
-                OURS_GT_TWO_INTERVAL_SCORE_AGGREGATION,
+                OURS_TWO_INTERVAL_SCORE_AGGREGATION,
             )
             self.assertEqual(
                 double_source["comparison_tolerance"],
                 GT_OURS_COMPARISON_TOLERANCE,
+            )
+            self.assertEqual(
+                double_source["double_gap_comparison_tolerance"],
+                GT_OURS_DOUBLE_GAP_COMPARISON_TOLERANCE,
             )
             self.assertEqual(
                 double_source["single_double_comparison_tolerance"],
@@ -432,6 +443,22 @@ class IntervalPrunePlanTest(unittest.TestCase):
             image = mpl_image.imread(path)
         height, width = image.shape[:2]
         self.assertGreater(width / height, 2.0)
+
+    def test_similarity_proxy_evidence_uses_unit_color_scale(self) -> None:
+        score = np.asarray([[1.0, 0.25], [np.nan, 1.0]], dtype=np.float64)
+        evidence = _similarity_proxy_evidence(
+            score,
+            display_name="Ours_Cosine",
+            metric_label="cosine",
+        )
+        np.testing.assert_allclose(
+            evidence["values"],
+            np.asarray([[0.0, 0.75], [np.nan, 0.0]], dtype=np.float64),
+            equal_nan=True,
+        )
+        self.assertEqual(evidence["vmin"], 0.0)
+        self.assertEqual(evidence["vmax"], 1.0)
+        self.assertEqual(evidence["title"], "Ours_Cosine evidence: 1 − cosine")
 
     def test_largest_adjacent_similarity_gaps(self) -> None:
         score = np.full((4, 4), np.nan, dtype=np.float64)
@@ -986,6 +1013,66 @@ class IntervalPrunePlanTest(unittest.TestCase):
             extra[2]["min_retained_units_between_intervals"],
             1,
         )
+
+    def test_two_interval_candidates_prefer_larger_gap_within_tolerance(self) -> None:
+        score = np.full((7, 7), np.nan, dtype=np.float64)
+        score[1, 1] = 0.1
+        score[3, 3] = 0.1
+        score[5, 5] = 0.105
+
+        drops, scores, extra = _one_or_two_interval_drop_sets_from_score(
+            score,
+            maximize=False,
+            selection_mode="two",
+            double_gap_comparison_tolerance=0.01,
+            require_cross_budget_interval_overlap=False,
+        )
+
+        self.assertEqual(drops[2], [1, 5])
+        self.assertAlmostEqual(scores[2], 0.205)
+        self.assertEqual(extra[2]["double_gap_comparison_tolerance"], 0.01)
+        self.assertEqual(
+            extra[2]["double_candidate_tie_policy"],
+            "prefer_larger_interval_gap",
+        )
+
+    def test_smaller_gap_double_must_win_beyond_gap_tolerance(self) -> None:
+        score = np.full((7, 7), np.nan, dtype=np.float64)
+        score[1, 1] = 0.1
+        score[3, 3] = 0.1
+        score[5, 5] = 0.111
+
+        drops, scores, _ = _one_or_two_interval_drop_sets_from_score(
+            score,
+            maximize=False,
+            selection_mode="two",
+            double_gap_comparison_tolerance=0.01,
+            require_cross_budget_interval_overlap=False,
+        )
+
+        self.assertEqual(drops[2], [1, 3])
+        self.assertAlmostEqual(scores[2], 0.2)
+
+    def test_double_gap_preference_does_not_chain_across_tolerance(self) -> None:
+        score = np.full((8, 8), np.nan, dtype=np.float64)
+        score[1, 1] = 0.0
+        score[3, 3] = 0.0
+        score[5, 5] = 0.009
+        score[7, 7] = 0.018
+
+        drops, scores, _ = _one_or_two_interval_drop_sets_from_score(
+            score,
+            maximize=False,
+            selection_mode="two",
+            two_interval_score_aggregation="max",
+            double_gap_comparison_tolerance=0.01,
+            require_cross_budget_interval_overlap=False,
+        )
+
+        # [1, 3] beats the widest [1, 7] by 0.018. The intermediate [1, 5]
+        # candidate is within 0.01 of both and must not cause a chained win.
+        self.assertEqual(drops[2], [1, 3])
+        self.assertAlmostEqual(scores[2], 0.0)
 
     def test_gt_minimization_compares_single_with_two_interval_sum(self) -> None:
         score = np.full((8, 8), np.nan, dtype=np.float64)

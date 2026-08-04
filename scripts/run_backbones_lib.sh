@@ -9,7 +9,6 @@
 #   VIS_MAX_POINTS=0
 # Outputs use ${OUTPUT_ROOT}/<backbone>/<dataset>/...
 
-: "${CONDA_ENV:=vggt}"
 : "${MAX_FRAMES:=30}"
 : "${OUTPUT_ROOT:=analysis_outputs_v3}"
 : "${ROOT_SCANNET_DEV50:=${SCANNET_ROOT_DEV50:-data/scans_dev50}}"
@@ -105,7 +104,7 @@ parse_dataset_list() {
 
 set_backend_pythonpath() {
   local backbone="$1"
-  export PYTHONPATH="$(conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.backbones.bootstrap --backbone "${backbone}"):${PYTHONPATH:-}"
+  export PYTHONPATH="$(python -m analysis.backbones.bootstrap --backbone "${backbone}"):${PYTHONPATH:-}"
 }
 
 experiment_output_hint() {

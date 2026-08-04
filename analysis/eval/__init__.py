@@ -14,7 +14,6 @@ _EXPORT_MODULES = {
     "build_fastvggt_scene_eval_context": "analysis.eval.prediction_eval",
     "build_scannet_eval_row_from_payload_with_context": "analysis.eval.prediction_eval",
     "delta_gt_metrics": "analysis.eval.prediction_eval",
-    "evaluate_depth_metrics_streamvggt": "analysis.eval.prediction_eval",
     "metrics_float_dict": "analysis.eval.prediction_eval",
     "prediction_payload_to_fastvggt_reconstruction": "analysis.eval.prediction_eval",
     "read_eval_scannet_rows_by_scene": "analysis.eval.prediction_eval",

@@ -11,7 +11,7 @@ The evaluation order is fixed:
 3. apply one inference compression adapter;
 4. run the unchanged dataset evaluation protocol.
 
-## `run_eval.sh` options
+## `scripts/run_eval.sh` options
 
 ```bash
 INFERENCE_COMPRESSION=none      # none | lora_merge | fastvggt | quantvggt
@@ -37,7 +37,7 @@ deployed LaRe model are preferred. The official W4A4 parameters calibrated on
 full VGGT can also be selected explicitly as a transfer baseline, as discussed
 below. There is no silent default because these two meanings should not be
 confused. The QuantVGGT submodule does not ship the generated `.pth` artifacts,
-and `run_eval.sh` intentionally does not perform calibration on the fly.
+and `scripts/run_eval.sh` intentionally does not perform calibration on the fly.
 
 Download and verify the official W4A4 files with:
 
@@ -51,21 +51,50 @@ The default path can then be passed as:
 INFERENCE_COMPRESSION=quantvggt \
 QUANTVGGT_DTYPE=w4a4 \
 QUANTVGGT_PARAMS_DIR=submodules/quantvggt/w4a4_official \
-  bash run_eval.sh
+  bash scripts/run_eval.sh
 ```
 
 For example:
 
 ```bash
-INFERENCE_COMPRESSION=lora_merge CHECKPOINT=/path/to/lare.pt bash run_eval.sh
+INFERENCE_COMPRESSION=lora_merge CHECKPOINT=/path/to/lare.pt bash scripts/run_eval.sh
 INFERENCE_COMPRESSION=quantvggt QUANTVGGT_DTYPE=w4a4 \
-  QUANTVGGT_PARAMS_DIR=/path/to/matching/w4a4_params bash run_eval.sh
+  QUANTVGGT_PARAMS_DIR=/path/to/matching/w4a4_params bash scripts/run_eval.sh
 ```
 
 Only one inference compression adapter may be selected in a run. Enabling one
 for Pi3 or VGGT-Omega is an error. Output model names receive a configuration
 suffix automatically, preventing compressed and uncompressed evaluations from
 overwriting one another.
+
+## Evaluate the best pruning + recovery model
+
+Step 10 in `main.sh` calls `scripts/run_testtime_eval.sh`. The standalone entry point
+reuses the completed Ours/CKA `prune_span12,14,...,24` checkpoints with
+`recovery_ghost_interval_sequential`, then evaluates FastVGGT and QuantVGGT as
+two alternative deployment transformations:
+
+```bash
+bash scripts/run_testtime_eval.sh
+```
+
+Useful overrides include:
+
+```bash
+TESTTIME_COMPRESSIONS=fastvggt \
+TESTTIME_PRUNE_PLAN_NAME=prune_span20 \
+TESTTIME_RUN=SCANNET_TEST50,NUSCENES_VAL \
+  bash scripts/run_testtime_eval.sh
+
+QUANTVGGT_PARAMS_DIR=/path/to/lare-aware/w4a4 \
+  bash scripts/run_testtime_eval.sh
+```
+
+The official W4A4 transfer parameters under
+`submodules/quantvggt/w4a4_official` are the explicit default of this stage;
+`scripts/run_eval.sh` itself continues to require an explicit parameter directory.
+Results are isolated from the uncompressed recovery baseline under
+`<OUTPUT_ROOT>/vggt/<dataset>/eval/testtime/<recovery>/<compression>/<selector>`.
 
 ## What the QuantVGGT parameter files contain
 

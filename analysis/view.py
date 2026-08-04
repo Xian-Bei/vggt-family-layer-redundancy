@@ -61,12 +61,12 @@ from analysis.redundancy.similarity_v3 import (
     resolve_redundancy_graph_path,
 )
 from analysis.redundancy.skip_metric_scaling import (
-    HIGHER_IS_BETTER as SHARED_SKIP_HIGHER_IS_BETTER,
-    SEVEN_METRIC_KEYS,
+    GT_METRIC_KEYS,
     degradation_pct_to_multiple,
     minmax_normalize_finite,
     normalized_degradation_to_retention,
     normalize_metric_components,
+    signed_delta_to_degradation,
 )
 from analysis.triangular_heatmap import configure_triangle_axes, imshow_upper_triangle, triangle_xy
 from analysis.eval.scannet_eval import SceneData, load_scene_images
@@ -145,7 +145,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root-nrgbd", type=Path, default=Path("data/neural_rgbd_data"))
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--server-name", type=str, default="127.0.0.1")
-    p.add_argument("--server-port", type=int, default=7860)
+    p.add_argument("--server-port", type=int, default=7888)
     p.add_argument("--viser-host", type=str, default="127.0.0.1", help="Host for embedded Viser server.")
     p.add_argument("--viser-port", type=int, default=8090, help="Port for embedded Viser server.")
     p.add_argument(
@@ -194,20 +194,13 @@ SKIP_MAIN_METRICS: List[Tuple[str, str]] = [
     ("rpe_trans", "RPE_trans"),
 ]
 
-SKIP_DEPTH_METRICS: List[Tuple[str, str]] = [
-    ("depth_abs_rel", "Depth abs rel"),
-    ("depth_delta1", "Depth delta1"),
-]
-
 SKIP_POINT_METRICS: List[Tuple[str, str]] = [
     ("acc", "Accuracy"),
     ("comp", "Completeness"),
     ("chamfer_distance", "Chamfer"),
-    ("nc", "Normal consistency"),
 ]
 
-SKIP_HIGHER_IS_BETTER = SHARED_SKIP_HIGHER_IS_BETTER
-SKIP_SEVEN_METRIC_KEYS = set(SEVEN_METRIC_KEYS)
+SKIP_GT_METRIC_KEYS = set(GT_METRIC_KEYS)
 
 
 class PairAttentionController:
@@ -518,7 +511,7 @@ class PairAttentionController:
         if not frame_ids:
             raise SystemExit(
                 f"Manifest entry for {scene_id!r} lacks frame_ids. "
-                "Re-run cache+redundancy (run_cache_redundancy.sh) so manifest includes frame_ids/image_paths."
+                "Re-run cache+redundancy (scripts/run_cache_redundancy.sh) so manifest includes frame_ids/image_paths."
             )
         row = _load_cache_row(self.cache_dir, item)
         replay_layers = row.get("aggregated_concat_per_layer")
@@ -1050,9 +1043,7 @@ def _gallery_update(items: List[Any]):
 
 
 STAGE2_METRIC_ROW_POSE = "pose"
-STAGE2_METRIC_ROW_DEPTH = "depth"
 STAGE2_METRIC_ROW_POINT = "point cloud"
-STAGE2_METRIC_ROW_NC = "nc"
 STAGE2_TOKEN_ROW_SPECIAL = "special"
 STAGE2_TOKEN_ROW_CAMERA = "camera"
 STAGE2_TOKEN_ROW_PATCH = "patch"
@@ -1245,10 +1236,7 @@ def _heatmaps_resolve_filters(
         has_sim = bool(token_choices)
 
     if has_skip:
-        allowed_m = {
-            STAGE2_METRIC_ROW_DEPTH,
-            STAGE2_METRIC_ROW_NC,
-        }
+        allowed_m = {STAGE2_METRIC_ROW_POINT}
         if metric_rows is None:
             m_val = []
         else:
@@ -1318,12 +1306,9 @@ _LORA_METRIC_ORDER = (
     "are",
     "rpe_trans",
     "rpe_rot",
-    "depth_abs_rel",
-    "depth_delta1",
     "acc",
     "comp",
     "cd",
-    "nc",
     "chamfer_distance",
 )
 
@@ -1334,20 +1319,17 @@ _RECOVERY_VIEW = "strategy_comparison"
 _RECOVERY_SPAN_RE = re.compile(r"^prune_span(\d+)$")
 _RECOVERY_METRIC_GRID = (
     ("ape", "are", "rpe_trans", "rpe_rot"),
-    ("acc", "comp", "cd", "nc"),
-    ("depth_abs_rel", "depth_delta1", "inference_time_ms", "infer_peak_vram_gb"),
+    ("acc", "comp", "cd", None),
+    ("inference_time_ms", "infer_peak_vram_gb", None, None),
 )
 _RECOVERY_METRIC_HEADERS = {
     "ape": "APE ↓",
     "are": "ARE (°) ↓",
     "rpe_trans": "RPE trans ↓",
     "rpe_rot": "RPE rot (°) ↓",
-    "depth_abs_rel": "AbsRel ↓",
-    "depth_delta1": "δ1 ↑",
     "acc": "Acc ↓",
     "comp": "Comp ↓",
     "cd": "CD ↓",
-    "nc": "NC ↑",
     "inference_time_ms": "Time (ms) ↓",
     "infer_peak_vram_gb": "VRAM (GB) ↓",
 }
@@ -1793,10 +1775,9 @@ def _stage2_row_visibility_flags(
     return out
 
 
-def _stage2_block_keys_for_mode(mode: str) -> Tuple[str, str, str, str, str, str, str, str, str]:
+def _stage2_block_keys_for_mode(mode: str) -> Tuple[str, str, str, str, str, str, str, str]:
     return (
         f"skip_{mode}_main",
-        f"skip_{mode}_depth",
         f"skip_{mode}_point",
         f"sim_{mode}_special",
         f"sim_{mode}_camera",
@@ -1821,7 +1802,7 @@ def _stage2_requested_block_keys(
     for mode in mode_order:
         if mode not in active_modes:
             continue
-        skip_main, skip_depth, skip_point, sim_special, sim_camera, sim_patch, sim_all, sim_mean, sim_min = _stage2_block_keys_for_mode(mode)
+        skip_main, skip_point, sim_special, sim_camera, sim_patch, sim_all, sim_mean, sim_min = _stage2_block_keys_for_mode(mode)
         has_skip = mode in skip_modes
         sim_regions = similarity_regions_by_mode.get(mode, set())
         if has_skip:
@@ -2171,7 +2152,7 @@ def _packed_delta_to_pct(
         if math.isnan(scalar):
             out.append(float("nan"))
             continue
-        degradation = -scalar if metric_key in SKIP_HIGHER_IS_BETTER else scalar
+        degradation = scalar
         pct = 100.0 * degradation / denom
         out.append(float(max(pct, lower)))
     return out
@@ -2464,6 +2445,43 @@ def _packed_elementwise_mean(packs: Sequence[List[float]]) -> List[float]:
     return out
 
 
+def _prepare_skip_maps_for_dataset_aggregation(
+    maps_by_mode: Dict[str, Dict[str, List[float]]],
+    *,
+    value_mode: str,
+    normalize_metrics: bool = False,
+    signed_absolute_input: bool = False,
+) -> Dict[str, Dict[str, List[float]]]:
+    """Clamp before cross-dataset averaging and optionally normalize per dataset."""
+    output: Dict[str, Dict[str, List[float]]] = {}
+    for mode, metric_map in maps_by_mode.items():
+        prepared: Dict[str, List[float]] = {}
+        for metric, packed in metric_map.items():
+            arr = np.asarray(packed, dtype=np.float64)
+            if str(value_mode) == "absolute":
+                if signed_absolute_input:
+                    arr = signed_delta_to_degradation(arr, metric=metric)
+                else:
+                    arr = np.array(arr, copy=True)
+                    finite = np.isfinite(arr)
+                    arr[finite] = np.maximum(arr[finite], 0.0)
+            else:
+                finite = np.isfinite(arr)
+                arr = np.array(arr, copy=True)
+                arr[finite] = np.maximum(arr[finite], 1.0)
+            if bool(normalize_metrics) and metric in SKIP_GT_METRIC_KEYS:
+                arr, _meta = minmax_normalize_finite(arr)
+                if str(value_mode) == "multiple":
+                    # Preserve the multiple neutral anchor so downstream
+                    # renderers can consume averaged canonical values without
+                    # needing a separate payload type.
+                    arr = 1.0 + arr
+            prepared[str(metric)] = arr.tolist()
+        if prepared:
+            output[str(mode)] = prepared
+    return output
+
+
 def _similarity_maps_with_token_aggregations(
     similarity_by_mode: Dict[str, Dict[str, Dict[str, List[float]]]],
 ) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
@@ -2554,12 +2572,101 @@ def _similarity_display_packed(
     return displayed
 
 
-def _packed_strict_upper_pearson(
+_SINKHORN_COST_CACHE: Dict[Tuple[int, int, str], torch.Tensor] = {}
+
+
+def _sinkhorn_2d_distance(
+    left_weights: np.ndarray,
+    right_weights: np.ndarray,
+    coordinates: np.ndarray,
+    *,
+    regularization: float = 0.1,
+    iterations: int = 100,
+) -> Optional[float]:
+    """Entropy-regularized 2D optimal transport, evaluated on GPU when available."""
+    left_support = left_weights > np.finfo(np.float64).eps
+    right_support = right_weights > np.finfo(np.float64).eps
+    if not np.any(left_support) or not np.any(right_support):
+        return None
+    left_probability = left_weights / left_weights.sum()
+    right_probability = right_weights / right_weights.sum()
+    if np.allclose(left_probability, right_probability, rtol=1e-7, atol=1e-9):
+        return 0.0
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    coordinate_tensor = torch.as_tensor(coordinates, dtype=dtype, device=device)
+    cache_key = (
+        int(coordinates.shape[0]),
+        hash(coordinates.tobytes()),
+        str(device),
+    )
+    cost = _SINKHORN_COST_CACHE.get(cache_key)
+    if cost is None or cost.shape[0] != coordinate_tensor.shape[0]:
+        cost = torch.cdist(coordinate_tensor, coordinate_tensor, p=2)
+        _SINKHORN_COST_CACHE[cache_key] = cost
+
+    left_indices = torch.as_tensor(
+        np.flatnonzero(left_support), dtype=torch.long, device=device
+    )
+    right_indices = torch.as_tensor(
+        np.flatnonzero(right_support), dtype=torch.long, device=device
+    )
+    transport_cost = cost.index_select(0, left_indices).index_select(
+        1, right_indices
+    )
+    left = torch.as_tensor(
+        left_probability[left_support], dtype=dtype, device=device
+    )
+    right = torch.as_tensor(
+        right_probability[right_support], dtype=dtype, device=device
+    )
+    log_left = torch.log(left)
+    log_right = torch.log(right)
+    epsilon = float(regularization)
+
+    # Log-domain Sinkhorn updates remain stable even when distant grid cells
+    # have extremely small transport kernels.
+    left_potential = torch.zeros_like(left)
+    right_potential = torch.zeros_like(right)
+    for _ in range(max(1, int(iterations))):
+        left_potential = epsilon * (
+            log_left
+            - torch.logsumexp(
+                (right_potential.unsqueeze(0) - transport_cost) / epsilon,
+                dim=1,
+            )
+        )
+        right_potential = epsilon * (
+            log_right
+            - torch.logsumexp(
+                (left_potential.unsqueeze(1) - transport_cost) / epsilon,
+                dim=0,
+            )
+        )
+
+    log_plan = (
+        left_potential.unsqueeze(1)
+        + right_potential.unsqueeze(0)
+        - transport_cost
+    ) / epsilon
+    distance = torch.sum(torch.exp(log_plan) * transport_cost)
+    scalar = float(distance.item())
+    return max(0.0, scalar) if math.isfinite(scalar) else None
+
+
+def _packed_strict_upper_heatmap_scores(
     left_packed: Sequence[float],
     right_packed: Sequence[float],
     num_layers: int,
-) -> Optional[float]:
-    """Pearson r over common finite strict-upper entries; diagonal is excluded."""
+) -> Optional[Dict[str, Optional[float]]]:
+    """Compare two normalized heatmaps over common finite strict-upper cells.
+
+    Soft IoU and Dice retain response magnitude. Jensen--Shannon divergence uses
+    base-2 logarithms and is therefore bounded by one. Sinkhorn uses the true
+    two-dimensional ``(row, column)`` layer-grid cost rather than flattened
+    array indices.
+    """
     try:
         left = np.asarray(
             upper_packed_to_symmetric_matrix(left_packed, num_layers),
@@ -2575,26 +2682,77 @@ def _packed_strict_upper_pearson(
     x = left[upper]
     y = right[upper]
     valid = np.isfinite(x) & np.isfinite(y)
-    if np.count_nonzero(valid) < 2:
+    if not np.any(valid):
         return None
-    x = x[valid]
-    y = y[valid]
-    if np.ptp(x) <= 1e-12 or np.ptp(y) <= 1e-12:
-        return None
-    score = float(np.corrcoef(x, y)[0, 1])
-    return score if math.isfinite(score) else None
+
+    # The rendered maps are normalized to [0, 1]. Clipping also absorbs tiny
+    # floating-point excursions introduced by aggregation/rebasing.
+    x = np.clip(x[valid], 0.0, 1.0)
+    y = np.clip(y[valid], 0.0, 1.0)
+    eps = np.finfo(np.float64).eps
+
+    union = float(np.maximum(x, y).sum())
+    soft_iou = float(np.minimum(x, y).sum() / union) if union > eps else 1.0
+    dice_denom = float(np.dot(x, x) + np.dot(y, y))
+    soft_dice = float(2.0 * np.dot(x, y) / dice_denom) if dice_denom > eps else 1.0
+
+    x_total = float(x.sum())
+    y_total = float(y.sum())
+    if x_total <= eps and y_total <= eps:
+        js_divergence = 0.0
+        sinkhorn_2d: Optional[float] = 0.0
+    elif x_total <= eps or y_total <= eps:
+        # A zero heatmap cannot be normalized into a probability distribution.
+        js_divergence = 1.0
+        sinkhorn_2d = None
+    else:
+        p = x / x_total
+        q = y / y_total
+        midpoint = 0.5 * (p + q)
+        p_mask = p > 0.0
+        q_mask = q > 0.0
+        js_divergence = float(
+            0.5 * np.sum(p[p_mask] * np.log2(p[p_mask] / midpoint[p_mask]))
+            + 0.5 * np.sum(q[q_mask] * np.log2(q[q_mask] / midpoint[q_mask]))
+        )
+        js_divergence = float(np.clip(js_divergence, 0.0, 1.0))
+
+        coordinates = np.column_stack((upper[0][valid], upper[1][valid])).astype(
+            np.float64,
+            copy=False,
+        )
+        sinkhorn_2d = _sinkhorn_2d_distance(x, y, coordinates)
+
+    return {
+        "soft_iou": soft_iou,
+        "soft_dice": soft_dice,
+        "sinkhorn_2d": sinkhorn_2d,
+        "js_divergence": js_divergence,
+    }
 
 
 def _score_title_suffix(
     *,
-    horizontal: Optional[float] = None,
-    vertical: Optional[float] = None,
+    horizontal: Optional[Mapping[str, Optional[float]]] = None,
+    vertical: Optional[Mapping[str, Optional[float]]] = None,
 ) -> str:
+    def _format(direction: str, scores: Mapping[str, Optional[float]]) -> str:
+        sinkhorn = scores.get("sinkhorn_2d")
+        fields = [
+            f"{direction} IoU={float(scores['soft_iou']):.3f}",
+            f"Dice={float(scores['soft_dice']):.3f}",
+            f"Sinkhorn={float(sinkhorn):.3f}"
+            if sinkhorn is not None
+            else "Sinkhorn=n/a",
+            f"JS={float(scores['js_divergence']):.3f}",
+        ]
+        return " ".join(fields)
+
     parts: List[str] = []
     if horizontal is not None:
-        parts.append(f"H r={horizontal:.3f}")
+        parts.append(_format("H", horizontal))
     if vertical is not None:
-        parts.append(f"V r={vertical:.3f}")
+        parts.append(_format("V", vertical))
     return f" | {' · '.join(parts)}" if parts else ""
 
 
@@ -2638,7 +2796,7 @@ def _similarity_score_suffixes(
             )
         )
         horizontal = (
-            _packed_strict_upper_pearson(
+            _packed_strict_upper_heatmap_scores(
                 displayed,
                 horizontal_reference,
                 num_layers,
@@ -2652,7 +2810,7 @@ def _similarity_score_suffixes(
             else None
         )
         vertical = (
-            _packed_strict_upper_pearson(
+            _packed_strict_upper_heatmap_scores(
                 (
                     original
                     if vertical_reference_is_displayed
@@ -2775,6 +2933,7 @@ def _build_cross_dataset_skip_maps(
     *,
     value_mode: str,
     aggregate: str,
+    normalize_metrics: bool = False,
 ) -> Dict[str, Dict[str, List[float]]]:
     """Aggregate mean-scene skip maps over the Heatmaps real-dataset allowlist."""
     per_dataset: List[Dict[str, Dict[str, List[float]]]] = []
@@ -2797,6 +2956,12 @@ def _build_cross_dataset_skip_maps(
                     f"Dataset {dataset!r} lacks saved degradation percentages required for multiple aggregation."
                 )
             maps = _degradation_pct_maps_to_multiples(maps)
+        maps = _prepare_skip_maps_for_dataset_aggregation(
+            maps,
+            value_mode=value_mode,
+            normalize_metrics=bool(normalize_metrics),
+            signed_absolute_input=value_mode == "absolute",
+        )
         per_dataset.append(maps)
 
     if not per_dataset:
@@ -3168,8 +3333,6 @@ def _render_skip_gallery(
                 if math.isnan(scalar):
                     degradation_packed.append(float("nan"))
                     continue
-                if metric_key in SKIP_HIGHER_IS_BETTER:
-                    scalar = -scalar
                 degradation_packed.append(max(0.0, scalar))
         else:
             degradation_packed = [
@@ -3183,7 +3346,7 @@ def _render_skip_gallery(
             threshold = float(np.nanpercentile(arr[finite], percentile))
             arr[finite] = np.minimum(arr[finite], threshold)
         degradation_packed = arr.tolist()
-        normalized = bool(normalize_seven_metrics and metric_key in SKIP_SEVEN_METRIC_KEYS)
+        normalized = bool(normalize_seven_metrics and metric_key in SKIP_GT_METRIC_KEYS)
         if normalized:
             arr, _meta = minmax_normalize_finite(
                 np.asarray(degradation_packed, dtype=np.float64)
@@ -3298,8 +3461,6 @@ def _skip_seven_metric_display_packed(
             continue
         arr = np.asarray(packed, dtype=np.float64)
         if value_mode == "absolute":
-            if metric_key in SKIP_HIGHER_IS_BETTER:
-                arr = -arr
             arr = np.maximum(arr, 0.0)
         else:
             arr = np.maximum(arr, 1.0)
@@ -3350,8 +3511,6 @@ def _render_skip_metric_mean(
             continue
         arr = np.asarray(packed, dtype=np.float64)
         if value_mode == "absolute":
-            if metric_key in SKIP_HIGHER_IS_BETTER:
-                arr = -arr
             arr = np.maximum(arr, 0.0)
         else:
             arr = np.maximum(arr, 1.0)
@@ -3476,6 +3635,11 @@ def _build_remaining_marginal_maps(
         remaining_report=remaining_report,
         base_interval=(start, end),
         value_mode=str(value_mode),
+    )
+    compact = _prepare_skip_maps_for_dataset_aggregation(
+        compact,
+        value_mode=str(value_mode),
+        signed_absolute_input=str(value_mode) == "absolute",
     )
     return (
         _align_skip_maps_to_full_unit_catalog(
@@ -3623,7 +3787,14 @@ def _build_stage2_skip_maps(
     report["skip_value_mode"] = "pct" if value_mode == "multiple" else "absolute"
     skip_by_mode = _extract_skip_metric_maps_by_mode(report)
     if value_mode == "absolute":
-        return skip_by_mode, "skip rows use saved absolute delta"
+        return (
+            _prepare_skip_maps_for_dataset_aggregation(
+                skip_by_mode,
+                value_mode="absolute",
+                signed_absolute_input=True,
+            ),
+            "skip rows use saved absolute delta clamped per dataset",
+        )
 
     fusion_by_mode = report.get("fusion_by_mode")
     if isinstance(fusion_by_mode, dict):
@@ -3729,7 +3900,6 @@ def _prepare_stage2_render(
     clip_key = int(round(float(np.clip(pct_clip_percent, 0.0, 100.0))))
     gamma_key = _sim_gamma_key(sim_gamma)
     cutoff_key = _sim_cutoff_key(sim_cutoff)
-    show_nc_requested = bool(requested_blocks and "__show_nc__" in requested_blocks)
     cache_key = (
         "combined_mean_raw_similarity_v3",
         scene_id,
@@ -3738,7 +3908,6 @@ def _prepare_stage2_render(
         gamma_key,
         cutoff_key,
         virtual_dataset,
-        show_nc_requested,
         bool(show_colorbar_histogram),
         bool(normalize_seven_metrics),
     )
@@ -3754,8 +3923,6 @@ def _prepare_stage2_render(
     for mode in mode_order:
         all_blocks.update(_stage2_block_keys_for_mode(mode))
     target_blocks = set(requested_blocks) if requested_blocks is not None else all_blocks
-    show_nc = "__show_nc__" in target_blocks
-    target_blocks.discard("__show_nc__")
 
     def _compose_visible_galleries(
         raw_galleries: Dict[str, List[np.ndarray]],
@@ -3764,7 +3931,6 @@ def _prepare_stage2_render(
         for current_mode in mode_order:
             (
                 _skip_main,
-                _skip_depth,
                 skip_point,
                 sim_special,
                 sim_camera,
@@ -3823,6 +3989,7 @@ def _prepare_stage2_render(
             controller,
             value_mode=value_mode,
             aggregate=virtual_dataset,
+            normalize_metrics=bool(normalize_seven_metrics),
         )
         op_label = "element-wise mean" if virtual_dataset == STAGE2_MEAN_DATASET else "element-wise min"
         skip_source = (
@@ -3840,7 +4007,7 @@ def _prepare_stage2_render(
 
     missing_similarity_notes: List[str] = []
     for mode in mode_order:
-        skip_main, skip_depth, skip_point, sim_special, sim_camera, sim_patch, sim_all, sim_mean, sim_min = _stage2_block_keys_for_mode(mode)
+        skip_main, skip_point, sim_special, sim_camera, sim_patch, sim_all, sim_mean, sim_min = _stage2_block_keys_for_mode(mode)
         horizontal_reference = (
             _skip_seven_metric_display_packed(
                 skip_by_mode.get(mode, {}),
@@ -3932,17 +4099,6 @@ def _prepare_stage2_render(
                 title_suffix_by_metric=_horizontal_suffixes(
                     sim_entry.get("camera", {})
                 ),
-            )
-        if skip_depth in target_blocks and skip_depth not in galleries:
-            galleries[skip_depth] = _render_skip_gallery(
-                skip_by_mode.get(mode, {}),
-                num_layers,
-                SKIP_DEPTH_METRICS,
-                value_mode=value_mode,
-                sim_cutoff=sim_cutoff,
-                show_colorbar_histogram=show_colorbar_histogram,
-                normalize_seven_metrics=normalize_seven_metrics,
-                percentile_clip=clip_key,
             )
         if skip_point in target_blocks and skip_point not in galleries:
             galleries[skip_point] = [
@@ -4259,6 +4415,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 render_controller,
                 value_mode=vm,
                 aggregate=str(render_controller.dataset),
+                normalize_metrics=bool(normalize_seven_metrics),
             )
             skip_modes = set(virtual_skip_maps)
             virtual_similarity_maps = _build_cross_dataset_similarity_regions(
@@ -4320,7 +4477,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             if _is_stage2_virtual_dataset(render_controller.dataset)
             else ""
         )
-        show_nc = STAGE2_METRIC_ROW_NC in set(m_val)
         cache_key = (
             "combined_mean_raw_similarity_v3",
             str(scene_id),
@@ -4329,7 +4485,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             gamma_key,
             cutoff_key,
             virtual_dataset,
-            show_nc,
             bool(show_colorbar_histogram),
             bool(normalize_seven_metrics),
             bool(show_remaining_pruning),
@@ -4366,7 +4521,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         if show_remaining_pruning:
             remaining_notes: List[str] = []
             for mode in stage2_modes_all:
-                skip_point = _stage2_block_keys_for_mode(mode)[2]
+                skip_point = _stage2_block_keys_for_mode(mode)[1]
                 if skip_point not in galleries:
                     continue
                 extra_images, extra_note = _heatmaps_remaining_images(
@@ -4718,6 +4873,11 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         vm,
                         clip,
                     )
+                    skip_by_mode = _prepare_skip_maps_for_dataset_aggregation(
+                        skip_by_mode,
+                        value_mode=vm,
+                        normalize_metrics=bool(normalize_metrics),
+                    )
                     mode_maps = skip_by_mode.get(mode)
                     num_layers = int(scoped.resolve_stage2_num_layers("mean"))
                     if mode_maps and num_layers > 0:
@@ -4725,7 +4885,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         layers_by_dataset[dataset] = num_layers
                         missing_metrics = [
                             metric
-                            for metric in SKIP_SEVEN_METRIC_KEYS
+                            for metric in SKIP_GT_METRIC_KEYS
                             if metric not in mode_maps
                         ]
                         if missing_metrics:
@@ -4987,6 +5147,11 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         value_mode,
                         percentile_clip,
                     )
+                    original_by_mode = _prepare_skip_maps_for_dataset_aggregation(
+                        original_by_mode,
+                        value_mode=value_mode,
+                        normalize_metrics=bool(normalize_seven_metrics),
+                    )
                     if original_by_mode.get(mode):
                         original_mode_maps.append(original_by_mode[mode])
                     full_unit_ids = [
@@ -5008,12 +5173,22 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         remaining_unit_ids=remaining_unit_ids,
                         full_unit_ids=full_unit_ids,
                     )
+                    remaining_by_mode = _prepare_skip_maps_for_dataset_aggregation(
+                        remaining_by_mode,
+                        value_mode=value_mode,
+                        normalize_metrics=bool(normalize_seven_metrics),
+                    )
                     if remaining_by_mode.get(mode):
                         remaining_mode_maps.append(remaining_by_mode[mode])
                     marginal_by_mode, _selector = _build_remaining_marginal_maps(
                         original_report=dict(original_report.report),
                         remaining_report=dict(remaining_report.report),
                         value_mode=value_mode,
+                    )
+                    marginal_by_mode = _prepare_skip_maps_for_dataset_aggregation(
+                        marginal_by_mode,
+                        value_mode=value_mode,
+                        normalize_metrics=bool(normalize_seven_metrics),
                     )
                     if marginal_by_mode.get(mode):
                         marginal_mode_maps.append(marginal_by_mode[mode])
@@ -5216,7 +5391,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             else None
         )
         skip_vertical_score = (
-            _packed_strict_upper_pearson(
+            _packed_strict_upper_heatmap_scores(
                 original_retention,
                 remaining_retention,
                 num_layers,
@@ -5226,7 +5401,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             else None
         )
         marginal_skip_vertical_score = (
-            _packed_strict_upper_pearson(
+            _packed_strict_upper_heatmap_scores(
                 original_retention,
                 marginal_retention,
                 num_layers,
@@ -5534,6 +5709,11 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         vm,
                         100.0,
                     )
+                    skip_by_mode = _prepare_skip_maps_for_dataset_aggregation(
+                        skip_by_mode,
+                        value_mode=vm,
+                        normalize_metrics=bool(normalize_seven_metrics),
+                    )
                     if skip_by_mode:
                         skip_maps_by_dataset[dataset] = skip_by_mode
                         skip_num_layers_by_dataset[dataset] = num_layers
@@ -5574,6 +5754,11 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                             remaining_unit_ids=remaining_unit_ids,
                             full_unit_ids=full_unit_ids,
                         )
+                        remaining_by_mode = _prepare_skip_maps_for_dataset_aggregation(
+                            remaining_by_mode,
+                            value_mode=vm,
+                            normalize_metrics=bool(normalize_seven_metrics),
+                        )
                         remaining_num_layers = (
                             len(full_unit_ids)
                             if full_unit_ids
@@ -5592,6 +5777,11 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                 ),
                                 value_mode=vm,
                             )
+                        )
+                        marginal_by_mode = _prepare_skip_maps_for_dataset_aggregation(
+                            marginal_by_mode,
+                            value_mode=vm,
+                            normalize_metrics=bool(normalize_seven_metrics),
                         )
                         if marginal_by_mode and remaining_num_layers > 0:
                             marginal_maps_by_dataset[dataset] = marginal_by_mode
@@ -7021,7 +7211,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 stage2_scene_ids=stage2_scene_ids,
                 initial_stage2_scene=initial_stage2_scene,
                 stage2_metric_row_pose=STAGE2_METRIC_ROW_POSE,
-                stage2_metric_row_depth=STAGE2_METRIC_ROW_DEPTH,
                 stage2_metric_row_point=STAGE2_METRIC_ROW_POINT,
                 stage2_token_row_special=STAGE2_TOKEN_ROW_SPECIAL,
                 stage2_token_row_camera=STAGE2_TOKEN_ROW_CAMERA,

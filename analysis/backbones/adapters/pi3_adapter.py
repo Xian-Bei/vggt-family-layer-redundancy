@@ -328,7 +328,17 @@ class Pi3Adapter(BackboneAdapter):
             from analysis.amp_policy import autocast_device_dtype
 
             with torch.no_grad(), torch.autocast(**autocast_device_dtype(device)):
-                _ = model(images)
+                # Match Pi3.forward through the public decoder boundary, then
+                # stop before point/confidence/camera prediction heads.
+                normalized = (images - model.image_mean) / model.image_std
+                _, _, channels, height, width = normalized.shape
+                encoded = model.encoder(
+                    normalized.reshape(bsz * seq_len, channels, height, width),
+                    is_training=True,
+                )
+                if isinstance(encoded, dict):
+                    encoded = encoded["x_norm_patchtokens"]
+                model.decode(encoded, seq_len, height, width)
         finally:
             self._restore_full_forward(model, restore_encoder_cpu)
 
@@ -752,9 +762,6 @@ class Pi3Adapter(BackboneAdapter):
             alignment_layers=[int(x) for x in rules],  # type: ignore[arg-type]
         )
         Pi3CacheReplayEngine.release_layer_cpu_cache(layer_cpu_cache, keep)
-
-    def periodic_eval_skip_depth(self) -> bool:
-        return True
 
     def validate_cached_prediction(self, pred: Dict[str, Any]) -> None:
         required = ("points", "camera_poses")

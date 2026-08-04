@@ -370,8 +370,6 @@ metrics = adapter.eval_scene(
 adaptor 接口：
 
 ```python
-def periodic_eval_skip_depth(self) -> bool
-
 def eval_scene(
     self,
     model: nn.Module,
@@ -390,8 +388,7 @@ def eval_scene(
 推荐公共 eval 路径：
 
 - 所有 backbone 先通过 `forward_predictions` 得到 `PredictionBundle`。
-- `eval_impl` 根据 `PredictionBundle` 统一计算 pose、point、depth 指标。
-- `ctx.skip_depth=True` 时跳过深度指标，例如 Pi3。
+- `eval_impl` 根据 `PredictionBundle` 统一计算 pose 和 point 指标。
 
 ## 新增 backbone checklist
 

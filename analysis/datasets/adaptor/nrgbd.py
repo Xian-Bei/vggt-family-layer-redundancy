@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterator
 from analysis.backbones.contracts import EvalSceneContext
 from analysis.datasets.contracts import DatasetAdaptor, EvalSampleBatch, PreparedSkipEvalScene
 from analysis.datasets.seven_and_n_common import count_7andn_scenes, iter_7andn_scenes, load_7andn_scene
-from analysis.schema.v3 import DatasetEvalProfile, DepthEvalProfile, GeometryEvalProfile
+from analysis.schema.v3 import DatasetEvalProfile, GeometryEvalProfile
 
 
 class NRGBDAdaptor(DatasetAdaptor):
@@ -32,7 +32,6 @@ class NRGBDAdaptor(DatasetAdaptor):
         return DatasetEvalProfile(
             dataset=self.name,
             geometry=GeometryEvalProfile(dist_clip=0.1, use_icp=True, max_points=999_999),
-            depth=DepthEvalProfile(max_depth=10.0, conf_thresh=1.0, crop_mode="center224"),
             kf_every=10,
             size=518,
         )

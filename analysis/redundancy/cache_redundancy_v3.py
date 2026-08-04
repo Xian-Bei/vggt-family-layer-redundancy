@@ -8,7 +8,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -16,6 +16,7 @@ import torch
 from tqdm import tqdm
 
 from analysis.amp_policy import amp_dtype_for_device
+from analysis.amp_policy import autocast_device_dtype
 from analysis.backbones.bootstrap import apply_pythonpath
 from analysis.backbones.registry import get_backbone
 from analysis.datasets.image_batch import prepare_cache_batch
@@ -31,6 +32,37 @@ from analysis.redundancy.similarity_v3 import (
     write_redundancy_outputs,
 )
 from analysis.schema.v3 import SCHEMA_VERSION, CacheManifestV3, stage_dir
+
+
+@dataclass
+class CacheRequirements:
+    unit_ids: Set[str] = field(default_factory=set)
+    auxiliary_ids: Set[str] = field(default_factory=set)
+    require_predictions: bool = False
+    require_initial_tokens: bool = False
+    metadata_only: bool = False
+
+    def merge_plan(self, plan: Any, unit_ids_all: List[str], model: Any = None) -> None:
+        method = str(getattr(plan, "extra", {}).get("recovery_method", ""))
+        if method in {"recovery_ghost_sequential", "recovery_ghost_interval_sequential"}:
+            # Progressive Ghost recomputes activations from image paths.
+            self.metadata_only = not self.unit_ids and not self.require_predictions
+            return
+        ids = _cache_unit_ids_from_plan_extra(plan, unit_ids_all)
+        if ids is None:
+            from analysis.prune_plan import required_cache_unit_ids
+
+            if model is None:
+                raise ValueError("CacheRequirements.merge_plan needs model for legacy plans")
+            ids = set(required_cache_unit_ids(plan, model))
+        self.unit_ids.update(ids - {"layer_-1"})
+        self.require_initial_tokens |= "layer_-1" in ids
+        self.auxiliary_ids.update(_auxiliary_ids_from_plan_extra(plan))
+        trainable = method in {"recovery_lora", "recovery_train"} or bool(
+            getattr(plan, "lora", {})
+        )
+        self.require_predictions |= trainable
+        self.metadata_only = False
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -217,6 +249,36 @@ def forward_cache_with_auxiliaries(
     return forward, auxiliary_map
 
 
+def forward_selected_units_with_auxiliaries(
+    *,
+    adapter: Any,
+    model: Any,
+    images: torch.Tensor,
+    device: torch.device,
+    unit_ids: Set[str],
+    auxiliary_ids: Set[str],
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any], Dict[str, torch.Tensor]]:
+    """Capture only selected units and residuals, without prediction heads."""
+    auxiliary_map, handles = _install_auxiliary_capture_hooks(
+        adapter, model, auxiliary_ids, images
+    )
+    try:
+        with torch.inference_mode(), torch.autocast(**autocast_device_dtype(device)):
+            unit_map, meta = adapter.extract_layer_units(
+                model, images, unit_ids=set(unit_ids)
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+    missing_units = sorted(set(unit_ids) - set(unit_map))
+    missing_aux = sorted(set(auxiliary_ids) - set(auxiliary_map))
+    if missing_units or missing_aux:
+        raise RuntimeError(
+            f"Selected cache forward missed units={missing_units}, auxiliaries={missing_aux}"
+        )
+    return unit_map, meta, auxiliary_map
+
+
 def _save_scene_cache(
     *,
     cache_root: Path,
@@ -234,6 +296,7 @@ def _save_scene_cache(
     initial_tokens: Optional[torch.Tensor] = None,
     unit_ids_filter: Optional[Set[str]] = None,
     auxiliary_map: Optional[Dict[str, torch.Tensor]] = None,
+    require_predictions: bool = True,
 ) -> Dict[str, Any]:
     out = _scene_out(cache_root, scene_id)
     layers_dir = out / "layers"
@@ -284,12 +347,13 @@ def _save_scene_cache(
         auxiliary_files[auxiliary_id] = str(aux_path.relative_to(cache_root))
 
     pred_path = out / "pred_v3.pt"
-    pred_payload: Dict[str, Any] = {}
-    for key in ("pose_enc", "depth", "depth_conf", "points", "camera_poses", "conf"):
-        val = getattr(pred, key, None)
-        if isinstance(val, torch.Tensor):
-            pred_payload[key] = val.detach().contiguous()
-    torch.save(pred_payload, pred_path)
+    if require_predictions:
+        pred_payload: Dict[str, Any] = {}
+        for key in ("pose_enc", "depth", "depth_conf", "points", "camera_poses", "conf"):
+            val = getattr(pred, key, None)
+            if isinstance(val, torch.Tensor):
+                pred_payload[key] = val.detach().contiguous()
+        torch.save(pred_payload, pred_path)
 
     meta_payload = {
         "scene_id": scene_id,
@@ -301,7 +365,7 @@ def _save_scene_cache(
         "frame_ids": frame_ids,
         "image_paths": image_paths,
         "inference_time_ms": float(infer_s * 1000.0),
-        "pred_path": str(pred_path.relative_to(cache_root)),
+        "pred_path": str(pred_path.relative_to(cache_root)) if require_predictions else None,
         "activations_device": str(next(iter(unit_map.values())).device) if unit_map else "cpu",
     }
     if scene_meta.get("scene_dir"):
@@ -375,6 +439,7 @@ def run_cache_redundancy(
 
     unit_ids_filter: Optional[Set[str]] = None
     auxiliary_ids_filter: Set[str] = set()
+    requirements: Optional[CacheRequirements] = None
     cache_save_policy: Optional[Dict[str, Any]] = None
     if save_cache and prune_plan_root is not None:
         from analysis.prune_plan import (
@@ -398,6 +463,7 @@ def run_cache_redundancy(
                 f"No recovery plan bundles found under {recovery_root}; "
                 "cache minimal mode requires both prune and recovery plans."
             )
+        requirements = CacheRequirements(metadata_only=True)
         unit_ids_filter = set()
         explicit_cache_units_used = 0
         plan_labels: List[str] = []
@@ -406,12 +472,22 @@ def run_cache_redundancy(
                 plan = UnitPrunePlan.load(plan_ref)
                 plan_labels.append(str(plan_ref.resolve()))
                 explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
-                if explicit_ids is not None:
+                method = str(getattr(plan, "extra", {}).get("recovery_method", ""))
+                sequential_ghost = method in {
+                    "recovery_ghost_sequential", "recovery_ghost_interval_sequential"
+                }
+                if explicit_ids is not None and not sequential_ghost:
                     unit_ids_filter.update(explicit_ids)
                     explicit_cache_units_used += 1
-                else:
+                elif not sequential_ghost:
                     unit_ids_filter.update(required_cache_unit_ids(plan, model))
-                auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
+                if not sequential_ghost:
+                    auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
+                requirements.require_predictions |= (
+                    method in {"recovery_lora", "recovery_train"}
+                    or bool(getattr(plan, "lora", {}))
+                )
+                requirements.metadata_only &= sequential_ghost
             else:
                 for recovery_name in recovery_names:
                     plan = compose_recovery_unit_prune_plan(
@@ -422,12 +498,26 @@ def run_cache_redundancy(
                     )
                     plan_labels.append(f"{plan_ref}+{recovery_name}")
                     explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
-                    if explicit_ids is not None:
+                    method = str(getattr(plan, "extra", {}).get("recovery_method", ""))
+                    sequential_ghost = method in {
+                        "recovery_ghost_sequential", "recovery_ghost_interval_sequential"
+                    }
+                    if explicit_ids is not None and not sequential_ghost:
                         unit_ids_filter.update(explicit_ids)
                         explicit_cache_units_used += 1
-                    else:
+                    elif not sequential_ghost:
                         unit_ids_filter.update(required_cache_unit_ids(plan, model))
-                    auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
+                    if not sequential_ghost:
+                        auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
+                    requirements.require_predictions |= (
+                        method in {"recovery_lora", "recovery_train"}
+                        or bool(getattr(plan, "lora", {}))
+                    )
+                    requirements.metadata_only &= sequential_ghost
+
+        requirements.require_initial_tokens = "layer_-1" in unit_ids_filter
+        requirements.unit_ids = set(unit_ids_filter) - {"layer_-1"}
+        requirements.auxiliary_ids = set(auxiliary_ids_filter)
 
         cache_save_policy = {
             "mode": "prune_plan_minimal_union" if len(plan_refs) > 1 else "prune_plan_minimal",
@@ -438,6 +528,9 @@ def run_cache_redundancy(
             "units_total": len(unit_ids),
             "explicit_cache_unit_ids_plans": int(explicit_cache_units_used),
             "auxiliary_ids": sorted(auxiliary_ids_filter),
+            "require_predictions": bool(requirements.require_predictions),
+            "require_initial_tokens": bool(requirements.require_initial_tokens),
+            "metadata_only": bool(requirements.metadata_only),
         }
         if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
             print(
@@ -498,21 +591,55 @@ def run_cache_redundancy(
         if progress and hasattr(scene_iter, "set_postfix_str"):
             scene_iter.set_postfix_str(f"{scene_id} | forward", refresh=True)
 
-        images = prepared.images.to(torch_device, non_blocking=False)
-        if torch_device.type == "cuda":
+        metadata_only_scene = bool(
+            requirements is not None
+            and requirements.metadata_only
+            and not compute_redundancy
+        )
+        images = (
+            prepared.images
+            if metadata_only_scene
+            else prepared.images.to(torch_device, non_blocking=False)
+        )
+        if torch_device.type == "cuda" and not metadata_only_scene:
             torch.cuda.synchronize(torch_device)
         t_infer0 = time.perf_counter()
-        fwd, auxiliary_map = forward_cache_with_auxiliaries(
-            adapter=adapter,
-            model=model,
-            images=images,
-            device=torch_device,
-            auxiliary_ids=auxiliary_ids_filter,
-        )
+        selected_only = requirements is not None and not compute_redundancy
+        if selected_only and requirements.metadata_only:
+            fwd = None
+            auxiliary_map = {}
+            unit_map = {}
+            meta = {"patch_start_idx": 0, "camera_token_count": 0}
+            pred = None
+            fwd_initial_tokens = None
+        elif selected_only and not requirements.require_predictions:
+            unit_map, meta, auxiliary_map = forward_selected_units_with_auxiliaries(
+                adapter=adapter,
+                model=model,
+                images=images,
+                device=torch_device,
+                unit_ids=requirements.unit_ids,
+                auxiliary_ids=requirements.auxiliary_ids,
+            )
+            pred = None
+            fwd = None
+            fwd_initial_tokens = (
+                adapter.build_initial_tokens(model, images)
+                if requirements.require_initial_tokens
+                else None
+            )
+        else:
+            fwd, auxiliary_map = forward_cache_with_auxiliaries(
+                adapter=adapter,
+                model=model,
+                images=images,
+                device=torch_device,
+                auxiliary_ids=auxiliary_ids_filter,
+            )
+            unit_map, meta, pred = fwd.unit_map, fwd.meta, fwd.pred
+            fwd_initial_tokens = getattr(fwd, "initial_tokens", None)
         infer_s = time.perf_counter() - t_infer0
         sum_infer_s += infer_s
-        unit_map, meta, pred = fwd.unit_map, fwd.meta, fwd.pred
-        fwd_initial_tokens = getattr(fwd, "initial_tokens", None)
         patch_start_idx = int(meta.get("patch_start_idx", 0))
         camera_token_count = int(meta.get("camera_token_count", 0))
 
@@ -565,6 +692,9 @@ def run_cache_redundancy(
                 initial_tokens=fwd_initial_tokens,
                 unit_ids_filter=unit_ids_filter,
                 auxiliary_map=auxiliary_map,
+                require_predictions=(
+                    requirements is None or requirements.require_predictions
+                ),
             )
             sum_disk_s += time.perf_counter() - t_disk0
             scene_rows.append(row)

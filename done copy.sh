@@ -4,13 +4,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
-source "${REPO_ROOT}/run_backbones_lib.sh"
+source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 
 # Default backbones for all stages. Override with BACKBONES="vggt,pi3,...".
 ALL_BACKBONES="${BACKBONES:-vggt,pi3,vggt_omega}"
 ALL_BACKBONES_SPACE_SEPARATED="${ALL_BACKBONES//,/ }"
 DEVICE="${DEVICE:-cuda}"
-CONDA_ENV="${CONDA_ENV:-vggt}"
 MAX_SCENES="${MAX_SCENES:-0}"
 export OUTPUT_ROOT
 
@@ -26,9 +25,8 @@ BACKBONES="${ALL_BACKBONES}" \
     EXPORT_VIS_3D=1 \
     PRUNE=0 \
     MAX_SCENES="${MAX_SCENES}" \
-    CONDA_ENV="${CONDA_ENV}" \
     DEVICE="${DEVICE}" \
-    bash "run_eval.sh"
+    bash "${REPO_ROOT}/scripts/run_eval.sh"
 
 
 # 2. Compute redundancy/similarity graphs for plan-building datasets.
@@ -39,11 +37,10 @@ BACKBONES="${ALL_BACKBONES}" \
     CACHE="" \
     METRICS=cka,cosine,inv_mse,cca \
     MAX_SCENES="${MAX_SCENES}" \
-    CONDA_ENV="${CONDA_ENV}" \
     DEVICE="${DEVICE}" \
     SKIP_REDUNDANCY=0 \
     SIM_TOKEN_REGIONS=special,patch,all \
-    bash "run_cache_redundancy.sh"
+    bash "${REPO_ROOT}/scripts/run_cache_redundancy.sh"
 
 
 # 3. Brute-force skip-GT sanity check on plan-building datasets.
@@ -52,10 +49,9 @@ BACKBONES="${ALL_BACKBONES}" \
 #    The interval index is:
 #    <OUTPUT_ROOT>/<backbone>/<dataset>/eval/pruning/skip_eval_interval_index_v3.json
 BACKBONES="${ALL_BACKBONES}" \
-    SKIP_GT_EVAL_SCANNET_DEV50=1 \
-    SKIP_GT_EVAL_NUSCENES_TRAIN=1 \
+    EVAL_DATASET=scannet_dev50,nuscenes_train \
     SKIP_GT_EVAL_MAX_SPAN=0 \
-    bash "run_skip_eval.sh"
+    bash "${REPO_ROOT}/scripts/run_skip_eval.sh"
 
 
 
@@ -67,11 +63,10 @@ BACKBONES="${ALL_BACKBONES}" \
     CACHE="" \
     METRICS=cka \
     MAX_SCENES="${MAX_SCENES}" \
-    CONDA_ENV="${CONDA_ENV}" \
     DEVICE="${DEVICE}" \
     SKIP_REDUNDANCY=0 \
     SIM_TOKEN_REGIONS=special,patch,all \
-    bash "run_cache_redundancy.sh"
+    bash "${REPO_ROOT}/scripts/run_cache_redundancy.sh"
 
 
 # 5. Build the prune-only multi-strategy bundle:
@@ -98,7 +93,7 @@ for bb in ${ALL_BACKBONES_SPACE_SEPARATED}; do
   rm -f "${plan_root}"/prune*.json
   rm -f "${plan_root}"/prune*.png
 
-  conda run -n "${CONDA_ENV}" python -m analysis.prune_plan.build_prune_plan_v3 \
+  python -m analysis.prune_plan.build_prune_plan_v3 \
     --experiment "${bb}" \
     --dataset "${PRUNE_DATASET}" \
     --backbone "${bb}" \
@@ -142,9 +137,8 @@ for bb in ${ALL_BACKBONES_SPACE_SEPARATED}; do
       PLAN_MAX_DROP="${PLAN_MAX_DROP}" \
       PLAN_DROP_STEP="${PLAN_DROP_STEP}" \
       MAX_SCENES="${MAX_SCENES}" \
-      CONDA_ENV="${CONDA_ENV}" \
       DEVICE="${DEVICE}" \
-      bash "run_eval.sh"
+      bash "${REPO_ROOT}/scripts/run_eval.sh"
 done
 
 
@@ -171,7 +165,7 @@ for bb in ${ALL_BACKBONES_SPACE_SEPARATED}; do
         ;;
     esac
     for lora_prefix in $(seq 1 "${max_prefix_for_method}"); do
-      conda run -n "${CONDA_ENV}" python -m analysis.prune_plan.build_recovery_plan \
+      python -m analysis.prune_plan.build_recovery_plan \
         --experiment "${bb}" \
         --backbone "${bb}" \
         --prune-plan-root "${plan_root}" \
@@ -200,7 +194,7 @@ SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-25}"
 #    <OUTPUT_ROOT>/<backbone>/<eval_dataset>/eval/recovery/<recovery_plan>/iS_jE/eval_record_v3.json
 #    <OUTPUT_ROOT>/<backbone>/<eval_dataset>/eval/recovery/<recovery_plan>/iS_jE/summary.json
 #    Recover metric plots are written to:
-#    run_recovery.sh automatically calls summary_v3 after each backbone and writes:
+#    scripts/run_recovery.sh automatically calls summary_v3 after each backbone and writes:
 #    <OUTPUT_ROOT>/<backbone>/<eval_dataset>/eval/recovery_plan_<eval_dataset>_recovery_drop.png
 #    <OUTPUT_ROOT>/<backbone>/recovery_plan_<backbone>_recovery_drop.png
 #    Summary table:
@@ -218,13 +212,12 @@ for bb in ${ALL_BACKBONES_SPACE_SEPARATED}; do
       CACHE=SCANNET_DEV50,NUSCENES_TRAIN \
       SKIP_REDUNDANCY=1 \
       MAX_SCENES="${MAX_SCENES}" \
-      CONDA_ENV="${CONDA_ENV}" \
       DEVICE="${DEVICE}" \
       PRUNE_PLAN_ROOT="${cache_root}" \
       RECOVERY_PLAN_ROOT="${cache_root}" \
       PRUNE_PLAN_NAME="prune_span12,prune_span14,prune_span16,prune_span18,prune_span20,prune_span22,prune_span24" \
       RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME}" \
-      bash "run_cache_redundancy.sh"
+      bash "${REPO_ROOT}/scripts/run_cache_redundancy.sh"
   
   BACKBONES="${bb}" \
       DATASETS=scannet_dev50,nuscenes_train \
@@ -234,11 +227,10 @@ for bb in ${ALL_BACKBONES_SPACE_SEPARATED}; do
       MAX_SCENES="${MAX_SCENES}" \
       EVAL_EPOCH="${EVAL_EPOCH}" \
       SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH}" \
-      CONDA_ENV="${CONDA_ENV}" \
       DEVICE="${DEVICE}" \
       EVAL_BOUNDS_ROOT="${OUTPUT_ROOT}" \
       EVAL=SCANNET_DEV50,SCANNET_TEST50,7SCENES_TEST,NUSCENES_VAL,WAYMO_VALIDATION \
-      bash "run_recovery.sh"
+      bash "${REPO_ROOT}/scripts/run_recovery.sh"
 
   rm -rf \
       "${cache_root}/scannet_dev50/cache" \

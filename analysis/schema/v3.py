@@ -26,7 +26,7 @@ class LayerUnitSpec:
 
 @dataclass
 class GeometryEvalProfile:
-    """Shared geometry params for Acc/Comp/CD/NC on one dataset."""
+    """Shared geometry params for Acc/Comp/CD on one dataset."""
 
     dist_clip: float = 0.1
     max_points: int = 999_999
@@ -34,22 +34,13 @@ class GeometryEvalProfile:
     icp_max_correspondence: float = 0.1
     use_icp: bool = True
     use_umeyama: bool = False
-    normal_radius: float = 0.1
-    normal_max_nn: int = 30
-
-
-@dataclass
-class DepthEvalProfile:
-    max_depth: float = 10.0
     conf_thresh: float = 1.0
-    crop_mode: str = "none"  # none | center224
 
 
 @dataclass
 class DatasetEvalProfile:
     dataset: str
     geometry: GeometryEvalProfile = field(default_factory=GeometryEvalProfile)
-    depth: DepthEvalProfile = field(default_factory=DepthEvalProfile)
     kf_every: int = 10
     size: int = 518
 
@@ -131,12 +122,9 @@ UNIFIED_METRIC_KEYS = (
     "are",
     "rpe_trans",
     "rpe_rot",
-    "depth_abs_rel",
-    "depth_delta1",
     "acc",
     "comp",
     "cd",
-    "nc",
     "inference_time_ms",
     "infer_peak_vram_gb",
 )

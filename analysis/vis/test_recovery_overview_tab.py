@@ -4,10 +4,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import gradio as gr
+import numpy as np
 
 from analysis.prune_plan import PRUNE_PLAN_BUNDLE_SCHEMA_VERSION
 from analysis.schema.v3 import EvalRecordV3
 from analysis.vis.recovery_overview_tab import (
+    build_recovery_overview_tab,
     discover_recovery_overview_datasets,
     discover_recovery_overview_options,
     render_recovery_overview,
@@ -121,6 +126,58 @@ class RecoveryOverviewTabTest(unittest.TestCase):
                     ],
                 ),
             )
+
+    def test_builder_exposes_metric_mode_and_normalization_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_fixture(root)
+            with gr.Blocks() as blocks:
+                ui = build_recovery_overview_tab(blocks=blocks, output_root=root)
+            self.assertIsInstance(ui["value_mode"], gr.Radio)
+            self.assertEqual(ui["value_mode"].value, "absolute")
+            self.assertTrue(ui["normalize_metrics"].value)
+
+    def test_recovery_plot_does_not_prepend_upper_anchor_to_strategies(self) -> None:
+        payload = {
+            "datasets": {
+                "scannet_dev50": {
+                    "strategies": {"recovery_linearpatch": {"points": {}}},
+                }
+            }
+        }
+        figure = object()
+        with (
+            patch(
+                "analysis.vis.recovery_overview_tab.collect_pruning_eval_payload",
+                return_value={},
+            ),
+            patch(
+                "analysis.vis.recovery_overview_tab.collect_recovery_eval_payload",
+                return_value=payload,
+            ),
+            patch(
+                "analysis.vis.recovery_overview_tab.add_recovery_comparison_strategies",
+                return_value=payload,
+            ),
+            patch(
+                "analysis.vis.recovery_overview_tab.render_strategy_metric_figure",
+                return_value=figure,
+            ) as render,
+            patch(
+                "analysis.vis.recovery_overview_tab._figure_to_rgb",
+                return_value=np.zeros((1, 1, 3), dtype=np.uint8),
+            ),
+            patch("analysis.vis.recovery_overview_tab.plt.close"),
+        ):
+            images, status = render_recovery_overview(
+                Path("/unused"),
+                ["vggt"],
+                ["recovery_linearpatch"],
+                "scannet_dev50",
+            )
+
+        self.assertEqual(len(images), 1, status)
+        self.assertFalse(render.call_args.kwargs["include_upper_anchor"])
 
 
 if __name__ == "__main__":

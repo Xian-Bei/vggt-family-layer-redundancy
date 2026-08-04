@@ -443,12 +443,29 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         if recovery_weights is not None and not (isinstance(recovery_specs, list) and recovery_specs):
             raise ValueError("Compact recovery checkpoint is missing recovery_specs")
         if isinstance(recovery_specs, list) and recovery_specs:
-            from analysis.recovery.operators import apply_recovery_weights, install_recovery_modules
+            from analysis.recovery.operators import (
+                apply_recovery_weights,
+                compact_recovery_operators,
+                install_recovery_modules,
+            )
 
             device = next(model.parameters()).device
+            recovery_specs, recovery_weights = compact_recovery_operators(
+                recovery_specs, recovery_weights
+            )
             install_recovery_modules(model, self, recovery_specs, device=device)
             if recovery_weights is not None:
                 apply_recovery_weights(model, self, recovery_specs, recovery_weights, device=device)
+        if "trainable_state_dict" in payload:
+            state = payload["trainable_state_dict"]
+            current = dict(model.named_parameters())
+            unexpected = sorted(set(state) - set(current))
+            if unexpected:
+                raise RuntimeError(
+                    f"Delta checkpoint contains unknown parameters: {unexpected[:8]}"
+                )
+            model.load_state_dict(state, strict=False)
+            return
         if "model_state_dict" not in payload and recovery_weights is not None:
             return
         state = payload.get("model_state_dict", payload)

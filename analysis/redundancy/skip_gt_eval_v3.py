@@ -28,12 +28,9 @@ SKIP_EVAL_METRICS: Tuple[str, ...] = (
     "are",
     "rpe_rot",
     "rpe_trans",
-    "depth_abs_rel",
-    "depth_delta1",
     "acc",
     "comp",
     "chamfer_distance",
-    "nc",
 )
 
 # Normalize legacy/evaluator metric keys to the public skip-eval names.
@@ -41,22 +38,6 @@ _EVAL_TO_VIEW_KEY: Dict[str, str] = {
     "ate": "ape",
     "cd": "chamfer_distance",
 }
-
-_LOWER_IS_WORSE = frozenset(
-    {
-        "ate",
-        "are",
-        "rpe_rot",
-        "rpe_trans",
-        "depth_abs_rel",
-        "comp",
-        "chamfer_distance",
-        "ape",
-        "cd",
-    }
-)
-_HIGHER_IS_WORSE = frozenset({"depth_delta1", "nc"})
-
 
 def _timing_enabled(explicit: Optional[bool] = None) -> bool:
     if explicit is not None:
@@ -155,9 +136,7 @@ def normalize_metrics(raw: Dict[str, float]) -> Dict[str, float]:
 
 
 def metric_worse_direction(metric: str) -> Literal["lower", "higher"]:
-    m = str(metric)
-    if m in _HIGHER_IS_WORSE:
-        return "higher"
+    del metric
     return "lower"
 
 
@@ -166,9 +145,8 @@ def degrade_pct_vs_upper(upper: float, current: float, metric: str, *, eps: floa
     u = float(upper)
     c = float(current)
     denom = max(abs(u), eps)
-    if metric_worse_direction(metric) == "lower":
-        return 100.0 * (c - u) / denom
-    return 100.0 * (u - c) / denom
+    del metric
+    return 100.0 * (c - u) / denom
 
 
 def delta_vs_upper(upper: float, current: float) -> float:
@@ -183,13 +161,12 @@ def load_upper_eval_or_fail(
     *,
     experiment: str,
     tagged_dataset: str,
-    require_depth: bool = False,
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
     upper_path = _upper_eval_path(experiment, tagged_dataset)
     if not upper_path.is_file():
         raise FileNotFoundError(
             "Missing upper eval record: "
-            f"{upper_path}. Please run run_eval.sh in upper mode before run_skip_eval.sh."
+            f"{upper_path}. Please run scripts/run_eval.sh in upper mode before scripts/run_skip_eval.sh."
         )
     payload = json.loads(upper_path.read_text(encoding="utf-8"))
     avg = dict(payload.get("average", {}))
@@ -212,11 +189,6 @@ def load_upper_eval_or_fail(
                 continue
             scene_metrics[sid] = normalize_metrics(row)
     avg_norm = normalize_metrics(avg)
-    if require_depth and not {"depth_abs_rel", "depth_delta1"}.issubset(avg_norm):
-        raise RuntimeError(
-            f"Upper eval {upper_path} predates sparse driving-depth evaluation. "
-            "Re-run run_eval.sh in upper mode before skip evaluation."
-        )
     return avg_norm, scene_metrics
 
 
@@ -800,7 +772,6 @@ def run_skip_gt_eval(
     upper_metrics, upper_scene_metrics = load_upper_eval_or_fail(
         experiment=experiment,
         tagged_dataset=tagged_dataset,
-        require_depth=dataset in {"nuscenes", "waymo"} and not adapter.periodic_eval_skip_depth(),
     )
     _latency_log(
         f"[skip_gt_eval] load upper eval ({len(upper_scene_metrics)} scenes) "
@@ -825,7 +796,6 @@ def run_skip_gt_eval(
         "metrics": list(metrics),
         "unit_ids": list(unit_ids),
         "spans": [[int(i), int(j)] for i, j in spans],
-        "skip_depth": bool(adapter.periodic_eval_skip_depth()),
     }
     _prepare_checkpoint_manifest(out_root, config=manifest_config, resume=bool(resume))
     _latency_log(
@@ -836,7 +806,6 @@ def run_skip_gt_eval(
     eval_ctx = EvalSceneContext(
         device=torch_device,
         profile=profile,
-        skip_depth=bool(adapter.periodic_eval_skip_depth()),
         export_vis_2d=False,
         export_vis_3d=False,
         vis_save_root=None,

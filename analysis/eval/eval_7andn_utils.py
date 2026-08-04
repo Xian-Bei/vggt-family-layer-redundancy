@@ -35,24 +35,15 @@ SEVEN_ANDN_METRIC_KEYS = (
     "acc",
     "comp",
     "cd",
-    "nc1",
-    "nc2",
-    "nc",
     "acc_med",
     "comp_med",
     "cd_med",
-    "nc1_med",
-    "nc2_med",
-    "nc_med",
     "ate",
     "are",
     "rpe_rot",
     "rpe_trans",
     "inference_time_ms",
     "infer_peak_vram_gb",
-    "depth_abs_rel",
-    "depth_delta1",
-    "depth_valid_pixels",
 )
 
 # Output schema for ``average_metrics.json`` (ordered for stable diffs).
@@ -60,50 +51,17 @@ AVERAGE_METRICS_SCHEMA_KEYS = (
     "acc",
     "comp",
     "cd",
-    "nc1",
-    "nc2",
-    "nc",
     "acc_med",
     "comp_med",
     "cd_med",
-    "nc1_med",
-    "nc2_med",
-    "nc_med",
     "ate",
     "are",
     "rpe_rot",
     "rpe_trans",
     "inference_time_ms",
     "infer_peak_vram_gb",
-    "depth_abs_rel",
-    "depth_delta1",
-    "depth_valid_pixels",
     "num_scenes",
 )
-
-
-def _center_crop_224_hw(arr: np.ndarray) -> np.ndarray:
-    """Match 7andn point-eval crop: 224×224 centered on VGGT-resolution frame."""
-    if arr.ndim != 2:
-        raise ValueError(f"Expected HxW depth slice, got {arr.shape}")
-    H, W = int(arr.shape[0]), int(arr.shape[1])
-    cx_, cy_ = W // 2, H // 2
-    l, t, r, b = cx_ - 112, cy_ - 112, cx_ + 112, cy_ + 112
-    return arr[t:b, l:r]
-
-
-def _view_depthmap_to_hw(view: Dict[str, Any]) -> np.ndarray:
-    """GT depth map in meters (CPU); ``depthmap`` is not moved to CUDA by ``_move_batch_to_device``."""
-    dm = view["depthmap"]
-    if isinstance(dm, torch.Tensor):
-        x = dm.detach().float().cpu().numpy()
-    else:
-        x = np.asarray(dm, dtype=np.float32)
-    while x.ndim > 2 and x.shape[0] == 1:
-        x = x[0]
-    if x.ndim != 2:
-        raise ValueError(f"Expected depthmap HxW after squeeze, got {x.shape}")
-    return x.astype(np.float32, copy=False)
 
 
 def _depth_to_bshw(depth: torch.Tensor) -> torch.Tensor:
@@ -217,11 +175,7 @@ def _uncollate_7andn_views(batch: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _move_batch_to_device(batch: List[Dict[str, Any]], device: str) -> None:
-    """Move per-view GT tensors to ``device`` for post-forward metric code (not inference).
-
-    ``img`` and ``depthmap`` stay on CPU: images are uploaded once for forward; depth maps
-    are read via :func:`_view_depthmap_to_hw` on CPU.
-    """
+    """Move per-view GT tensors to ``device`` for post-forward metric code."""
     ignore_keys = {"depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng", "img"}
     for view in batch:
         for name in list(view.keys()):
@@ -385,20 +339,11 @@ def _evaluate_one_scene_7andn(
 
     gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = criterion.get_all_pts3d_t(batch, preds)
 
-    dv = len(batch)
-    depth_sl = depth[:, -dv:, :, :]
-    depth_conf_sl = depth_conf[:, -dv:, :, :]
-    dep_s_hw = depth_sl[0].detach().float().cpu().numpy()
-    conf_s_hw = depth_conf_sl[0].detach().float().cpu().numpy()
-    pred_m_hw = np.where(conf_s_hw >= float(eval_conf_thresh), dep_s_hw, np.nan).astype(np.float32)
-
     pts_all: List[np.ndarray] = []
     pts_gt_all: List[np.ndarray] = []
     images_all: List[np.ndarray] = []
     masks_all: List[np.ndarray] = []
     conf_all: List[np.ndarray] = []
-    pred_depth_crops: List[np.ndarray] = []
-    gt_depth_crops: List[np.ndarray] = []
     for j, view in enumerate(batch):
         image = view["img"].permute(0, 2, 3, 1).detach().cpu().numpy()[0]
         mask = view["valid_mask"].detach().cpu().numpy()[0]
@@ -419,8 +364,6 @@ def _evaluate_one_scene_7andn(
         pts_gt_all.append(pts_gt[None, ...])
         masks_all.append(mask[None, ...])
         conf_all.append(conf_np[None, ...])
-        pred_depth_crops.append(_center_crop_224_hw(pred_m_hw[j]))
-        gt_depth_crops.append(_center_crop_224_hw(_view_depthmap_to_hw(view)))
 
     images_arr = np.concatenate(images_all, axis=0)
     pts_arr = np.concatenate(pts_all, axis=0)
@@ -433,7 +376,7 @@ def _evaluate_one_scene_7andn(
     # metrics extended that lifetime and caused OOM on the *next* scene. Drop GPU tensors
     # once NumPy copies exist; keep ``extrinsics`` / ``intrinsics`` for vis + pose metrics.
     del preds, pred_pts, gt_pts, gt_factor, pr_factor, masks, monitoring
-    del world_points_from_depth, depth_f, depth_sl, depth_conf_sl, depth, depth_conf, predictions
+    del world_points_from_depth, depth_f, depth, depth_conf, predictions
     for _v in batch:
         if isinstance(_v.get("img"), torch.Tensor) and _v["img"].is_cuda:
             _v["img"] = _v["img"].detach().cpu()
@@ -573,28 +516,8 @@ def _evaluate_one_scene_7andn(
         o3d.pipelines.registration.TransformationEstimationPointToPoint(),
     )
     pcd = pcd.transform(reg_p2p.transformation)
-    pcd.estimate_normals()
-    pcd_gt.estimate_normals()
-    gt_normal = np.asarray(pcd_gt.normals)
-    pred_normal = np.asarray(pcd.normals)
-    acc, acc_med, nc1, nc1_med = accuracy(pcd_gt.points, pcd.points, gt_normal, pred_normal)
-    comp, comp_med, nc2, nc2_med = completion(pcd_gt.points, pcd.points, gt_normal, pred_normal)
-
-    pred_depth_stack = np.stack(pred_depth_crops, axis=0)
-    gt_depth_stack = np.stack(gt_depth_crops, axis=0)
-    from .metrics_core import compute_depth_metrics, require_depth_stack_shapes
-    from analysis.schema.v3 import DepthEvalProfile
-
-    require_depth_stack_shapes(
-        pred_depth_stack,
-        gt_depth_stack,
-        context=f"7andn legacy eval {scene_id}",
-    )
-    depth_stats = compute_depth_metrics(
-        pred_depth_stack.astype(np.float32, copy=False),
-        gt_depth_stack.astype(np.float32, copy=False),
-        DepthEvalProfile(max_depth=10.0, conf_thresh=1.0, crop_mode="center224"),
-    )
+    acc, acc_med = accuracy(pcd_gt.points, pcd.points)
+    comp, comp_med = completion(pcd_gt.points, pcd.points)
 
     extr_np = extrinsics.detach().float().cpu().numpy()
     if extr_np.ndim == 4:
@@ -649,9 +572,8 @@ def _evaluate_one_scene_7andn(
     cd_med = float(acc_med) + float(comp_med)
     line = (
         f"Idx: {scene_id}, NumImgs: {scene_num_images}, "
-        f"Acc: {acc}, Comp: {comp}, Cd: {cd}, NC1: {nc1}, NC2: {nc2} - "
-        f"Acc_med: {acc_med}, Compc_med: {comp_med}, Cd_med: {cd_med}, "
-        f"NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
+        f"Acc: {acc}, Comp: {comp}, Cd: {cd} - "
+        f"Acc_med: {acc_med}, Compc_med: {comp_med}, Cd_med: {cd_med}"
     )
     if not quiet:
         print(line, flush=True)
@@ -666,24 +588,15 @@ def _evaluate_one_scene_7andn(
         "acc": float(acc),
         "comp": float(comp),
         "cd": cd,
-        "nc1": float(nc1),
-        "nc2": float(nc2),
-        "nc": (float(nc1) + float(nc2)) / 2.0,
         "acc_med": float(acc_med),
         "comp_med": float(comp_med),
         "cd_med": cd_med,
-        "nc1_med": float(nc1_med),
-        "nc2_med": float(nc2_med),
-        "nc_med": (float(nc1_med) + float(nc2_med)) / 2.0,
         "inference_time_ms": float(inference_time_ms),
         "infer_peak_vram_gb": float(infer_peak_vram_gb),
         "ate": float(pose_stats["ate"]),
         "are": float(pose_stats["are"]),
         "rpe_rot": float(pose_stats["rpe_rot"]),
         "rpe_trans": float(pose_stats["rpe_trans"]),
-        "depth_abs_rel": float(depth_stats["depth_abs_rel"]),
-        "depth_delta1": float(depth_stats["depth_delta1"]),
-        "depth_valid_pixels": float(depth_stats["depth_valid_pixels"]),
     }
 
     if save_path is not None and write_scene_metrics:

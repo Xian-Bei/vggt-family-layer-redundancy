@@ -325,11 +325,11 @@ class VGGTOmegaAdapter(BackboneAdapter):
             raise RuntimeError("vggt_omega forward requires CUDA device")
 
         agg = model.aggregator
-        depth = len(agg.frame_blocks)
         want = unit_ids or {u.unit_id for u in self.layer_unit_catalog(model)}
+        wanted_layers = {int(unit_id.split("_", 1)[1]) for unit_id in want}
         prev_cached = set(getattr(agg, "cached_layer_indices", set()))
         try:
-            agg.cached_layer_indices = set(range(depth))
+            agg.cached_layer_indices = wanted_layers
             with torch.no_grad():
                 tokens_list, patch_start = agg(x)
         finally:

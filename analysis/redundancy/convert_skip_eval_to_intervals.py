@@ -15,12 +15,9 @@ SKIP_EVAL_METRICS = (
     "are",
     "rpe_rot",
     "rpe_trans",
-    "depth_abs_rel",
-    "depth_delta1",
     "acc",
     "comp",
     "chamfer_distance",
-    "nc",
 )
 _EVAL_TO_VIEW_KEY = {
     "ate": "ape",

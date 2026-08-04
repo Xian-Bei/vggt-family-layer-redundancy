@@ -216,7 +216,7 @@ source/target unit ID 与 index 映射一致
 
 ```text
 Python package : analysis.recovery
-shell entry    : run_recovery.sh
+shell entry    : scripts/run_recovery.sh
 checkpoint dir : <OUTPUT_ROOT>/<backbone>/recovery/...
 evaluation dir : <OUTPUT_ROOT>/<backbone>/<dataset>/eval/recovery/...
 JSON kind      : recovery

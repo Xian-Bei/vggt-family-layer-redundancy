@@ -13,7 +13,6 @@ from analysis.redundancy.metrics import (
     upper_triangle_pack,
 )
 from analysis.redundancy.skip_metric_scaling import (
-    HIGHER_IS_BETTER,
     degradation_pct_to_multiple,
 )
 
@@ -144,14 +143,9 @@ def build_marginal_skip_maps(
                 base_metric = full_upper + base_delta
                 current_metric = full_upper + compact_delta
                 denominator = max(abs(base_metric), 1e-8)
-                if metric in HIGHER_IS_BETTER:
-                    degradation_pct = 100.0 * (
-                        base_metric - current_metric
-                    ) / denominator
-                else:
-                    degradation_pct = 100.0 * (
-                        current_metric - base_metric
-                    ) / denominator
+                degradation_pct = 100.0 * (
+                    current_metric - base_metric
+                ) / denominator
                 rebased = degradation_pct_to_multiple(
                     degradation_pct, metric=metric
                 )

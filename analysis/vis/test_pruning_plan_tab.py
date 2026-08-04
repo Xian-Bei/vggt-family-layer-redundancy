@@ -4,13 +4,17 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gradio as gr
 import numpy as np
 
 from analysis.prune_plan import PRUNE_PLAN_BUNDLE_SCHEMA_VERSION
+from analysis.prune_plan.eval_plots import STRATEGY_PLOT_COLORS
 from analysis.schema.v3 import EvalRecordV3
 from analysis.vis.pruning_plan_tab import (
+    _mean_backbone_plot_payloads,
+    _merge_replaceme_strategies,
     build_pruning_plan_tab,
     discover_pruning_plan_backbones,
     discover_pruning_plan_scopes,
@@ -20,8 +24,10 @@ from analysis.vis.pruning_plan_tab import (
 
 
 class PruningPlanTabTest(unittest.TestCase):
-    def _write_fixture(self, root: Path) -> None:
-        backbone = root / "vggt"
+    def _write_fixture(
+        self, root: Path, backbone_name: str = "vggt", metric_value: float = 2.0
+    ) -> None:
+        backbone = root / backbone_name
         backbone.mkdir(parents=True)
         strategies = {
             key: {"display_name": key, "points": {"2": "i1_j2"}}
@@ -42,7 +48,7 @@ class PruningPlanTabTest(unittest.TestCase):
         }
         bundle = {
             "schema_version": PRUNE_PLAN_BUNDLE_SCHEMA_VERSION,
-            "backbone": "vggt",
+            "backbone": backbone_name,
             "dataset": "train_a",
             "num_units": 4,
             "intervals": {
@@ -63,19 +69,19 @@ class PruningPlanTabTest(unittest.TestCase):
             json.dumps(bundle), encoding="utf-8"
         )
         metrics = {
-            "ape": 2.0,
-            "are": 2.0,
-            "rpe_trans": 2.0,
-            "rpe_rot": 2.0,
-            "acc": 2.0,
-            "comp": 2.0,
-            "chamfer_distance": 2.0,
+            "ape": metric_value,
+            "are": metric_value,
+            "rpe_trans": metric_value,
+            "rpe_rot": metric_value,
+            "acc": metric_value,
+            "comp": metric_value,
+            "chamfer_distance": metric_value,
         }
         for dataset in ("train_a", "test_a"):
             upper = backbone / dataset / "eval" / "upper"
             upper.mkdir(parents=True)
             EvalRecordV3(
-                backbone="vggt",
+                backbone=backbone_name,
                 dataset=dataset,
                 model_name="upper",
                 average={key: 1.0 for key in metrics},
@@ -112,30 +118,143 @@ class PruningPlanTabTest(unittest.TestCase):
                 ["test_a"],
             )
 
-    def test_renders_four_live_plots_without_saved_pngs(self) -> None:
+    def test_renders_two_live_plots_without_saved_pngs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self._write_fixture(root)
             gallery, status = render_pruning_plan_gallery(
                 root, "vggt", ["training"]
             )
-            self.assertEqual(len(gallery), 4, status)
-            self.assertIn("plots=4/4", status)
+            self.assertEqual(len(gallery), 2, status)
+            self.assertIn("plots=2/2", status)
             self.assertIsInstance(gallery[0][0], np.ndarray)
             self.assertEqual(gallery[0][0].ndim, 3)
             self.assertFalse(any(root.rglob("*.png")))
+
+    def test_live_plots_default_to_drop_step_two(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_fixture(root)
+            with mock.patch(
+                "analysis.vis.pruning_plan_tab.collect_pruning_eval_payload",
+                wraps=__import__(
+                    "analysis.vis.pruning_plan_tab", fromlist=["collect_pruning_eval_payload"]
+                ).collect_pruning_eval_payload,
+            ) as collect:
+                render_pruning_plan_gallery(root, "vggt", ["training"])
+            self.assertEqual(collect.call_args.kwargs["drop_step"], 2)
+
+    def test_renders_multiple_backbones_and_mean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_fixture(root, "vggt", 2.0)
+            self._write_fixture(root, "pi3", 4.0)
+            gallery, status = render_pruning_plan_gallery(
+                root, ["vggt", "pi3", "mean"], ["training"]
+            )
+            self.assertEqual(len(gallery), 6, status)
+            self.assertIn("mean/training", status)
+
+    def test_mean_backbone_averages_only_shared_points(self) -> None:
+        def payload(value: float, include_extra: bool = False) -> dict:
+            points = {
+                "2": {
+                    "available": True,
+                    "drop_count": 2,
+                    "metrics_mean": {"ape": value},
+                    "normalized_degradation": {"ape": value / 10.0},
+                }
+            }
+            if include_extra:
+                points["4"] = {
+                    "available": True,
+                    "drop_count": 4,
+                    "metrics_mean": {"ape": 9.0},
+                }
+            return {
+                "upper_average": {"ape": 1.0},
+                "strategies": {"ours_double": {"points": points}},
+            }
+
+        mean = _mean_backbone_plot_payloads([payload(2.0, True), payload(4.0)])
+        points = mean["strategies"]["ours_double"]["points"]
+        self.assertEqual(points["2"]["metrics_mean"]["ape"], 3.0)
+        self.assertAlmostEqual(
+            points["2"]["normalized_degradation"]["ape"], 0.3
+        )
+        self.assertNotIn("4", points)
+
+    def test_merges_replaceme_curves_with_pointwise_metric_minimum(self) -> None:
+        def point(value: float) -> dict:
+            return {
+                "available": True,
+                "drop_count": 2,
+                "metrics_mean": {"ape": value},
+                "absolute_degradation": {"ape": value + 1.0},
+                "multiple_degradation": {"ape": value + 2.0},
+                "normalized_degradation": {"ape": value + 3.0},
+            }
+
+        payload = {
+            "strategies": {
+                "replaceme_single": {"points": {"2": point(4.0)}},
+                "replaceme_double": {"points": {"2": point(2.0)}},
+                "shortgpt": {"points": {}},
+            }
+        }
+        merged = _merge_replaceme_strategies(payload)
+        strategies = merged["strategies"]
+        self.assertNotIn("replaceme_single", strategies)
+        self.assertNotIn("replaceme_double", strategies)
+        self.assertIn("shortgpt", strategies)
+        merged_point = strategies["replaceme"]["points"]["2"]
+        self.assertEqual(merged_point["metrics_mean"]["ape"], 2.0)
+        self.assertEqual(merged_point["absolute_degradation"]["ape"], 3.0)
+        self.assertEqual(merged_point["multiple_degradation"]["ape"], 4.0)
+        self.assertEqual(merged_point["normalized_degradation"]["ape"], 5.0)
+
+    def test_baseline_plot_excludes_ours_and_gt_single(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_fixture(root)
+            with mock.patch(
+                "analysis.vis.pruning_plan_tab.render_strategy_metric_figure",
+                return_value=None,
+            ) as render:
+                render_pruning_plan_gallery(root, "vggt", ["training"])
+            self.assertEqual(render.call_count, 2)
+            baseline_keys = render.call_args_list[1].kwargs["strategy_keys"]
+            self.assertNotIn("ours_single", baseline_keys)
+            self.assertNotIn("gt_single", baseline_keys)
+            self.assertIn("ours_double", baseline_keys)
+            self.assertIn("gt_double", baseline_keys)
+
+    def test_ours_cka_uses_red_and_replaceme_uses_green(self) -> None:
+        self.assertEqual(STRATEGY_PLOT_COLORS["ours"], "#d62728")
+        self.assertEqual(STRATEGY_PLOT_COLORS["ours_single"], "#d62728")
+        self.assertEqual(STRATEGY_PLOT_COLORS["ours_double"], "#d62728")
+        self.assertEqual(STRATEGY_PLOT_COLORS["replaceme"], "#2ca02c")
 
     def test_builder_uses_multi_select_checkboxes_and_auto_height_gallery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self._write_fixture(root)
+            self._write_fixture(root, "pi3")
             with gr.Blocks() as blocks:
                 ui = build_pruning_plan_tab(blocks=blocks, output_root=root)
             self.assertIsInstance(ui["scope_cb"], gr.CheckboxGroup)
+            self.assertIsInstance(ui["backbone_dd"], gr.CheckboxGroup)
+            self.assertIn(("mean", "mean"), ui["backbone_dd"].choices)
+            self.assertEqual(ui["backbone_dd"].value, ["vggt", "pi3"])
             self.assertTrue(ui["scope_cb"].interactive)
             self.assertEqual(ui["scope_cb"].type, "value")
             self.assertEqual(ui["gallery"].height, "auto")
             self.assertEqual(ui["gallery"].columns, 2)
+            self.assertIsInstance(ui["value_mode"], gr.Radio)
+            self.assertEqual(ui["value_mode"].value, "absolute")
+            self.assertTrue(ui["normalize_metrics"].value)
+            self.assertIsInstance(ui["merge_replaceme"], gr.Checkbox)
+            self.assertTrue(ui["merge_replaceme"].value)
 
 
 if __name__ == "__main__":

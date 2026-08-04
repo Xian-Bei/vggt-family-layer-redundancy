@@ -54,7 +54,7 @@ inv_mse_double
 - `cosine_single/double`、`inv_mse_single/double` 是 Ours 的内部相似度
   ablation，不应描述成对应论文的严格官方方法。
 
-`done.sh` 默认包含：
+`main.sh` 默认包含：
 
 ```text
 gt_single,gt_double,
@@ -63,7 +63,7 @@ replaceme_single,replaceme_double,
 shortgpt,simpler
 ```
 
-环境变量 `PRUNE_STRATEGY` 和 `PLAN_STRATEGY` 可以覆盖实际参与生成和评测的方法。`TODO.sh` 可能为当前实验临时注释步骤或缩小默认方法集合，因此论文实验应同时记录实际环境变量。
+环境变量 `PRUNE_STRATEGY` 可以覆盖实际参与生成和评测的方法。TODO 脚本可能为当前实验临时注释步骤或缩小默认方法集合，因此论文实验应同时记录实际环境变量。
 
 ## 2. 步骤 6 的输入和输出
 
@@ -268,13 +268,15 @@ double score = D[a,b] + D[c,d]       # sum 模式
 double score = max(D[a,b], D[c,d])   # max 模式
 ```
 
-双区间联合目标由
-`OURS_GT_TWO_INTERVAL_SCORE_AGGREGATION = "sum" | "max"` 硬编码控制：
+双区间联合目标分别由两个参数硬编码控制：
 
-- `sum`：默认值，保持原有“两个区间下降量相加”的近似；
+- `GT_TWO_INTERVAL_SCORE_AGGREGATION = "sum"`；
+- `OURS_TWO_INTERVAL_SCORE_AGGREGATION = "max"`。
+
+- `sum`：保持原有“两个区间下降量相加”的近似；
 - `max`：联合下降由两个分量中更大的下降量决定。
 
-该开关只作用于 GT Double 和 Ours 系列的 Double 版本，即
+这两个开关分别作用于 GT Double 和 Ours 系列的 Double 版本，即
 Ours_CKA、Ours_Cosine、Ours_INV_MSE；所有 Single 版本以及 ReplaceMe、
 ShortGPT、SIMPLER 均不受影响。每个 Double strategy 的 `source` 和每个
 预算点的 `joint_score_aggregation` 都会记录实际模式。
@@ -327,12 +329,10 @@ comp
 chamfer_distance
 ```
 
-NC 不参与 GT 七指标均值。
-
 每个指标先换算为相对 upper model 的退化倍数，再在自己的单区间 heatmap 上归一化，随后：
 
 ```text
-七指标求均值 → dataset GT heatmap
+GT 指标求均值 → dataset GT heatmap
 两个 training datasets 求均值 → 最终 G[a,b]
 ```
 
@@ -665,7 +665,7 @@ training datasets 的单区间 brute-force 结果应已存在：
 
 ## 14. Plot 语义
 
-Pruning metric plot 只绘制七指标 mean degradation。
+Pruning metric plot 只绘制 GT metric mean degradation。
 
 - 颜色表示方法；
 - 虚线表示显式 Single 版本；

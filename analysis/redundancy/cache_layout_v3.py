@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -48,7 +48,7 @@ def require_minimal_cache_geometry(meta: Dict[str, Any], *, cache_dir: Path) -> 
         raise RuntimeError(
             f"Minimal training cache under {cache_dir} is missing metadata {missing}. "
             "Re-run cache with PRUNE_PLAN_ROOT set, e.g. "
-            "PRUNE_PLAN_ROOT=analysis/prune_plan SAVE_SCANNET=1 bash run_cache_redundancy.sh"
+            "PRUNE_PLAN_ROOT=analysis/prune_plan SAVE_SCANNET=1 bash scripts/run_cache_redundancy.sh"
         )
 
 
@@ -120,23 +120,98 @@ def _reshape_global_to_match_frame(frame: torch.Tensor, global_t: torch.Tensor) 
     )
 
 
-def _load_unit_tensor(path: Path, *, map_location: Optional[str] = None) -> torch.Tensor:
+def _is_cpu_location(map_location: Optional[Union[str, torch.device]]) -> bool:
+    if map_location is None:
+        return True
+    try:
+        return torch.device(map_location).type == "cpu"
+    except (TypeError, RuntimeError):
+        return False
+
+
+def _torch_load_tensor(
+    path: Path,
+    *,
+    mmap: bool = False,
+    map_location: Optional[Union[str, torch.device]] = None,
+) -> torch.Tensor:
+    """Load a tensor, using file-backed storage when PyTorch supports it.
+
+    mmap is deliberately restricted to CPU loads.  A CUDA map location would
+    materialize the complete storage on the device and defeats bounded staging.
+    Older PyTorch releases and legacy serialization formats are retried without
+    mmap for backward compatibility.
+    """
     if not path.is_file():
         raise FileNotFoundError(f"Missing layer unit file {path}")
     load_kw: Dict[str, Any] = {"weights_only": False}
     if map_location is not None:
         load_kw["map_location"] = map_location
-    t = torch.load(path, **load_kw)
+    use_mmap = bool(mmap and _is_cpu_location(map_location))
+    if use_mmap:
+        load_kw["mmap"] = True
+    try:
+        value = torch.load(path, **load_kw)
+    except (TypeError, RuntimeError) as exc:
+        if not use_mmap:
+            raise
+        # torch<2.0 has no mmap keyword; old pickle serialization cannot mmap.
+        load_kw.pop("mmap", None)
+        try:
+            value = torch.load(path, **load_kw)
+        except Exception:
+            raise exc
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"Expected tensor in {path}, got {type(value).__name__}")
+    return value
+
+
+def _load_unit_tensor(path: Path, *, map_location: Optional[str] = None) -> torch.Tensor:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing layer unit file {path}")
+    t = _torch_load_tensor(path, map_location=map_location)
     if t.dim() == 3:
         t = t.unsqueeze(0)
     if t.dim() == 2:
         raise ValueError(
-            f"Unit tensor at {path} is flattened [N,C]; re-run run_cache_redundancy.sh with SAVE_*=1 "
+            f"Unit tensor at {path} is flattened [N,C]; re-run scripts/run_cache_redundancy.sh with SAVE_*=1 "
             "so training receives full [B,S,P,C] activations."
         )
     if t.dim() != 4:
         raise ValueError(f"Expected 4D unit tensor at {path}, got {tuple(t.shape)}")
     return t.contiguous()
+
+
+def _normalise_direct_unit(
+    tensor: torch.Tensor,
+    *,
+    unit_id: str,
+    metadata: Optional[Dict[str, Any]],
+    path: Path,
+) -> torch.Tensor:
+    """Return the canonical [B,S,P,C] view without copying its storage."""
+    t = tensor
+    if t.dim() == 3:
+        t = t.unsqueeze(0)
+    if t.dim() != 4:
+        raise ValueError(f"Expected 4D unit tensor at {path}, got {tuple(t.shape)}")
+    if not str(unit_id).startswith("global_"):
+        return t
+
+    # Current caches normally already store [B,S,P,C].  Some early v3 caches
+    # stored global tokens as [B,1,S*P,C]; metadata is sufficient to recover the
+    # canonical layout without loading frame_i merely to discover S.
+    num_frames = int((metadata or {}).get("num_frames") or 0)
+    if num_frames <= 0 or int(t.shape[1]) == num_frames:
+        return t
+    if int(t.shape[1]) == 1 and int(t.shape[2]) % num_frames == 0:
+        return t.reshape(
+            int(t.shape[0]), num_frames, int(t.shape[2]) // num_frames, int(t.shape[3])
+        )
+    raise ValueError(
+        f"Cannot normalize {unit_id} at {path} with shape {tuple(t.shape)} "
+        f"and num_frames={num_frames}"
+    )
 
 
 def _unit_path_from_manifest(
@@ -158,6 +233,73 @@ def _unit_path_from_manifest(
 def _missing_partner_like(ref: torch.Tensor) -> torch.Tensor:
     """Create zero tensor for missing frame/global partner with same shape."""
     return torch.zeros_like(ref).contiguous()
+
+
+def load_scene_unit_v3(
+    cache_dir: Path,
+    item: Dict[str, Any],
+    unit_id: str,
+    *,
+    mmap: bool = True,
+    map_location: Optional[Union[str, torch.device]] = "cpu",
+) -> torch.Tensor:
+    """Load exactly one frame/global unit from a v3 scene cache.
+
+    The fast path opens only the requested unit file and never constructs a
+    [frame, global] concat tensor.  A legacy ``layer_i.pt`` concat is accepted as
+    a compatibility fallback when no direct unit file exists.
+    """
+    key = str(unit_id)
+    try:
+        kind, idx_s = key.split("_", 1)
+        layer_idx = int(idx_s)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid unit id {unit_id!r}") from exc
+    if kind not in {"frame", "global"} or layer_idx < 0:
+        raise ValueError(f"Unsupported unit id {unit_id!r}")
+
+    cache_dir = Path(cache_dir)
+    scene_dir = cache_dir / str(item.get("dir", item.get("scene_id", "")))
+    direct_path, has_direct = _unit_path_from_manifest(
+        cache_dir, scene_dir, item, key
+    )
+    if has_direct and direct_path.is_file():
+        metadata: Optional[Dict[str, Any]] = None
+        if kind == "global":
+            # Prefer metadata already merged into training items and avoid an
+            # extra JSON read in the common recovery path.
+            metadata = item if item.get("num_frames") is not None else None
+            if metadata is None:
+                try:
+                    metadata = load_scene_metadata_v3(cache_dir, item)
+                except FileNotFoundError:
+                    metadata = None
+        return _normalise_direct_unit(
+            _torch_load_tensor(
+                direct_path, mmap=bool(mmap), map_location=map_location
+            ),
+            unit_id=key,
+            metadata=metadata,
+            path=direct_path,
+        )
+
+    # Early caches may expose only a full layer_i tensor.  This fallback is the
+    # sole direct-loader path allowed to slice a 2C representation.
+    legacy_path = scene_dir / "layers" / f"layer_{layer_idx}.pt"
+    if legacy_path.is_file():
+        concat = _torch_load_tensor(
+            legacy_path, mmap=bool(mmap), map_location=map_location
+        )
+        if concat.dim() == 3:
+            concat = concat.unsqueeze(0)
+        if concat.dim() != 4 or int(concat.shape[-1]) % 2:
+            raise ValueError(
+                f"Expected legacy [B,S,P,2C] tensor at {legacy_path}, got {tuple(concat.shape)}"
+            )
+        channels = int(concat.shape[-1]) // 2
+        return concat[..., :channels] if kind == "frame" else concat[..., channels:]
+
+    raise FileNotFoundError(f"Scene {scene_dir.name} missing requested unit {key}")
 
 
 def load_scene_replay_layer_v3(

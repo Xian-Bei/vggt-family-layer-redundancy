@@ -60,11 +60,16 @@ from analysis.prune_plan.recovery_plan import compose_recovery_unit_prune_plan
 from analysis.schema.v3 import dataset_output_tag, parse_dataset_plugin_args
 from analysis.backbones.cache_replay.vggt_family import mask_from_depth
 from analysis.recovery.train.model import build_skipped_layer_indices
+from analysis.recovery.train.checkpoint_v3 import (
+    atomic_publish_latest,
+    atomic_save_checkpoint,
+)
 from analysis.redundancy.cache_layout import (
     _replay_layer_files,
     load_scene_metadata,
     load_scene_pred,
     load_scene_replay_layer,
+    load_scene_unit,
 )
 from analysis.eval.prediction_eval import _load_gt_depth_for_scene
 from analysis.eval.scannet_eval import (
@@ -439,18 +444,10 @@ _SCANNET_KEEP_KEYS = (
     "comp",
     "cd",
     "chamfer_distance",
-    "nc1",
-    "nc2",
-    "nc",
-    "nc1_med",
-    "nc2_med",
-    "nc_med",
     "ape",
     "are",
     "rpe_rot",
     "rpe_trans",
-    "depth_abs_rel",
-    "depth_delta1",
 )
 
 # Omitted from periodic-eval history / CSV / plots (still computed inside eval helpers).
@@ -459,7 +456,7 @@ _EVAL_HISTORY_SKIP_KEYS = frozenset({"inference_time_ms", "infer_peak_vram_gb"})
 
 # Periodic eval covers the enabled dataset tags. Two metric families:
 #   - scannet_dev50, scannet_test50 → ScanNet metrics (chamfer/ape/are/...)
-#   - 7scenes, nrgbd, nuscenes, waymo → reconstruction + trajectory (acc/comp/nc/..., ape/are/rpe, timing)
+#   - 7scenes, nrgbd, nuscenes, waymo → reconstruction + trajectory (acc/comp/cd, ape/are/rpe, timing)
 # Plotting groups (`_write_eval_artifacts`) share these splits.
 EVAL_SCANNET_DATASETS = ("scannet_dev50", "scannet_test50")
 EVAL_RECON_DATASETS = ("7scenes", "nrgbd", "nuscenes", "waymo")
@@ -469,19 +466,15 @@ _RECON_KEEP_KEYS = (
     "acc",
     "comp",
     "cd",
-    "nc",
     "acc_med",
     "comp_med",
     "cd_med",
-    "nc_med",
     "ape",
     "are",
     "rpe_rot",
     "rpe_trans",
     "inference_time_ms",
     "infer_peak_vram_gb",
-    "depth_abs_rel",
-    "depth_delta1",
 )
 
 
@@ -677,7 +670,6 @@ def _run_periodic_eval_for_epoch(
                 model_name=f"Train_epoch_{eval_epoch}",
                 device=device,
                 output_dir=out_p,
-                skip_depth=adapter.periodic_eval_skip_depth(),
                 max_scenes=int(args.eval_max_scenes),
                 max_frames=int(args.max_eval_views),
             )
@@ -695,7 +687,6 @@ def _run_periodic_eval_for_epoch(
                 model_name=f"Train_epoch_{eval_epoch}",
                 device=device,
                 output_dir=out_p,
-                skip_depth=adapter.periodic_eval_skip_depth(),
                 max_scenes=int(args.eval_max_scenes),
                 max_frames=int(args.max_eval_views),
             )
@@ -715,7 +706,6 @@ def _run_periodic_eval_for_epoch(
                 model_name=f"Train_epoch_{eval_epoch}",
                 device=device,
                 output_dir=out_p,
-                skip_depth=adapter.periodic_eval_skip_depth(),
                 max_scenes=int(args.eval_max_scenes),
                 max_frames=int(args.max_eval_views),
                 split=split,
@@ -751,8 +741,8 @@ def _plot_metric_dataset(
 
     A metric is plotted when this dataset has upper/lower bounds and at least one
     history row. When ``metric_whitelist`` is provided, only those metrics are considered (drops
-    plot-clutter rows like ``num_scenes`` / ``nc1`` / ``nc2`` that are stored in
-    bounds for transparency but not meaningful in periodic-eval curves).
+    plot-clutter rows like ``num_scenes`` that are stored in bounds for
+    transparency but not meaningful in periodic-eval curves).
     """
     import matplotlib.pyplot as plt  # type: ignore
 
@@ -1029,7 +1019,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("training", "validation", "train", "val"),
         help="Waymo split for periodic eval (output tag: waymo_<split>).",
     )
-    # Non-ScanNet periodic eval roots (mirrors run_eval.sh defaults).
+    # Non-ScanNet periodic eval roots (mirrors scripts/run_eval.sh defaults).
     p.add_argument("--root-7scenes", type=Path, default=Path("data/7scenes"))
     p.add_argument("--root-nrgbd", type=Path, default=Path("data/neural_rgbd_data"))
     p.add_argument("--root-nuscenes", type=Path, default=Path("data/nuscenes"))
@@ -1038,7 +1028,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--eval-7andn-kf",
         type=int,
         default=10,
-        help="Keyframe step for 7scenes/NRGBD eval (matches run_eval.sh KF=10).",
+        help="Keyframe step for 7scenes/NRGBD eval (matches scripts/run_eval.sh KF=10).",
     )
     p.add_argument(
         "--eval-7andn-max-scenes-per-dataset",
@@ -1306,7 +1296,31 @@ def main() -> None:
         if not ckpt_path.exists():
             raise SystemExit(f"--resume-from not found: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        if "trainable_state_dict" in ckpt:
+            current_trainable = {
+                name: parameter
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            }
+            saved = ckpt["trainable_state_dict"]
+            if set(saved) != set(current_trainable):
+                missing = sorted(set(current_trainable) - set(saved))
+                unexpected = sorted(set(saved) - set(current_trainable))
+                raise RuntimeError(
+                    "Delta checkpoint trainable parameter set mismatch: "
+                    f"missing={missing[:8]} unexpected={unexpected[:8]}"
+                )
+            with torch.no_grad():
+                for name, parameter in current_trainable.items():
+                    value = saved[name]
+                    if tuple(value.shape) != tuple(parameter.shape):
+                        raise RuntimeError(
+                            f"Delta checkpoint shape mismatch for {name}: "
+                            f"{tuple(value.shape)} vs {tuple(parameter.shape)}"
+                        )
+                    parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+        else:
+            model.load_state_dict(ckpt["model_state_dict"], strict=True)
         optim.load_state_dict(ckpt["optimizer_state_dict"])
         scaler_state = ckpt.get("scaler_state_dict")
         if scaler_state is not None:
@@ -1345,8 +1359,7 @@ def main() -> None:
     )
     pbar = tqdm(total=total_steps if total_steps > 0 else None, desc=train_desc, dynamic_ncols=True)
     def _save_checkpoint(ckpt_path: Path, epoch_idx: int) -> None:
-        torch.save(
-            {
+        payload = {
                 "global_step": global_step,
                 "epoch": int(epoch_idx),
                 "epochs": int(args.epochs),
@@ -1355,15 +1368,23 @@ def main() -> None:
                 "train_unit_indices": train_unit_indices,
                 "training_method": training_method,
                 "prune_plan": asdict(prune_plan),
-                "variant": args.variant,
+                "variant": "trainable_recovery_delta_v1",
+                "training_variant": args.variant,
+                "checkpoint_format": "trainable_recovery_delta_v1",
                 "save_every_epoch": int(args.save_every_epoch),
-                "model_state_dict": model.state_dict(),
+                "trainable_state_dict": {
+                    name: parameter.detach()
+                    for name, parameter in model.named_parameters()
+                    if parameter.requires_grad
+                },
                 "optimizer_state_dict": optim.state_dict(),
                 "scaler_state_dict": scaler.state_dict(),
                 "args": vars(args),
-            },
-            ckpt_path,
-        )
+            }
+        atomic_save_checkpoint(payload, ckpt_path)
+
+    def _publish_latest(serialized_path: Path) -> None:
+        atomic_publish_latest(serialized_path, serialized_path.parent / "latest.pt")
 
     for epoch in range(start_epoch, int(args.epochs)):
         epoch_scenes = list(scenes)
@@ -1379,21 +1400,39 @@ def main() -> None:
             row = _load_scene_cache_row(item_cache_dir, item)
             engine.validate_cache_row(row, num_layers=num_layers)
             layer_cpu_cache: Dict[int, torch.Tensor] = {}
+            unit_cpu_cache: Dict[str, torch.Tensor] = {}
 
             def _get_layer_cpu(idx: int) -> torch.Tensor:
                 cached = layer_cpu_cache.get(idx)
                 if cached is not None:
                     return cached
-                map_loc = str(device) if device.type == "cuda" else "cpu"
                 t = load_scene_replay_layer(
                     item_cache_dir,
                     item,
                     int(idx),
                     expected_num_layers=num_layers,
-                    map_location=map_loc,
+                    map_location="cpu",
                 )
                 layer_cpu_cache[idx] = t
                 return t
+
+            def _get_unit_cpu(unit_id: str) -> torch.Tensor:
+                key = str(unit_id)
+                cached = unit_cpu_cache.get(key)
+                if cached is None:
+                    cached = load_scene_unit(
+                        item_cache_dir,
+                        item,
+                        key,
+                        mmap=True,
+                        map_location="cpu",
+                    )
+                    unit_cpu_cache[key] = cached
+                return cached
+
+            # Replay engines use this direct-unit callback for the seed while
+            # preserving their public get_layer_cpu API for head concat layers.
+            setattr(_get_layer_cpu, "unit_loader", _get_unit_cpu)
 
             from analysis.redundancy.cache_layout_v3 import require_minimal_cache_geometry
 
@@ -1472,11 +1511,12 @@ def main() -> None:
                     s_kind = "frame" if (s_idx % 2 == 0) else "global"
                     t_kind = "frame" if (t_idx % 2 == 0) else "global"
                     s_concat = replay.concat_by_layer[s_layer]
-                    t_concat = _get_layer_cpu(int(t_layer)).to(device=device, non_blocking=(device.type == "cuda"))
+                    t_unit_id = f"{t_kind}_{t_layer}"
+                    t_term = _get_unit_cpu(t_unit_id).to(
+                        device=device, non_blocking=(device.type == "cuda")
+                    )
                     c_s = int(s_concat.shape[-1] // 2)
-                    c_t = int(t_concat.shape[-1] // 2)
                     s_term = s_concat[..., :c_s] if s_kind == "frame" else s_concat[..., c_s:]
-                    t_term = t_concat[..., :c_t] if t_kind == "frame" else t_concat[..., c_t:]
                     s_term = engine.normalize_alignment_term(s_term)
                     t_term = engine.normalize_alignment_term(t_term)
                     mse_i, cos_i, cka_i, term_loss = align_activation_term(
@@ -1504,6 +1544,7 @@ def main() -> None:
                     num_layers=int(num_layers),
                     seed_layer=int(seed_layer),
                 )
+                unit_cpu_cache.clear()
                 t_pred0 = time.perf_counter()
                 if str(args.target_source) == "teacher":
                     target_dataset_name = str(item.get("dataset", "") or row.get("dataset", "")).strip()
@@ -1628,8 +1669,11 @@ def main() -> None:
             if int(args.max_steps) > 0 and global_step >= int(args.max_steps):
                 break
         if int(args.save_every_epoch) > 0 and (((epoch + 1) % int(args.save_every_epoch)) == 0):
-            _save_checkpoint(out_dir / "checkpoints" / f"epoch_{epoch+1}.pt", epoch)
-        _save_checkpoint(out_dir / "checkpoints" / "latest.pt", epoch)
+            epoch_path = out_dir / "checkpoints" / f"epoch_{epoch+1}.pt"
+            _save_checkpoint(epoch_path, epoch)
+            _publish_latest(epoch_path)
+        else:
+            _save_checkpoint(out_dir / "checkpoints" / "latest.pt", epoch)
         _write_curves(out_dir, rows)
         if (
             engine.supports_periodic_eval()

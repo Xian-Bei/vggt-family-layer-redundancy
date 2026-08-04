@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -12,7 +12,6 @@ PRUNE_PLAN_NAME="${PRUNE_PLAN_NAME:-}"
 EXPECTED_DROP_COUNT="${EXPECTED_DROP_COUNT:-}"
 BASE_SELECTION_PATH="${BASE_SELECTION_PATH:-}"
 MAX_SCENES="${MAX_SCENES:-0}"
-CONDA_ENV="${CONDA_ENV:-vggt}"
 DEVICE="${DEVICE:-cuda}"
 MAX_TOKENS="${MAX_TOKENS:-0}"
 METRICS="${METRICS:-cka}"
@@ -21,8 +20,8 @@ REDUNDANCY_SEED="${REDUNDANCY_SEED:-0}"
 REUSE_COMPLETE_REMAINING_REDUNDANCY="${REUSE_COMPLETE_REMAINING_REDUNDANCY:-1}"
 export OUTPUT_ROOT
 
-# shellcheck source=run_backbones_lib.sh
-source "${REPO_ROOT}/run_backbones_lib.sh"
+# shellcheck source=scripts/run_backbones_lib.sh
+source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 parse_backbones_list
 parse_dataset_list "${RUN}" "RUN" "${DATASET_KEYS[@]}"
 RUN_LIST=("${PARSED_DATASETS[@]}")
@@ -35,13 +34,8 @@ if [[ -z "${PRUNE_PLAN_ROOT//[[:space:]]/}" ]]; then
   echo "error: PRUNE_PLAN_ROOT is required" >&2
   exit 1
 fi
-if [[ -z "${PRUNE_PLAN_NAME//[[:space:]]/}" && -z "${EXPECTED_DROP_COUNT//[[:space:]]/}" ]]; then
-  read -r PRUNE_PLAN_NAME EXPECTED_DROP_COUNT < <(
-    conda run --no-capture-output -n "${CONDA_ENV}" \
-      python -m analysis.prune_plan.knee_point --root "${PRUNE_PLAN_ROOT}"
-  )
-elif [[ -z "${PRUNE_PLAN_NAME//[[:space:]]/}" || -z "${EXPECTED_DROP_COUNT//[[:space:]]/}" ]]; then
-  echo "error: set both PRUNE_PLAN_NAME and EXPECTED_DROP_COUNT, or leave both empty to use prune_plan_all.json knee_points.ours" >&2
+if [[ -z "${PRUNE_PLAN_NAME//[[:space:]]/}" || -z "${EXPECTED_DROP_COUNT//[[:space:]]/}" ]]; then
+  echo "error: PRUNE_PLAN_NAME and EXPECTED_DROP_COUNT are required" >&2
   exit 1
 fi
 if [[ -z "${PRUNE_PLAN_NAME//[[:space:]]/}" ]]; then
@@ -78,8 +72,7 @@ remaining_output_complete() {
   local output_dataset="$2"
   local manifest_path="${OUTPUT_ROOT}/${backbone}/${output_dataset}/remaining_redundancy/manifest.json"
   [[ -f "${manifest_path}" ]] || return 1
-  conda run --no-capture-output -n "${CONDA_ENV}" \
-    python -c '
+  python -c '
 import hashlib, json, pathlib, sys
 manifest_path, selector, count, metrics, regions, max_tokens, seed, max_frames, selection_path = sys.argv[1:]
 root = pathlib.Path(manifest_path).parent
@@ -146,8 +139,7 @@ run_one_dataset() {
     echo "== remaining redundancy dataset=${dataset}${split:+_${split}}${output_dataset:+ -> ${output_dataset}} backbone=${backbone} prune_plan=${PRUNE_PLAN_NAME} expected_drop_count=${EXPECTED_DROP_COUNT} =="
   fi
 
-  run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" \
-    python -m analysis.redundancy.remaining_redundancy_v3 \
+  run_progress_command python -m analysis.redundancy.remaining_redundancy_v3 \
       --experiment "${backbone}" \
       --dataset "${dataset}" \
       "${output_dataset_args[@]}" \

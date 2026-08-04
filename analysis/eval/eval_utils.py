@@ -167,14 +167,8 @@ def umeyama_alignment(src, dst, estimate_scale=True):
         return scale, R, t
 
 
-def compute_chamfer_and_normal_consistency(points_pred, points_gt, max_dist=1.0):
-    """Voxel-downsampled ScanNet-style geometry: Chamfer (clipped means) + NC (7andn-style).
-
-    Chamfer matches the legacy ``compute_chamfer_distance`` definition (sum of directional
-    means after per-direction clipping). Normal consistency uses :mod:`analysis.eval.utils`
-    on the same downsampled points with Open3D-estimated normals.
-    """
-    from analysis.eval.utils import accuracy, completion
+def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0):
+    """Voxel-downsampled ScanNet-style Chamfer distance with clipped means."""
 
     MAX_POINTS = 100000
     if points_pred.shape[0] > MAX_POINTS:
@@ -203,37 +197,7 @@ def compute_chamfer_and_normal_consistency(points_pred, points_gt, max_dist=1.0)
     distances2_c = np.clip(distances2, 0, max_dist)
     chamfer_dist = float(np.mean(distances1_c) + np.mean(distances2_c))
 
-    search_param = o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
-    pcd_pred.estimate_normals(search_param)
-    pcd_gt.estimate_normals(search_param)
-
-    gt_pts = np.asarray(pcd_gt.points, dtype=np.float64)
-    pred_pts = np.asarray(pcd_pred.points, dtype=np.float64)
-    gt_n = np.asarray(pcd_gt.normals, dtype=np.float64)
-    pred_n = np.asarray(pcd_pred.normals, dtype=np.float64)
-    if gt_pts.shape[0] < 4 or pred_pts.shape[0] < 4:
-        nan6 = {k: float("nan") for k in ("nc1", "nc2", "nc", "nc1_med", "nc2_med", "nc_med")}
-        return {"chamfer_distance": chamfer_dist, **nan6}
-
-    acc, acc_med, nc1, nc1_med = accuracy(gt_pts, pred_pts, gt_n, pred_n)
-    comp, comp_med, nc2, nc2_med = completion(gt_pts, pred_pts, gt_n, pred_n)
-    return {
-        "chamfer_distance": chamfer_dist,
-        "nc1": float(nc1),
-        "nc2": float(nc2),
-        "nc": float((nc1 + nc2) / 2.0),
-        "nc1_med": float(nc1_med),
-        "nc2_med": float(nc2_med),
-        "nc_med": float((nc1_med + nc2_med) / 2.0),
-    }
-
-
-def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0):
-    return float(
-        compute_chamfer_and_normal_consistency(points_pred, points_gt, max_dist=max_dist)[
-            "chamfer_distance"
-        ]
-    )
+    return chamfer_dist
 
 
 def load_gt_pointcloud(scene_id, gt_ply_dir):

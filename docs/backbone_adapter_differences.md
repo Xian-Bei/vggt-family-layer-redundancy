@@ -25,7 +25,7 @@ FastVGGT 与 QuantVGGT 不属于本表；它们是恢复 LaRe 模型后应用的
 - `lower`：仅应用 prune plan。
 - `model`：应用 prune plan、恢复 LoRA topology，并加载训练 checkpoint。
 
-`run_eval.sh` 可在上述任一模式之后应用一个 inference compression adapter。部署压缩
+`scripts/run_eval.sh` 可在上述任一模式之后应用一个 inference compression adapter。部署压缩
 不参与 cache、冗余分析、prune-plan 生成或 LoRA 训练。
 
 ## 最小验证

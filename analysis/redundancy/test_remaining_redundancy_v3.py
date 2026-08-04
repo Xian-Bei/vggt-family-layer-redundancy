@@ -130,11 +130,11 @@ class RemainingRedundancyGpuTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_root = Path(temporary_dir)
             output_dir = output_root / "vggt" / "fake" / "remaining_redundancy"
-            selection_path = output_root / "remaining_skip_gt_knee.json"
+            selection_path = output_root / "remaining_skip_base_selection.json"
             selection_path.write_text(
                 json.dumps(
                     {
-                        "schema_version": "gt_single_interval_knee_v1",
+                        "schema_version": "gt_single_interval_at_point_v1",
                         "method": "threshold",
                         "selector": "i1_j1",
                         "drop_count": 1,
@@ -272,11 +272,11 @@ class RemainingRedundancyGpuTest(unittest.TestCase):
         )
         self.assertEqual(plan.drop, [1, 2])
         with tempfile.TemporaryDirectory() as temporary_dir:
-            selection_path = Path(temporary_dir) / "knee.json"
+            selection_path = Path(temporary_dir) / "base_selection.json"
             selection_path.write_text(
                 json.dumps(
                     {
-                        "schema_version": "gt_single_interval_knee_v1",
+                        "schema_version": "gt_single_interval_at_point_v1",
                         "method": "threshold",
                         "selector": "i1_j2",
                         "drop_count": 2,

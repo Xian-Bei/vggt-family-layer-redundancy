@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
@@ -29,13 +29,17 @@ RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
 # Optional output-only alias for evaluating multiple checkpoints from one
 # recovery plan (for example CKA-only epoch snapshots).
 RECOVERY_OUTPUT_NAME="${RECOVERY_OUTPUT_NAME:-${RECOVERY_PLAN_NAME}}"
+# Recovered deployment-compression evaluations must not share the ordinary
+# recovery result tree, otherwise they overwrite the uncompressed baseline.
+# `testtime` writes:
+#   eval/testtime/<recovery>/<compression>/<physical-selector>/...
+RECOVERY_RESULT_KIND="${RECOVERY_RESULT_KIND:-recovery}"
 MAX_SCENES="${MAX_SCENES:-0}"
 WRITE_SUMMARY="${WRITE_SUMMARY:-1}"
 
 #############################################
 
 DEVICE="${DEVICE:-cuda}"
-CONDA_ENV="${CONDA_ENV:-vggt}"
 CHECKPOINT="${CHECKPOINT:-}"
 INFERENCE_COMPRESSION="${INFERENCE_COMPRESSION:-none}"
 FASTVGGT_MERGE_START="${FASTVGGT_MERGE_START:-0}"
@@ -44,8 +48,8 @@ QUANTVGGT_DTYPE="${QUANTVGGT_DTYPE:-w4a4}"
 # No universal default: quantvggt requires calibration files matching the final LaRe topology/dtype.
 QUANTVGGT_PARAMS_DIR="${QUANTVGGT_PARAMS_DIR:-}"
 
-# shellcheck source=run_backbones_lib.sh
-source "${REPO_ROOT}/run_backbones_lib.sh"
+# shellcheck source=scripts/run_backbones_lib.sh
+source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 parse_backbones_list
 parse_dataset_list "${RUN}" "RUN" "${DATASET_KEYS[@]}"
 RUN_LIST=("${PARSED_DATASETS[@]}")
@@ -113,6 +117,17 @@ case "${INFERENCE_COMPRESSION}" in
     exit 1
     ;;
 esac
+case "${RECOVERY_RESULT_KIND}" in
+  recovery|testtime) ;;
+  *)
+    echo "error: RECOVERY_RESULT_KIND must be recovery or testtime; got ${RECOVERY_RESULT_KIND}" >&2
+    exit 1
+    ;;
+esac
+if [[ "${RECOVERY_RESULT_KIND}" == "testtime" && ( -z "${RECOVERY_PLAN_NAME}" || "${INFERENCE_COMPRESSION}" == "none" ) ]]; then
+  echo "error: RECOVERY_RESULT_KIND=testtime requires RECOVERY_PLAN_NAME and a non-none INFERENCE_COMPRESSION" >&2
+  exit 1
+fi
 case "${QUANTVGGT_DTYPE}" in
   w4a4|w6a6|w8a8) ;;
   *)
@@ -170,7 +185,7 @@ run_progress_command() {
 
 python_plan_group_from_name() {
   local name="$1"
-  PRUNE_PLAN_NAME_FOR_PY="${name}" conda run --no-capture-output -n "${CONDA_ENV}" python -c "
+  PRUNE_PLAN_NAME_FOR_PY="${name}" python -c "
 import os
 from analysis.prune_plan import plan_group_from_name
 print(plan_group_from_name(os.environ['PRUNE_PLAN_NAME_FOR_PY']))
@@ -180,7 +195,7 @@ print(plan_group_from_name(os.environ['PRUNE_PLAN_NAME_FOR_PY']))
 python_resolve_canonical_plan() {
   local root="$1"
   local group="$2"
-  PRUNE_PLAN_ROOT_FOR_PY="${root}" PLAN_GROUP_FOR_PY="${group}" conda run --no-capture-output -n "${CONDA_ENV}" python -c "
+  PRUNE_PLAN_ROOT_FOR_PY="${root}" PLAN_GROUP_FOR_PY="${group}" python -c "
 import os
 from pathlib import Path
 from analysis.prune_plan import canonical_plan_name_for_group
@@ -193,7 +208,7 @@ except FileNotFoundError:
 
 python_list_plan_groups() {
   local root="$1"
-  PRUNE_PLAN_ROOT_FOR_PY="${root}" conda run --no-capture-output -n "${CONDA_ENV}" python -c "
+  PRUNE_PLAN_ROOT_FOR_PY="${root}" python -c "
 import os
 from pathlib import Path
 from analysis.prune_plan import list_plan_groups
@@ -208,7 +223,7 @@ python_select_interval_range() {
   local max_drop="$3"
   local step="$4"
   local strategies="$5"
-  PRUNE_PLAN_ROOT_FOR_PY="${root}" PLAN_MIN_DROP_FOR_PY="${min_drop}" PLAN_MAX_DROP_FOR_PY="${max_drop}" PLAN_DROP_STEP_FOR_PY="${step}" PLAN_STRATEGY_FOR_PY="${strategies}" conda run --no-capture-output -n "${CONDA_ENV}" python -c "
+  PRUNE_PLAN_ROOT_FOR_PY="${root}" PLAN_MIN_DROP_FOR_PY="${min_drop}" PLAN_MAX_DROP_FOR_PY="${max_drop}" PLAN_DROP_STEP_FOR_PY="${step}" PLAN_STRATEGY_FOR_PY="${strategies}" python -c "
 import os
 from pathlib import Path
 from analysis.prune_plan import strategy_interval_selectors
@@ -308,7 +323,11 @@ run_eval_dataset() {
     out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/pruning/${output_plan_name}"
   elif [[ "${mode}" == "model" && -n "${prune_plan_name}" ]]; then
     if [[ -n "${RECOVERY_PLAN_NAME}" ]]; then
-      out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/recovery/${RECOVERY_OUTPUT_NAME}/${output_plan_name}"
+      if [[ "${RECOVERY_RESULT_KIND}" == "testtime" ]]; then
+        out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/testtime/${RECOVERY_OUTPUT_NAME}/${compression_tag}/${output_plan_name}"
+      else
+        out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/recovery/${RECOVERY_OUTPUT_NAME}/${output_plan_name}"
+      fi
     else
       out_dir="${out_dir}/${output_plan_name}"
     fi
@@ -324,6 +343,7 @@ run_eval_dataset() {
     --fastvggt-merge-ratio "${FASTVGGT_MERGE_RATIO}"
     --quantvggt-dtype "${QUANTVGGT_DTYPE}"
   )
+  local resolved_ckpt=""
   local recovery_root="${RECOVERY_PLAN_ROOT:-${PRUNE_PLAN_ROOT}}"
   if [[ -n "${RECOVERY_PLAN_NAME}" ]]; then
     extra+=(--recovery-plan-root "${recovery_root}")
@@ -355,9 +375,11 @@ run_eval_dataset() {
     upper)
       if [[ -n "${CHECKPOINT}" && -f "${CHECKPOINT}" ]]; then
         extra+=(--checkpoint "${CHECKPOINT}")
+        resolved_ckpt="${CHECKPOINT}"
       elif [[ -n "${CHECKPOINT}" ]]; then
         echo "warning: CHECKPOINT set but missing for upper mode: ${CHECKPOINT}" >&2
         extra+=(--checkpoint "${CHECKPOINT}")
+        resolved_ckpt="${CHECKPOINT}"
       fi
       ;;
     lower)
@@ -371,12 +393,55 @@ run_eval_dataset() {
       ckpt="$(checkpoint_for_model_mode "${backbone}" "${ckpt_tag}" "${prune_plan_name}")"
       if [[ -f "${ckpt}" ]]; then
         extra+=(--checkpoint "${ckpt}")
+        resolved_ckpt="${ckpt}"
       else
         echo "error: model mode requires checkpoint (set CHECKPOINT or recovery first): ${ckpt}" >&2
         return 1
       fi
       ;;
   esac
+
+  if [[ -n "${EVAL_JOBS_MANIFEST:-}" ]]; then
+    JOB_MANIFEST="${EVAL_JOBS_MANIFEST}" \
+    JOB_DATASET="${dataset}" JOB_DATA_ROOT="${data_root}" \
+    JOB_OUTPUT_DATASET="${output_dataset}" JOB_OUTPUT_DIR="${out_dir}" \
+    JOB_SPLIT="${split}" JOB_BACKBONE="${backbone}" JOB_MODE="${mode}" \
+    JOB_MODEL_NAME="${model_name}" JOB_CHECKPOINT="${resolved_ckpt}" \
+    JOB_PRUNE_ROOT="${PRUNE_PLAN_ROOT}" JOB_PRUNE_NAME="${prune_plan_name}" \
+    JOB_RECOVERY_ROOT="${recovery_root}" JOB_RECOVERY_NAME="${RECOVERY_PLAN_NAME}" \
+    JOB_DEVICE="${DEVICE}" JOB_MAX_SCENES="${MAX_SCENES}" \
+    JOB_MAX_FRAMES="${MAX_FRAMES}" JOB_VIS_2D="${EXPORT_VIS_2D}" \
+    JOB_VIS_3D="${EXPORT_VIS_3D}" JOB_VIS_POINTS="${VIS_MAX_POINTS:-0}" \
+    JOB_COMPRESSION="${INFERENCE_COMPRESSION}" JOB_FAST_START="${FASTVGGT_MERGE_START}" \
+    JOB_FAST_RATIO="${FASTVGGT_MERGE_RATIO}" JOB_QUANT_DTYPE="${QUANTVGGT_DTYPE}" \
+    JOB_QUANT_DIR="${QUANTVGGT_PARAMS_DIR}" python -c '
+import json, os
+from pathlib import Path
+p = Path(os.environ["JOB_MANIFEST"])
+jobs = json.loads(p.read_text())
+truthy = lambda value: value.lower() in {"1", "true", "yes"}
+jobs.append({
+    "experiment": os.environ["JOB_BACKBONE"], "backbone": os.environ["JOB_BACKBONE"],
+    "dataset": os.environ["JOB_DATASET"], "data_root": os.environ["JOB_DATA_ROOT"],
+    "output_dataset": os.environ["JOB_OUTPUT_DATASET"], "output_dir": os.environ["JOB_OUTPUT_DIR"],
+    "split": os.environ["JOB_SPLIT"] or None, "device": os.environ["JOB_DEVICE"],
+    "eval_mode": os.environ["JOB_MODE"], "model_name": os.environ["JOB_MODEL_NAME"],
+    "checkpoint": os.environ["JOB_CHECKPOINT"] or None,
+    "prune_plan_root": os.environ["JOB_PRUNE_ROOT"], "prune_plan_name": os.environ["JOB_PRUNE_NAME"],
+    "recovery_plan_root": os.environ["JOB_RECOVERY_ROOT"], "recovery_plan_name": os.environ["JOB_RECOVERY_NAME"],
+    "max_scenes": int(os.environ["JOB_MAX_SCENES"]), "max_frames": int(os.environ["JOB_MAX_FRAMES"]),
+    "export_vis_2d": truthy(os.environ["JOB_VIS_2D"]), "export_vis_3d": truthy(os.environ["JOB_VIS_3D"]),
+    "vis_max_points": int(os.environ["JOB_VIS_POINTS"]),
+    "inference_compression": os.environ["JOB_COMPRESSION"],
+    "fastvggt_merge_start": int(os.environ["JOB_FAST_START"]),
+    "fastvggt_merge_ratio": float(os.environ["JOB_FAST_RATIO"]),
+    "quantvggt_dtype": os.environ["JOB_QUANT_DTYPE"],
+    "quantvggt_params_dir": os.environ["JOB_QUANT_DIR"] or None,
+})
+p.write_text(json.dumps(jobs, indent=2))
+'
+    return 0
+  fi
 
   if truthy "${COMPACT_LOG:-0}"; then
     printf '\n  eval\n    model: %s\n' "${backbone}"
@@ -390,7 +455,7 @@ run_eval_dataset() {
   else
     echo "   [eval/${output_dataset}] ${effective_model_name}/${backbone} mode=${mode} compression=${INFERENCE_COMPRESSION}"
   fi
-  run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.eval_v3 \
+  run_progress_command python -m analysis.eval.eval_v3 \
     --experiment "${backbone}" \
     --dataset "${dataset}" \
     --data-root "${data_root}" \
@@ -459,10 +524,21 @@ run_datasets_for_backbone() {
     fi
   fi
 
+  local jobs_manifest
+  jobs_manifest="$(mktemp "${TMPDIR:-/tmp}/lare_eval_jobs.XXXXXX.json")"
+  printf '[]\n' > "${jobs_manifest}"
+  export EVAL_JOBS_MANIFEST="${jobs_manifest}"
   local dataset_key
   for dataset_key in "${RUN_LIST[@]}"; do
     run_eval_dataset_key "${dataset_key}" "${backbone}" "${mode}" "${model_name}" "${prune_plan_name}" "${plan_group}"
   done
+  unset EVAL_JOBS_MANIFEST
+  if truthy "${COMPACT_LOG:-0}"; then
+    printf '\n  eval\n    model: %s\n    datasets: %s\n\n' "${backbone}" "${#RUN_LIST[@]}"
+  fi
+  run_progress_command python -m analysis.eval.eval_v3 \
+    --jobs-manifest "${jobs_manifest}"
+  rm -f "${jobs_manifest}"
 }
 
 run_eval_group_variant() {
@@ -582,7 +658,7 @@ for bb in "${BB_LIST[@]}"; do
     if ! truthy "${COMPACT_LOG:-0}"; then
       echo "   [summary] ${OUTPUT_ROOT}/${bb}/summary_comparison.md"
     fi
-    run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" python -m analysis.eval.summary_v3 \
+    run_progress_command python -m analysis.eval.summary_v3 \
       --experiment "${bb}" \
       --prune-plan-root "${PRUNE_PLAN_ROOT}"
   fi

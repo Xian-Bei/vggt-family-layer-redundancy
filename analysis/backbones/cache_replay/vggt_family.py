@@ -150,15 +150,23 @@ def _load_replay_seed(
     device: torch.device,
 ) -> Tuple[torch.Tensor, int, int, int, int]:
     """Load cached half-unit seed and return (seed_tensor, bsz, seq_len, p, c)."""
-    seed_concat = get_layer_cpu(int(seed_layer)).to(device=device, non_blocking=(device.type == "cuda"))
-    seed_frame, seed_global = split_concat(seed_concat)
     kind = str(seed_kind).strip().lower()
-    if kind == "frame":
-        seed = seed_frame
-    elif kind == "global":
-        seed = seed_global
+    unit_loader = getattr(get_layer_cpu, "unit_loader", None)
+    if callable(unit_loader) and kind in {"frame", "global"}:
+        seed = unit_loader(f"{kind}_{int(seed_layer)}").to(
+            device=device, non_blocking=(device.type == "cuda")
+        )
     else:
-        raise ValueError(f"seed_kind must be frame or global, got {seed_kind!r}")
+        seed_concat = get_layer_cpu(int(seed_layer)).to(
+            device=device, non_blocking=(device.type == "cuda")
+        )
+        seed_frame, seed_global = split_concat(seed_concat)
+        if kind == "frame":
+            seed = seed_frame
+        elif kind == "global":
+            seed = seed_global
+        else:
+            raise ValueError(f"seed_kind must be frame or global, got {seed_kind!r}")
     bsz, seq_len, p, c = (int(x) for x in seed.shape)
     return seed, bsz, seq_len, p, c
 

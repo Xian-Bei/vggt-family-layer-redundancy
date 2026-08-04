@@ -16,9 +16,9 @@ from analysis.prune_plan import (
     physical_pruning_selector_from_record,
 )
 from analysis.redundancy.skip_metric_scaling import (
-    SEVEN_METRIC_KEYS,
-    apply_minmax_bounds,
-    minmax_normalize_finite,
+    GT_METRIC_KEYS,
+    normalize_canonical_degradation,
+    raw_metric_to_degradation,
 )
 
 PRUNING_METRIC_GRID = (
@@ -31,7 +31,6 @@ RECOVERY_METRIC_GRID = (
     ("acc", "comp", "chamfer_distance", "gt_mean"),
 )
 GT_MEAN_METRICS = ("ape", "are", "rpe_trans", "rpe_rot", "acc", "comp", "chamfer_distance")
-DEFAULT_KNEE_DEGRADATION_THRESHOLD = 0.1
 METRIC_HEADERS = {
     "ape": "APE ↓",
     "are": "ARE (deg) ↓",
@@ -41,10 +40,8 @@ METRIC_HEADERS = {
     "comp": "Comp ↓",
     "chamfer_distance": "CD ↓",
     "cd": "CD ↓",
-    "nc": "NC ↑",
     "gt_mean": "7-metric mean degradation ↓",
 }
-HIGHER_IS_BETTER = frozenset({"depth_delta1", "nc"})
 STRATEGY_PLOT_ORDER = (
     "no_recovery_single",
     "no_recovery_double",
@@ -52,29 +49,11 @@ STRATEGY_PLOT_ORDER = (
     "gt_drop",
     "recovery_linearpatch",
     "recovery_ghost",
+    "recovery_ghost_sequential",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
-    "recovery_ghost_cos",
-    "recovery_ghost_cos_more",
-    "recovery_ghost_cos_scale",
-    "recovery_ghost_mse_more",
-    "recovery_ghost_mse_cos_more",
-    "recovery_ghost_mse_cka_more",
-    "recovery_ghost_mse_cos_cka_more",
-    "recovery_ghost_mse_cos_balanced_more",
-    "recovery_ghost_mse_cka_balanced_more",
-    "recovery_ghost_mse_cos_cka_balanced_more",
-    "recovery_ghost_mse_cka_ema_more",
-    "recovery_ghost_mse_cos_cka_ema_half_more",
-    "recovery_ghost_mse_cos_cka_ema_one_more",
-    "recovery_ghost_mse_cka",
-    "recovery_ghost_cka_only",
-    "recovery_ghost_cka_ridge",
     "recovery_replaceme_ls",
     "recovery_replaceme_cos",
-    "recovery_replaceme_cos_more",
-    "recovery_replaceme_cos_scale",
-    "recovery_prunecomp",
     "recovery_lora",
     "recovery_train",
     "gt_single",
@@ -94,18 +73,18 @@ RECOVERY_METHOD_ORDER = tuple(
     method for method in STRATEGY_PLOT_ORDER if method.startswith("recovery_")
 )
 STRATEGY_PLOT_COLORS = {
-    "ours": "#2ca02c",
-    "ours_single": "#2ca02c",
-    "ours_double": "#2ca02c",
+    "ours": "#d62728",
+    "ours_single": "#d62728",
+    "ours_double": "#d62728",
     "cosine": "#ff7f0e",
     "cosine_single": "#ff7f0e",
     "cosine_double": "#ff7f0e",
     "gt": "#1f77b4",
     "gt_single": "#1f77b4",
     "gt_double": "#1f77b4",
-    "replaceme": "#d62728",
-    "replaceme_single": "#d62728",
-    "replaceme_double": "#d62728",
+    "replaceme": "#2ca02c",
+    "replaceme_single": "#2ca02c",
+    "replaceme_double": "#2ca02c",
     "inv_mse": "#9467bd",
     "inv_mse_single": "#9467bd",
     "inv_mse_double": "#9467bd",
@@ -117,29 +96,11 @@ STRATEGY_PLOT_COLORS = {
     "gt_drop": "#7f7f7f",
     "recovery_linearpatch": "#ff7f0e",
     "recovery_ghost": "#9467bd",
+    "recovery_ghost_sequential": "#8b5cf6",
     "recovery_ghost_interval": "#2ca02c",
     "recovery_ghost_interval_sequential": "#17becf",
-    "recovery_ghost_cos": "#17becf",
-    "recovery_ghost_cos_more": "#0e7490",
-    "recovery_ghost_cos_scale": "#67e8f9",
-    "recovery_ghost_mse_more": "#b45309",
-    "recovery_ghost_mse_cos_more": "#ea580c",
-    "recovery_ghost_mse_cka_more": "#7c3aed",
-    "recovery_ghost_mse_cos_cka_more": "#c026d3",
-    "recovery_ghost_mse_cos_balanced_more": "#fb923c",
-    "recovery_ghost_mse_cka_balanced_more": "#a78bfa",
-    "recovery_ghost_mse_cos_cka_balanced_more": "#e879f9",
-    "recovery_ghost_mse_cka_ema_more": "#2563eb",
-    "recovery_ghost_mse_cos_cka_ema_half_more": "#0891b2",
-    "recovery_ghost_mse_cos_cka_ema_one_more": "#059669",
-    "recovery_ghost_mse_cka": "#0f766e",
-    "recovery_ghost_cka_only": "#db2777",
-    "recovery_ghost_cka_ridge": "#84cc16",
     "recovery_replaceme_ls": "#8c564b",
     "recovery_replaceme_cos": "#d62728",
-    "recovery_replaceme_cos_more": "#be185d",
-    "recovery_replaceme_cos_scale": "#f9a8d4",
-    "recovery_prunecomp": "#2ca02c",
     "recovery_lora": "#7f7f7f",
     "recovery_train": "#bcbd22",
 }
@@ -378,13 +339,130 @@ def metrics_relative_to_upper(
         upper = metric_value(upper_average, str(metric_key))
         if upper is None or upper <= 0.0:
             continue
-        if str(metric_key) in HIGHER_IS_BETTER:
-            ratio = upper / max(float(value), 1e-8)
-        else:
-            ratio = float(value) / upper
+        ratio = float(value) / upper
         if math.isfinite(ratio):
             out[str(metric_key)] = float(max(1.0, ratio))
     return out
+
+
+def pruning_max_drop_budget(bundle: dict[str, Any]) -> Optional[int]:
+    """Resolve the visualization/evaluation budget without hard-coding 24."""
+    extra = bundle.get("extra", {}) if isinstance(bundle, dict) else {}
+    candidates: list[Any] = []
+    if isinstance(extra, dict):
+        candidates.append(extra.get("max_drop_budget"))
+    strategies = bundle_strategy_records(bundle) if isinstance(bundle, dict) else {}
+    for strategy in strategies.values():
+        source = strategy.get("source", {}) if isinstance(strategy, dict) else {}
+        if isinstance(source, dict):
+            candidates.append(source.get("max_drop_budget"))
+    for candidate in candidates:
+        if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+            value = int(candidate)
+            if value > 0:
+                return value
+    drop_counts = [
+        int(drop_key)
+        for strategy in strategies.values()
+        if isinstance(strategy, dict)
+        for drop_key in (strategy.get("points", {}) or {})
+        if str(drop_key).isdigit()
+    ]
+    return max(drop_counts) if drop_counts else None
+
+
+def _fit_pruning_normalization_profile(
+    *,
+    summaries: dict[str, dict[str, Any]],
+    upper_average: dict[str, Any],
+    result_root: Path,
+    max_drop_budget: Optional[int],
+) -> dict[str, Any]:
+    maxima: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for metric_key in GT_METRIC_KEYS:
+        upper = metric_value(upper_average, metric_key)
+        values: list[float] = []
+        for summary in summaries.values():
+            drop_count = summary.get("drop_count") if isinstance(summary, dict) else None
+            if not isinstance(drop_count, (int, float)):
+                continue
+            if max_drop_budget is not None and int(drop_count) > int(max_drop_budget):
+                continue
+            metrics = summary.get("metrics_mean", {})
+            current = metric_value(metrics, metric_key) if isinstance(metrics, dict) else None
+            if current is None:
+                continue
+            value = raw_metric_to_degradation(
+                np.asarray([current]),
+                metric=metric_key,
+                upper_baseline=upper,
+                value_mode="absolute",
+            )[0]
+            if math.isfinite(float(value)):
+                values.append(float(value))
+        if values:
+            maxima[metric_key] = float(max(values))
+            counts[metric_key] = len(values)
+    return {
+        "method": "pruning_budget_capped_canonical_absolute_max",
+        "source": str(result_root),
+        "max_drop_budget": max_drop_budget,
+        "upper_average": {
+            key: value
+            for key in GT_METRIC_KEYS
+            for value in [metric_value(upper_average, key)]
+            if value is not None
+        },
+        "maximum_absolute_degradation": maxima,
+        "candidate_counts": counts,
+    }
+
+
+def _apply_degradation_profile_to_point(
+    point: dict[str, Any],
+    *,
+    upper_average: dict[str, Any],
+    profile: dict[str, Any],
+) -> None:
+    metrics = point.get("metrics_mean", {})
+    if not isinstance(metrics, dict):
+        return
+    maxima = profile.get("maximum_absolute_degradation", {})
+    if not isinstance(maxima, dict):
+        maxima = {}
+    absolute: dict[str, float] = {}
+    multiple: dict[str, float] = {}
+    normalized: dict[str, float] = {}
+    for metric_key in GT_METRIC_KEYS:
+        current = metric_value(metrics, metric_key)
+        upper = metric_value(upper_average, metric_key)
+        if current is None or upper is None:
+            continue
+        absolute_value = raw_metric_to_degradation(
+            np.asarray([current]), metric=metric_key,
+            upper_baseline=upper, value_mode="absolute",
+        )[0]
+        multiple_value = raw_metric_to_degradation(
+            np.asarray([current]), metric=metric_key,
+            upper_baseline=upper, value_mode="multiple",
+        )[0]
+        if math.isfinite(float(absolute_value)):
+            absolute[metric_key] = float(absolute_value)
+        if math.isfinite(float(multiple_value)):
+            multiple[metric_key] = float(multiple_value)
+        maximum = maxima.get(metric_key)
+        if maximum is not None and math.isfinite(float(absolute_value)):
+            normalized[metric_key] = float(
+                normalize_canonical_degradation(
+                    np.asarray([absolute_value]), maximum=float(maximum)
+                )[0]
+            )
+    point["absolute_degradation"] = absolute
+    point["multiple_degradation"] = multiple
+    point["normalized_degradation"] = normalized
+    # Compatibility for existing callers.
+    point["normalized_relative_to_upper"] = dict(normalized)
 
 
 def _strategy_points_sorted(strategy_record: dict[str, Any]) -> list[tuple[int, str]]:
@@ -418,6 +496,7 @@ def collect_pruning_eval_payload(
     if strategies is None:
         strategies = bundle_strategy_records(bundle)
     plan_records = bundle_plan_records(bundle)
+    max_drop_budget = pruning_max_drop_budget(bundle)
     requested_eval_selectors = (
         None
         if eval_selectors is None
@@ -447,25 +526,12 @@ def collect_pruning_eval_payload(
         if requested_datasets is not None and dataset not in requested_datasets:
             continue
         upper_average = load_upper_average_for_result_root(result_root)
-        relative_by_selector = {
-            selector: metrics_relative_to_upper(summary.get("metrics_mean", {}), upper_average)
-            for selector, summary in summaries.items()
-            if str(selector).startswith("i") and "_j" in str(selector)
-        }
-        normalization_bounds: dict[str, dict[str, float]] = {}
-        for metric_key in SEVEN_METRIC_KEYS:
-            values = [
-                metric_value(relative, metric_key)
-                for relative in relative_by_selector.values()
-            ]
-            finite_values = [float(value) for value in values if value is not None]
-            if not finite_values:
-                continue
-            _normalized, meta = minmax_normalize_finite(np.asarray(finite_values))
-            normalization_bounds[metric_key] = {
-                "min": float(meta["min"]),
-                "max": float(meta["max"]),
-            }
+        normalization_profile = _fit_pruning_normalization_profile(
+            summaries=summaries,
+            upper_average=upper_average,
+            result_root=result_root,
+            max_drop_budget=max_drop_budget,
+        )
         strategy_payload: dict[str, Any] = {}
         for strategy_key, strategy_record in strategies.items():
             display_name = str(strategy_record.get("display_name", strategy_key))
@@ -508,7 +574,7 @@ def collect_pruning_eval_payload(
                     continue
                 metrics_mean = dict(summary.get("metrics_mean", {}))
                 relative = metrics_relative_to_upper(metrics_mean, upper_average)
-                points_payload[str(drop_count)] = {
+                point_payload = {
                     "available": True,
                     "selector": selector,
                     "drop_count": int(drop_count),
@@ -516,17 +582,13 @@ def collect_pruning_eval_payload(
                     "num_scenes": summary.get("num_scenes"),
                     "metrics_mean": metrics_mean,
                     "relative_to_upper": relative,
-                    "normalized_relative_to_upper": {
-                        metric_key: apply_minmax_bounds(
-                            value,
-                            minimum=normalization_bounds[metric_key]["min"],
-                            maximum=normalization_bounds[metric_key]["max"],
-                        )
-                        for metric_key in SEVEN_METRIC_KEYS
-                        for value in [metric_value(relative, metric_key)]
-                        if value is not None and metric_key in normalization_bounds
-                    },
                 }
+                _apply_degradation_profile_to_point(
+                    point_payload,
+                    upper_average=upper_average,
+                    profile=normalization_profile,
+                )
+                points_payload[str(drop_count)] = point_payload
             strategy_payload[strategy_key] = {
                 "display_name": display_name,
                 "points": points_payload,
@@ -534,7 +596,13 @@ def collect_pruning_eval_payload(
         dataset_payloads[dataset] = {
             "result_root": str(result_root),
             "upper_average": upper_average,
-            "normalization_bounds": normalization_bounds,
+            "normalization_profile": normalization_profile,
+            "normalization_bounds": {
+                metric: {"min": 0.0, "max": float(maximum)}
+                for metric, maximum in normalization_profile.get(
+                    "maximum_absolute_degradation", {}
+                ).items()
+            },
             "strategies": strategy_payload,
         }
     return _with_dataset_average(
@@ -712,9 +780,50 @@ def add_recovery_comparison_strategies(
                     "points": comparison_points,
                 }
 
-    for dataset_payload in recovery_datasets.values():
-        if isinstance(dataset_payload, dict):
-            _normalize_strategy_points_for_dataset(dataset_payload)
+    missing_profile_datasets: list[str] = []
+    for dataset, dataset_payload in recovery_datasets.items():
+        if not isinstance(dataset_payload, dict):
+            continue
+        pruning_dataset = pruning_datasets.get(dataset, {})
+        profile = (
+            pruning_dataset.get("normalization_profile", {})
+            if isinstance(pruning_dataset, dict)
+            else {}
+        )
+        maxima = profile.get("maximum_absolute_degradation", {}) if isinstance(profile, dict) else {}
+        if not isinstance(maxima, dict) or not maxima:
+            dataset_payload["normalization_skip_reason"] = (
+                "missing_complete_pruning_normalization_profile"
+            )
+            missing_profile_datasets.append(str(dataset))
+            continue
+        missing_metrics = [metric for metric in GT_METRIC_KEYS if metric not in maxima]
+        if missing_metrics:
+            dataset_payload["normalization_incomplete_metrics"] = missing_metrics
+        dataset_payload["normalization_profile"] = deepcopy(profile)
+        dataset_payload["normalization_bounds"] = {
+            metric: {"min": 0.0, "max": float(maxima[metric])}
+            for metric in GT_METRIC_KEYS
+            if metric in maxima
+        }
+        upper_average = profile.get("upper_average", {})
+        if not isinstance(upper_average, dict) or not upper_average:
+            upper_average = dataset_payload.get("upper_average", {})
+        strategies = dataset_payload.get("strategies", {})
+        if not isinstance(upper_average, dict) or not isinstance(strategies, dict):
+            continue
+        for strategy_payload in strategies.values():
+            points = strategy_payload.get("points", {}) if isinstance(strategy_payload, dict) else {}
+            if not isinstance(points, dict):
+                continue
+            for point in points.values():
+                if isinstance(point, dict) and bool(point.get("available", False)):
+                    _apply_degradation_profile_to_point(
+                        point,
+                        upper_average=upper_average,
+                        profile=profile,
+                    )
+    recovery_payload["skipped_normalization_datasets"] = missing_profile_datasets
 
     # Rebuild the mean from the per-dataset payload after all recovery and
     # no-recovery curves have been normalized together.  Do not replace these
@@ -760,61 +869,15 @@ def add_recovery_comparison_strategies(
     return merged
 
 
-def _normalize_strategy_points_for_dataset(dataset_payload: dict[str, Any]) -> None:
-    """Apply common per-metric bounds to every strategy shown for one dataset."""
-    strategies = dataset_payload.get("strategies", {})
-    if not isinstance(strategies, dict):
-        return
-    values_by_metric: dict[str, list[float]] = {key: [] for key in SEVEN_METRIC_KEYS}
-    for strategy_payload in strategies.values():
-        points = strategy_payload.get("points", {}) if isinstance(strategy_payload, dict) else {}
-        if not isinstance(points, dict):
-            continue
-        for point in points.values():
-            if not isinstance(point, dict) or not bool(point.get("available", False)):
-                continue
-            relative = point.get("relative_to_upper", {})
-            if not isinstance(relative, dict):
-                continue
-            for metric_key in SEVEN_METRIC_KEYS:
-                value = metric_value(relative, metric_key)
-                if value is not None:
-                    values_by_metric[metric_key].append(float(value))
-
-    bounds: dict[str, dict[str, float]] = {}
-    for metric_key, values in values_by_metric.items():
-        if not values:
-            continue
-        _normalized, meta = minmax_normalize_finite(np.asarray(values))
-        bounds[metric_key] = {"min": float(meta["min"]), "max": float(meta["max"])}
-    dataset_payload["normalization_bounds"] = bounds
-
-    for strategy_payload in strategies.values():
-        points = strategy_payload.get("points", {}) if isinstance(strategy_payload, dict) else {}
-        if not isinstance(points, dict):
-            continue
-        for point in points.values():
-            if not isinstance(point, dict) or not bool(point.get("available", False)):
-                continue
-            relative = point.get("relative_to_upper", {})
-            if not isinstance(relative, dict):
-                continue
-            point["normalized_relative_to_upper"] = {
-                metric_key: apply_minmax_bounds(
-                    value,
-                    minimum=bounds[metric_key]["min"],
-                    maximum=bounds[metric_key]["max"],
-                )
-                for metric_key in SEVEN_METRIC_KEYS
-                for value in [metric_value(relative, metric_key)]
-                if value is not None and metric_key in bounds
-            }
-
-
 def _with_dataset_average(payload: dict[str, Any]) -> dict[str, Any]:
     metric_values: dict[str, dict[str, dict[str, list[float]]]] = {}
     relative_values: dict[str, dict[str, dict[str, list[float]]]] = {}
     normalized_relative_values: dict[str, dict[str, dict[str, list[float]]]] = {}
+    degradation_values: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {
+        "absolute_degradation": {},
+        "multiple_degradation": {},
+        "normalized_degradation": {},
+    }
     upper_values: dict[str, list[float]] = {}
     for dataset_payload in payload.get("datasets", {}).values():
         upper_average = dataset_payload.get("upper_average", {})
@@ -857,6 +920,15 @@ def _with_dataset_average(payload: dict[str, Any]) -> dict[str, Any]:
                             normalized_relative_values.setdefault(str(strategy_key), {}).setdefault(
                                 str(drop_key), {}
                             ).setdefault(str(metric_key), []).append(float(value))
+                for field, field_values in degradation_values.items():
+                    metric_map = point.get(field, {})
+                    if not isinstance(metric_map, dict):
+                        continue
+                    for metric_key, value in metric_map.items():
+                        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                            field_values.setdefault(str(strategy_key), {}).setdefault(
+                                str(drop_key), {}
+                            ).setdefault(str(metric_key), []).append(float(value))
 
     strategies_average: dict[str, Any] = {}
     strategy_names = sorted(k for k in metric_values.keys() if k != "__upper__")
@@ -888,6 +960,16 @@ def _with_dataset_average(payload: dict[str, Any]) -> dict[str, Any]:
                         normalized_relative_values.get(strategy_key, {}).get(str(drop_key), {}).items()
                     )
                     if values
+                },
+                **{
+                    field: {
+                        metric_key: float(np.mean(values))
+                        for metric_key, values in sorted(
+                            field_values.get(strategy_key, {}).get(str(drop_key), {}).items()
+                        )
+                        if values
+                    }
+                    for field, field_values in degradation_values.items()
                 },
             }
         strategies_average[strategy_key] = {
@@ -1270,169 +1352,6 @@ def gt_mean_degradation_series(
     return series if len(series) > 1 else []
 
 
-def select_max_drop_below_mean_degradation(
-    payload: dict[str, Any],
-    *,
-    strategy_key: str = "ours",
-    threshold: float = DEFAULT_KNEE_DEGRADATION_THRESHOLD,
-    drop_step: int = 1,
-) -> dict[str, Any]:
-    """Select the largest strategy drop count whose normalized 7-metric mean is allowed."""
-    limit = float(threshold)
-    if not math.isfinite(limit) or not 0.0 <= limit <= 1.0:
-        raise ValueError(f"degradation threshold must be finite and in [0, 1], got {threshold}")
-    if isinstance(drop_step, bool) or int(drop_step) <= 0:
-        raise ValueError(f"drop_step must be a positive integer, got {drop_step}")
-    step = int(drop_step)
-    average = payload.get("dataset_average", {})
-    strategies = average.get("strategies", {}) if isinstance(average, dict) else {}
-    if not isinstance(strategies, dict) or str(strategy_key) not in strategies:
-        raise ValueError(f"pruning payload has no strategy {strategy_key!r}")
-    strategy = strategies.get(str(strategy_key), {}) if isinstance(strategies, dict) else {}
-    points = strategy.get("points", {}) if isinstance(strategy, dict) else {}
-    if not isinstance(points, dict):
-        points = {}
-
-    candidates: list[tuple[int, float, str]] = [(0, 0.0, "")]
-    for drop_key, point in points.items():
-        if not str(drop_key).isdigit() or not isinstance(point, dict):
-            continue
-        if int(drop_key) % step != 0:
-            continue
-        if not bool(point.get("available", False)):
-            continue
-        normalized = point.get("normalized_relative_to_upper", {})
-        if not isinstance(normalized, dict):
-            continue
-        values = [metric_value(normalized, metric) for metric in GT_MEAN_METRICS]
-        finite = [float(value) for value in values if value is not None]
-        if len(finite) != len(GT_MEAN_METRICS):
-            continue
-        mean_degradation = float(np.mean(finite))
-        if mean_degradation <= limit:
-            candidates.append(
-                (int(drop_key), mean_degradation, str(point.get("selector", "")))
-            )
-    drop_count, mean_degradation, selector = max(candidates, key=lambda item: item[0])
-    return {
-        "schema_version": "pruning_knee_v1",
-        "method": "max_drop_at_or_below_normalized_7_metric_mean_threshold",
-        "strategy": str(strategy_key),
-        "threshold": limit,
-        "drop_step": step,
-        "drop_count": int(drop_count),
-        "plan_name": f"prune_span{drop_count}" if drop_count > 0 else "upper",
-        **({"selector": selector} if selector else {}),
-        "mean_normalized_degradation": mean_degradation,
-        "num_metrics": len(GT_MEAN_METRICS),
-    }
-
-
-def write_pruning_strategy_knee_plot(
-    *,
-    experiment_root: Path,
-    backbone: str,
-    payload: dict[str, Any],
-    knee_points: dict[str, dict[str, Any]],
-    threshold: float = DEFAULT_KNEE_DEGRADATION_THRESHOLD,
-) -> Optional[Path]:
-    """Plot pruning-strategy degradation curves and their selected knees."""
-    average = payload.get("dataset_average", {})
-    strategies = average.get("strategies", {}) if isinstance(average, dict) else {}
-    if not isinstance(strategies, dict):
-        return None
-    try:
-        import matplotlib.pyplot as plt  # type: ignore
-    except Exception as exc:
-        print(f"[warn] Could not import matplotlib for knee plot: {exc}", flush=True)
-        return None
-
-    fig, ax = plt.subplots(figsize=(10.5, 6.5))
-    plotted = False
-    for strategy_candidates, label in (
-        (("ours_double", "ours"), "Ours_CKA"),
-        (("cosine_double", "cosine"), "Ours_Cosine"),
-        (("gt_double", "gt"), "GT"),
-        (("replaceme_double", "replaceme"), "ReplaceMe"),
-        (("inv_mse_double", "inv_mse"), "Ours_INV_MSE"),
-        (("shortgpt",), "ShortGPT"),
-        (("simpler",), "SIMPLER"),
-    ):
-        strategy_key = next(
-            (key for key in strategy_candidates if key in strategies),
-            strategy_candidates[0],
-        )
-        strategy = strategies.get(strategy_key, {})
-        points = strategy.get("points", {}) if isinstance(strategy, dict) else {}
-        if not isinstance(points, dict):
-            continue
-        xs: list[int] = [0]
-        ys: list[float] = [0.0]
-        for drop_key, point in sorted(
-            points.items(),
-            key=lambda item: int(item[0]) if str(item[0]).isdigit() else 10**9,
-        ):
-            if not str(drop_key).isdigit() or not isinstance(point, dict):
-                continue
-            if not bool(point.get("available", False)):
-                continue
-            normalized = point.get("normalized_relative_to_upper", {})
-            if not isinstance(normalized, dict):
-                continue
-            values = [metric_value(normalized, metric) for metric in GT_MEAN_METRICS]
-            finite = [float(value) for value in values if value is not None]
-            if len(finite) != len(GT_MEAN_METRICS):
-                continue
-            xs.append(int(drop_key))
-            ys.append(float(np.mean(finite)))
-        if len(xs) <= 1:
-            continue
-        plotted = True
-        color = STRATEGY_PLOT_COLORS.get(strategy_key)
-        ax.plot(xs, ys, marker="o", markersize=4.5, linewidth=2.2, color=color, label=label)
-        knee = knee_points.get(strategy_key, {})
-        drop_count = knee.get("drop_count") if isinstance(knee, dict) else None
-        if isinstance(drop_count, int):
-            ax.axvline(
-                drop_count,
-                color=color,
-                linestyle="--",
-                linewidth=1.8,
-                alpha=0.9,
-                label=f"{label} knee = {drop_count}",
-            )
-    if not plotted:
-        plt.close(fig)
-        return None
-    ax.axhline(
-        float(threshold),
-        color="#333333",
-        linestyle="--",
-        linewidth=1.8,
-        label=f"threshold = {float(threshold):g}",
-    )
-    ax.set_title(
-        f"{backbone}: pruning strategy knees",
-        fontweight="bold",
-    )
-    ax.set_xlabel("Dropped units")
-    ax.set_ylabel("7-metric mean normalized degradation")
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
-    ax.grid(True, alpha=0.25)
-    ax.legend(ncol=2, fontsize=9)
-    fig.tight_layout()
-    safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
-    out_path = (
-        Path(experiment_root)
-        / f"prune_plan_{safe_backbone}_strategy_knees.png"
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
 def render_strategy_metric_figure(
     *,
     payload: dict[str, Any],
@@ -1441,6 +1360,9 @@ def render_strategy_metric_figure(
     strategy_keys: Optional[Sequence[str]] = None,
     compact_pruning_legend: bool = False,
     legend_fontsize: float = 8.0,
+    value_mode: Optional[str] = None,
+    normalize_metrics: Optional[bool] = None,
+    include_upper_anchor: bool = True,
 ) -> Optional[Any]:
     """Render a strategy metric figure without reading or writing a cached PNG."""
     strategies = payload.get("strategies", {})
@@ -1468,6 +1390,16 @@ def render_strategy_metric_figure(
     upper_average = payload.get("upper_average", {})
     if not isinstance(upper_average, dict):
         upper_average = {}
+    modern_scaling = str(value_mode or "").lower() in {"absolute", "multiple"}
+    mode = str(value_mode or "absolute").lower()
+    normalized_view = bool(normalize_metrics) if modern_scaling else False
+    value_field = (
+        "normalized_degradation"
+        if normalized_view
+        else "absolute_degradation"
+        if mode == "absolute"
+        else "multiple_degradation"
+    )
     try:
         import matplotlib.pyplot as plt  # type: ignore
         from matplotlib.lines import Line2D  # type: ignore
@@ -1490,7 +1422,10 @@ def render_strategy_metric_figure(
     for row_idx, row in enumerate(metric_grid):
         for col_idx, metric_key in enumerate(row):
             ax = axes[row_idx][col_idx]
-            upper_value = 0.0 if metric_key == "gt_mean" else metric_value(upper_average, metric_key)
+            if modern_scaling:
+                upper_value = 0.0 if normalized_view or mode == "absolute" else 1.0
+            else:
+                upper_value = 0.0 if metric_key == "gt_mean" else metric_value(upper_average, metric_key)
             has_data = upper_value is not None
             if upper_value is not None:
                 ax.axhline(
@@ -1512,7 +1447,7 @@ def render_strategy_metric_figure(
                     continue
                 xs: list[int] = []
                 ys: list[float] = []
-                if upper_value is not None:
+                if include_upper_anchor and upper_value is not None:
                     xs.append(0)
                     ys.append(float(upper_value))
                 for drop_key, point in sorted(
@@ -1523,19 +1458,27 @@ def render_strategy_metric_figure(
                         continue
                     if not bool(point.get("available", False)):
                         continue
-                    if metric_key == "gt_mean":
+                    if modern_scaling:
+                        metric_map = point.get(value_field, {})
+                        if not isinstance(metric_map, dict):
+                            continue
+                        if metric_key == "gt_mean":
+                            component_values = [
+                                metric_value(metric_map, name) for name in GT_MEAN_METRICS
+                            ]
+                            finite_values = [
+                                float(item) for item in component_values if item is not None
+                            ]
+                            value = float(np.mean(finite_values)) if finite_values else None
+                        else:
+                            value = metric_value(metric_map, metric_key)
+                    elif metric_key == "gt_mean":
                         relative = point.get("normalized_relative_to_upper", {})
                         if not isinstance(relative, dict):
                             continue
-                        relative_values = [
-                            metric_value(relative, name) for name in GT_MEAN_METRICS
-                        ]
-                        finite_values = [
-                            float(value) for value in relative_values if value is not None
-                        ]
-                        value = (
-                            float(np.mean(finite_values)) if finite_values else None
-                        )
+                        relative_values = [metric_value(relative, name) for name in GT_MEAN_METRICS]
+                        finite_values = [float(item) for item in relative_values if item is not None]
+                        value = float(np.mean(finite_values)) if finite_values else None
                     else:
                         metrics_mean = point.get("metrics_mean", {})
                         if not isinstance(metrics_mean, dict):
@@ -1546,7 +1489,7 @@ def render_strategy_metric_figure(
                     xs.append(int(drop_key))
                     ys.append(float(value))
                     all_xs.append(int(drop_key))
-                if len(xs) <= (1 if upper_value is not None else 0):
+                if len(xs) <= (1 if include_upper_anchor and upper_value is not None else 0):
                     continue
                 has_data = True
                 any_data = True
@@ -1587,7 +1530,16 @@ def render_strategy_metric_figure(
             if not has_data:
                 ax.axis("off")
                 continue
-            ax.set_title(METRIC_HEADERS.get(metric_key, metric_key), fontsize=11, fontweight="bold")
+            metric_title = METRIC_HEADERS.get(metric_key, metric_key)
+            if modern_scaling:
+                suffix = "normalized degradation" if normalized_view else (
+                    "absolute degradation Δ" if mode == "absolute" else "degradation multiple"
+                )
+                metric_title = f"{metric_title} · {suffix}"
+                ax.set_ylim(bottom=0.0 if normalized_view or mode == "absolute" else 1.0)
+                if normalized_view:
+                    ax.set_ylim(0.0, 1.0)
+            ax.set_title(metric_title, fontsize=11, fontweight="bold")
             ax.set_xlabel("Dropped units")
             ax.grid(True, alpha=0.25)
             ax.set_xlim(left=0)

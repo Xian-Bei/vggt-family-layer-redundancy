@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -16,11 +16,10 @@ REMAINING_SKIP_EVAL_MAX_SPAN="${REMAINING_SKIP_EVAL_MAX_SPAN:-0}"
 REMAINING_SKIP_EVAL_TIMING="${REMAINING_SKIP_EVAL_TIMING:-0}"
 REMAINING_SKIP_EVAL_RESUME="${REMAINING_SKIP_EVAL_RESUME:-1}"
 DEVICE="${DEVICE:-cuda}"
-CONDA_ENV="${CONDA_ENV:-vggt}"
 export OUTPUT_ROOT
 
-# shellcheck source=run_backbones_lib.sh
-source "${REPO_ROOT}/run_backbones_lib.sh"
+# shellcheck source=scripts/run_backbones_lib.sh
+source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 parse_backbones_list
 parse_dataset_list "${RUN}" "RUN" "${DATASET_KEYS[@]}"
 RUN_LIST=("${PARSED_DATASETS[@]}")
@@ -33,13 +32,8 @@ if [[ -z "${PRUNE_PLAN_ROOT//[[:space:]]/}" ]]; then
   echo "error: PRUNE_PLAN_ROOT is required" >&2
   exit 1
 fi
-if [[ -z "${PRUNE_PLAN_NAME//[[:space:]]/}" && -z "${EXPECTED_DROP_COUNT//[[:space:]]/}" ]]; then
-  read -r PRUNE_PLAN_NAME EXPECTED_DROP_COUNT < <(
-    conda run --no-capture-output -n "${CONDA_ENV}" \
-      python -m analysis.prune_plan.knee_point --root "${PRUNE_PLAN_ROOT}"
-  )
-elif [[ -z "${PRUNE_PLAN_NAME//[[:space:]]/}" || -z "${EXPECTED_DROP_COUNT//[[:space:]]/}" ]]; then
-  echo "error: set both PRUNE_PLAN_NAME and EXPECTED_DROP_COUNT, or leave both empty to use prune_plan_all.json knee_points.ours" >&2
+if [[ -z "${PRUNE_PLAN_NAME//[[:space:]]/}" || -z "${EXPECTED_DROP_COUNT//[[:space:]]/}" ]]; then
+  echo "error: PRUNE_PLAN_NAME and EXPECTED_DROP_COUNT are required" >&2
   exit 1
 fi
 if [[ -z "${PRUNE_PLAN_NAME//[[:space:]]/}" ]]; then
@@ -120,8 +114,7 @@ run_one_dataset() {
     echo "== remaining_skip_eval dataset=${output_dataset:-${dataset}${split:+_${split}}} backbone=${backbone} prune_plan=${PRUNE_PLAN_NAME} max_span=${REMAINING_SKIP_EVAL_MAX_SPAN} resume=${REMAINING_SKIP_EVAL_RESUME} =="
   fi
 
-  run_progress_command conda run --no-capture-output -n "${CONDA_ENV}" \
-    python -m analysis.redundancy.remaining_skip_gt_eval_v3 "${extra[@]}"
+  run_progress_command python -m analysis.redundancy.remaining_skip_gt_eval_v3 "${extra[@]}"
 }
 
 run_dataset_key() {

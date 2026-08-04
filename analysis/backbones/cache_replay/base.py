@@ -153,6 +153,3 @@ class CacheReplayEngine(ABC):
         num_layers: int,
     ) -> None:
         del layer_cpu_cache, rules, prev_layers, num_layers
-
-    def periodic_eval_skip_depth(self) -> bool:
-        return False

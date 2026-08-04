@@ -25,7 +25,6 @@ class HeatmapsTabTest(unittest.TestCase):
                 stage2_scene_ids=["mean"],
                 initial_stage2_scene="mean",
                 stage2_metric_row_pose="pose",
-                stage2_metric_row_depth="depth",
                 stage2_metric_row_point="point",
                 stage2_token_row_special="special",
                 stage2_token_row_camera="camera",

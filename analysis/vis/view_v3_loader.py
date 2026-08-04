@@ -465,7 +465,6 @@ def discover_v3_skip_reports(skip_eval_dir: Path) -> Dict[str, Any]:
                         continue
                 upper_by_scene[sid] = clean
 
-    higher_is_better = {"depth_delta1", "nc"}
     # ``upper_triangle_unpack_for_heatmap`` uses the inclusive upper triangle,
     # so checkpoint spans must include (i, i) as well as i < j.
     packed_len = n * (n + 1) // 2
@@ -521,7 +520,7 @@ def discover_v3_skip_reports(skip_eval_dir: Path) -> Dict[str, Any]:
                         continue
                     d = float(current) - baseline
                     delta.append(d)
-                    pct.append(100.0 * (-d if metric in higher_is_better else d) / denom)
+                    pct.append(100.0 * d / denom)
             if len(delta) == packed_len:
                 delta_by_metric[metric] = delta
                 pct_by_metric[metric] = pct

@@ -34,12 +34,9 @@ METRIC_HEADERS: Dict[str, str] = {
     "are": "ARE (°) ↓",
     "rpe_trans": "RPE trans ↓",
     "rpe_rot": "RPE rot (°) ↓",
-    "depth_abs_rel": "AbsRel ↓",
-    "depth_delta1": "δ1 ↑",
     "acc": "Acc ↓",
     "comp": "Comp ↓",
     "cd": "CD ↓",
-    "nc": "NC ↑",
     "inference_time_ms": "Time (ms) ↓",
     "infer_peak_vram_gb": "VRAM (GB) ↓",
     AGG_PARAMS_KEY: "Block params ↓",
@@ -185,8 +182,6 @@ def _fmt_value(key: str, value: float) -> str:
         return f"{value:.1f}"
     if key in ("infer_peak_vram_gb",):
         return f"{value:.2f}"
-    if key in ("depth_delta1", "nc"):
-        return f"{value:.4f}"
     return f"{value:.4f}"
 
 
@@ -423,8 +418,8 @@ def _write_metric_curve_grid(
 
     metric_grid: List[List[Optional[str]]] = [
         ["ape", "are", "rpe_trans", "rpe_rot"],
-        ["acc", "comp", "cd", "nc"],
-        ["depth_abs_rel", "depth_delta1", "inference_time_ms", "infer_peak_vram_gb"],
+        ["acc", "comp", "cd", None],
+        ["inference_time_ms", "infer_peak_vram_gb", None, None],
     ]
     n_rows = 3
     n_cols = 4
@@ -524,8 +519,8 @@ def _write_strategy_metric_curve_grid(
         return None
     metric_grid: List[List[Optional[str]]] = [
         ["ape", "are", "rpe_trans", "rpe_rot"],
-        ["acc", "comp", "cd", "nc"],
-        ["depth_abs_rel", "depth_delta1", "inference_time_ms", "infer_peak_vram_gb"],
+        ["acc", "comp", "cd", None],
+        ["inference_time_ms", "infer_peak_vram_gb", None, None],
     ]
     all_drops = sorted(
         {
@@ -609,8 +604,8 @@ def _write_recovery_strategy_comparison_grid(
 
     metric_grid: List[List[Optional[str]]] = [
         ["ape", "are", "rpe_trans", "rpe_rot"],
-        ["acc", "comp", "cd", "nc"],
-        ["depth_abs_rel", "depth_delta1", "inference_time_ms", "infer_peak_vram_gb"],
+        ["acc", "comp", "cd", None],
+        ["inference_time_ms", "infer_peak_vram_gb", None, None],
     ]
     n_rows = 3
     n_cols = 4

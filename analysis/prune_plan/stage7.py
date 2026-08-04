@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -22,6 +23,19 @@ class SelectedPlan:
     selector: str
     num_intervals: int
     references: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    key: str
+    directory: str
+    training: bool
+
+
+@dataclass(frozen=True)
+class ScheduledPlan:
+    selector: str
+    dataset_keys: tuple[str, ...]
 
 
 def selected_plans(
@@ -130,6 +144,36 @@ def missing_plans_for_dataset(
     return missing
 
 
+def missing_plan_schedule(
+    *,
+    prune_plan_root: Path,
+    plans: Sequence[SelectedPlan],
+    datasets: Sequence[DatasetSpec],
+) -> tuple[list[ScheduledPlan], list[tuple[DatasetSpec, list[SelectedPlan]]]]:
+    dataset_keys_by_selector: dict[str, list[str]] = {}
+    dataset_results: list[tuple[DatasetSpec, list[SelectedPlan]]] = []
+    for dataset in datasets:
+        missing = missing_plans_for_dataset(
+            result_root=(
+                Path(prune_plan_root)
+                / dataset.directory
+                / "eval"
+                / "pruning"
+            ),
+            plans=plans,
+            training_dataset=dataset.training,
+            dataset=dataset.directory,
+        )
+        dataset_results.append((dataset, missing))
+        for plan in missing:
+            dataset_keys_by_selector.setdefault(plan.selector, []).append(dataset.key)
+    schedule = [
+        ScheduledPlan(selector=selector, dataset_keys=tuple(dataset_keys))
+        for selector, dataset_keys in dataset_keys_by_selector.items()
+    ]
+    return schedule, dataset_results
+
+
 def _split(raw: str) -> list[str]:
     return [
         value.strip()
@@ -138,13 +182,43 @@ def _split(raw: str) -> list[str]:
     ]
 
 
+def _parse_dataset_spec(raw: str) -> DatasetSpec:
+    parts = str(raw).split(":")
+    if len(parts) != 3 or not parts[0].strip() or not parts[1].strip():
+        raise ValueError(
+            "--dataset-spec must be KEY:DIRECTORY:TRAINING, "
+            f"got {raw!r}"
+        )
+    training_raw = parts[2].strip().lower()
+    if training_raw not in {"0", "1", "false", "true"}:
+        raise ValueError(
+            "dataset TRAINING must be 0/1/false/true, "
+            f"got {parts[2]!r}"
+        )
+    return DatasetSpec(
+        key=parts[0].strip(),
+        directory=parts[1].strip(),
+        training=training_raw in {"1", "true"},
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Resolve missing physical pruning selectors for one dataset."
+        description="Resolve and schedule missing physical pruning selectors."
     )
     parser.add_argument("--prune-plan-root", type=Path, required=True)
-    parser.add_argument("--result-root", type=Path, required=True)
-    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--result-root", type=Path)
+    parser.add_argument("--dataset")
+    parser.add_argument(
+        "--dataset-spec",
+        action="append",
+        type=_parse_dataset_spec,
+        default=[],
+        help=(
+            "Batch scheduling input KEY:DIRECTORY:TRAINING. Repeat for each "
+            "dataset; outputs SELECTOR<TAB>KEY[,KEY...] to stdout."
+        ),
+    )
     parser.add_argument("--strategies", required=True)
     parser.add_argument("--selectors", default="")
     parser.add_argument("--min-drop", type=int, required=True)
@@ -162,6 +236,46 @@ def main() -> None:
         drop_step=args.drop_step,
         explicit_selectors=_split(args.selectors) or None,
     )
+    if args.dataset_spec:
+        if (
+            args.result_root is not None
+            or args.dataset is not None
+            or args.training
+        ):
+            parser.error(
+                "--dataset-spec cannot be combined with --result-root, "
+                "--dataset, or --training"
+            )
+        datasets = list(args.dataset_spec)
+        schedule, dataset_results = missing_plan_schedule(
+            prune_plan_root=args.prune_plan_root,
+            plans=plans,
+            datasets=datasets,
+        )
+        for dataset_spec, missing in dataset_results:
+            dataset_label = (
+                f"{Path(args.prune_plan_root).name}/{dataset_spec.directory}"
+            )
+            if missing:
+                selectors = ",".join(plan.selector for plan in missing)
+                print(
+                    f"   [missing] {dataset_label}: {selectors}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"   [reuse] {dataset_label}: "
+                    "all selected plans already complete",
+                    file=sys.stderr,
+                )
+        for item in schedule:
+            print(f"{item.selector}\t{','.join(item.dataset_keys)}")
+        return
+
+    if args.result_root is None or args.dataset is None:
+        parser.error(
+            "--result-root and --dataset are required without --dataset-spec"
+        )
     missing = missing_plans_for_dataset(
         result_root=args.result_root,
         plans=plans,

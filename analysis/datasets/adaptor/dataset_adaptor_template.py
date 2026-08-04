@@ -23,14 +23,14 @@ from typing import Any, Dict, Iterator
 
 from analysis.backbones.contracts import EvalSceneContext
 from analysis.datasets.contracts import DatasetAdaptor, EvalSampleBatch
-from analysis.schema.v3 import DatasetEvalProfile, DepthEvalProfile, GeometryEvalProfile
+from analysis.schema.v3 import DatasetEvalProfile, GeometryEvalProfile
 
 
 class NewDatasetAdaptor(DatasetAdaptor):
     """Fill-in template for a new dataset.
 
     Required methods:
-    - ``eval_profile``: metric thresholds, depth config, frame stride/size.
+    - ``eval_profile``: metric thresholds and frame stride/size.
     - ``iter_scenes``: discover scenes and yield unified ``EvalSampleBatch``.
     - ``load_scene_for_cache``: load one scene by stable ``scene_id``.
     - ``evaluate_scene``: run backbone prediction and compute dataset metrics.
@@ -89,8 +89,7 @@ class NewDatasetAdaptor(DatasetAdaptor):
     def eval_profile(self) -> DatasetEvalProfile:
         """Return dataset-specific metric/eval settings.
 
-        ``GeometryEvalProfile`` controls point metrics such as Acc/Comp/CD/NC.
-        ``DepthEvalProfile`` controls dense-depth metrics and crop behavior.
+        ``GeometryEvalProfile`` controls point metrics such as Acc/Comp/CD.
         ``kf_every`` and ``size`` describe the dataset's default evaluation
         sampling/resolution conventions.
         """
@@ -100,11 +99,6 @@ class NewDatasetAdaptor(DatasetAdaptor):
                 dist_clip=0.1,
                 use_icp=True,
                 max_points=999_999,
-            ),
-            depth=DepthEvalProfile(
-                max_depth=10.0,
-                conf_thresh=1.0,
-                crop_mode="none",
             ),
             kf_every=1,
             size=518,
@@ -171,8 +165,7 @@ class NewDatasetAdaptor(DatasetAdaptor):
         - compute unified metric keys used by ``EvalRecordV3``.
 
         Return only JSON-serializable metric values. Common keys include:
-        ``ape``, ``are``, ``rpe_trans``, ``rpe_rot``, ``depth_abs_rel``,
-        ``depth_delta1``, ``acc``, ``comp``, ``cd``, ``nc``,
+        ``ape``, ``are``, ``rpe_trans``, ``rpe_rot``, ``acc``, ``comp``, ``cd``,
         ``inference_time_ms``, and ``infer_peak_vram_gb``.
         """
         del backbone_adaptor, model, batch, ctx

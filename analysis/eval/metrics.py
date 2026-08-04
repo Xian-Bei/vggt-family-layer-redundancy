@@ -13,64 +13,10 @@ import numpy as np
 from PIL import Image
 
 from .eval_utils import (
-    compute_chamfer_and_normal_consistency,
+    compute_chamfer_distance,
     eval_trajectory,
     load_gt_pointcloud,
 )
-
-STREAMVGGT_DEPTH_MAX = 10.0
-
-
-def evaluate_depth_metrics_streamvggt(
-    pred_depth: np.ndarray,
-    gt_depth: np.ndarray,
-    *,
-    max_depth: float = STREAMVGGT_DEPTH_MAX,
-) -> Dict[str, float]:
-    """Compute depth_abs_rel / depth_delta1 with StreamVGGT-style scale alignment.
-
-    The valid mask uses GT depth range and finite predicted depth; prediction confidence
-    is intentionally not used as a metric mask.
-    """
-    import torch
-
-    pred = torch.from_numpy(np.asarray(pred_depth, dtype=np.float32))
-    gt = torch.from_numpy(np.asarray(gt_depth, dtype=np.float32))
-    if pred.shape != gt.shape:
-        raise ValueError(f"Pred depth shape {pred.shape} != GT depth shape {gt.shape}")
-    if pred.dim() == 3:
-        _, _, w = pred.shape
-        pred = pred.view(-1, w)
-        gt = gt.view(-1, w)
-    mask = (gt > 0) & (gt < float(max_depth)) & torch.isfinite(pred)
-    valid_pixels = int(mask.sum().item())
-    if valid_pixels <= 0:
-        raise RuntimeError(
-            "depth metrics: no valid GT pixels in range (0, max_depth); "
-            f"max_depth={max_depth}, pred shape={tuple(pred.shape)}, gt shape={tuple(gt.shape)}"
-        )
-    pred_valid = pred[mask]
-    gt_valid = gt[mask]
-
-    # StreamVGGT video depth defaults to scale alignment.
-    s = torch.nanmean(gt_valid) / torch.clamp(torch.nanmean(pred_valid), min=1e-8)
-    for _ in range(10):
-        residuals = s * pred_valid - gt_valid
-        weights = 1.0 / (residuals.abs() + 1e-8)
-        numerator = torch.sum(weights * pred_valid * gt_valid)
-        denominator = torch.sum(weights * pred_valid.square()).clamp(min=1e-8)
-        s = (numerator / denominator).clamp(min=1e-3).detach()
-    pred_valid = pred_valid * s
-
-    abs_rel = torch.mean(torch.abs(pred_valid - gt_valid) / gt_valid).item()
-    max_ratio = torch.maximum(pred_valid / gt_valid, gt_valid / pred_valid.clamp(min=1e-5))
-    delta1 = torch.mean((max_ratio < 1.25).float()).item()
-    return {
-        "depth_abs_rel": float(abs_rel),
-        "depth_delta1": float(delta1),
-        "depth_valid_pixels": float(valid_pixels),
-    }
-
 
 def _seven_andn_gt_c2w_valid(c2w: np.ndarray) -> bool:
     """True when GT cam-to-world is usable for trajectory metrics.
@@ -217,12 +163,9 @@ def evaluate_scene_metrics(
     *,
     infer_peak_vram_gb: float = 0.0,
     gt_point_cloud: Optional[np.ndarray] = None,
-    pred_depth: Optional[np.ndarray] = None,
-    gt_depth: Optional[np.ndarray] = None,
-    depth_max: float = STREAMVGGT_DEPTH_MAX,
     plot_trajectory: bool = False,
 ) -> Tuple[Optional[Dict[str, float]], Optional[Image.Image]]:
-    """Trajectory (ATE/ARE/RPE) + Chamfer vs ScanNet mesh GT (+ optional depth metrics)."""
+    """Trajectory (ATE/ARE/RPE) and Chamfer metrics versus ScanNet mesh GT."""
     if not all_cam_to_world_mat or not all_world_points:
         raise RuntimeError(
             f"{scene}: cannot evaluate metrics — empty camera poses or point clouds"
@@ -263,16 +206,10 @@ def evaluate_scene_metrics(
         t = np.asarray(sim3_T[:3, 3], dtype=np.float64)
         world_points_scaled = (P @ R.T) + t[None, :]
 
-        geom = compute_chamfer_and_normal_consistency(
+        chamfer = compute_chamfer_distance(
             world_points_scaled, gt_point_cloud, max_dist=chamfer_max_dist
         )
-        stats_aligned["chamfer_distance"] = float(geom["chamfer_distance"])
-        stats_aligned["nc1"] = float(geom["nc1"])
-        stats_aligned["nc2"] = float(geom["nc2"])
-        stats_aligned["nc"] = float(geom["nc"])
-        stats_aligned["nc1_med"] = float(geom["nc1_med"])
-        stats_aligned["nc2_med"] = float(geom["nc2_med"])
-        stats_aligned["nc_med"] = float(geom["nc_med"])
+        stats_aligned["chamfer_distance"] = float(chamfer)
     except Exception as e:
         msg = str(e)
         if "Degenerate covariance rank" not in msg and "Umeyama alignment" not in msg:
@@ -284,23 +221,11 @@ def evaluate_scene_metrics(
             "rpe_rot": float("nan"),
             "rpe_trans": float("nan"),
             "chamfer_distance": float("nan"),
-            "nc1": float("nan"),
-            "nc2": float("nan"),
-            "nc": float("nan"),
-            "nc1_med": float("nan"),
-            "nc2_med": float("nan"),
-            "nc_med": float("nan"),
         }
 
     all_metrics: Dict[str, float] = deepcopy(stats_aligned)
     all_metrics["inference_time_ms"] = float(inference_time_ms)
     all_metrics["infer_peak_vram_gb"] = float(infer_peak_vram_gb)
-    if pred_depth is not None and gt_depth is not None:
-        depth_metrics = evaluate_depth_metrics_streamvggt(
-            pred_depth, gt_depth, max_depth=depth_max
-        )
-        for k, v in depth_metrics.items():
-            all_metrics[k] = float(v)
     merge_numeric_metrics_into(all_metrics, all_metrics)
     return all_metrics, traj_plot
 
@@ -319,9 +244,6 @@ def evaluate_scene_and_save(
     plot_flag: bool,
     *,
     infer_peak_vram_gb: float = 0.0,
-    pred_depth: Optional[np.ndarray] = None,
-    gt_depth: Optional[np.ndarray] = None,
-    depth_max: float = STREAMVGGT_DEPTH_MAX,
 ) -> Optional[Dict[str, float]]:
     all_metrics, traj_plot = evaluate_scene_metrics(
         scene,
@@ -334,9 +256,6 @@ def evaluate_scene_and_save(
         chamfer_max_dist,
         inference_time_ms,
         infer_peak_vram_gb=infer_peak_vram_gb,
-        pred_depth=pred_depth,
-        gt_depth=gt_depth,
-        depth_max=depth_max,
         plot_trajectory=plot_flag,
     )
     if all_metrics is None:
@@ -360,20 +279,12 @@ def compute_average_metrics_and_save(
 ) -> Dict[str, float]:
     metric_names = [
         "chamfer_distance",
-        "nc1",
-        "nc2",
-        "nc",
-        "nc1_med",
-        "nc2_med",
-        "nc_med",
         "ate",
         "are",
         "rpe_rot",
         "rpe_trans",
         "inference_time_ms",
         "infer_peak_vram_gb",
-        "depth_abs_rel",
-        "depth_delta1",
     ]
     scenes_payload = all_scenes_metrics.get("scenes") or {}
     if not scenes_payload:
@@ -407,12 +318,6 @@ def compute_average_metrics_and_save(
 
 FASTVGGT_CORE_METRICS = (
     "chamfer_distance",
-    "nc1",
-    "nc2",
-    "nc",
-    "nc1_med",
-    "nc2_med",
-    "nc_med",
     "ate",
     "are",
     "rpe_rot",
@@ -436,9 +341,6 @@ def evaluate_scene_metrics_fastvggt(
     plot_trajectory: bool = False,
     plot_path: Optional[Path] = None,
     gt_point_cloud: Optional[np.ndarray] = None,
-    pred_depth: Optional[np.ndarray] = None,
-    gt_depth: Optional[np.ndarray] = None,
-    depth_max: float = STREAMVGGT_DEPTH_MAX,
 ) -> Optional[Dict[str, float]]:
     """Optional trajectory plot export; otherwise same as :func:`evaluate_scene_metrics`."""
     all_metrics, traj_plot = evaluate_scene_metrics(
@@ -453,9 +355,6 @@ def evaluate_scene_metrics_fastvggt(
         inference_time_ms,
         infer_peak_vram_gb=infer_peak_vram_gb,
         gt_point_cloud=gt_point_cloud,
-        pred_depth=pred_depth,
-        gt_depth=gt_depth,
-        depth_max=depth_max,
         plot_trajectory=plot_trajectory,
     )
     if all_metrics is None:

@@ -314,10 +314,6 @@ class NewBackboneAdapter(BackboneAdapter):
         """Optional memory cleanup hook after one replay step."""
         del layer_cpu_cache, rules, prev_layers, num_layers, seed_layer
 
-    def periodic_eval_skip_depth(self) -> bool:
-        """Return True when eval should omit dense-depth metrics."""
-        return False
-
     @staticmethod
     def _get_submodule(model: nn.Module, module_path: str) -> nn.Module:
         module: nn.Module = model

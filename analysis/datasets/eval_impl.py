@@ -14,9 +14,7 @@ from analysis.backbones.contracts import EvalSceneContext, PredictionBundle
 from analysis.datasets.contracts import PreparedSkipEvalScene
 from analysis.eval.metrics_core import (
     compute_point_metrics,
-    compute_depth_metrics,
     merge_scene_metrics,
-    require_depth_stack_shapes,
 )
 from analysis.eval.vis_export_v3 import (
     export_7andn_points_3d,
@@ -121,7 +119,7 @@ def _as_view_conf_np(conf: torch.Tensor | None, n_views: int) -> list[np.ndarray
 
 
 def _nan_point_metrics() -> Dict[str, float]:
-    return {k: float("nan") for k in ("acc", "comp", "cd", "nc")}
+    return {k: float("nan") for k in ("acc", "comp", "cd")}
 
 
 def _prepare_7andn_eval_batch(adapter, batch, device: torch.device):
@@ -132,39 +130,6 @@ def _prepare_7andn_eval_batch(adapter, batch, device: torch.device):
     imgs = adapter.load_eval_images(image_paths)
     images_b = imgs.unsqueeze(0).float().to(device)
     return scene_batch, images_b
-
-
-def _depth_metrics_from_prediction(
-    adapter,
-    *,
-    scene_id: str,
-    scene_batch: List[Dict[str, Any]],
-    pred_depth: torch.Tensor,
-    profile,
-) -> Dict[str, float]:
-    d = pred_depth.detach().float()
-    if d.ndim == 5 and d.shape[-1] == 1:
-        d = d.squeeze(-1)
-    if d.ndim == 5 and d.shape[2] == 1:
-        d = d[:, :, 0]
-    if d.ndim != 4:
-        raise ValueError(f"Unexpected depth shape for {scene_id}: {tuple(d.shape)}")
-    pred_np = d[0].cpu().numpy().astype(np.float32, copy=False)
-    n_views = min(len(scene_batch), int(pred_np.shape[0]))
-    if n_views <= 0:
-        raise ValueError(f"{scene_id}: empty predicted depth stack")
-    pred_stack = pred_np[:n_views]
-    gt_maps = []
-    for j in range(n_views):
-        output_hw = (int(pred_stack[j].shape[0]), int(pred_stack[j].shape[1]))
-        gt_maps.append(adapter.align_7andn_gt_depth(scene_batch[j], output_hw=output_hw))
-    gt_stack = np.stack(gt_maps, axis=0).astype(np.float32, copy=False)
-    require_depth_stack_shapes(
-        pred_stack,
-        gt_stack,
-        context=f"7andn {scene_id}",
-    )
-    return compute_depth_metrics(pred_stack, gt_stack, profile.depth)
 
 
 def prepare_scannet_skip_scene(adapter, batch, device, profile) -> PreparedSkipEvalScene:
@@ -191,20 +156,14 @@ def prepare_scannet_skip_scene(adapter, batch, device, profile) -> PreparedSkipE
         for i, fid in enumerate(frame_ids)
         if int(fid) in pose_frame_to_idx
     ]
-    gt_depth = adapter.load_scannet_gt_depth(
-        selected,
-        output_hw=(int(images_b.shape[-2]), int(images_b.shape[-1])),
-    )
     return PreparedSkipEvalScene(
         scene_id=str(batch.scene_id),
         images=images_b,
         state={
-            "selected": selected,
             "gt_points": gt_pts,
             "poses_gt": poses_gt,
             "first_gt_pose": first_gt_pose,
             "matched_gt": matched_gt,
-            "gt_depth": gt_depth,
         },
     )
 
@@ -217,13 +176,10 @@ def score_scannet_skip_prediction(
     *,
     runtime_metrics: Dict[str, float] | None = None,
 ) -> Dict[str, float]:
-    from analysis.eval.metrics import evaluate_depth_metrics_streamvggt
-
     metrics: Dict[str, float] = dict(runtime_metrics or {})
     gt_pts = prepared.state.get("gt_points")
 
     pts = bundle.points
-    depth = bundle.depth
     est_w2c = None
     est_w2c_eval = None
     w2cs = None
@@ -249,32 +205,6 @@ def score_scannet_skip_prediction(
                 )
             except Exception as e:
                 print(f"[warn] ScanNet Pi3 3D vis failed for {prepared.scene_id}: {e}", flush=True)
-
-    # Depth metrics use all finite predictions on valid GT pixels; prediction confidence is not a metric mask.
-    if isinstance(depth, torch.Tensor):
-        d = depth.detach().float()
-        if d.ndim == 5 and d.shape[-1] == 1:
-            d = d.squeeze(-1)
-        if d.ndim != 4:
-            raise ValueError(f"Unexpected ScanNet depth shape for {prepared.scene_id}: {tuple(d.shape)}")
-        pred_stack = d[0].cpu().numpy().astype(np.float32, copy=False)
-        gt_depth = prepared.state.get("gt_depth")
-        if gt_depth is None:
-            raise ValueError(f"ScanNet {prepared.scene_id}: missing GT depth")
-        require_depth_stack_shapes(
-            pred_stack,
-            gt_depth,
-            context=f"ScanNet {prepared.scene_id}",
-        )
-        from analysis.eval.metrics import evaluate_depth_metrics_streamvggt
-
-        metrics.update(
-            evaluate_depth_metrics_streamvggt(
-                pred_stack,
-                gt_depth.astype(np.float32, copy=False),
-                max_depth=float(profile.depth.max_depth),
-            )
-        )
 
     poses = bundle.camera_poses
     if poses is not None:
@@ -416,10 +346,10 @@ def eval_7andn_points_adapter(adapter, model, batch, device, profile, ctx: EvalS
                 continue
             p_np = pred_view_chunks[j]
             c_np = conf_view_chunks[j] if conf_view_chunks is not None and j < len(conf_view_chunks) else None
-            if c_np is not None and c_np.shape[0] == p_np.shape[0]:
-                keep = c_np >= float(profile.depth.conf_thresh)
-                p_np = p_np[keep]
-                c_np = c_np[keep]
+            # Confidence is retained only for optional visualization. Point metrics
+            # use every predicted point for every backbone.
+            if c_np is not None and c_np.shape[0] != p_np.shape[0]:
+                c_np = None
             g = view.get("pts3d")
             m = view.get("valid_mask")
             if g is None:
@@ -450,18 +380,6 @@ def eval_7andn_points_adapter(adapter, model, batch, device, profile, ctx: EvalS
             metrics.update(_nan_point_metrics())
     elif pred.shape[0] > 0 and gt_all.shape[0] > 0:
         metrics.update(_nan_point_metrics())
-
-    # Depth metrics use all finite predictions on valid GT pixels; prediction confidence is not a metric mask.
-    if isinstance(depth, torch.Tensor):
-        metrics.update(
-            _depth_metrics_from_prediction(
-                adapter,
-                scene_id=str(batch.scene_id),
-                scene_batch=scene_batch,
-                pred_depth=depth,
-                profile=profile,
-            )
-        )
 
     if ctx.export_vis_3d and ctx.vis_save_root is not None and pred.shape[0] > 0:
         try:
@@ -511,11 +429,6 @@ def prepare_7andn_skip_scene(adapter, batch, device, profile) -> PreparedSkipEva
         gt_poses = gt_poses[:, 0]
     pose_valid = np.array([_valid_7andn_gt_c2w(p) for p in gt_poses], dtype=bool)
     gt_points_by_view: List[np.ndarray] = []
-    output_hw = (int(images.shape[-2]), int(images.shape[-1]))
-    gt_depth_stack = np.stack(
-        [adapter.align_7andn_gt_depth(view, output_hw=output_hw) for view in scene_batch],
-        axis=0,
-    ).astype(np.float32, copy=False)
     for view in scene_batch:
         gt = view.get("pts3d")
         mask = view.get("valid_mask")
@@ -534,7 +447,6 @@ def prepare_7andn_skip_scene(adapter, batch, device, profile) -> PreparedSkipEva
             "gt_poses": gt_poses,
             "pose_valid": pose_valid,
             "gt_points_by_view": gt_points_by_view,
-            "gt_depth_stack": gt_depth_stack,
         },
     )
 
@@ -573,14 +485,10 @@ def score_7andn_skip_prediction(
     pred_chunks: List[np.ndarray] = []
     gt_chunks: List[np.ndarray] = []
     pred_views = _as_view_points_np(bundle.points, len(scene_batch)) if bundle.points is not None else None
-    conf_views = _as_view_conf_np(bundle.conf, len(scene_batch))
     if pred_views is not None:
         for j, pred_view in enumerate(pred_views):
             if j >= len(pose_valid) or not bool(pose_valid[j]):
                 continue
-            conf_view = conf_views[j] if conf_views is not None and j < len(conf_views) else None
-            if conf_view is not None and conf_view.shape[0] == pred_view.shape[0]:
-                pred_view = pred_view[conf_view >= float(profile.depth.conf_thresh)]
             pred_chunks.append(pred_view)
             gt_chunks.append(prepared.state["gt_points_by_view"][j])
     pred_all = np.concatenate(pred_chunks, axis=0) if pred_chunks else np.zeros((0, 3), dtype=np.float32)
@@ -594,25 +502,4 @@ def score_7andn_skip_prediction(
     elif pred_all.shape[0] and gt_all.shape[0]:
         metrics.update(_nan_point_metrics())
 
-    if isinstance(bundle.depth, torch.Tensor):
-        d = bundle.depth.detach().float()
-        if d.ndim == 5 and d.shape[-1] == 1:
-            d = d.squeeze(-1)
-        if d.ndim == 5 and d.shape[2] == 1:
-            d = d[:, :, 0]
-        if d.ndim != 4:
-            raise ValueError(f"Unexpected depth shape for {prepared.scene_id}: {tuple(d.shape)}")
-        pred_stack = d[0].cpu().numpy().astype(np.float32, copy=False)
-        gt_stack = np.asarray(prepared.state["gt_depth_stack"], dtype=np.float32)
-        n_views = min(int(pred_stack.shape[0]), int(gt_stack.shape[0]))
-        if n_views <= 0:
-            raise ValueError(f"7andn skip {prepared.scene_id}: empty depth stack")
-        pred_stack = pred_stack[:n_views]
-        gt_stack = gt_stack[:n_views]
-        require_depth_stack_shapes(
-            pred_stack,
-            gt_stack,
-            context=f"7andn skip {prepared.scene_id}",
-        )
-        metrics.update(compute_depth_metrics(pred_stack, gt_stack, profile.depth))
     return merge_scene_metrics(metrics)

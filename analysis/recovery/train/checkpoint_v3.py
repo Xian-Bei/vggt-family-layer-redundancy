@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import shutil
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch.nn as nn
@@ -11,6 +13,37 @@ from analysis.backbones.contracts import BackboneAdapter
 from analysis.prune_plan import UnitPrunePlan, prune_actions_from_plan
 
 EvalMode = Literal["upper", "lower", "model"]
+
+
+def atomic_save_checkpoint(payload: Dict[str, Any], path: Path) -> None:
+    """Serialize once to a same-directory temporary file, then atomically replace."""
+    import torch
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def atomic_publish_latest(serialized_path: Path, latest_path: Path) -> None:
+    """Publish an existing checkpoint by hard link, with atomic-copy fallback."""
+    serialized_path, latest_path = Path(serialized_path), Path(latest_path)
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = latest_path.with_name(f".{latest_path.name}.tmp.{os.getpid()}")
+    try:
+        try:
+            os.link(serialized_path, temporary)
+        except OSError:
+            shutil.copy2(serialized_path, temporary)
+        os.replace(temporary, latest_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def load_train_checkpoint_payload(path, *, map_location=None) -> Dict[str, Any]:
@@ -52,7 +85,9 @@ def apply_eval_model_structure(
     if eval_mode == "upper":
         if has_ckpt:
             payload = load_train_checkpoint_payload(ckpt_path, map_location=map_location)
-            if payload.get("variant") == "training_free_recovery_delta" and "model_state_dict" not in payload:
+            if payload.get("variant") in {
+                "training_free_recovery_delta", "trainable_recovery_delta_v1"
+            } and "model_state_dict" not in payload:
                 raise ValueError("upper eval cannot load a compact recovery delta checkpoint")
             state = payload.get("model_state_dict", payload)
             model.load_state_dict(state, strict=False)

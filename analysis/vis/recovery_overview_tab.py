@@ -108,6 +108,8 @@ def render_recovery_overview(
     selected_backbones: Sequence[str] | None,
     selected_methods: Sequence[str] | None,
     dataset: str = "mean",
+    value_mode: str = "absolute",
+    normalize_metrics: bool = True,
 ) -> Tuple[List[Tuple[np.ndarray, str]], str]:
     """Reload summaries and redraw one recovery comparison figure per backbone."""
     backbones = list(dict.fromkeys(str(name) for name in (selected_backbones or [])))
@@ -129,6 +131,7 @@ def render_recovery_overview(
             )
             recovery = collect_recovery_eval_payload(experiment_root=backbone_root)
             recovery = add_recovery_comparison_strategies(recovery, pruning)
+            skipped_profiles = recovery.get("skipped_normalization_datasets", [])
             if dataset == "mean":
                 plot_payload = recovery.get("dataset_average", {})
                 title_scope = "averaged over datasets"
@@ -156,6 +159,9 @@ def render_recovery_overview(
                 metric_grid=RECOVERY_METRIC_GRID,
                 strategy_keys=selected,
                 legend_fontsize=11,
+                value_mode=str(value_mode),
+                normalize_metrics=bool(normalize_metrics),
+                include_upper_anchor=False,
             )
             if fig is None:
                 messages.append(f"{backbone}: no matching recovery data")
@@ -166,8 +172,11 @@ def render_recovery_overview(
                 plt.close(fig)
             missing = [method for method in methods if method not in available]
             suffix = f" (missing: {', '.join(missing)})" if missing else ""
+            if skipped_profiles:
+                suffix += f" (missing pruning profile: {', '.join(skipped_profiles)})"
             messages.append(
-                f"{backbone} / {dataset}: redrawn from current summaries{suffix}"
+                f"{backbone} / {dataset}: redrawn from current summaries "
+                f"| mode={value_mode} | normalized={bool(normalize_metrics)}{suffix}"
             )
         except Exception as exc:
             messages.append(f"{backbone}: {type(exc).__name__}: {exc}")
@@ -182,15 +191,20 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
         selected_backbones: Sequence[str],
         selected_methods: Sequence[str],
         dataset: str,
+        value_mode: str,
+        normalize_metrics: bool,
     ):
         return render_recovery_overview(
-            Path(output_root), selected_backbones, selected_methods, dataset
+            Path(output_root), selected_backbones, selected_methods, dataset,
+            value_mode, normalize_metrics,
         )
 
     def _refresh_options(
         selected_backbones: Sequence[str],
         selected_methods: Sequence[str],
         dataset: str,
+        value_mode: str,
+        normalize_metrics: bool,
     ):
         latest_backbones, latest_methods = discover_recovery_overview_options(
             Path(output_root)
@@ -204,7 +218,8 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
         ] or latest_methods
         dataset_value = dataset if dataset in latest_datasets else "mean"
         gallery_value, status_value = render_recovery_overview(
-            Path(output_root), backbone_value, method_value, dataset_value
+            Path(output_root), backbone_value, method_value, dataset_value,
+            value_mode, normalize_metrics,
         )
         return (
             gr.update(choices=latest_backbones, value=backbone_value),
@@ -244,6 +259,15 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
                     value="mean",
                     multiselect=False,
                 )
+                value_mode = gr.Radio(
+                    label="Metric value",
+                    choices=["absolute", "multiple"],
+                    value="absolute",
+                )
+                normalize_metrics = gr.Checkbox(
+                    label="Normalize metrics to [0,1]",
+                    value=True,
+                )
                 refresh_btn = gr.Button("Refresh latest data", variant="primary")
                 status = gr.Textbox(label="Status", interactive=False, lines=4)
             with gr.Column(scale=5):
@@ -259,24 +283,30 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
                     ],
                 )
 
-        for event in (backbone_cb.change, method_cb.change, dataset_dd.change):
+        for event in (
+            backbone_cb.change,
+            method_cb.change,
+            dataset_dd.change,
+            value_mode.change,
+            normalize_metrics.change,
+        ):
             event(
                 _redraw,
-                inputs=[backbone_cb, method_cb, dataset_dd],
+                inputs=[backbone_cb, method_cb, dataset_dd, value_mode, normalize_metrics],
                 outputs=[gallery, status],
                 show_progress="minimal",
                 trigger_mode="always_last",
             )
         refresh_btn.click(
             _refresh_options,
-            inputs=[backbone_cb, method_cb, dataset_dd],
+            inputs=[backbone_cb, method_cb, dataset_dd, value_mode, normalize_metrics],
             outputs=[backbone_cb, method_cb, dataset_dd, gallery, status],
             show_progress="minimal",
             trigger_mode="always_last",
         )
         blocks.load(
             _redraw,
-            inputs=[backbone_cb, method_cb, dataset_dd],
+            inputs=[backbone_cb, method_cb, dataset_dd, value_mode, normalize_metrics],
             outputs=[gallery, status],
             show_progress="minimal",
         )
@@ -286,6 +316,8 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
         "backbone_cb": backbone_cb,
         "method_cb": method_cb,
         "dataset_dd": dataset_dd,
+        "value_mode": value_mode,
+        "normalize_metrics": normalize_metrics,
         "gallery": gallery,
         "status": status,
     }

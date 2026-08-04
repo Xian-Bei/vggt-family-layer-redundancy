@@ -133,13 +133,13 @@ class SkipCheckpointTest(unittest.TestCase):
     def test_span_enumeration(self) -> None:
         self.assertEqual(len(list(iter_unit_spans(48, max_span=8))), 356)
 
-    def test_point_metric_family_is_retained(self) -> None:
+    def test_removed_point_metric_is_ignored(self) -> None:
         from analysis.redundancy.skip_gt_eval_v3 import normalize_metrics
 
         row = normalize_metrics({"acc": 1.0, "comp": 2.0, "cd": 3.0, "nc": 4.0})
         self.assertEqual(
             row,
-            {"acc": 1.0, "comp": 2.0, "chamfer_distance": 3.0, "nc": 4.0},
+            {"acc": 1.0, "comp": 2.0, "chamfer_distance": 3.0},
         )
 
     def test_jsonl_resume_uses_latest_and_ignores_bad_tail(self) -> None:

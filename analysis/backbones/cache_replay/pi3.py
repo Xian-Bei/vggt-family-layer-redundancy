@@ -175,14 +175,22 @@ def _replay_pi3_cache_first(
             raise RuntimeError(f"Expected layer_-1 tokens [B,S,P,C], got {tuple(seed_tensor.shape)}")
         use_frame_seed = True
     else:
-        seed_concat = get_layer_cpu(int(seed_layer)).to(device=device, non_blocking=(device.type == "cuda"))
-        seed_frame, seed_global = split_concat(seed_concat)
-        if kind == "frame":
-            seed_tensor = seed_frame
-        elif kind == "global":
-            seed_tensor = seed_global
+        unit_loader = getattr(get_layer_cpu, "unit_loader", None)
+        if callable(unit_loader) and kind in {"frame", "global"}:
+            seed_tensor = unit_loader(f"{kind}_{int(seed_layer)}").to(
+                device=device, non_blocking=(device.type == "cuda")
+            )
         else:
-            raise ValueError(f"seed_kind must be frame, global, or none, got {seed_kind!r}")
+            seed_concat = get_layer_cpu(int(seed_layer)).to(
+                device=device, non_blocking=(device.type == "cuda")
+            )
+            seed_frame, seed_global = split_concat(seed_concat)
+            if kind == "frame":
+                seed_tensor = seed_frame
+            elif kind == "global":
+                seed_tensor = seed_global
+            else:
+                raise ValueError(f"seed_kind must be frame, global, or none, got {seed_kind!r}")
         use_frame_seed = kind == "frame"
     H, W = _resolve_pi3_image_hw(dummy_images, image_hw)
     seed_tensor = _canonicalize_pi3_replay_seed(seed_tensor, model=model, h=H, w=W)

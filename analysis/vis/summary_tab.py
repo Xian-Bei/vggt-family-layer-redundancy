@@ -44,6 +44,7 @@ _MODE_KIND_ORDER: Tuple[str, ...] = (
     "lower",
     "linearpatch",
     "ghost",
+    "ghost_sequential",
     "ghost_interval",
     "ghost_interval_sequential",
     "ghost_cos",
@@ -152,18 +153,12 @@ def _metric_key_for_header(header: str) -> Optional[str]:
         return "rpe_trans"
     if key.startswith("rpe rot"):
         return "rpe_rot"
-    if key.startswith("absrel"):
-        return "depth_abs_rel"
-    if key.startswith("δ1") or key.startswith("delta1"):
-        return "depth_delta1"
     if key.startswith("acc"):
         return "acc"
     if key.startswith("comp"):
         return "comp"
     if key == "cd":
         return "cd"
-    if key.startswith("nc"):
-        return "nc"
     return None
 
 
@@ -173,7 +168,7 @@ def _metric_higher_is_better(header: str, metric_key: str) -> bool:
         return True
     if "↓" in text:
         return False
-    return metric_key in {"depth_delta1", "nc"}
+    return False
 
 
 def _format_training_metric(value: float, epoch: int) -> str:

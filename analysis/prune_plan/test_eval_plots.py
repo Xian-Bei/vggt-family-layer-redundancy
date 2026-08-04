@@ -10,6 +10,7 @@ from analysis.prune_plan import (
     canonical_plan_name_for_group,
 )
 from analysis.prune_plan.eval_plots import (
+    _fit_pruning_normalization_profile,
     PRUNING_METHOD_LABELS,
     RECOVERY_METRIC_GRID,
     STRATEGY_PLOT_COLORS,
@@ -21,19 +22,17 @@ from analysis.prune_plan.eval_plots import (
     pruning_average_strategy_keys,
     pruning_structure_strategy_keys,
     render_strategy_metric_figure,
-    select_max_drop_below_mean_degradation,
     strategy_plot_dashes,
     strategy_plot_linestyle,
     strategy_plot_marker,
     strategy_plot_marker_offset,
     strategy_plot_zorder,
-    write_pruning_strategy_knee_plot,
     write_gt_degradation_plot,
     write_recovery_eval_plots,
     write_pruning_eval_plots,
     write_source_pruning_eval_plots,
 )
-from analysis.redundancy.skip_metric_scaling import SEVEN_METRIC_KEYS
+from analysis.redundancy.skip_metric_scaling import GT_METRIC_KEYS
 from analysis.schema.v3 import EvalRecordV3
 
 
@@ -110,6 +109,22 @@ def _write_summary(path: Path, selector: str = "i1_j2") -> None:
 
 
 class EvalPlotsTest(unittest.TestCase):
+    def test_normalization_profile_excludes_results_above_plan_budget(self) -> None:
+        metrics_24 = {metric: 2.0 for metric in GT_METRIC_KEYS}
+        metrics_47 = {metric: 100.0 for metric in GT_METRIC_KEYS}
+        profile = _fit_pruning_normalization_profile(
+            summaries={
+                "i1_j24": {"drop_count": 24, "metrics_mean": metrics_24},
+                "i1_j47": {"drop_count": 47, "metrics_mean": metrics_47},
+            },
+            upper_average={metric: 1.0 for metric in GT_METRIC_KEYS},
+            result_root=Path("/tmp/pruning"),
+            max_drop_budget=24,
+        )
+        self.assertEqual(profile["max_drop_budget"], 24)
+        self.assertEqual(profile["candidate_counts"]["ape"], 1)
+        self.assertEqual(profile["maximum_absolute_degradation"]["ape"], 1.0)
+
     def test_pruning_method_labels_and_training_plot_groups(self) -> None:
         self.assertEqual(PRUNING_METHOD_LABELS["ours"], "Ours_CKA")
         self.assertEqual(PRUNING_METHOD_LABELS["cosine"], "Ours_Cosine")
@@ -205,7 +220,7 @@ class EvalPlotsTest(unittest.TestCase):
         except Exception as exc:  # pragma: no cover
             self.skipTest(f"matplotlib unavailable: {exc}")
 
-        normalized = {key: 0.05 for key in SEVEN_METRIC_KEYS}
+        normalized = {key: 0.05 for key in GT_METRIC_KEYS}
         strategies = {
             key: {
                 "display_name": key,
@@ -336,116 +351,6 @@ class EvalPlotsTest(unittest.TestCase):
             self.assertIn("ours", average_strategies)
             self.assertIn("gt", average_strategies)
 
-    def test_writes_pruning_strategy_knee_plot(self) -> None:
-        strategy_keys = (
-            "ours",
-            "cosine",
-            "gt",
-            "replaceme",
-            "inv_mse",
-            "shortgpt",
-            "simpler",
-        )
-        self.assertEqual(
-            len({STRATEGY_PLOT_COLORS[key] for key in strategy_keys}),
-            len(strategy_keys),
-        )
-        try:
-            import matplotlib  # noqa: F401
-        except Exception as exc:  # pragma: no cover
-            self.skipTest(f"matplotlib unavailable: {exc}")
-        normalized = {key: 0.05 for key in SEVEN_METRIC_KEYS}
-        strategies = {
-            key: {
-                "points": {
-                    "1": {
-                        "available": True,
-                        "normalized_relative_to_upper": normalized,
-                    }
-                }
-            }
-            for key in strategy_keys
-        }
-        knees = {
-            key: {"drop_count": 1}
-            for key in strategy_keys
-        }
-        with tempfile.TemporaryDirectory() as td:
-            path = write_pruning_strategy_knee_plot(
-                experiment_root=Path(td),
-                backbone="vggt",
-                payload={"dataset_average": {"strategies": strategies}},
-                knee_points=knees,
-            )
-            self.assertIsNotNone(path)
-            assert path is not None
-            self.assertEqual(
-                path.name,
-                "prune_plan_vggt_strategy_knees.png",
-            )
-            self.assertTrue(path.is_file())
-
-    def test_selects_largest_complete_ours_point_at_threshold(self) -> None:
-        metrics_at_threshold = {key: 0.1 for key in SEVEN_METRIC_KEYS}
-        metrics_below = {key: 0.05 for key in SEVEN_METRIC_KEYS}
-        metrics_above = {key: 0.11 for key in SEVEN_METRIC_KEYS}
-        payload = {
-            "dataset_average": {
-                "strategies": {
-                    "ours": {
-                        "points": {
-                            "12": {
-                                "available": True,
-                                "selector": "i1_j12",
-                                "normalized_relative_to_upper": metrics_below,
-                            },
-                            "17": {
-                                "available": True,
-                                "selector": "i1_j17",
-                                "normalized_relative_to_upper": metrics_below,
-                            },
-                            "16": {
-                                "available": True,
-                                "selector": "i1_j16",
-                                "normalized_relative_to_upper": metrics_at_threshold,
-                            },
-                            "18": {
-                                "available": True,
-                                "selector": "i1_j18",
-                                "normalized_relative_to_upper": metrics_above,
-                            },
-                        }
-                    }
-                }
-            }
-        }
-        selected = select_max_drop_below_mean_degradation(payload)
-        self.assertEqual(selected["drop_count"], 17)
-        self.assertEqual(selected["drop_step"], 1)
-        self.assertEqual(selected["plan_name"], "prune_span17")
-        self.assertEqual(selected["selector"], "i1_j17")
-        self.assertAlmostEqual(selected["mean_normalized_degradation"], 0.05)
-
-    def test_knee_selection_falls_back_to_unpruned_for_incomplete_points(self) -> None:
-        payload = {
-            "dataset_average": {
-                "strategies": {
-                    "ours": {
-                        "points": {
-                            "12": {
-                                "available": True,
-                                "selector": "i1_j12",
-                                "normalized_relative_to_upper": {"ape": 0.01},
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        selected = select_max_drop_below_mean_degradation(payload)
-        self.assertEqual(selected["drop_count"], 0)
-        self.assertEqual(selected["plan_name"], "upper")
-
     def test_single_variants_use_dashed_plot_lines(self) -> None:
         self.assertEqual(strategy_plot_linestyle("gt"), "-")
         self.assertEqual(strategy_plot_linestyle("ours_double"), "-")
@@ -465,12 +370,13 @@ class EvalPlotsTest(unittest.TestCase):
                     STRATEGY_PLOT_COLORS[key]
                     for key in (
                         "recovery_ghost",
+                        "recovery_ghost_sequential",
                         "recovery_ghost_interval",
                         "recovery_ghost_interval_sequential",
                     )
                 }
             ),
-            3,
+            4,
         )
         self.assertEqual(strategy_plot_linestyle("gt_single"), "--")
         self.assertEqual(strategy_plot_linestyle("ours_single"), "--")
@@ -503,7 +409,7 @@ class EvalPlotsTest(unittest.TestCase):
         except Exception as exc:  # pragma: no cover
             self.skipTest(f"matplotlib unavailable: {exc}")
 
-        normalized = {key: 0.25 for key in SEVEN_METRIC_KEYS}
+        normalized = {key: 0.25 for key in GT_METRIC_KEYS}
         strategies = {
             key: {
                 "display_name": key,
@@ -699,13 +605,13 @@ class EvalPlotsTest(unittest.TestCase):
             pruning_average_point = pruning["dataset_average"]["strategies"]["ours"]["points"]["2"]
             self.assertEqual(pruning_average_point["relative_to_upper"]["ape"], 2.0)
             self.assertEqual(pruning_average_point["relative_to_upper"]["chamfer_distance"], 2.0)
-            self.assertEqual(pruning_average_point["normalized_relative_to_upper"]["ape"], 0.0)
+            self.assertEqual(pruning_average_point["normalized_relative_to_upper"]["ape"], 1.0)
             self.assertEqual(
                 gt_mean_degradation_series(pruning),
-                [(0, 0.0), (2, 0.0)],
+                [(0, 0.0), (2, 1.0)],
             )
             self.assertEqual(
-                STRATEGY_PLOT_ORDER[:29],
+                STRATEGY_PLOT_ORDER,
                 (
                     "no_recovery_single",
                     "no_recovery_double",
@@ -713,29 +619,25 @@ class EvalPlotsTest(unittest.TestCase):
                     "gt_drop",
                     "recovery_linearpatch",
                     "recovery_ghost",
+                    "recovery_ghost_sequential",
                     "recovery_ghost_interval",
                     "recovery_ghost_interval_sequential",
-                    "recovery_ghost_cos",
-                    "recovery_ghost_cos_more",
-                    "recovery_ghost_cos_scale",
-                    "recovery_ghost_mse_more",
-                    "recovery_ghost_mse_cos_more",
-                    "recovery_ghost_mse_cka_more",
-                    "recovery_ghost_mse_cos_cka_more",
-                    "recovery_ghost_mse_cos_balanced_more",
-                    "recovery_ghost_mse_cka_balanced_more",
-                    "recovery_ghost_mse_cos_cka_balanced_more",
-                    "recovery_ghost_mse_cka_ema_more",
-                    "recovery_ghost_mse_cos_cka_ema_half_more",
-                    "recovery_ghost_mse_cos_cka_ema_one_more",
-                    "recovery_ghost_mse_cka",
-                    "recovery_ghost_cka_only",
-                    "recovery_ghost_cka_ridge",
                     "recovery_replaceme_ls",
                     "recovery_replaceme_cos",
-                    "recovery_replaceme_cos_more",
-                    "recovery_replaceme_cos_scale",
-                    "recovery_prunecomp",
+                    "recovery_lora",
+                    "recovery_train",
+                    "gt_single",
+                    "gt_double",
+                    "ours_single",
+                    "ours_double",
+                    "cosine_single",
+                    "cosine_double",
+                    "inv_mse_single",
+                    "inv_mse_double",
+                    "replaceme_single",
+                    "replaceme_double",
+                    "shortgpt",
+                    "simpler",
                 ),
             )
             pruning_versions = (
@@ -766,16 +668,16 @@ class EvalPlotsTest(unittest.TestCase):
             ]["points"]["2"]
             self.assertEqual(
                 set(linearpatch_point["normalized_relative_to_upper"]),
-                set(SEVEN_METRIC_KEYS) & set(linearpatch_point["relative_to_upper"]),
+                set(GT_METRIC_KEYS) & set(linearpatch_point["relative_to_upper"]),
             )
 
     def test_recovery_comparison_adds_explicit_single_and_double_baselines(self) -> None:
-        metric_values = {key: 2.0 for key in SEVEN_METRIC_KEYS}
-        relative_values = {key: 2.0 for key in SEVEN_METRIC_KEYS}
+        metric_values = {key: 2.0 for key in GT_METRIC_KEYS}
+        relative_values = {key: 2.0 for key in GT_METRIC_KEYS}
         recovery = {
             "datasets": {
                 "scannet_dev50": {
-                    "upper_average": {key: 1.0 for key in SEVEN_METRIC_KEYS},
+                    "upper_average": {key: 1.0 for key in GT_METRIC_KEYS},
                     "strategies": {
                         "recovery_ghost": {
                             "display_name": "ghost",
@@ -783,9 +685,9 @@ class EvalPlotsTest(unittest.TestCase):
                                 "2": {
                                     "available": True,
                                     "drop_count": 2,
-                                    "metrics_mean": {key: 1.5 for key in SEVEN_METRIC_KEYS},
+                                    "metrics_mean": {key: 1.5 for key in GT_METRIC_KEYS},
                                     "relative_to_upper": {
-                                        key: 1.5 for key in SEVEN_METRIC_KEYS
+                                        key: 1.5 for key in GT_METRIC_KEYS
                                     },
                                 }
                             },
@@ -798,6 +700,12 @@ class EvalPlotsTest(unittest.TestCase):
             "gt_route_datasets": [],
             "datasets": {
                 "scannet_dev50": {
+                    "upper_average": {key: 1.0 for key in GT_METRIC_KEYS},
+                    "normalization_profile": {
+                        "maximum_absolute_degradation": {
+                            key: 1.0 for key in GT_METRIC_KEYS
+                        }
+                    },
                     "strategies": {
                         name: {
                             "display_name": name,
@@ -824,7 +732,7 @@ class EvalPlotsTest(unittest.TestCase):
                                 "available": True,
                                 "drop_count": 2,
                                 "normalized_relative_to_upper": {
-                                    key: 0.0 for key in SEVEN_METRIC_KEYS
+                                    key: 0.0 for key in GT_METRIC_KEYS
                                 },
                             }
                         }
@@ -850,7 +758,7 @@ class EvalPlotsTest(unittest.TestCase):
             all(
                 no_recovery_point["normalized_relative_to_upper"][key]
                 > recovery_point["normalized_relative_to_upper"][key]
-                for key in SEVEN_METRIC_KEYS
+                for key in GT_METRIC_KEYS
             )
         )
 
