@@ -9,6 +9,7 @@ from analysis.prune_plan import interval_bounds_from_selector, is_interval_selec
 from analysis.schema.v3 import EvalRecordV3, SCHEMA_VERSION
 
 INDEX_FILENAME = "skip_eval_interval_index_v3.json"
+RECOVERY_INDEX_FILENAME = "recovery_eval_index_v3.json"
 
 
 def normalize_interval_metrics(raw: dict[str, Any]) -> dict[str, float]:
@@ -67,6 +68,42 @@ def _index_for_result_root(root: Path) -> dict[str, Any]:
     }
 
 
+def _recovery_index_for_selector_root(root: Path, selector: str) -> dict[str, Any]:
+    methods: dict[str, dict[str, Any]] = {}
+    for summary_path in sorted(root.glob("recovery_*/summary.json")):
+        raw = _load_summary(summary_path)
+        if not raw:
+            continue
+        recovery_name = str(
+            raw.get("recovery_plan_name") or summary_path.parent.name
+        ).strip()
+        if not recovery_name:
+            continue
+        methods[recovery_name] = {
+            "recovery_plan_name": recovery_name,
+            "selector": str(raw.get("selector") or selector),
+            "drop_count": raw.get("drop_count"),
+            "num_scenes": raw.get("num_scenes"),
+            "summary_path": str(summary_path),
+            "eval_record_path": str(summary_path.parent / "eval_record_v3.json"),
+        }
+    return {
+        "schema_version": "recovery_eval_index_v1",
+        "kind": "recovery_eval_index",
+        "selector": str(selector),
+        "result_root": str(root),
+        "methods": methods,
+    }
+
+
+def _load_summary(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def materialize_eval_interval_result(
     out_dir: Path,
     *,
@@ -115,6 +152,11 @@ def materialize_eval_interval_result(
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     scene_text = "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in scene_rows)
     (out_dir / "scenes.jsonl").write_text(scene_text, encoding="utf-8")
-    index = _index_for_result_root(out_dir.parent)
-    (out_dir.parent / INDEX_FILENAME).write_text(json.dumps(index, indent=2), encoding="utf-8")
+    if recovery_plan_name:
+        index = _recovery_index_for_selector_root(out_dir.parent, selector)
+        index_path = out_dir.parent / RECOVERY_INDEX_FILENAME
+    else:
+        index = _index_for_result_root(out_dir.parent)
+        index_path = out_dir.parent / INDEX_FILENAME
+    index_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
     return out_dir / "summary.json"

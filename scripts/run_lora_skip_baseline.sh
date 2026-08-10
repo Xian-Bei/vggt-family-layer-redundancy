@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 # v3 cache/eval outputs are split by dataset tag under ${OUTPUT_ROOT}/<backbone>/<dataset_tag>/...
 # Trainable recovery can consume one or more cache dataset tags and writes under
-# ${OUTPUT_ROOT}/<backbone>/<OUTPUT_KIND>/<prune_plan>/<recovery_plan>/.
+# ${OUTPUT_ROOT}/<backbone>/<OUTPUT_KIND>/<physical_selector>/<recovery_plan>/.
 DATASETS="${DATASETS:-${DATASET:-scannet_dev50}}"
 EPOCHS="${EPOCHS:-5}"
 MAX_SCENES="${MAX_SCENES:-1}"
@@ -33,18 +33,6 @@ source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 parse_backbones_list
 parse_dataset_list "${EVAL}" "EVAL" "${DATASET_KEYS[@]}"
 EVAL_LIST=("${PARSED_DATASETS[@]}")
-
-truthy() {
-  [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
-}
-
-run_progress_command() {
-  if truthy "${COMPACT_LOG:-0}"; then
-    "$@" >/dev/null
-  else
-    "$@"
-  fi
-}
 
 PRUNE_PLAN_NAME_LIST=()
 read -r -a _PRUNE_PLAN_NAME_RAW <<< "${PRUNE_PLAN_NAME//,/ }"
@@ -211,7 +199,7 @@ run_one_backbone() {
   else
     echo "== ${OUTPUT_KIND} v3 datasets=${DATASETS_FOR_PY} backbone=${backbone} prune_plan_name=${prune_plan_name} recovery_plan_name=${recovery_plan_name} prune_plan_root=${plan_root} eval_at_start=${EVAL_AT_START} save_every_epoch=${SAVE_EVERY_EPOCH} =="
   fi
-  run_progress_command python -m analysis.recovery.train.train_prune_lora_v3 \
+  run_command python -m analysis.recovery.train.train_prune_lora_v3 \
     --experiment "${backbone}" \
     --dataset "${DATASETS_FOR_PY}" \
     --backbone "${backbone}" \

@@ -94,7 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only forward (+ optional --save-cache); skip similarity matrices and redundancy npz.",
     )
-    p.add_argument("--metrics", type=str, default="cka,cosine,angular,inv_mse")
+    p.add_argument("--metrics", type=str, default="cka,cosine,angular,inv_mse,cca")
     p.add_argument("--max-span", type=int, default=8)
     p.add_argument("--max-tokens", type=int, default=4096, help="Per-layer token subsample for similarity (0=all).")
     p.add_argument("--token-regions", type=str, default="all")
@@ -392,7 +392,7 @@ def run_cache_redundancy(
     max_frames: int = 50,
     seed: int = 0,
     save_cache: bool = False,
-    metrics: str = "cka,cosine,angular,inv_mse",
+    metrics: str = "cka,cosine,angular,inv_mse,cca",
     max_span: int = 8,
     max_tokens: int = 4096,
     token_regions: str = "all",

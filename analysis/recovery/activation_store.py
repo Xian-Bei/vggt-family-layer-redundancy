@@ -211,8 +211,12 @@ class RecoverySession:
             for tensor in self.mmap_units.values()
         )
 
-    def close(self) -> None:
+    def clear_units(self) -> None:
+        """Release mmap tensor references while retaining manifests and statistics."""
         self.mmap_units.clear()
+
+    def close(self) -> None:
+        self.clear_units()
         self.manifests.clear()
         self.sufficient_statistics.clear()
         self.validated_prefixes.clear()

@@ -67,7 +67,6 @@ class RemainingSkipRebaseTest(unittest.TestCase):
             original_report=original,
             remaining_report=remaining,
             base_interval=(1, 2),
-            value_mode="absolute",
         )
         matrix = np.asarray(
             upper_packed_to_symmetric_matrix(
@@ -75,22 +74,6 @@ class RemainingSkipRebaseTest(unittest.TestCase):
             )
         )
         np.testing.assert_allclose(matrix, [[1.0, 3.0], [3.0, 2.0]])
-
-        multiples = build_marginal_skip_maps(
-            original_report=original,
-            remaining_report=remaining,
-            base_interval=(1, 2),
-            value_mode="multiple",
-        )
-        multiple_matrix = np.asarray(
-            upper_packed_to_symmetric_matrix(
-                multiples["mixed_units"]["ape"], 2
-            )
-        )
-        np.testing.assert_allclose(
-            multiple_matrix,
-            [[13.0 / 12.0, 15.0 / 12.0], [15.0 / 12.0, 14.0 / 12.0]],
-        )
 
 
 if __name__ == "__main__":

@@ -12,11 +12,6 @@ from analysis.redundancy.metrics import (
     upper_packed_to_symmetric_matrix,
     upper_triangle_pack,
 )
-from analysis.redundancy.skip_metric_scaling import (
-    degradation_pct_to_multiple,
-)
-
-
 def resolve_plan_interval(
     plan: Any,
     *,
@@ -79,7 +74,6 @@ def build_marginal_skip_maps(
     original_report: Mapping[str, Any],
     remaining_report: Mapping[str, Any],
     base_interval: Tuple[int, int],
-    value_mode: str,
 ) -> Dict[str, Dict[str, List[float]]]:
     """Return compact remaining-unit maps rebased to the base-pruned model."""
     full_ids = [str(unit_id) for unit_id in original_report.get("unit_ids", [])]
@@ -137,20 +131,7 @@ def build_marginal_skip_maps(
                 dtype=np.float64,
             )
             marginal_delta = compact_delta - base_delta
-            if str(value_mode) == "absolute":
-                rebased = marginal_delta
-            elif str(value_mode) == "multiple":
-                base_metric = full_upper + base_delta
-                current_metric = full_upper + compact_delta
-                denominator = max(abs(base_metric), 1e-8)
-                degradation_pct = 100.0 * (
-                    current_metric - base_metric
-                ) / denominator
-                rebased = degradation_pct_to_multiple(
-                    degradation_pct, metric=metric
-                )
-            else:
-                raise ValueError(f"Unsupported skip heatmap value mode: {value_mode!r}")
+            rebased = marginal_delta
             metrics[metric] = upper_triangle_pack(
                 torch.from_numpy(np.asarray(rebased, dtype=np.float64))
             )

@@ -10,9 +10,9 @@ HEATMAP_REAL_DATASETS: Tuple[str, ...] = (
 )
 
 _BACKBONE_ORDER: Tuple[str, ...] = (
-    "vggt",
-    "pi3",
     "vggt_omega",
+    "pi3",
+    "vggt",
 )
 
 _DATASET_ORDER: Tuple[str, ...] = (
@@ -78,17 +78,18 @@ def build_heatmaps_tab(
         key=_dataset_sort_key,
     )
 
-    with gr.Tab("Metrics & Remaining") as tab_stage2:
-        gr.Markdown("## Metrics & Remaining")
+    with gr.Tab("Similarity Metrics") as tab_stage2:
+        gr.Markdown("## Similarity Metrics")
         gr.Markdown(
             "Choose `mean` or a scene. Each skip mode shows one row containing the "
             "**7-metric mean** followed by the four similarity heatmaps for each "
             "selected token region and backbone. "
+            "The 7-metric mean always normalizes each metric to `[0,1]` before averaging. "
             "Dataset **`min`**: virtual cross-dataset view (element-wise min of each dataset's `mean` "
             "similarity; Scene locked to `mean`). "
             "Dataset **`mean`**: virtual cross-dataset view (element-wise mean of each dataset's `mean` "
             "similarity; Scene locked to `mean`). "
-            "Skip absolute/multiple applies only to the 7-metric mean. "
+            "Skip values use absolute degradation. "
             "**Show remaining** adds remaining-vs-full versions of only the "
             "7-metric mean and similarity maps, plus marginal 7-metric mean "
             "and similarity maps rebased by the first prune interval's "
@@ -103,15 +104,11 @@ def build_heatmaps_tab(
             "(lower is closer)."
         )
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=1, elem_classes=["control-column"]):
                 stage2_backbone_filter = gr.CheckboxGroup(
                     label="Backbones",
                     choices=sorted_backbone_choices,
-                    value=(
-                        ["vggt"]
-                        if "vggt" in sorted_backbone_choices
-                        else sorted_backbone_choices[:1]
-                    ),
+                    value=sorted_backbone_choices,
                 )
                 stage2_dataset_dd = gr.Dropdown(
                     label="Dataset",
@@ -127,11 +124,10 @@ def build_heatmaps_tab(
                     value=[],
                     visible=False,
                 )
-                stage2_value_mode = gr.Radio(
-                    label="Skip heatmap value",
-                    choices=["absolute", "multiple"],
-                    value=_hm_vm,
-                    elem_classes=["hm-value-mode"] + (["hm-value-mode-pct-locked"] if not _hm_po else []),
+                stage2_value_mode = gr.Dropdown(
+                    choices=["absolute"],
+                    value="absolute",
+                    visible=False,
                 )
                 stage2_pct_clip_slider = gr.Slider(
                     minimum=0,
@@ -148,10 +144,6 @@ def build_heatmaps_tab(
                 stage2_colorbar_histogram = gr.Checkbox(
                     label="Show row/column mean plots",
                     value=False,
-                )
-                stage2_normalize_skip_metrics = gr.Checkbox(
-                    label="Normalize 7-metric mean to [0,1]",
-                    value=True,
                 )
                 stage2_show_remaining = gr.Checkbox(
                     label="Show remaining",
@@ -211,7 +203,6 @@ def build_heatmaps_tab(
             stage2_sim_gamma_slider,
             stage2_sim_cutoff_slider,
             stage2_colorbar_histogram,
-            stage2_normalize_skip_metrics,
             stage2_show_remaining,
         ]
         stage2_outputs = [
@@ -250,10 +241,8 @@ def build_heatmaps_tab(
                     stage2_refresh_events.append(event)
 
             _bind_refresh(stage2_scene_dd.change)
-            _bind_refresh(stage2_value_mode.change)
             _bind_refresh(stage2_token_rows_filter.change)
             _bind_refresh(stage2_colorbar_histogram.change)
-            _bind_refresh(stage2_normalize_skip_metrics.change)
             _bind_refresh(stage2_show_remaining.change)
             _bind_refresh(tab_stage2.select, with_trigger_mode=False)
         else:
@@ -277,7 +266,6 @@ def build_heatmaps_tab(
         "stage2_sim_gamma_slider": stage2_sim_gamma_slider,
         "stage2_sim_cutoff_slider": stage2_sim_cutoff_slider,
         "stage2_colorbar_histogram": stage2_colorbar_histogram,
-        "stage2_normalize_skip_metrics": stage2_normalize_skip_metrics,
         "stage2_show_remaining": stage2_show_remaining,
         "stage2_inputs": stage2_inputs,
         "stage2_outputs": stage2_outputs,

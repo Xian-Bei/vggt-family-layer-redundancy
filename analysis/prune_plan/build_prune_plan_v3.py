@@ -29,9 +29,7 @@ from analysis.redundancy.similarity_v3 import (
     unit_similarity_to_interval_score,
 )
 from analysis.redundancy.skip_metric_scaling import (
-    degradation_pct_to_upper_multiple_score,
     normalize_metric_components,
-    raw_metric_to_upper_multiple_score,
 )
 from analysis.prune_plan.triangle_prune import TrianglePick
 from analysis.prune_plan.visualize_triangle_prune import (
@@ -40,7 +38,7 @@ from analysis.prune_plan.visualize_triangle_prune import (
 
 # ---------------------------------------------------------------------------
 # GT / Ours controls
-# Edit this block to tune GT and all Ours variants (CKA, cosine, inverse-MSE).
+# Edit this block to tune GT and all Ours variants (CKA, cosine, inverse-MSE, CCA).
 # ---------------------------------------------------------------------------
 
 # GT score construction and metric fusion.
@@ -49,18 +47,7 @@ GT_POSE_METRICS = ("ape", "are", "rpe_trans", "rpe_rot")
 GT_POINT_METRICS = ("acc", "comp", "chamfer_distance")
 GT_AGGREGATE_METRICS = (*GT_POSE_METRICS, *GT_POINT_METRICS)
 
-# A Single candidate replaces the earlier Single candidate only when it is
-# strictly better by more than this value.
-GT_OURS_COMPARISON_TOLERANCE = 0.005
-# When comparing two Double candidates, prefer the candidate whose component
-# intervals are farther apart. A smaller-gap candidate replaces it only when
-# its score is strictly better by more than this value.
-GT_OURS_DOUBLE_GAP_COMPARISON_TOLERANCE = 0.005
-# A Double candidate replaces the best Single candidate only when it is strictly
-# better by more than this value.
-GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE = 0.005
-
-# Shared plan-budget, interval, and cross-budget constraints.
+GT_OURS_COMPARISON_TOLERANCE = GT_OURS_DOUBLE_GAP_COMPARISON_TOLERANCE = GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE = 5e-3
 MIN_RETAINED_UNITS_BETWEEN_INTERVALS = 1
 # For Double-to-Double transitions, continuity is one-to-one: each current
 # interval overlaps a previous interval and each previous interval survives.
@@ -83,6 +70,8 @@ SUPPORTED_PRUNING_STRATEGIES = (
     "replaceme_double",
     "inv_mse_single",
     "inv_mse_double",
+    "cca_single",
+    "cca_double",
     "shortgpt",
     "simpler",
 )
@@ -90,6 +79,7 @@ PRUNING_STRATEGY_FAMILY_ALIASES = {
     "ours": ("ours_single", "ours_double"),
     "cosine": ("cosine_single", "cosine_double"),
     "inv_mse": ("inv_mse_single", "inv_mse_double"),
+    "cca": ("cca_single", "cca_double"),
     "gt": ("gt_single", "gt_double"),
     "replaceme": ("replaceme_single", "replaceme_double"),
 }
@@ -252,6 +242,63 @@ def _normalize_and_aggregate_gt_components(
         **meta,
         "component_aggregation": mode,
     }
+
+
+def _raw_metric_to_upper_clamped_score(
+    values: np.ndarray,
+    *,
+    upper_baseline: Optional[float],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Clamp better-than-upper values without ratio scaling.
+
+    For a positive upper baseline, min-max normalization of
+    ``max(current, upper)`` is exactly equivalent to normalizing
+    ``max(current / upper, 1)``.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    finite = np.isfinite(arr)
+    meta: dict[str, Any] = {
+        "scale_mode": "raw_metric_upper_clamped",
+        "upper_baseline": upper_baseline,
+        "enabled": False,
+    }
+    if not np.any(finite) or upper_baseline is None:
+        meta["skip_reason"] = "no_finite_values_or_missing_upper_baseline"
+        return out, meta
+    upper = float(upper_baseline)
+    if not math.isfinite(upper) or upper <= 0.0:
+        meta["skip_reason"] = "invalid_upper_baseline"
+        return out, meta
+    out[finite] = np.maximum(arr[finite], upper)
+    meta["enabled"] = True
+    return out, meta
+
+
+def _degradation_pct_to_upper_clamped_score(
+    values: np.ndarray,
+    *,
+    upper_baseline: Optional[float],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Clamp signed degradation percentages at zero before min-max scaling."""
+    arr = np.asarray(values, dtype=np.float64)
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    finite = np.isfinite(arr)
+    meta: dict[str, Any] = {
+        "scale_mode": "degradation_pct_zero_clamped",
+        "upper_baseline": upper_baseline,
+        "enabled": False,
+    }
+    if not np.any(finite) or upper_baseline is None:
+        meta["skip_reason"] = "no_finite_values_or_missing_upper_baseline"
+        return out, meta
+    upper = float(upper_baseline)
+    if not math.isfinite(upper) or upper <= 0.0:
+        meta["skip_reason"] = "invalid_upper_baseline"
+        return out, meta
+    out[finite] = np.maximum(arr[finite], 0.0)
+    meta["enabled"] = True
+    return out, meta
 
 
 def _compute_aggregator_total_params(backbone: str) -> int:
@@ -496,29 +543,28 @@ def _load_gt_aggregate_from_pruning_dir(
             start, end = interval_bounds_from_selector(selector)
             raw_values[start, end] = value
         upper_value = _dict_metric_value(upper_average, metric_key)
-        multiple_score, scaling_meta = raw_metric_to_upper_multiple_score(
+        clamped_score, scaling_meta = _raw_metric_to_upper_clamped_score(
             raw_values,
-            metric=str(metric_key),
             upper_baseline=upper_value,
         )
-        component_heatmaps[str(metric_key)] = multiple_score
+        component_heatmaps[str(metric_key)] = clamped_score
         component_metric_names.append(str(metric_key))
 
         finite_raw = np.isfinite(raw_values)
-        finite_score = np.isfinite(multiple_score)
+        finite_score = np.isfinite(clamped_score)
         if np.any(finite_raw):
             metric_records.append(
                 {
                     "metric": str(metric_key),
                     "raw_min": float(np.nanmin(raw_values[finite_raw])),
                     "raw_max": float(np.nanmax(raw_values[finite_raw])),
-                    "multiple_score_min": (
-                        float(np.nanmin(multiple_score[finite_score]))
+                    "clamped_score_min": (
+                        float(np.nanmin(clamped_score[finite_score]))
                         if np.any(finite_score)
                         else None
                     ),
-                    "multiple_score_max": (
-                        float(np.nanmax(multiple_score[finite_score]))
+                    "clamped_score_max": (
+                        float(np.nanmax(clamped_score[finite_score]))
                         if np.any(finite_score)
                         else None
                     ),
@@ -586,10 +632,10 @@ def _load_gt_aggregate_from_pruning_dir(
         "component_aggregation": str(GT_COMPONENT_AGGREGATION),
         "component_normalization": normalization_meta,
         "metric_normalization": (
-            "Raw eval/pruning interval metrics are converted to upper-relative "
-            "degradation multiples. Lower-is-better metrics use current/upper, "
-            "higher-is-better metrics use upper/current, and values better than "
-            "upper are floored to 1. Each metric heatmap is then independently "
+            "Raw eval/pruning interval metrics are clamped at the upper baseline: "
+            "lower-is-better values that outperform upper are replaced by upper. "
+            "This removes ratio scaling while preserving the exact subsequent "
+            "min-max result. Each metric heatmap is then independently "
             "min-max normalized to [0,1] before the seven metrics are averaged."
         ),
         "metric_records": metric_records,
@@ -1007,9 +1053,8 @@ def _load_gt_aggregate_from_skip_eval_report(
                 if not math.isfinite(val):
                     continue
                 corner_values[a, b] = val
-        multiple_score, scaling_meta = degradation_pct_to_upper_multiple_score(
+        clamped_score, scaling_meta = _degradation_pct_to_upper_clamped_score(
             corner_values,
-            metric=str(metric_key),
             upper_baseline=(
                 float(upper_average[str(metric_key)])
                 if str(metric_key) in upper_average
@@ -1017,24 +1062,24 @@ def _load_gt_aggregate_from_skip_eval_report(
                 else None
             ),
         )
-        component_heatmaps[str(metric_key)] = multiple_score
+        component_heatmaps[str(metric_key)] = clamped_score
         component_metric_names.append(str(metric_key))
 
         finite_raw = np.isfinite(corner_values)
-        finite_score = np.isfinite(multiple_score)
+        finite_score = np.isfinite(clamped_score)
         if np.any(finite_raw):
             metric_records.append(
                 {
                     "metric": str(metric_key),
                     "degrade_pct_min": float(np.nanmin(corner_values[finite_raw])),
                     "degrade_pct_max": float(np.nanmax(corner_values[finite_raw])),
-                    "multiple_score_min": (
-                        float(np.nanmin(multiple_score[finite_score]))
+                    "clamped_score_min": (
+                        float(np.nanmin(clamped_score[finite_score]))
                         if np.any(finite_score)
                         else None
                     ),
-                    "multiple_score_max": (
-                        float(np.nanmax(multiple_score[finite_score]))
+                    "clamped_score_max": (
+                        float(np.nanmax(clamped_score[finite_score]))
                         if np.any(finite_score)
                         else None
                     ),
@@ -1097,11 +1142,10 @@ def _load_gt_aggregate_from_skip_eval_report(
         "component_normalization": normalization_meta,
         "metric_normalization": (
             "Only pose metrics (ape, are, rpe_trans, rpe_rot) and point-cloud "
-            "metrics (acc, comp, chamfer_distance) are used. NC is excluded. For each metric, "
-            "direction-normalized degrade_pct is converted back to a raw-metric "
-            "relative degradation multiple: lower-is-better metrics use "
-            "current/upper, higher-is-better metrics use upper/current. Values "
-            "better than upper are floored to 1. Each metric heatmap is "
+            "metrics (acc, comp, chamfer_distance) are used. NC is excluded. "
+            "Saved signed degradation percentages are clamped at zero, which is "
+            "min-max equivalent to the previous upper-relative multiple without "
+            "performing ratio scaling. Each metric heatmap is "
             "independently min-max normalized to [0,1] "
             + f"before components are aggregated with {GT_COMPONENT_AGGREGATION!r}."
         ),
@@ -2369,6 +2413,7 @@ def run_build_prune_plan(
     strategies: dict[str, dict[str, Any]] = {}
     cosine_interval_score: Optional[np.ndarray] = None
     inv_mse_interval_score: Optional[np.ndarray] = None
+    cca_interval_score: Optional[np.ndarray] = None
     angular_interval_distance: Optional[np.ndarray] = None
     strategies.update(
         _build_ours_metric_strategy_pair(
@@ -2490,6 +2535,39 @@ def run_build_prune_plan(
             )
     except Exception as exc:
         print(f"[warn] Could not build INV_MSE strategies: {exc}", flush=True)
+
+    try:
+        cca_unit_ids, cca_unit_similarity, cca_similarity_source = load_similarity(
+            experiment=experiment,
+            dataset=dataset,
+            token_region=token_region,
+            metric="cca",
+        )
+        if list(cca_unit_ids) != list(unit_ids):
+            print(
+                "[warn] Skip CCA strategies: unit_ids do not match Ours source.",
+                flush=True,
+            )
+        else:
+            cca_interval_score = build_interval_score_matrix(cca_unit_similarity)
+            strategies.update(
+                _build_ours_metric_strategy_pair(
+                    family_key="cca",
+                    display_name="Ours_CCA",
+                    metric="cca",
+                    interval_score=cca_interval_score,
+                    similarity_source=cca_similarity_source,
+                    token_region=token_region,
+                    dataset=dataset,
+                    unit_ids=cca_unit_ids,
+                    num_units=num_units,
+                    param_accounting=param_accounting,
+                    sets=set_records,
+                    max_drop_budget=max_drop_budget,
+                )
+            )
+    except Exception as exc:
+        print(f"[warn] Could not build CCA strategies: {exc}", flush=True)
 
     try:
         angular_unit_ids, angular_unit_distance, angular_distance_source = load_similarity(
@@ -2813,6 +2891,12 @@ def run_build_prune_plan(
                 inv_mse_interval_score,
                 display_name="Ours_INV_MSE",
                 metric_label="INV_MSE",
+            )
+        if cca_interval_score is not None:
+            strategy_evidence["Ours_CCA"] = _similarity_proxy_evidence(
+                cca_interval_score,
+                display_name="Ours_CCA",
+                metric_label="CCA",
             )
         if angular_interval_distance is not None:
             strategy_evidence["ReplaceMe"] = {

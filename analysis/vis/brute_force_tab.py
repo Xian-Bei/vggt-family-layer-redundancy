@@ -50,28 +50,20 @@ def build_brute_force_tab(
             "**outdoor point cloud**. Indoor combines ScanNet and 7Scenes; outdoor "
             "combines nuScenes and Waymo. Pose uses ARE, APE, RPE rotation, and RPE "
             "translation; point cloud uses accuracy, completeness, and Chamfer distance. "
+            "Each metric is normalized to `[0,1]` before a multi-metric mean is computed. "
             "Pose heatmaps use the viridis color scale and point-cloud heatmaps use coolwarm. "
             "The status box lists the datasets actually included and any incomplete results."
         )
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=1, elem_classes=["control-column"]):
                 overview_backbone_filter = gr.CheckboxGroup(
                     label="Backbones",
                     choices=backbones,
                     value=backbones,
                 )
-                overview_value_mode = gr.Radio(
-                    label="Skip heatmap value",
-                    choices=["absolute", "multiple"],
-                    value="absolute",
-                )
                 overview_histogram = gr.Checkbox(
                     label="Show row/column mean plots",
                     value=False,
-                )
-                overview_normalize = gr.Checkbox(
-                    label="Normalize metrics to [0,1] before averaging",
-                    value=True,
                 )
                 overview_info = gr.Textbox(
                     label="Displayed scopes",
@@ -96,9 +88,7 @@ def build_brute_force_tab(
 
         overview_inputs = [
             overview_backbone_filter,
-            overview_value_mode,
             overview_histogram,
-            overview_normalize,
         ]
         overview_outputs = [*overview_galleries, *overview_rows, overview_info]
         _bind_refresh(
@@ -108,9 +98,7 @@ def build_brute_force_tab(
             refresh_cb=refresh_overview_cb,
             triggers=[
                 (overview_backbone_filter.change, False),
-                (overview_value_mode.change, False),
                 (overview_histogram.change, False),
-                (overview_normalize.change, False),
                 (overview_tab.select, True),
             ],
         )
@@ -124,7 +112,7 @@ def build_brute_force_tab(
             "visualization is available in the **Heatmaps** tab."
         )
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=1, elem_classes=["control-column"]):
                 backbone_filter = gr.CheckboxGroup(
                     label="Backbones",
                     choices=backbones,
@@ -161,18 +149,14 @@ def build_brute_force_tab(
                     choices=dataset_scopes,
                     value=["mean"],
                 )
-                value_mode = gr.Radio(
-                    label="Skip heatmap value",
-                    choices=["absolute", "multiple"],
-                    value="absolute",
-                )
                 colorbar_histogram = gr.Checkbox(
                     label="Show row/column mean plots",
                     value=False,
                 )
                 normalize_skip_metrics = gr.Checkbox(
-                    label="Normalize skip metrics to [0,1]",
+                    label="Normalize individual skip metrics to [0,1]",
                     value=True,
+                    info="The 7-metric mean is always normalized per metric before averaging.",
                 )
                 info = gr.Textbox(label="Displayed scopes", interactive=False)
 
@@ -235,7 +219,6 @@ def build_brute_force_tab(
             *skip_dataset_checks,
             skip_mean_check,
             similarity_dataset_filter,
-            value_mode,
             colorbar_histogram,
             normalize_skip_metrics,
         ]
@@ -271,7 +254,6 @@ def build_brute_force_tab(
                     for checkbox in [*skip_dataset_checks, skip_mean_check]
                 ],
                 (similarity_dataset_filter.change, False),
-                (value_mode.change, False),
                 (colorbar_histogram.change, False),
                 (normalize_skip_metrics.change, False),
                 (detail_tab.select, True),

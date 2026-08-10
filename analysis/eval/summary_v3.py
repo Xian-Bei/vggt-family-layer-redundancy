@@ -14,6 +14,7 @@ from analysis.prune_plan import (
     is_interval_selector,
     is_plan_group_name,
     load_prune_plan_bundle,
+    physical_pruning_selector_from_record,
     plan_group_from_name,
     prune_plan_bundle_path,
 )
@@ -319,8 +320,15 @@ def _record_label(rec: EvalRecordV3, rel_run_dir: Path) -> tuple[str, str, str]:
     parts = rel_run_dir.parts
     compression = _compression_tag(rec)
     if parts and parts[0] == "recovery":
-        recovery_plan = parts[1] if len(parts) >= 2 else ""
-        raw_plan = parts[2] if len(parts) >= 3 else ""
+        if len(parts) >= 4 and parts[2] in RECOVERY_METHOD_ORDER:
+            recovery_plan = parts[2]
+            raw_plan = parts[3]
+        elif len(parts) >= 3 and parts[2] in RECOVERY_METHOD_ORDER:
+            raw_plan = parts[1]
+            recovery_plan = parts[2]
+        else:
+            recovery_plan = parts[1] if len(parts) >= 2 else ""
+            raw_plan = parts[2] if len(parts) >= 3 else ""
         base = _recovery_label(raw_plan, recovery_plan)
         return "recovery", f"{base}+{compression}" if compression else base, raw_plan
 
@@ -347,11 +355,31 @@ def _record_label(rec: EvalRecordV3, rel_run_dir: Path) -> tuple[str, str, str]:
     return mode, f"{base}+{compression}" if compression else base, raw_plan
 
 
-def _collect_by_dataset(root: Path) -> Dict[str, Dict[str, EvalRecordV3]]:
+def _collect_by_dataset(
+    root: Path,
+    recovery_prune_strategy: str = "",
+) -> Dict[str, Dict[str, EvalRecordV3]]:
     grouped: Dict[str, Dict[str, EvalRecordV3]] = {}
     picked_scores: Dict[str, Dict[str, int]] = {}
     if not root.is_dir():
         return grouped
+    allowed_recovery_selectors: set[str] = set()
+    if recovery_prune_strategy:
+        try:
+            bundle = load_prune_plan_bundle(root)
+            plans = bundle_plan_records(bundle)
+            strategy_record = bundle_strategy_records(bundle).get(
+                recovery_prune_strategy, {}
+            )
+            points = strategy_record.get("points", {}) if isinstance(strategy_record, dict) else {}
+            for selector in points.values() if isinstance(points, dict) else ():
+                record = plans.get(str(selector))
+                if isinstance(record, dict):
+                    allowed_recovery_selectors.add(
+                        physical_pruning_selector_from_record(record)
+                    )
+        except Exception:
+            allowed_recovery_selectors = set()
     for dataset_dir in root.iterdir():
         if not dataset_dir.is_dir():
             continue
@@ -362,12 +390,17 @@ def _collect_by_dataset(root: Path) -> Dict[str, Dict[str, EvalRecordV3]]:
         for rec_path in eval_root.rglob("eval_record_v3.json"):
             run_dir = rec_path.parent
             rel_run_dir = run_dir.relative_to(eval_root)
-            if (
-                rel_run_dir.parts
-                and rel_run_dir.parts[0] == "recovery"
-                and (len(rel_run_dir.parts) < 2 or rel_run_dir.parts[1] not in RECOVERY_METHOD_ORDER)
-            ):
-                continue
+            if rel_run_dir.parts and rel_run_dir.parts[0] == "recovery":
+                parts = rel_run_dir.parts
+                if len(parts) >= 3 and parts[2] in RECOVERY_METHOD_ORDER:
+                    selector = parts[3] if len(parts) >= 4 else parts[1]
+                    if recovery_prune_strategy and selector not in allowed_recovery_selectors:
+                        continue
+                elif len(parts) >= 3 and parts[1] in RECOVERY_METHOD_ORDER:
+                    if recovery_prune_strategy and parts[2] not in allowed_recovery_selectors:
+                        continue
+                else:
+                    continue
             rec = EvalRecordV3.load(rec_path)
             mode, label, raw_plan = _record_label(rec, rel_run_dir)
             score = _mode_candidate_score(mode, rel_run_dir, raw_plan)
@@ -889,10 +922,16 @@ def main() -> None:
         action="store_true",
         help="Skip reading stored aggregator block parameter counts from prune_plan_all.json.",
     )
+    p.add_argument(
+        "--recovery-prune-strategy",
+        default="",
+        help="Filter shared selector-first recovery evaluations using this strategy.",
+    )
     args = p.parse_args()
 
     root = OUTPUT_ROOT_DEFAULT / args.experiment
-    grouped = _collect_by_dataset(root)
+    recovery_prune_strategy = str(args.recovery_prune_strategy or "").strip()
+    grouped = _collect_by_dataset(root, recovery_prune_strategy)
     grouped = _filter_to_current_prune_spans(grouped, Path(args.prune_plan_root))
 
     upper_agg_params: Optional[int] = None
@@ -923,7 +962,11 @@ def main() -> None:
         lower_agg_params_by_label=lower_agg_params_by_label,
     )
 
-    out = args.output or (root / "summary_comparison.md")
+    out = args.output or (
+        root / f"summary_comparison_{recovery_prune_strategy}.md"
+        if recovery_prune_strategy
+        else root / "summary_comparison.md"
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content, encoding="utf-8")
     print(f"Wrote {out}")
@@ -936,11 +979,15 @@ def main() -> None:
     except Exception as exc:
         print(f"[warn] Could not collect pruning comparisons: {exc}", flush=True)
     try:
-        recovery_payload = collect_recovery_eval_payload(experiment_root=root)
+        recovery_payload = collect_recovery_eval_payload(
+            experiment_root=root,
+            prune_strategy=recovery_prune_strategy or None,
+        )
         if pruning_payload is not None:
             recovery_payload = add_recovery_comparison_strategies(
                 recovery_payload,
                 pruning_payload,
+                recovery_prune_strategy or None,
             )
         for plot_path in write_recovery_eval_plots(
             experiment_root=root,

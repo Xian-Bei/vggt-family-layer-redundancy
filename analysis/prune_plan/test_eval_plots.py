@@ -5,12 +5,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from analysis.prune_plan import (
     PRUNE_PLAN_BUNDLE_SCHEMA_VERSION,
     canonical_plan_name_for_group,
 )
 from analysis.prune_plan.eval_plots import (
+    _apply_metric_profile_to_point,
     _fit_pruning_normalization_profile,
+    _with_dataset_average,
     PRUNING_METHOD_LABELS,
     RECOVERY_METRIC_GRID,
     STRATEGY_PLOT_COLORS,
@@ -32,7 +36,11 @@ from analysis.prune_plan.eval_plots import (
     write_pruning_eval_plots,
     write_source_pruning_eval_plots,
 )
-from analysis.redundancy.skip_metric_scaling import GT_METRIC_KEYS
+from analysis.prune_plan.build_prune_plan_v3 import _raw_metric_to_upper_clamped_score
+from analysis.redundancy.skip_metric_scaling import (
+    GT_METRIC_KEYS,
+    minmax_normalize_finite,
+)
 from analysis.schema.v3 import EvalRecordV3
 
 
@@ -109,26 +117,128 @@ def _write_summary(path: Path, selector: str = "i1_j2") -> None:
 
 
 class EvalPlotsTest(unittest.TestCase):
-    def test_normalization_profile_excludes_results_above_plan_budget(self) -> None:
+    def test_raw_upper_clamp_preserves_previous_minmax_result(self) -> None:
+        raw = np.asarray([0.5, 1.0, 1.5, 3.0], dtype=np.float64)
+        clamped, _meta = _raw_metric_to_upper_clamped_score(
+            raw,
+            upper_baseline=1.0,
+        )
+        previous = np.maximum(raw / 1.0, 1.0)
+        np.testing.assert_allclose(
+            minmax_normalize_finite(clamped)[0],
+            minmax_normalize_finite(previous)[0],
+        )
+
+    def test_normalization_profile_uses_single_intervals_up_to_24_drops(self) -> None:
         metrics_24 = {metric: 2.0 for metric in GT_METRIC_KEYS}
         metrics_47 = {metric: 100.0 for metric in GT_METRIC_KEYS}
+        metrics_double = {metric: 200.0 for metric in GT_METRIC_KEYS}
         profile = _fit_pruning_normalization_profile(
             summaries={
                 "i1_j24": {"drop_count": 24, "metrics_mean": metrics_24},
                 "i1_j47": {"drop_count": 47, "metrics_mean": metrics_47},
+                "i1_j2_i4_j5": {
+                    "drop_count": 4,
+                    "metrics_mean": metrics_double,
+                },
             },
             upper_average={metric: 1.0 for metric in GT_METRIC_KEYS},
             result_root=Path("/tmp/pruning"),
-            max_drop_budget=24,
         )
         self.assertEqual(profile["max_drop_budget"], 24)
+        self.assertEqual(
+            profile["candidate_scope"],
+            "single_intervals_with_drop_count_at_most_24",
+        )
         self.assertEqual(profile["candidate_counts"]["ape"], 1)
-        self.assertEqual(profile["maximum_absolute_degradation"]["ape"], 1.0)
+        self.assertEqual(profile["maximum_single_interval_metric"]["ape"], 2.0)
+
+    def test_plot_uses_current_and_upper_anchored_normalization(self) -> None:
+        point = {
+            "metrics_mean": {metric: 0.5 for metric in GT_METRIC_KEYS}
+        }
+        _apply_metric_profile_to_point(
+            point,
+            upper_average={metric: 1.0 for metric in GT_METRIC_KEYS},
+            profile={
+                "maximum_single_interval_metric": {
+                    metric: 2.0 for metric in GT_METRIC_KEYS
+                }
+            },
+        )
+        self.assertEqual(point["raw_metric"]["ape"], 0.5)
+        self.assertEqual(point["normalized_metric"]["ape"], -0.5)
+
+        fig = render_strategy_metric_figure(
+            payload={
+                "upper_average": {"ape": 1.0},
+                "normalized_upper_average": {"ape": 0.0},
+                "normalization_bounds": {"ape": {"min": 0.0, "max": 2.0}},
+                "strategies": {
+                    "ours_double": {
+                        "display_name": "Ours",
+                        "points": {"2": {"available": True, **point}},
+                    }
+                }
+            },
+            title="better than upper",
+            metric_grid=(("ape",),),
+            normalize_metrics=True,
+            include_upper_anchor=False,
+        )
+        self.assertIsNotNone(fig)
+        assert fig is not None
+        axis = fig.axes[0]
+        self.assertEqual(float(axis.lines[0].get_ydata()[0]), 0.0)
+        self.assertEqual(float(axis.lines[-1].get_ydata()[0]), -0.5)
+        self.assertEqual(axis.get_ylim()[1], 1.0)
+
+        raw_fig = render_strategy_metric_figure(
+            payload={
+                "upper_average": {"ape": 1.0},
+                "normalization_bounds": {"ape": {"min": 0.0, "max": 2.0}},
+                "strategies": {
+                    "ours_double": {
+                        "display_name": "Ours",
+                        "points": {"2": {"available": True, **point}},
+                    }
+                },
+            },
+            title="raw current metric",
+            metric_grid=(("ape",),),
+            normalize_metrics=False,
+            include_upper_anchor=False,
+        )
+        self.assertIsNotNone(raw_fig)
+        assert raw_fig is not None
+        raw_axis = raw_fig.axes[0]
+        self.assertEqual(float(raw_axis.lines[0].get_ydata()[0]), 1.0)
+        self.assertEqual(float(raw_axis.lines[-1].get_ydata()[0]), 0.5)
+        self.assertEqual(raw_axis.get_ylim()[1], 2.0)
+
+    def test_dataset_average_preserves_mean_normalization_upper_bounds(self) -> None:
+        payload = _with_dataset_average({
+            "datasets": {
+                "first": {
+                    "normalization_bounds": {"ape": {"min": 0.0, "max": 2.0}},
+                    "strategies": {},
+                },
+                "second": {
+                    "normalization_bounds": {"ape": {"min": 0.0, "max": 4.0}},
+                    "strategies": {},
+                },
+            }
+        })
+        self.assertEqual(
+            payload["dataset_average"]["normalization_bounds"]["ape"]["max"],
+            3.0,
+        )
 
     def test_pruning_method_labels_and_training_plot_groups(self) -> None:
         self.assertEqual(PRUNING_METHOD_LABELS["ours"], "Ours_CKA")
         self.assertEqual(PRUNING_METHOD_LABELS["cosine"], "Ours_Cosine")
         self.assertEqual(PRUNING_METHOD_LABELS["inv_mse"], "Ours_INV_MSE")
+        self.assertEqual(PRUNING_METHOD_LABELS["cca"], "Ours_CCA")
 
         strategies = (
             "gt_single",
@@ -139,6 +249,8 @@ class EvalPlotsTest(unittest.TestCase):
             "cosine_double",
             "inv_mse_single",
             "inv_mse_double",
+            "cca_single",
+            "cca_double",
             "replaceme_single",
             "shortgpt",
             "simpler",
@@ -154,6 +266,8 @@ class EvalPlotsTest(unittest.TestCase):
                 "cosine_double",
                 "inv_mse_single",
                 "inv_mse_double",
+                "cca_single",
+                "cca_double",
             ),
         )
         self.assertEqual(
@@ -163,6 +277,7 @@ class EvalPlotsTest(unittest.TestCase):
                 "ours_single",
                 "cosine_single",
                 "inv_mse_single",
+                "cca_single",
             ),
         )
         self.assertEqual(
@@ -172,6 +287,7 @@ class EvalPlotsTest(unittest.TestCase):
                 "ours_double",
                 "cosine_double",
                 "inv_mse_double",
+                "cca_double",
             ),
         )
         self.assertEqual(
@@ -193,6 +309,7 @@ class EvalPlotsTest(unittest.TestCase):
                 "ours_single",
                 "cosine_single",
                 "inv_mse_single",
+                "cca_single",
                 "replaceme_single",
                 "simpler",
             ),
@@ -287,6 +404,14 @@ class EvalPlotsTest(unittest.TestCase):
             bundle["strategies"]["ours"]["points"] = {"2": "ours_k2"}
             bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
             _write_upper(root / "scannet_dev50" / "eval" / "upper")
+            _write_summary(
+                root
+                / "scannet_dev50"
+                / "eval"
+                / "pruning"
+                / "i1_j1",
+                selector="i1_j1",
+            )
             _write_summary(
                 root
                 / "scannet_dev50"
@@ -586,6 +711,7 @@ class EvalPlotsTest(unittest.TestCase):
             self.assertNotIn("gt_drop", recovery["datasets"]["7scenes_test"]["strategies"])
             self.assertIn("no_recovery", recovery["datasets"]["7scenes_test"]["strategies"])
             self.assertNotIn("gt_drop", recovery["dataset_average"]["strategies"])
+
             self.assertEqual(
                 set(recovery["datasets"]["scannet_dev50"]["strategies"]["gt_drop"]["points"]),
                 {"2"},
@@ -599,7 +725,7 @@ class EvalPlotsTest(unittest.TestCase):
                 {
                     drop_key
                     for drop_key in pruning["dataset_average"]["strategies"]["ours"]["points"]
-                    if 2 <= int(drop_key) <= 24 and int(drop_key) % 2 == 0
+                    if int(drop_key) % 2 == 0
                 },
             )
             pruning_average_point = pruning["dataset_average"]["strategies"]["ours"]["points"]["2"]
@@ -634,6 +760,8 @@ class EvalPlotsTest(unittest.TestCase):
                     "cosine_double",
                     "inv_mse_single",
                     "inv_mse_double",
+                    "cca_single",
+                    "cca_double",
                     "replaceme_single",
                     "replaceme_double",
                     "shortgpt",
@@ -702,8 +830,8 @@ class EvalPlotsTest(unittest.TestCase):
                 "scannet_dev50": {
                     "upper_average": {key: 1.0 for key in GT_METRIC_KEYS},
                     "normalization_profile": {
-                        "maximum_absolute_degradation": {
-                            key: 1.0 for key in GT_METRIC_KEYS
+                        "maximum_single_interval_metric": {
+                            key: 2.0 for key in GT_METRIC_KEYS
                         }
                     },
                     "strategies": {
@@ -762,6 +890,30 @@ class EvalPlotsTest(unittest.TestCase):
             )
         )
 
+    def test_recovery_collector_shares_selector_across_strategies(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "vggt"
+            _write_plan_bundle(root)
+            _write_upper(root / "scannet_dev50" / "eval" / "upper")
+            recovery_root = root / "scannet_dev50" / "eval" / "recovery"
+            _write_summary(recovery_root / "i1_j2" / "recovery_linearpatch")
+
+            ours = collect_recovery_eval_payload(
+                experiment_root=root,
+                prune_strategy="ours",
+            )
+            strategies = ours["datasets"]["scannet_dev50"]["strategies"]
+            self.assertIn("recovery_linearpatch", strategies)
+            self.assertEqual(ours["prune_strategy"], "ours")
+            gt = collect_recovery_eval_payload(
+                experiment_root=root,
+                prune_strategy="gt",
+            )
+            self.assertIn(
+                "recovery_linearpatch",
+                gt["datasets"]["scannet_dev50"]["strategies"],
+            )
+
     def test_render_strategy_metric_figure_accepts_larger_legend_font(self) -> None:
         strategies = {
             "recovery_ghost": {
@@ -790,6 +942,42 @@ class EvalPlotsTest(unittest.TestCase):
         self.assertIsNotNone(legend)
         assert legend is not None
         self.assertEqual(legend.get_texts()[0].get_fontsize(), 11.0)
+
+    def test_metric_mean_can_stay_normalized_when_individual_metrics_are_raw(self) -> None:
+        absolute = {key: 10.0 for key in GT_METRIC_KEYS}
+        normalized = {key: 0.25 for key in GT_METRIC_KEYS}
+        absolute["ape"] = 4.0
+        normalized["ape"] = 0.4
+        fig = render_strategy_metric_figure(
+            payload={
+                "strategies": {
+                    "recovery_ghost": {
+                        "display_name": "Ghost",
+                        "points": {
+                            "2": {
+                                "available": True,
+                                "raw_metric": absolute,
+                                "normalized_metric": normalized,
+                            }
+                        },
+                    }
+                }
+            },
+            title="mixed normalization",
+            metric_grid=(("ape", "gt_mean"),),
+            normalize_metrics=False,
+            always_normalize_metric_mean=True,
+            include_upper_anchor=False,
+        )
+        self.assertIsNotNone(fig)
+        assert fig is not None
+        self.assertAlmostEqual(float(fig.axes[0].lines[-1].get_ydata()[0]), 4.0)
+        self.assertAlmostEqual(
+            float(fig.axes[1].lines[-1].get_ydata()[0]),
+            (0.4 + 6 * 0.25) / 7,
+        )
+        self.assertIn("raw metric", fig.axes[0].get_title())
+        self.assertIn("normalized metric", fig.axes[1].get_title())
 
     def test_pruning_collector_accepts_in_memory_bundle_before_plan_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as td:

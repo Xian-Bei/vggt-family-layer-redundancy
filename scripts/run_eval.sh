@@ -26,6 +26,9 @@ PLAN_MAX_DROP="${PLAN_MAX_DROP:-}"
 PLAN_DROP_STEP="${PLAN_DROP_STEP:-}"
 RECOVERY_PLAN_ROOT="${RECOVERY_PLAN_ROOT:-}"
 RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
+RECOVERY_PRUNE_STRATEGY="${RECOVERY_PRUNE_STRATEGY:-}"
+# Ordinary recovery eval writes below
+# eval/recovery/<physical_selector>/<recovery_method>/.
 # Optional output-only alias for evaluating multiple checkpoints from one
 # recovery plan (for example CKA-only epoch snapshots).
 RECOVERY_OUTPUT_NAME="${RECOVERY_OUTPUT_NAME:-${RECOVERY_PLAN_NAME}}"
@@ -36,6 +39,7 @@ RECOVERY_OUTPUT_NAME="${RECOVERY_OUTPUT_NAME:-${RECOVERY_PLAN_NAME}}"
 RECOVERY_RESULT_KIND="${RECOVERY_RESULT_KIND:-recovery}"
 MAX_SCENES="${MAX_SCENES:-0}"
 WRITE_SUMMARY="${WRITE_SUMMARY:-1}"
+RECOVERY_FORCE_RERUN="${RECOVERY_FORCE_RERUN:-0}"
 
 #############################################
 
@@ -169,18 +173,6 @@ compression_output_tag() {
       ;;
     quantvggt) echo "quantvggt_${QUANTVGGT_DTYPE}" ;;
   esac
-}
-
-truthy() {
-  [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
-}
-
-run_progress_command() {
-  if truthy "${COMPACT_LOG:-0}"; then
-    "$@" >/dev/null
-  else
-    "$@"
-  fi
 }
 
 python_plan_group_from_name() {
@@ -326,7 +318,7 @@ run_eval_dataset() {
       if [[ "${RECOVERY_RESULT_KIND}" == "testtime" ]]; then
         out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/testtime/${RECOVERY_OUTPUT_NAME}/${compression_tag}/${output_plan_name}"
       else
-        out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/recovery/${RECOVERY_OUTPUT_NAME}/${output_plan_name}"
+        out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/recovery/${output_plan_name}/${RECOVERY_OUTPUT_NAME}"
       fi
     else
       out_dir="${out_dir}/${output_plan_name}"
@@ -355,6 +347,19 @@ run_eval_dataset() {
   extra+=(--max-frames "${MAX_FRAMES}")
   if [[ -n "${split}" ]]; then
     extra+=(--split "${split}")
+  fi
+  if (
+    [[ "${mode}" == "model" ]] \
+      && [[ "${RECOVERY_RESULT_KIND}" == "recovery" ]] \
+      && [[ -n "${RECOVERY_PLAN_NAME}" ]] \
+      && ! truthy "${RECOVERY_FORCE_RERUN}" \
+      && python -m analysis.recovery.shared_results eval-complete \
+        --output-dir "${out_dir}" \
+        --selector "${output_plan_name}" \
+        --recovery-plan-name "${RECOVERY_PLAN_NAME}"
+  ); then
+    echo "   [reuse eval] ${backbone}/${output_dataset}/${output_plan_name}/${RECOVERY_PLAN_NAME}"
+    return 0
   fi
 
   if truthy "${EXPORT_VIS:-0}"; then
@@ -455,7 +460,7 @@ p.write_text(json.dumps(jobs, indent=2))
   else
     echo "   [eval/${output_dataset}] ${effective_model_name}/${backbone} mode=${mode} compression=${INFERENCE_COMPRESSION}"
   fi
-  run_progress_command python -m analysis.eval.eval_v3 \
+  run_command python -m analysis.eval.eval_v3 \
     --experiment "${backbone}" \
     --dataset "${dataset}" \
     --data-root "${data_root}" \
@@ -536,8 +541,12 @@ run_datasets_for_backbone() {
   if truthy "${COMPACT_LOG:-0}"; then
     printf '\n  eval\n    model: %s\n    datasets: %s\n\n' "${backbone}" "${#RUN_LIST[@]}"
   fi
-  run_progress_command python -m analysis.eval.eval_v3 \
-    --jobs-manifest "${jobs_manifest}"
+  local job_count
+  job_count="$(python -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "${jobs_manifest}")"
+  if [[ "${job_count}" -gt 0 ]]; then
+    run_command python -m analysis.eval.eval_v3 \
+      --jobs-manifest "${jobs_manifest}"
+  fi
   rm -f "${jobs_manifest}"
 }
 
@@ -658,7 +667,7 @@ for bb in "${BB_LIST[@]}"; do
     if ! truthy "${COMPACT_LOG:-0}"; then
       echo "   [summary] ${OUTPUT_ROOT}/${bb}/summary_comparison.md"
     fi
-    run_progress_command python -m analysis.eval.summary_v3 \
+    run_command python -m analysis.eval.summary_v3 \
       --experiment "${bb}" \
       --prune-plan-root "${PRUNE_PLAN_ROOT}"
   fi

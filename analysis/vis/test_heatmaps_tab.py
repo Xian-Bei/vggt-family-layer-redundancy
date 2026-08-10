@@ -5,7 +5,7 @@ import unittest
 
 import gradio as gr
 
-from analysis.vis.heatmaps_tab import build_heatmaps_tab
+from analysis.vis import build_heatmaps_tab
 
 
 class HeatmapsTabTest(unittest.TestCase):
@@ -45,5 +45,9 @@ class HeatmapsTabTest(unittest.TestCase):
                 refresh_stage2_full_cb=lambda *_args: (),
             )
 
-        self.assertEqual(ui["tab"].label, "Metrics & Remaining")
-        self.assertEqual(ui["stage2_backbone_filter"].value, ["vggt"])
+        self.assertEqual(ui["tab"].label, "Similarity Metrics")
+        self.assertEqual(
+            ui["stage2_backbone_filter"].value,
+            ["vggt_omega", "pi3", "vggt"],
+        )
+        self.assertNotIn("stage2_normalize_skip_metrics", ui)

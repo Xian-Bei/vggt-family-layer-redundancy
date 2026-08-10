@@ -298,7 +298,7 @@ def build_recovery_tab(
     with gr.Tab("Recovery Results", id=tab_id) as tab_recovery:
         gr.Markdown("## Recovery Results")
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=1, elem_classes=["control-column"]):
                 recovery_backbone_dd = gr.Dropdown(
                     label="Backbone",
                     choices=backbone_choices,

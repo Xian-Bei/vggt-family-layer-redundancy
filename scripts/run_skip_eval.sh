@@ -27,18 +27,6 @@ if [[ "${#EVAL_LIST[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-truthy() {
-  [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
-}
-
-run_progress_command() {
-  if truthy "${COMPACT_LOG:-0}"; then
-    "$@" >/dev/null
-  else
-    "$@"
-  fi
-}
-
 run_skip_eval_dataset() {
   local dataset="$1"
   local data_root="$2"
@@ -79,7 +67,7 @@ run_skip_eval_dataset() {
   else
     echo "== skip_gt_eval dataset=${output_dataset} backbone=${backbone} max_span=${SKIP_GT_EVAL_MAX_SPAN} resume=${SKIP_GT_EVAL_RESUME} =="
   fi
-  run_progress_command python -m analysis.redundancy.skip_gt_eval_v3 \
+  run_command python -m analysis.redundancy.skip_gt_eval_v3 \
     "${extra[@]}"
 }
 

@@ -1,4 +1,4 @@
-"""QuantVGGT fake-quant deployment adapter for a restored LaRe VGGT model."""
+"""QuantVGGT fake-quant adapter for restored VGGT, Pi3, and VGGT-Omega models."""
 
 from __future__ import annotations
 
@@ -70,7 +70,35 @@ def _expected_calibration_keys(block: nn.Module, quantized_type: type[nn.Module]
 
 class QuantVGGTInferenceAdapter(InferenceCompressionAdapter):
     name = "quantvggt"
-    supported_backbones = frozenset({"vggt"})
+    supported_backbones = frozenset({"vggt", "pi3", "vggt_omega"})
+
+    @staticmethod
+    def _block_groups(model: nn.Module, backbone_name: str):
+        """Map logical frame/global calibration indices to physical containers."""
+        if backbone_name == "pi3":
+            decoder = getattr(model, "decoder", None)
+            if decoder is None:
+                raise TypeError("QuantVGGT requires Pi3 model.decoder")
+            return (
+                ("frame", decoder, [(i, 2 * i) for i in range((len(decoder) + 1) // 2)]),
+                ("global", decoder, [(i, 2 * i + 1) for i in range(len(decoder) // 2)]),
+            )
+        aggregator = getattr(model, "aggregator", None)
+        if aggregator is None:
+            raise TypeError(f"QuantVGGT requires {backbone_name}.aggregator")
+        frame_blocks = getattr(aggregator, "frame_blocks", None)
+        global_name = "inter_frame_blocks" if backbone_name == "vggt_omega" else "global_blocks"
+        global_blocks = getattr(aggregator, global_name, None)
+        if frame_blocks is None or global_blocks is None:
+            raise TypeError(f"QuantVGGT cannot find frame/global blocks for {backbone_name}")
+        return (
+            ("frame", frame_blocks, [(i, i) for i in range(len(frame_blocks))]),
+            ("global", global_blocks, [(i, i) for i in range(len(global_blocks))]),
+        )
+
+    @staticmethod
+    def _is_skipped(block: nn.Module) -> bool:
+        return isinstance(block, SkipIdentityBlock) or not hasattr(block, "attn")
 
     def validate_config(self, config: InferenceCompressionConfig) -> None:
         dtype = str(config.quantvggt_dtype).strip().lower()
@@ -119,11 +147,7 @@ class QuantVGGTInferenceAdapter(InferenceCompressionAdapter):
         if not torch.cuda.is_available():
             raise RuntimeError("The vendored QuantVGGT implementation requires CUDA")
 
-        aggregator = getattr(model, "aggregator", None)
-        frame_blocks = getattr(aggregator, "frame_blocks", None)
-        global_blocks = getattr(aggregator, "global_blocks", None)
-        if aggregator is None or frame_blocks is None or global_blocks is None:
-            raise TypeError("QuantVGGT requires a VGGT model with frame_blocks and global_blocks")
+        block_groups = self._block_groups(model, backbone_name)
 
         model.eval()
         merged_count = merge_lora_linears(model)
@@ -133,7 +157,7 @@ class QuantVGGTInferenceAdapter(InferenceCompressionAdapter):
         quant_config.update_from_args(
             wbit=w_bits,
             abit=a_bits,
-            model_id="facebook/VGGT-1B",
+            model_id=backbone_name,
             not_smooth=False,
             not_rot=False,
             lwc=True,
@@ -142,33 +166,35 @@ class QuantVGGTInferenceAdapter(InferenceCompressionAdapter):
             exp_name="inference",
         )
 
-        for blocks in (frame_blocks, global_blocks):
-            for index, block in enumerate(blocks):
-                if isinstance(block, SkipIdentityBlock):
+        for _label, blocks, logical_to_physical in block_groups:
+            for _logical_index, physical_index in logical_to_physical:
+                block = blocks[physical_index]
+                if self._is_skipped(block):
                     continue
-                blocks[index] = quantize_linear(block, args=quant_config)
+                blocks[physical_index] = quantize_linear(block, args=quant_config)
 
         # The official files are about 1.92 GB each. Memory-map and consume them
         # sequentially so applying QuantVGGT does not materialize both in host RAM.
-        for label, blocks, params_path in (
-            ("frame", frame_blocks, frame_path),
-            ("global", global_blocks, global_path),
-        ):
+        params_paths = {"frame": frame_path, "global": global_path}
+        for label, blocks, logical_to_physical in block_groups:
+            params_path = params_paths[label]
             all_params = torch.load(
                 params_path,
                 map_location="cpu",
                 weights_only=True,
                 mmap=True,
             )
-            for index, block in enumerate(blocks):
-                if isinstance(block, SkipIdentityBlock):
+            for logical_index, physical_index in logical_to_physical:
+                block = blocks[physical_index]
+                if self._is_skipped(block):
                     continue
-                state = _layer_params(all_params, index)
+                state = _layer_params(all_params, logical_index)
                 expected = _expected_calibration_keys(block, quantized_type)
                 missing = sorted(expected.difference(state.keys()))
                 if missing:
                     raise ValueError(
-                        f"QuantVGGT {label} layer {index} parameters do not match {dtype}; "
+                        f"QuantVGGT {backbone_name} {label} layer {logical_index} "
+                        f"parameters do not match {dtype}; "
                         f"missing keys: {missing[:8]}"
                     )
                 block.load_state_dict(state, strict=False)

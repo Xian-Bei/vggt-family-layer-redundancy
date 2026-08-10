@@ -13,30 +13,46 @@ from PIL import Image
 
 from analysis.prune_plan import load_prune_plan_bundle
 from analysis.prune_plan.eval_plots import (
+    PRUNING_METRIC_GRID,
     PRUNING_MEAN_METRIC_GRID,
     collect_pruning_eval_payload,
     pruning_average_strategy_keys,
     render_strategy_metric_figure,
+    strategy_is_single_interval,
+)
+from analysis.vis.dataset_average_warning import (
+    DATASET_AVERAGE_GROUPS,
+    format_incomplete_average_warning,
 )
 
 
-GalleryItems = List[Tuple[np.ndarray, str]]
+GalleryItems = List[np.ndarray]
 
-_BACKBONE_ORDER = ("vggt", "pi3", "vggt_omega")
+_BACKBONE_ORDER = ("vggt_omega", "pi3", "vggt")
 _AVERAGE_SCOPES = ("training", "testing")
 _MEAN_BACKBONE = "mean"
 _DEFAULT_DROP_STEP = 2
-_PLOT_SPECS = (
-    ("ours", "Ours + GT · Single + Multi"),
-    ("others", "Ours_CKA + GT + baselines"),
+_DETAIL_PLOT_GROUPS = (("ours", "ours"), ("others", "others"))
+_OVERVIEW_PLOT_GROUPS = (
+    ("single", "ours"),
+    ("double", "ours"),
+    ("others", "others"),
 )
+_OVERVIEW_SINGLE_MUTED_STYLE = {
+    "linewidth": 1.6,
+    "alpha": 0.55,
+    "zorder": 1.5,
+    "markeredgewidth": 1.5,
+    "markersize": 49.0,
+    "marker_alpha": 0.55,
+    "marker_zorder": 1.7,
+}
 _POINT_METRIC_FIELDS = (
     "metrics_mean",
     "relative_to_upper",
     "normalized_relative_to_upper",
-    "absolute_degradation",
-    "multiple_degradation",
-    "normalized_degradation",
+    "raw_metric",
+    "normalized_metric",
 )
 
 
@@ -112,8 +128,34 @@ def resolve_pruning_scope_datasets(
     if scope == "training":
         return [dataset for dataset in available if dataset in training]
     if scope == "testing":
-        return [dataset for dataset in available if dataset not in training]
+        expected = _expected_pruning_scope_datasets(backbone_root, scope)
+        return [dataset for dataset in expected if dataset in set(available)]
     return [scope] if scope in available else []
+
+
+def _expected_pruning_scope_datasets(
+    backbone_root: Path,
+    scope: str,
+) -> List[str]:
+    """Return the complete dataset set an average is expected to contain."""
+    training = _bundle_training_datasets(backbone_root)
+    if scope == "training":
+        if set(training).intersection(DATASET_AVERAGE_GROUPS["training average"]):
+            return list(DATASET_AVERAGE_GROUPS["training average"])
+        return training
+    if scope == "testing":
+        # Production plans use the canonical two training datasets and four
+        # held-out datasets. Keep synthetic/custom plans useful by falling back
+        # to their discovered non-training datasets.
+        known_names = {
+            *DATASET_AVERAGE_GROUPS["training average"],
+            *DATASET_AVERAGE_GROUPS["testing average"],
+        }
+        available = _result_datasets(backbone_root)
+        if set(training).intersection(known_names) or set(available).intersection(known_names):
+            return list(DATASET_AVERAGE_GROUPS["testing average"])
+        return [dataset for dataset in available if dataset not in set(training)]
+    return [scope]
 
 
 def _figure_to_rgb(fig: Any) -> np.ndarray:
@@ -265,6 +307,12 @@ def _mean_backbone_plot_payloads(
         "upper_average": _average_metric_maps(
             [payload.get("upper_average", {}) for payload in plot_payloads]
         ),
+        "normalized_upper_average": _average_metric_maps(
+            [
+                payload.get("normalized_upper_average", {})
+                for payload in plot_payloads
+            ]
+        ),
         "strategies": mean_strategies,
         "num_backbones": len(plot_payloads),
     }
@@ -274,11 +322,20 @@ def render_pruning_plan_gallery(
     output_root: Path,
     backbone: str | Sequence[str],
     selected_scopes: Sequence[str] | None,
-    value_mode: str = "absolute",
-    normalize_metrics: bool = True,
     merge_replaceme: bool = True,
+    view: str = "overview",
+    normalize_individual_metrics: bool = True,
 ) -> Tuple[GalleryItems, str]:
     """Reload current summaries and render the pruning views in memory."""
+    view_key = str(view).strip().lower()
+    if view_key not in {"overview", "detail"}:
+        raise ValueError(f"Unsupported pruning-plan view: {view!r}")
+    detail_metrics = [metric for row in PRUNING_METRIC_GRID for metric in row]
+    metric_keys = detail_metrics if view_key == "detail" else ["gt_mean"]
+    plot_groups = (
+        _DETAIL_PLOT_GROUPS if view_key == "detail" else _OVERVIEW_PLOT_GROUPS
+    )
+    expected_plots = len(plot_groups) * len(metric_keys)
     scopes = list(dict.fromkeys(str(scope) for scope in (selected_scopes or [])))
     selected_backbones = (
         [str(backbone)]
@@ -297,6 +354,7 @@ def render_pruning_plan_gallery(
         if item == _MEAN_BACKBONE or item in available_backbones
     ]
     gallery: GalleryItems = []
+    warnings: List[str] = []
     messages: List[str] = []
     for selected_backbone in selected_backbones:
         contributors = (
@@ -308,14 +366,25 @@ def render_pruning_plan_gallery(
             try:
                 contributor_plots: List[Dict[str, Any]] = []
                 dataset_labels: List[str] = []
-                profile_budgets: set[int] = set()
                 for contributor in contributors:
+                    backbone_root = Path(output_root) / contributor
                     datasets = resolve_pruning_scope_datasets(
                         Path(output_root), contributor, scope
                     )
+                    if scope in _AVERAGE_SCOPES:
+                        expected = _expected_pruning_scope_datasets(
+                            backbone_root, scope
+                        )
+                        warning = format_incomplete_average_warning(
+                            owner=contributor,
+                            scope=_scope_label(scope),
+                            expected=expected,
+                            available=datasets,
+                        )
+                        if warning:
+                            warnings.append(warning)
                     if not datasets:
                         continue
-                    backbone_root = Path(output_root) / contributor
                     payload = collect_pruning_eval_payload(
                         experiment_root=backbone_root,
                         prune_plan_root=backbone_root,
@@ -324,14 +393,6 @@ def render_pruning_plan_gallery(
                     )
                     contributor_plots.append(_scope_plot_payload(payload, scope))
                     dataset_labels.extend(f"{contributor}:{item}" for item in datasets)
-                    profile_budgets.update(
-                        int(profile.get("max_drop_budget"))
-                        for dataset_payload in payload.get("datasets", {}).values()
-                        if isinstance(dataset_payload, dict)
-                        for profile in [dataset_payload.get("normalization_profile", {})]
-                        if isinstance(profile, dict)
-                        and isinstance(profile.get("max_drop_budget"), (int, float))
-                    )
                 if len(contributor_plots) != len(contributors):
                     messages.append(
                         f"{selected_backbone}/{scope}: missing one or more backbone summaries"
@@ -347,51 +408,83 @@ def render_pruning_plan_gallery(
                 strategies = plot_payload.get("strategies", {})
                 strategy_keys = tuple(strategies) if isinstance(strategies, dict) else ()
                 rendered = 0
-                for plot_group, plot_label in _PLOT_SPECS:
-                    selected = pruning_average_strategy_keys(strategy_keys, plot_group)
+                for plot_group, strategy_group in plot_groups:
+                    selected = pruning_average_strategy_keys(
+                        strategy_keys, strategy_group
+                    )
+                    style_overrides: Dict[str, Dict[str, Any]] = {}
+                    if view_key == "overview" and plot_group in {"single", "double"}:
+                        single_keys = tuple(
+                            key
+                            for key in selected
+                            if strategy_is_single_interval(key)
+                        )
+                        if plot_group == "single":
+                            selected = single_keys
+                            style_overrides = {
+                                key: {"linestyle": "-", "dashes": None}
+                                for key in single_keys
+                            }
+                        else:
+                            style_overrides = {
+                                key: dict(_OVERVIEW_SINGLE_MUTED_STYLE)
+                                for key in single_keys
+                            }
                     if plot_group == "others":
                         selected = tuple(
                             key
                             for key in selected
                             if key not in {"ours_single", "gt_single"}
                         )
-                    fig = render_strategy_metric_figure(
-                        payload=plot_payload,
-                        title=(
-                            f"{selected_backbone}: pruning strategies · "
-                            f"{_scope_label(scope)}"
-                        ),
-                        metric_grid=PRUNING_MEAN_METRIC_GRID,
-                        strategy_keys=selected,
-                        compact_pruning_legend=True,
-                        value_mode=str(value_mode),
-                        normalize_metrics=bool(normalize_metrics),
-                    )
-                    if fig is None:
-                        continue
-                    try:
-                        gallery.append(
-                            (
-                                _figure_to_rgb(fig),
-                                f"{selected_backbone} · {_scope_label(scope)} · {plot_label}",
-                            )
+                    for metric_key in metric_keys:
+                        metric_grid = (
+                            PRUNING_MEAN_METRIC_GRID
+                            if view_key == "overview"
+                            else ((metric_key,),)
                         )
-                        rendered += 1
-                    finally:
-                        plt.close(fig)
+                        fig = render_strategy_metric_figure(
+                            payload=plot_payload,
+                            title=(
+                                f"{selected_backbone}: pruning strategies · "
+                                f"{_scope_label(scope)}"
+                                + (
+                                    f" · {plot_group.title()}"
+                                    if view_key == "overview"
+                                    else ""
+                                )
+                            ),
+                            metric_grid=metric_grid,
+                            strategy_keys=selected,
+                            compact_pruning_legend=True,
+                            normalize_metrics=(
+                                True
+                                if metric_key == "gt_mean"
+                                else bool(normalize_individual_metrics)
+                            ),
+                            strategy_style_overrides=style_overrides,
+                        )
+                        if fig is None:
+                            continue
+                        try:
+                            gallery.append(_figure_to_rgb(fig))
+                            rendered += 1
+                        finally:
+                            plt.close(fig)
                 messages.append(
                     f"{selected_backbone}/{scope}: datasets={','.join(dataset_labels)} "
-                    f"| plots={rendered}/{len(_PLOT_SPECS)} "
-                    f"| mode={value_mode} | normalized={bool(normalize_metrics)} "
+                    f"| view={view_key} | plots={rendered}/{expected_plots} "
+                    f"| individual_normalized={bool(normalize_individual_metrics)} "
+                    "| mean_normalized=True "
                     f"| merge_replaceme={bool(merge_replaceme)} "
-                    f"| profile_max_drop="
-                    f"{','.join(map(str, sorted(profile_budgets))) or 'missing'}"
+                    "| normalization_scope=single_intervals_drop_lte_24"
                 )
             except Exception as exc:
                 messages.append(
                     f"{selected_backbone}/{scope}: {type(exc).__name__}: {exc}"
                 )
-    return gallery, f"backbones={','.join(selected_backbones)}\n" + "\n".join(messages)
+    return gallery, "\n".join(
+        [*warnings, f"backbones={','.join(selected_backbones)}", *messages]
+    )
 
 
 def build_pruning_plan_tab(
@@ -429,23 +522,63 @@ def build_pruning_plan_tab(
             for scope in ordered
         ]
 
-    def _redraw(backbone: Sequence[str], selected_scopes: Sequence[str], value_mode: str, normalize_metrics: bool, merge_replaceme: bool):
+    def _render(
+        backbone: Sequence[str],
+        selected_scopes: Sequence[str],
+        merge_replaceme: bool,
+        *,
+        view: str,
+        normalize_individual_metrics: bool = True,
+    ) -> Tuple[GalleryItems, str]:
         return render_pruning_plan_gallery(
-            root, backbone, selected_scopes, value_mode, normalize_metrics, merge_replaceme
+            root,
+            backbone,
+            selected_scopes,
+            merge_replaceme=merge_replaceme,
+            view=view,
+            normalize_individual_metrics=normalize_individual_metrics,
         )
 
-    def _backbone_changed(backbone: Sequence[str], selected_scopes: Sequence[str], value_mode: str, normalize_metrics: bool, merge_replaceme: bool):
+    def _selected_scopes_after_backbone_change(
+        backbone: Sequence[str],
+        selected_scopes: Sequence[str],
+    ) -> List[str]:
         scopes = [value for _, value in _scope_choices(backbone)]
         retained = [scope for scope in (selected_scopes or []) if scope in scopes]
-        selected = retained or (["training"] if "training" in scopes else scopes[:1])
-        gallery, status = render_pruning_plan_gallery(root, backbone, selected, value_mode, normalize_metrics, merge_replaceme)
+        return retained or (["training"] if "training" in scopes else scopes[:1])
+
+    def _backbone_changed(
+        backbone: Sequence[str],
+        selected_scopes: Sequence[str],
+        merge_replaceme: bool,
+        *,
+        view: str,
+        normalize_individual_metrics: bool = True,
+    ) -> Tuple[Any, GalleryItems, str]:
+        selected = _selected_scopes_after_backbone_change(
+            backbone, selected_scopes
+        )
+        gallery, status = _render(
+            backbone,
+            selected,
+            merge_replaceme,
+            view=view,
+            normalize_individual_metrics=normalize_individual_metrics,
+        )
         return (
             gr.update(choices=_scope_choices(backbone), value=selected),
             gallery,
             status,
         )
 
-    def _refresh(backbone: Sequence[str], selected_scopes: Sequence[str], value_mode: str, normalize_metrics: bool, merge_replaceme: bool):
+    def _refresh(
+        backbone: Sequence[str],
+        selected_scopes: Sequence[str],
+        merge_replaceme: bool,
+        *,
+        view: str,
+        normalize_individual_metrics: bool = True,
+    ) -> Tuple[Any, Any, GalleryItems, str]:
         latest_backbones = discover_pruning_plan_backbones(root)
         backbone_value = [
             value
@@ -456,122 +589,186 @@ def build_pruning_plan_tab(
         scopes = [value for _, value in _scope_choices(backbone_value)]
         selected = [scope for scope in (selected_scopes or []) if scope in scopes]
         selected = selected or (["training"] if "training" in scopes else scopes[:1])
-        gallery, status = render_pruning_plan_gallery(
-            root, backbone_value, selected, value_mode, normalize_metrics, merge_replaceme
+        gallery, status = _render(
+            backbone_value,
+            selected,
+            merge_replaceme,
+            view=view,
+            normalize_individual_metrics=normalize_individual_metrics,
         )
         return (
-            gr.update(choices=[*latest_backbones, _MEAN_BACKBONE], value=backbone_value),
+            gr.update(choices=[_MEAN_BACKBONE, *latest_backbones], value=backbone_value),
             gr.update(choices=_scope_choices(backbone_value), value=selected),
             gallery,
             status,
         )
 
-    with gr.Tab("Pruning Plan", id=tab_id) as tab:
-        gr.Markdown("## Pruning Plan")
-        gr.Markdown(
-            "Reload current pruning summaries and render the selected backbones "
-            "or their mean in memory. No saved plot images are used."
-        )
-        with gr.Row():
-            with gr.Column(scale=1):
-                backbone_dd = gr.CheckboxGroup(
-                    label="Backbones",
-                    choices=[*backbones, _MEAN_BACKBONE],
-                    value=backbones,
+    def _controls(*, detail: bool) -> Dict[str, Any]:
+        view = "detail" if detail else "overview"
+        title = "Pruning Plan Detail" if detail else "Pruning Plan Overview"
+        tab_suffix = "detail" if detail else "overview"
+        with gr.Tab(title, id=f"{tab_id}_{tab_suffix}") as tab:
+            gr.Markdown(f"## {title}")
+            if detail:
+                gr.Markdown(
+                    "Each of the two strategy groups is shown as eight metric plots "
+                    "in two rows: four pose metrics, then three point-cloud metrics "
+                    "and the normalized 7-metric mean."
                 )
-                scope_cb = gr.CheckboxGroup(
-                    label="Datasets / averages (multi-select)",
-                    choices=_scope_choices(backbones),
-                    value=initial_selection,
-                    type="value",
-                    interactive=True,
-                    info="Check one or more individual datasets, Training, or Testing.",
+            else:
+                gr.Markdown(
+                    "Each selected backbone and scope shows the two strategy groups "
+                    "using only the normalized 7-metric mean."
                 )
-                value_mode = gr.Radio(
-                    label="Metric value",
-                    choices=["absolute", "multiple"],
-                    value="absolute",
-                )
-                normalize_metrics = gr.Checkbox(
-                    label="Normalize metrics to [0,1]",
-                    value=True,
-                )
-                merge_replaceme = gr.Checkbox(
-                    label="Merge ReplaceMe Single/Double (pointwise min)",
-                    value=True,
-                )
-                refresh_btn = gr.Button("Reload summaries", variant="primary")
-                status = gr.Textbox(
-                    label="Status",
-                    interactive=False,
-                    lines=5,
-                )
-            with gr.Column(scale=5):
-                gallery = gr.Gallery(
-                    label="Live pruning-plan plots",
-                    columns=2,
-                    height="auto",
-                    object_fit="contain",
-                    elem_classes=["results-gallery", "pruning-plan-gallery"],
-                )
+            with gr.Row():
+                with gr.Column(scale=1, elem_classes=["control-column"]):
+                    backbone_dd = gr.CheckboxGroup(
+                        label="Backbones",
+                        choices=[_MEAN_BACKBONE, *backbones],
+                        value=[_MEAN_BACKBONE, *backbones],
+                    )
+                    scope_cb = gr.CheckboxGroup(
+                        label="Datasets / averages (multi-select)",
+                        choices=_scope_choices(backbones),
+                        value=initial_selection,
+                        type="value",
+                        interactive=True,
+                        info="Check one or more individual datasets, Training, or Testing.",
+                    )
+                    normalize_metrics = (
+                        gr.Checkbox(
+                            label="Normalize individual metrics to [0,1]",
+                            value=True,
+                            info="The 7-metric mean is always normalized per metric.",
+                        )
+                        if detail
+                        else None
+                    )
+                    merge_replaceme = gr.Checkbox(
+                        label="Merge ReplaceMe Single/Double (pointwise min)",
+                        value=True,
+                    )
+                    refresh_btn = gr.Button("Reload summaries", variant="primary")
+                    status = gr.Textbox(
+                        label="Status",
+                        interactive=False,
+                        lines=5,
+                    )
+                with gr.Column(scale=5):
+                    gallery = gr.Gallery(
+                        label=f"Live pruning-plan {view} plots",
+                        columns=4 if detail else 3,
+                        height="auto",
+                        object_fit="contain",
+                        elem_classes=[
+                            "results-gallery",
+                            "pruning-plan-gallery",
+                            (
+                                "pruning-plan-detail-gallery"
+                                if detail
+                                else "pruning-plan-overview-gallery"
+                            ),
+                        ],
+                    )
 
-        scope_cb.change(
-            _redraw,
-            inputs=[backbone_dd, scope_cb, value_mode, normalize_metrics, merge_replaceme],
-            outputs=[gallery, status],
-            show_progress="minimal",
-            trigger_mode="always_last",
-        )
-        value_mode.change(
-            _redraw,
-            inputs=[backbone_dd, scope_cb, value_mode, normalize_metrics, merge_replaceme],
-            outputs=[gallery, status],
-            show_progress="minimal",
-            trigger_mode="always_last",
-        )
-        normalize_metrics.change(
-            _redraw,
-            inputs=[backbone_dd, scope_cb, value_mode, normalize_metrics, merge_replaceme],
-            outputs=[gallery, status],
-            show_progress="minimal",
-            trigger_mode="always_last",
-        )
-        merge_replaceme.change(
-            _redraw,
-            inputs=[backbone_dd, scope_cb, value_mode, normalize_metrics, merge_replaceme],
-            outputs=[gallery, status],
-            show_progress="minimal",
-            trigger_mode="always_last",
-        )
-        backbone_dd.change(
-            _backbone_changed,
-            inputs=[backbone_dd, scope_cb, value_mode, normalize_metrics, merge_replaceme],
-            outputs=[scope_cb, gallery, status],
-            show_progress="minimal",
-            trigger_mode="always_last",
-        )
-        refresh_btn.click(
-            _refresh,
-            inputs=[backbone_dd, scope_cb, value_mode, normalize_metrics, merge_replaceme],
-            outputs=[backbone_dd, scope_cb, gallery, status],
-            show_progress="minimal",
-            trigger_mode="always_last",
-        )
-        blocks.load(
-            _redraw,
-            inputs=[backbone_dd, scope_cb, value_mode, normalize_metrics, merge_replaceme],
-            outputs=[gallery, status],
-            show_progress="minimal",
-        )
+            if detail:
+                assert normalize_metrics is not None
+
+                def redraw(backbone, scopes, normalize, merge):
+                    return _render(
+                        backbone,
+                        scopes,
+                        merge,
+                        view=view,
+                        normalize_individual_metrics=bool(normalize),
+                    )
+
+                def backbone_changed(backbone, scopes, normalize, merge):
+                    return _backbone_changed(
+                        backbone,
+                        scopes,
+                        merge,
+                        view=view,
+                        normalize_individual_metrics=bool(normalize),
+                    )
+
+                def refresh(backbone, scopes, normalize, merge):
+                    return _refresh(
+                        backbone,
+                        scopes,
+                        merge,
+                        view=view,
+                        normalize_individual_metrics=bool(normalize),
+                    )
+
+                inputs = [backbone_dd, scope_cb, normalize_metrics, merge_replaceme]
+                change_triggers = [
+                    scope_cb.change,
+                    normalize_metrics.change,
+                    merge_replaceme.change,
+                ]
+            else:
+                def redraw(backbone, scopes, merge):
+                    return _render(backbone, scopes, merge, view=view)
+
+                def backbone_changed(backbone, scopes, merge):
+                    return _backbone_changed(backbone, scopes, merge, view=view)
+
+                def refresh(backbone, scopes, merge):
+                    return _refresh(backbone, scopes, merge, view=view)
+
+                inputs = [backbone_dd, scope_cb, merge_replaceme]
+                change_triggers = [scope_cb.change, merge_replaceme.change]
+
+            for trigger in change_triggers:
+                trigger(
+                    redraw,
+                    inputs=inputs,
+                    outputs=[gallery, status],
+                    show_progress="minimal",
+                    trigger_mode="always_last",
+                )
+            backbone_dd.change(
+                backbone_changed,
+                inputs=inputs,
+                outputs=[scope_cb, gallery, status],
+                show_progress="minimal",
+                trigger_mode="always_last",
+            )
+            refresh_btn.click(
+                refresh,
+                inputs=inputs,
+                outputs=[backbone_dd, scope_cb, gallery, status],
+                show_progress="minimal",
+                trigger_mode="always_last",
+            )
+            blocks.load(
+                redraw,
+                inputs=inputs,
+                outputs=[gallery, status],
+                show_progress="minimal",
+            )
+
+        controls = {
+            "tab": tab,
+            "backbone_dd": backbone_dd,
+            "scope_cb": scope_cb,
+            "merge_replaceme": merge_replaceme,
+            "gallery": gallery,
+            "status": status,
+            "refresh_btn": refresh_btn,
+        }
+        if normalize_metrics is not None:
+            controls["normalize_metrics"] = normalize_metrics
+        return controls
+
+    overview = _controls(detail=False)
+    detail = _controls(detail=True)
 
     return {
-        "tab": tab,
-        "backbone_dd": backbone_dd,
-        "scope_cb": scope_cb,
-        "value_mode": value_mode,
-        "normalize_metrics": normalize_metrics,
-        "merge_replaceme": merge_replaceme,
-        "gallery": gallery,
-        "status": status,
-        "refresh_btn": refresh_btn,
+        **overview,
+        "overview_tab": overview["tab"],
+        "overview": overview,
+        "detail_tab": detail["tab"],
+        "detail": detail,
     }

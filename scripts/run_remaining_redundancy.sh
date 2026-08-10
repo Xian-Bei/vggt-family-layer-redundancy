@@ -55,18 +55,6 @@ if [[ "${DEVICE}" != cuda && "${DEVICE}" != cuda:* ]]; then
   exit 1
 fi
 
-truthy() {
-  [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
-}
-
-run_progress_command() {
-  if truthy "${COMPACT_LOG:-0}"; then
-    "$@" >/dev/null
-  else
-    "$@"
-  fi
-}
-
 remaining_output_complete() {
   local backbone="$1"
   local output_dataset="$2"
@@ -139,7 +127,7 @@ run_one_dataset() {
     echo "== remaining redundancy dataset=${dataset}${split:+_${split}}${output_dataset:+ -> ${output_dataset}} backbone=${backbone} prune_plan=${PRUNE_PLAN_NAME} expected_drop_count=${EXPECTED_DROP_COUNT} =="
   fi
 
-  run_progress_command python -m analysis.redundancy.remaining_redundancy_v3 \
+  run_command python -m analysis.redundancy.remaining_redundancy_v3 \
       --experiment "${backbone}" \
       --dataset "${dataset}" \
       "${output_dataset_args[@]}" \

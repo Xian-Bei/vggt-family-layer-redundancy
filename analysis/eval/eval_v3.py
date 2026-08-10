@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -32,8 +33,76 @@ from analysis.prune_plan import (
 from analysis.prune_plan.recovery_plan import compose_recovery_unit_prune_plan
 from analysis.schema.v3 import EvalRecordV3, stage_dir
 from analysis.recovery.train.checkpoint_v3 import EvalMode, apply_eval_model_structure
+from analysis.recovery.shared_results import eval_result_complete
 
 _EVAL_MODES = ("upper", "lower", "model")
+_DERIVED_GHOST_RECOVERY_NAMES = {
+    "recovery_ghost_sequential",
+    "recovery_ghost_interval",
+    "recovery_ghost_interval_sequential",
+}
+
+
+def _replace_with_relative_symlink(target: Path, source: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
+    target.symlink_to(
+        os.path.relpath(source, start=target.parent),
+        target_is_directory=source.is_dir(),
+    )
+
+
+def _try_link_derived_ghost_eval(
+    args: argparse.Namespace, jobs: List[Dict[str, Any]]
+) -> bool:
+    """Link complete Ghost evals and leave only missing dataset jobs to run."""
+    recovery_name = str(args.recovery_plan_name or "")
+    if recovery_name not in _DERIVED_GHOST_RECOVERY_NAMES or not jobs:
+        return False
+    checkpoint = Path(args.checkpoint) if args.checkpoint else None
+    if checkpoint is None or len(checkpoint.parents) < 2:
+        return False
+    # Recovery fitting creates this directory symlink only after confirming
+    # that the physical prune plan is one contiguous interval.
+    if not checkpoint.parent.parent.is_symlink():
+        return False
+
+    links: List[tuple[Path, Path, str]] = []
+    remaining_jobs: List[Dict[str, Any]] = []
+    for job in jobs:
+        output_value = job.get("output_dir")
+        output_dataset = str(job.get("output_dataset") or job.get("dataset") or "")
+        if not output_value:
+            return False
+        target = Path(str(output_value))
+        if target.name != recovery_name:
+            return False
+        source = target.parent / "recovery_ghost"
+        if not eval_result_complete(
+            source,
+            selector=target.parent.name,
+            recovery_plan_name="recovery_ghost",
+        ):
+            remaining_jobs.append(job)
+            continue
+        links.append((target, source, output_dataset))
+
+    for target, source, output_dataset in links:
+        _replace_with_relative_symlink(target, source)
+        print(
+            "\n  eval reuse\n"
+            f"    recovery: {recovery_name.removeprefix('recovery_')}\n"
+            f"    dataset: {output_dataset}\n"
+            "    source: ghost\n"
+            f"    link: {target} -> {source}\n",
+            file=sys.stderr,
+            flush=True,
+        )
+    jobs[:] = remaining_jobs
+    return not jobs
 
 
 def _result_selector_from_prune_plan(prune_plan: UnitPrunePlan, fallback: str) -> str:
@@ -327,6 +396,8 @@ def main() -> None:
                 )
     elif not args.dataset or args.data_root is None:
         raise ValueError("--dataset and --data-root are required without --jobs-manifest")
+    if _try_link_derived_ghost_eval(args, jobs):
+        return
     adapter = get_backbone(args.backbone)
     apply_pythonpath(adapter.name)
     device = torch.device(args.device)
@@ -411,9 +482,29 @@ def main() -> None:
             "split": args.split,
         }
     ]
-    for job in eval_jobs:
+    total_eval_jobs = len(eval_jobs)
+    for job_index, job in enumerate(eval_jobs, start=1):
         ds_plugin = get_dataset(str(job["dataset"]))
         split = ds_plugin.validate_split(job.get("split", args.split))
+        output_dataset = str(
+            job.get("output_dataset") or ds_plugin.output_tag(split)
+        )
+        recovery_name = str(
+            job.get("recovery_plan_name") or args.recovery_plan_name or ""
+        ).removeprefix("recovery_")
+        prune_name = str(
+            job.get("prune_plan_name") or args.prune_plan_name or ""
+        )
+        print(
+            "\n  eval\n"
+            f"    job: {job_index}/{total_eval_jobs}\n"
+            f"    model: {adapter.name}\n"
+            f"    span: {prune_name.removeprefix('prune_span') or '-'}\n"
+            f"    recovery: {recovery_name or '-'}\n"
+            f"    dataset: {output_dataset}\n",
+            file=sys.stderr,
+            flush=True,
+        )
         out_dir = evaluate_model_v3(
             adapter=adapter,
             model=model,

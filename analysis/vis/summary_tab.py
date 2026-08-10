@@ -845,7 +845,7 @@ def build_summary_tab(
         )
         training_loaded_state = gr.State(False)
         with gr.Row():
-            with gr.Column(scale=1, min_width=240):
+            with gr.Column(scale=1, min_width=240, elem_classes=["control-column"]):
                 summary_training_btn = gr.Button(
                     value="Load training eval best",
                     variant="secondary",

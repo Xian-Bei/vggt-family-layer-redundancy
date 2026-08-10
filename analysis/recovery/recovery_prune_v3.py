@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import tempfile
 import copy
 import hashlib
@@ -42,6 +43,7 @@ from analysis.recovery.activation_store import (
     rows_view,
 )
 from analysis.recovery.train.checkpoint_v3 import atomic_save_checkpoint
+from analysis.recovery.shared_results import recovery_result_complete
 from analysis.redundancy.cache_layout import load_scene_unit
 from analysis.redundancy.cache_layout_v3 import (
     _torch_load_tensor,
@@ -61,6 +63,11 @@ from analysis.prune_plan.recovery_plan import (
 
 
 DEFAULT_RECOVERY_CHUNK_ROWS = 16_384
+_DERIVED_GHOST_METHODS = {
+    "recovery_ghost_sequential",
+    "recovery_ghost_interval",
+    "recovery_ghost_interval_sequential",
+}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -306,6 +313,8 @@ def _fit_boundary_weight(
     device: torch.device,
     ridge: float,
     chunk_rows: int = DEFAULT_RECOVERY_CHUNK_ROWS,
+    boundary_index: int = 0,
+    boundary_total: int = 1,
 ) -> torch.Tensor:
     cache_key: Tuple[Any, ...] = (
         str(method), str(source_unit_id), str(target_unit_id), int(num_layers),
@@ -324,7 +333,8 @@ def _fit_boundary_weight(
     sum_y_abs: Optional[torch.Tensor] = None
     count = 0
     hmat: Optional[torch.Tensor] = None
-    for item in scenes:
+    total_scenes = len(scenes)
+    for scene_index, item in enumerate(scenes, start=1):
         cache_dir = Path(str(item["_cache_dir"]))
         x_cpu = rows_view(
             _load_unit_tensor(
@@ -366,7 +376,18 @@ def _fit_boundary_weight(
                 del xx, yy, sx, sy
             del x, y
         del x_cpu, y_cpu
+        if scene_index == total_scenes or scene_index % 10 == 0:
+            print(
+                "[recovery-fit]"
+                f"[boundary={boundary_index + 1}/{boundary_total}]"
+                f"[scenes={scene_index}/{total_scenes}] "
+                f"method={method.removeprefix('recovery_')}",
+                file=sys.stderr,
+                flush=True,
+            )
 
+    if _ACTIVE_RECOVERY_SESSION is not None:
+        _ACTIVE_RECOVERY_SESSION.clear_units()
     if method == "recovery_ghost":
         if xtx is None or xtd is None:
             raise RuntimeError("No activation rows were available for ghost recovery")
@@ -408,12 +429,15 @@ def _fit_replaceme_ls(
     device: torch.device,
     alpha: float,
     chunk_rows: int = DEFAULT_RECOVERY_CHUNK_ROWS,
+    boundary_index: int = 0,
+    boundary_total: int = 1,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     rtr: Optional[torch.Tensor] = None
     rtd: Optional[torch.Tensor] = None
     rows = 0
     auxiliary_id = f"replaceme_residual:{source_unit_id}"
-    for item in scenes:
+    total_scenes = len(scenes)
+    for scene_index, item in enumerate(scenes, start=1):
         cache_dir = Path(str(item["_cache_dir"]))
         h_raw = _load_unit_tensor(cache_dir, item, source_unit_id, num_layers=num_layers, map_location="cpu")
         y_raw = _load_unit_tensor(cache_dir, item, target_unit_id, num_layers=num_layers, map_location="cpu")
@@ -440,6 +464,17 @@ def _fit_replaceme_ls(
             rows += int(r.shape[0])
             del h, y, r, r64, d64, rr, rd
         del h_raw, y_raw, r_raw, h_cpu, y_cpu, r_cpu
+        if scene_index == total_scenes or scene_index % 10 == 0:
+            print(
+                "[recovery-fit]"
+                f"[boundary={boundary_index + 1}/{boundary_total}]"
+                f"[scenes={scene_index}/{total_scenes}] "
+                "method=replaceme_ls",
+                file=sys.stderr,
+                flush=True,
+            )
+    if _ACTIVE_RECOVERY_SESSION is not None:
+        _ACTIVE_RECOVERY_SESSION.clear_units()
     if rtr is None or rtd is None or rows <= 0:
         raise RuntimeError("No activation rows were available for ReplaceMe LS")
     channels = int(rtr.shape[0])
@@ -450,6 +485,120 @@ def _fit_replaceme_ls(
         "ls_alpha": float(alpha),
         "chunk_rows": int(chunk_rows),
     }
+
+
+def _available_cpu_memory_bytes() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _materialize_cosine_rows(
+    row_store: ShardedRowStore,
+    *,
+    device: torch.device,
+    chunk_rows: int = DEFAULT_RECOVERY_CHUNK_ROWS,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], str]:
+    """Build contiguous FP32 activation matrices without changing fit inputs."""
+    num_rows = int(row_store.num_rows)
+    channels = int(row_store.channels)
+    required_bytes = num_rows * channels * 2 * torch.float32.itemsize
+    candidates: List[Tuple[torch.device, str]] = []
+    if device.type == "cuda":
+        indexed_device = torch.device(
+            "cuda",
+            device.index if device.index is not None else torch.cuda.current_device(),
+        )
+        free_bytes, total_bytes = torch.cuda.mem_get_info(indexed_device)
+        reserve_bytes = max(4 * 1024**3, int(total_bytes * 0.10))
+        if required_bytes + reserve_bytes <= free_bytes:
+            candidates.append((indexed_device, "contiguous_gpu_float32"))
+        else:
+            print(
+                "[recovery-warning] method=replaceme_cos "
+                "fallback=contiguous_cpu reason=insufficient_gpu_memory "
+                f"required={required_bytes} free={free_bytes} reserve={reserve_bytes}",
+                file=sys.stderr,
+                flush=True,
+            )
+    cpu_available = _available_cpu_memory_bytes()
+    if cpu_available <= 0 or required_bytes + 8 * 1024**3 <= cpu_available:
+        candidates.append((torch.device("cpu"), "contiguous_cpu_float32"))
+    elif device.type != "cuda" or not candidates:
+        print(
+            "[recovery-warning] method=replaceme_cos "
+            "fallback=scene_sharded reason=insufficient_cpu_memory "
+            f"required={required_bytes} available={cpu_available}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    for storage_device, storage_mode in candidates:
+        inputs: Optional[torch.Tensor] = None
+        desired: Optional[torch.Tensor] = None
+        try:
+            inputs = torch.empty(
+                (num_rows, channels), device=storage_device, dtype=torch.float32
+            )
+            desired = torch.empty_like(inputs)
+            cursor = 0
+            for _scene_id, scene_inputs, scene_desired in row_store.iter_scenes():
+                scene_rows = int(scene_inputs.shape[0])
+                if scene_desired.shape != scene_inputs.shape:
+                    raise RuntimeError(
+                        "ReplaceMe contiguous materialization received mismatched rows: "
+                        f"{tuple(scene_inputs.shape)} vs {tuple(scene_desired.shape)}"
+                    )
+                for start in range(0, scene_rows, int(chunk_rows)):
+                    end = min(start + int(chunk_rows), scene_rows)
+                    out_start = cursor + start
+                    out_end = cursor + end
+                    inputs[out_start:out_end].copy_(
+                        scene_inputs[start:end].to(
+                            device=storage_device, dtype=torch.float32
+                        )
+                    )
+                    desired[out_start:out_end].copy_(
+                        scene_desired[start:end].to(
+                            device=storage_device, dtype=torch.float32
+                        )
+                    )
+                cursor += scene_rows
+            if cursor != num_rows:
+                raise RuntimeError(
+                    f"ReplaceMe materialized {cursor} rows, expected {num_rows}"
+                )
+            row_store.close()
+            print(
+                "[recovery-fit] "
+                f"method=replaceme_cos storage={storage_mode} "
+                f"rows={num_rows} channels={channels} "
+                f"bytes={required_bytes}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return inputs, desired, storage_mode
+        except torch.OutOfMemoryError:
+            del inputs, desired
+            if storage_device.type == "cuda":
+                torch.cuda.empty_cache()
+            print(
+                "[recovery-warning] method=replaceme_cos "
+                f"storage={storage_mode} fallback=next_available reason=oom",
+                file=sys.stderr,
+                flush=True,
+            )
+    print(
+        "[recovery-warning] method=replaceme_cos "
+        "fallback=scene_sharded reason=no_contiguous_storage_available",
+        file=sys.stderr,
+        flush=True,
+    )
+    return None, None, "scene_sharded"
 
 
 def _optimize_cosine_transform(
@@ -464,7 +613,7 @@ def _optimize_cosine_transform(
     seed: int,
     method_name: str,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Fit the retained ReplaceMe cosine objective without global ``cat``."""
+    """Fit the ReplaceMe cosine objective from contiguous or sharded rows."""
     if epochs <= 0 or batch_size <= 0 or lr <= 0:
         raise ValueError(
             f"{method_name} epochs, batch size, and learning rate must be positive"
@@ -486,6 +635,9 @@ def _optimize_cosine_transform(
 
     channels = int(row_store.channels)
     num_rows = int(row_store.num_rows)
+    all_inputs, all_desired, row_storage = _materialize_cosine_rows(
+        row_store, device=device
+    )
     transform = torch.eye(
         channels, device=device, dtype=torch.float32, requires_grad=True
     )
@@ -499,39 +651,61 @@ def _optimize_cosine_transform(
 
     for epoch in range(1, int(epochs) + 1):
         order = torch.randperm(num_rows, generator=generator)
-        epoch_loss = 0.0
+        order_device = order.to(device=device) if all_inputs is not None and all_inputs.device.type == "cuda" else order
+        epoch_loss = torch.zeros((), device=device, dtype=torch.float32)
+        last_loss: Optional[torch.Tensor] = None
         epoch_steps = 0
         for start in range(0, num_rows, int(batch_size)):
             indices = order[start : start + int(batch_size)]
-            xb_cpu, yb_cpu = row_store.gather(
-                indices, pin_memory=device.type == "cuda"
-            )
-            xb = xb_cpu.to(
-                device=device, dtype=torch.float32, non_blocking=device.type == "cuda"
-            )
-            yb = yb_cpu.to(
-                device=device, dtype=torch.float32, non_blocking=device.type == "cuda"
-            )
-            row_store.record_transfer()
+            if all_inputs is not None and all_desired is not None:
+                storage_indices = (
+                    order_device[start : start + int(batch_size)]
+                    if all_inputs.device.type == "cuda"
+                    else indices
+                )
+                xb = all_inputs[storage_indices].to(device=device, dtype=torch.float32)
+                yb = all_desired[storage_indices].to(device=device, dtype=torch.float32)
+            else:
+                xb_cpu, yb_cpu = row_store.gather(
+                    indices, pin_memory=device.type == "cuda"
+                )
+                xb = xb_cpu.to(
+                    device=device, dtype=torch.float32, non_blocking=device.type == "cuda"
+                )
+                yb = yb_cpu.to(
+                    device=device, dtype=torch.float32, non_blocking=device.type == "cuda"
+                )
+                row_store.record_transfer()
             optimizer.zero_grad(set_to_none=True)
             prediction = xb @ transform
             prediction_norm = prediction / prediction.norm(dim=1, keepdim=True)
             desired_norm = yb / yb.norm(dim=1, keepdim=True)
             loss = 1.0 - (prediction_norm * desired_norm).sum(dim=1).mean()
-            if not bool(torch.isfinite(loss)):
-                raise FloatingPointError(f"{method_name} produced a non-finite loss")
             loss.backward()
             optimizer.step()
-            final_loss = float(loss.detach().item())
-            epoch_loss += final_loss
+            last_loss = loss.detach()
+            epoch_loss.add_(last_loss)
             epoch_steps += 1
             rows_seen += int(xb.shape[0])
             optimizer_steps += 1
+        mean_loss_tensor = epoch_loss / float(epoch_steps)
+        if not bool(torch.isfinite(mean_loss_tensor)):
+            raise FloatingPointError(f"{method_name} produced a non-finite loss")
+        mean_loss = float(mean_loss_tensor.item())
+        assert last_loss is not None
+        final_loss = float(last_loss.item())
         history.append(
             {
                 "epoch": epoch,
-                "mean_loss": epoch_loss / float(epoch_steps),
+                "mean_loss": mean_loss,
             }
+        )
+        print(
+            "[recovery-fit] "
+            f"method={method_name.lower().replace(' ', '_')} "
+            f"epochs={epoch}/{epochs} mean_loss={history[-1]['mean_loss']:.6g}",
+            file=sys.stderr,
+            flush=True,
         )
 
     result = transform.detach().cpu()
@@ -547,8 +721,9 @@ def _optimize_cosine_transform(
         "final_loss": final_loss,
         "optimizer_steps": optimizer_steps,
         "history": history,
-        "row_storage": "scene_sharded",
+        "row_storage": row_storage,
     }
+    del all_inputs, all_desired
     if owns_store:
         row_store.close()
     return result, diagnostics
@@ -565,10 +740,13 @@ def _fit_replaceme_cos(
     batch_size: int,
     lr: float,
     seed: int,
+    boundary_index: int = 0,
+    boundary_total: int = 1,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     auxiliary_id = f"replaceme_residual:{source_unit_id}"
     shards: List[RowShard] = []
-    for item in scenes:
+    total_scenes = len(scenes)
+    for scene_index, item in enumerate(scenes, start=1):
         cache_dir = Path(str(item["_cache_dir"]))
         h_raw = _load_unit_tensor(cache_dir, item, source_unit_id, num_layers=num_layers, map_location="cpu")
         y_raw = _load_unit_tensor(cache_dir, item, target_unit_id, num_layers=num_layers, map_location="cpu")
@@ -600,6 +778,15 @@ def _fit_replaceme_cos(
                 desired_builder=desired_builder,
             )
         )
+        if scene_index == total_scenes or scene_index % 10 == 0:
+            print(
+                "[recovery-fit]"
+                f"[boundary={boundary_index + 1}/{boundary_total}]"
+                f"[scenes={scene_index}/{total_scenes}] "
+                "method=replaceme_cos phase=collection",
+                file=sys.stderr,
+                flush=True,
+            )
     store = RecoveryActivationStore(shards)
     try:
         return _optimize_cosine_transform(
@@ -613,6 +800,8 @@ def _fit_replaceme_cos(
         )
     finally:
         store.close()
+        if _ACTIVE_RECOVERY_SESSION is not None:
+            _ACTIVE_RECOVERY_SESSION.clear_units()
 
 
 def _forward_current_ghost_boundary(
@@ -666,13 +855,16 @@ def _fit_current_ghost_boundary(
     device: torch.device,
     ridge: float,
     chunk_rows: int = DEFAULT_RECOVERY_CHUNK_ROWS,
+    boundary_index: int = 0,
+    boundary_total: int = 1,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """Fit one progressive Ghost boundary with O(C^2) persistent memory."""
     xtx: Optional[torch.Tensor] = None
     xtd: Optional[torch.Tensor] = None
     num_rows = 0
     num_scenes = 0
-    for item in scenes:
+    total_scenes = len(scenes)
+    for scene_index, item in enumerate(scenes, start=1):
         unit_map, images = _forward_current_ghost_boundary(
             model=model,
             adapter=adapter,
@@ -712,6 +904,16 @@ def _fit_current_ghost_boundary(
         num_rows += int(source_flat.shape[0])
         num_scenes += 1
         del unit_map, images, source, target, source_flat, target_flat
+        if scene_index == total_scenes or scene_index % 10 == 0:
+            print(
+                "[recovery-fit]"
+                f"[boundary={boundary_index + 1}/{boundary_total}]"
+                f"[scenes={scene_index}/{total_scenes}] "
+                "method=ghost_sequential "
+                f"source={source_unit_id} target={target_unit_id}",
+                file=sys.stderr,
+                flush=True,
+            )
     if xtx is None or xtd is None:
         raise RuntimeError("Ghost recovery requires at least one activation row")
     weight = _solve_ghost_from_statistics(xtx, xtd, ridge=float(ridge))
@@ -775,6 +977,77 @@ def _boundary_signature(raw: Dict[str, Any]) -> Tuple[Any, ...]:
         int(raw.get("drop_start_index", -1)),
         int(raw.get("drop_end_index", -1)),
     )
+
+
+def _has_single_drop_interval(prune_plan: UnitPrunePlan) -> bool:
+    dropped = sorted(set(int(index) for index in prune_plan.drop))
+    return bool(dropped) and dropped == list(range(dropped[0], dropped[-1] + 1))
+
+
+def _replace_with_relative_symlink(target: Path, source: Path) -> None:
+    target = Path(target)
+    source = Path(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
+    relative_source = os.path.relpath(source, start=target.parent)
+    target.symlink_to(relative_source, target_is_directory=source.is_dir())
+
+
+def _try_link_derived_ghost_recovery(
+    *,
+    method: str,
+    prune_plan: UnitPrunePlan,
+    recovery_plan_name: str,
+    out_dir: Path,
+    plan_root: Path,
+    backbone: str,
+    selector: str,
+) -> bool:
+    """Reuse ordinary Ghost artifacts when a derived method is identical."""
+    if method not in _DERIVED_GHOST_METHODS or not _has_single_drop_interval(prune_plan):
+        return False
+    source_dir = Path(out_dir).parent / "recovery_ghost"
+    if not recovery_result_complete(
+        source_dir,
+        plan_root=Path(plan_root),
+        backbone=backbone,
+        selector=selector,
+        recovery_plan_name="recovery_ghost",
+    ):
+        return False
+    _replace_with_relative_symlink(Path(out_dir), source_dir)
+    print(
+        "\n  recovery reuse\n"
+        f"    method: {recovery_plan_name.removeprefix('recovery_')}\n"
+        "    source: ghost\n"
+        "    reason: single contiguous drop interval\n"
+        f"    link: {out_dir} -> {source_dir}\n",
+        file=sys.stderr,
+        flush=True,
+    )
+    return True
+
+
+def _scenes_have_cached_units(
+    scenes: Sequence[Dict[str, Any]], unit_ids: Sequence[str]
+) -> bool:
+    """Return whether every calibration scene has all requested unit files."""
+    if not scenes:
+        return False
+    requested = [str(unit_id) for unit_id in unit_ids]
+    for item in scenes:
+        layer_files = item.get("layer_files")
+        if not isinstance(layer_files, dict):
+            return False
+        cache_dir = Path(str(item.get("_cache_dir", "")))
+        for unit_id in requested:
+            relative = str(layer_files.get(unit_id, "")).strip()
+            if not relative or not (cache_dir / relative).is_file():
+                return False
+    return True
 
 
 def _collect_current_replaceme_rows(
@@ -900,6 +1173,7 @@ def _fit_ghost_interval_sequential(
     ridge: float,
     chunk_rows: int = DEFAULT_RECOVERY_CHUNK_ROWS,
     method: str = "recovery_ghost_interval_sequential",
+    num_layers: int = 0,
 ) -> List[Tuple[torch.Tensor, Dict[str, Any]]]:
     """Fit Ghost operators front-to-back on the evolving model."""
     model = adapter.load_pretrained(
@@ -930,9 +1204,44 @@ def _fit_ghost_interval_sequential(
         record = dict(raw)
         source_unit_id = str(record["source_unit_id"])
         target_unit_id = str(record["target_unit_id"])
+        print(
+            "[recovery-fit]"
+            f"[boundary={boundary_index + 1}/{len(records)}] "
+            f"method={method.removeprefix('recovery_')} "
+            f"source={source_unit_id} target={target_unit_id} scenes={len(scenes)}",
+            file=sys.stderr,
+            flush=True,
+        )
         if boundary_index < len(reusable):
             weight = reusable[boundary_index][0].clone()
             diagnostics = dict(reusable[boundary_index][1])
+        elif boundary_index == 0 and _scenes_have_cached_units(
+            scenes, (source_unit_id, target_unit_id)
+        ):
+            print(
+                "[recovery-fit]"
+                f"[boundary=1/{len(records)}] source=disk_cache",
+                file=sys.stderr,
+                flush=True,
+            )
+            weight = _fit_boundary_weight(
+                method="recovery_ghost",
+                source_unit_id=source_unit_id,
+                target_unit_id=target_unit_id,
+                scenes=scenes,
+                num_layers=int(num_layers),
+                device=device,
+                ridge=ridge,
+                chunk_rows=chunk_rows,
+                boundary_index=boundary_index,
+                boundary_total=len(records),
+            )
+            diagnostics = {
+                "fit_mode": "disk_cache",
+                "num_scenes": len(scenes),
+                "ridge": float(ridge),
+                "chunk_rows": int(chunk_rows),
+            }
         else:
             weight, diagnostics = _fit_current_ghost_boundary(
                 model=model,
@@ -943,6 +1252,8 @@ def _fit_ghost_interval_sequential(
                 device=device,
                 ridge=ridge,
                 chunk_rows=chunk_rows,
+                boundary_index=boundary_index,
+                boundary_total=len(records),
             )
         diagnostics["boundary_index"] = boundary_index
         module_name = recovery_module_name(source_unit_id)
@@ -1005,6 +1316,8 @@ def _fit_replaceme_cos_sequential(
     seed: int,
 ) -> List[Tuple[torch.Tensor, Dict[str, Any]]]:
     """Fit Multi-LT cosine transforms front-to-back on the evolving model."""
+    if _ACTIVE_RECOVERY_SESSION is not None:
+        _ACTIVE_RECOVERY_SESSION.clear_units()
     model = adapter.load_pretrained(
         hf_model=str(hf_model or adapter.default_hf_model()),
         device=str(device),
@@ -1034,6 +1347,14 @@ def _fit_replaceme_cos_sequential(
         record = dict(raw)
         source_unit_id = str(record["source_unit_id"])
         target_unit_id = str(record["target_unit_id"])
+        print(
+            "[recovery-fit]"
+            f"[boundary={boundary_index + 1}/{len(records)}] "
+            "method=replaceme_cos_sequential "
+            f"source={source_unit_id} target={target_unit_id} scenes={len(scenes)}",
+            file=sys.stderr,
+            flush=True,
+        )
         if boundary_index < len(reusable):
             weight = reusable[boundary_index][0].clone()
             diagnostics = dict(reusable[boundary_index][1])
@@ -1126,6 +1447,7 @@ def _compact_resource_log(
         f"mapped={stats.get('mapped_bytes', 0)} anon={stats.get('anonymous_bytes', 0)} "
         f"cuda_alloc={stats.get('cuda_allocated_bytes', 0)} "
         f"cuda_reserved={stats.get('cuda_reserved_bytes', 0)}",
+        file=sys.stderr,
         flush=True,
     )
 
@@ -1149,6 +1471,25 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
     )
     bundle = load_recovery_plan_bundle(recovery_root, recovery_plan_name)
     method, pair_records = _pair_records(bundle, prune_plan, recovery_plan_name)
+    default_output_root = Path(os.environ.get("OUTPUT_ROOT", str(OUTPUT_ROOT_DEFAULT)))
+    out_dir = (
+        args.output_dir
+        or default_output_root
+        / adapter.name
+        / "recovery"
+        / prune_plan_name
+        / recovery_plan_name
+    )
+    if _try_link_derived_ghost_recovery(
+        method=method,
+        prune_plan=prune_plan,
+        recovery_plan_name=recovery_plan_name,
+        out_dir=out_dir,
+        plan_root=plan_root,
+        backbone=adapter.name,
+        selector=prune_plan_name,
+    ):
+        return
     dataset_names = _parse_name_list(args.datasets or args.dataset)
     cache_dirs = [stage_dir(args.experiment, name, "cache") for name in dataset_names]
     scenes = _load_training_scenes(cache_dirs, int(args.max_scenes))
@@ -1158,6 +1499,21 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
     num_layers = max((int(u.index) for u in first_manifest.layer_units if u.kind in ("frame", "global")), default=-1) + 1
     if int(prune_plan.num_units) != int(num_layers * 2):
         raise SystemExit(f"prune plan num_units={prune_plan.num_units} != cache num_units={num_layers * 2}")
+
+    job_index = int(getattr(args, "_job_index", 1))
+    job_total = int(getattr(args, "_job_total", 1))
+    print(
+        "\n  recovery fit\n"
+        f"    job: {job_index}/{job_total}\n"
+        f"    model: {adapter.name}\n"
+        f"    span: {prune_plan_name.removeprefix('prune_span')}\n"
+        f"    method: {method.removeprefix('recovery_')}\n"
+        f"    datasets: {','.join(dataset_names)}\n"
+        f"    scenes: {len(scenes)}\n"
+        f"    boundaries: {len(pair_records)}\n",
+        file=sys.stderr,
+        flush=True,
+    )
 
     weights: List[torch.Tensor] = []
     recovery_specs: List[Dict[str, Any]] = []
@@ -1177,6 +1533,7 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
             ridge=float(args.ridge),
             chunk_rows=chunk_rows,
             method=method,
+            num_layers=num_layers,
         )
     if method == "recovery_replaceme_cos" and len(pair_records) > 1:
         sequential_replaceme_results = _fit_replaceme_cos_sequential(
@@ -1200,6 +1557,15 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
         source_unit_id = str(record.get("source_unit_id", ""))
         target_unit_id = str(record.get("target_unit_id", ""))
         diagnostics: Dict[str, Any] = {}
+        if sequential_ghost_results is None and sequential_replaceme_results is None:
+            print(
+                "[recovery-fit]"
+                f"[boundary={record_index + 1}/{len(pair_records)}] "
+                f"method={method.removeprefix('recovery_')} "
+                f"source={source_unit_id} target={target_unit_id}",
+                file=sys.stderr,
+                flush=True,
+            )
         if sequential_ghost_results is not None:
             weight, diagnostics = sequential_ghost_results[record_index]
         elif sequential_replaceme_results is not None:
@@ -1224,6 +1590,8 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
                 device=device,
                 ridge=float(args.ridge),
                 chunk_rows=chunk_rows,
+                boundary_index=record_index,
+                boundary_total=len(pair_records),
             )
         elif method == "recovery_replaceme_ls":
             weight, diagnostics = _fit_replaceme_ls(
@@ -1234,6 +1602,8 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
                 device=device,
                 alpha=float(args.replaceme_ls_alpha),
                 chunk_rows=chunk_rows,
+                boundary_index=record_index,
+                boundary_total=len(pair_records),
             )
         elif method == "recovery_replaceme_cos":
             weight, diagnostics = _fit_replaceme_cos(
@@ -1246,6 +1616,8 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
                 batch_size=int(args.replaceme_cos_batch_size),
                 lr=float(args.replaceme_cos_lr),
                 seed=int(args.replaceme_seed),
+                boundary_index=record_index,
+                boundary_total=len(pair_records),
             )
         else:
             raise ValueError(f"Unsupported training-free recovery method {method!r}")
@@ -1276,8 +1648,6 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
     )
     weights = [entry["weight"] for entry in compact_entries]
 
-    default_output_root = Path(os.environ.get("OUTPUT_ROOT", str(OUTPUT_ROOT_DEFAULT)))
-    out_dir = args.output_dir or default_output_root / adapter.name / "recovery" / prune_plan_name / recovery_plan_name
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     summary = {
@@ -1350,6 +1720,7 @@ def main() -> None:
         raise ValueError("--jobs-manifest must contain a non-empty JSON list")
     _ACTIVE_RECOVERY_SESSION = RecoverySession(str(args.backbone))
     try:
+        job_total = len(payload)
         for index, raw in enumerate(payload):
             if not isinstance(raw, dict):
                 raise ValueError(f"Recovery job {index} is not an object")
@@ -1361,6 +1732,8 @@ def main() -> None:
                 if field == "output_dir":
                     value = Path(str(value))
                 setattr(job_args, field, value)
+            setattr(job_args, "_job_index", index + 1)
+            setattr(job_args, "_job_total", job_total)
             _run_recovery_request(job_args)
     finally:
         _ACTIVE_RECOVERY_SESSION.close()

@@ -1,8 +1,7 @@
-"""FastVGGT token merging applied to an already-restored LaRe VGGT model."""
+"""FastVGGT token merging applied to restored VGGT, Pi3, and VGGT-Omega models."""
 
 from __future__ import annotations
 
-import importlib.util
 import types
 from functools import lru_cache
 from pathlib import Path
@@ -30,26 +29,66 @@ def _token_merge_function() -> Callable[..., Tuple[Callable, Callable]]:
         raise FileNotFoundError(
             f"FastVGGT submodule is missing {source}. Run: git submodule update --init submodules/FastVGGT"
         )
-    spec = importlib.util.spec_from_file_location("lare_fastvggt_merge", source)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load FastVGGT token merge implementation from {source}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Upstream FastVGGT assumes exactly five special tokens per image. Pi3 also
+    # uses five, while VGGT-Omega uses camera + 16 register tokens. Load the
+    # vendored implementation with that constant promoted to an argument; this
+    # keeps the algorithm identical without modifying the git submodule.
+    code = source.read_text(encoding="utf-8")
+    replacements = {
+        "    enable_protection: bool = False,\n) -> Tuple[Callable, Callable]:":
+            "    enable_protection: bool = False,\n    num_special_tokens: int = 5,\n) -> Tuple[Callable, Callable]:",
+        "tokens_per_img = w * h + 5": "tokens_per_img = w * h + num_special_tokens",
+        '"Token count doesn\'t match (w*h+5)*num_imgs"':
+            '"Token count does not match the patch grid and special-token count"',
+        "torch.arange(5, device=metric.device)":
+            "torch.arange(num_special_tokens, device=metric.device)",
+        "* tokens_per_img + 5": "* tokens_per_img + num_special_tokens",
+    }
+    for old, new in replacements.items():
+        if old not in code:
+            raise RuntimeError(f"FastVGGT merge source changed; missing expected fragment: {old!r}")
+        code = code.replace(old, new)
+    module = types.ModuleType("lare_fastvggt_merge")
+    module.__file__ = str(source)
+    exec(compile(code, str(source), "exec"), module.__dict__)
     return module.token_merge_bipartite2d
 
 
-def _fast_attention_forward(attn: nn.Module, x: torch.Tensor, pos=None) -> torch.Tensor:
+def _fast_attention_forward(
+    attn: nn.Module,
+    x: torch.Tensor,
+    pos=None,
+    attn_bias=None,
+    xpos=None,
+    rope=None,
+    **_kwargs: Any,
+) -> torch.Tensor:
+    if attn_bias is not None:
+        raise ValueError("FastVGGT token merging does not support an attention bias")
     batch, num_tokens, channels = x.shape
+    head_dim = channels // int(attn.num_heads)
     qkv = (
         attn.qkv(x)
-        .reshape(batch, num_tokens, 3, attn.num_heads, attn.head_dim)
+        .reshape(batch, num_tokens, 3, attn.num_heads, head_dim)
         .permute(2, 0, 3, 1, 4)
     )
     q, k, v = qkv.unbind(0)
-    q, k = attn.q_norm(q), attn.k_norm(k)
-    if attn.rope is not None:
-        q = attn.rope(q, pos)
-        k = attn.rope(k, pos)
+    q_norm, k_norm = getattr(attn, "q_norm", None), getattr(attn, "k_norm", None)
+    if q_norm is not None:
+        q = q_norm(q).to(v.dtype)
+    if k_norm is not None:
+        k = k_norm(k).to(v.dtype)
+    # VGGT and Pi3 own their RoPE module and receive positions as pos/xpos.
+    # Omega instead receives a precomputed (sin, cos) tuple from its block.
+    external_rope = rope
+    if external_rope is not None and hasattr(attn, "apply_rope"):
+        q, k = attn.apply_rope(q, k, external_rope)
+    else:
+        internal_rope = getattr(attn, "rope", None)
+        position = pos if pos is not None else xpos
+        if internal_rope is not None:
+            q = internal_rope(q, position)
+            k = internal_rope(k, position)
 
     merge, unmerge = _token_merge_function()(
         x,
@@ -61,6 +100,7 @@ def _fast_attention_forward(attn: nn.Module, x: torch.Tensor, pos=None) -> torch
         False,
         torch.Generator(device=x.device).manual_seed(33),
         enable_protection=True,
+        num_special_tokens=int(attn._fastvggt_num_special_tokens),
     )
     q_shape = q.shape
     q_in = q.permute(0, 2, 1, 3).reshape(batch, num_tokens, channels)
@@ -91,7 +131,42 @@ def _fast_attention_forward(attn: nn.Module, x: torch.Tensor, pos=None) -> torch
 
 class FastVGGTInferenceAdapter(InferenceCompressionAdapter):
     name = "fastvggt"
-    supported_backbones = frozenset({"vggt"})
+    supported_backbones = frozenset({"vggt", "pi3", "vggt_omega"})
+
+    @staticmethod
+    def _global_blocks(
+        model: nn.Module, backbone_name: str
+    ) -> tuple[list[nn.Module], nn.Module, int, int]:
+        """Return global blocks, image-input owner, patch size, and special-token count."""
+        if backbone_name == "pi3":
+            decoder = getattr(model, "decoder", None)
+            if decoder is None:
+                raise TypeError("FastVGGT requires Pi3 model.decoder")
+            return (
+                list(decoder[1::2]), model, int(getattr(model, "patch_size", 14)),
+                int(getattr(model, "patch_start_idx", 5)),
+            )
+
+        aggregator = getattr(model, "aggregator", None)
+        if aggregator is None:
+            raise TypeError(f"FastVGGT requires {backbone_name}.aggregator")
+        if backbone_name == "vggt_omega":
+            all_blocks = getattr(aggregator, "inter_frame_blocks", None)
+            attention_types = getattr(aggregator, "inter_frame_attention_types", None)
+            if all_blocks is None or not isinstance(attention_types, (list, tuple)):
+                raise TypeError("FastVGGT requires Omega inter-frame blocks and attention types")
+            # Register-only Omega blocks never receive patch tokens and therefore
+            # must retain their ordinary attention implementation.
+            blocks = [
+                block for index, block in enumerate(all_blocks)
+                if index < len(attention_types) and str(attention_types[index]) == "global"
+            ]
+        else:
+            blocks = list(getattr(aggregator, "global_blocks", []))
+        special_tokens = int(
+            getattr(aggregator, "patch_token_start", getattr(aggregator, "patch_start_idx", 5))
+        )
+        return blocks, aggregator, int(getattr(aggregator, "patch_size", 14)), special_tokens
 
     def validate_config(self, config: InferenceCompressionConfig) -> None:
         start = int(config.fastvggt_merge_start)
@@ -113,10 +188,11 @@ class FastVGGTInferenceAdapter(InferenceCompressionAdapter):
         start = int(config.fastvggt_merge_start)
         ratio = float(config.fastvggt_merge_ratio)
 
-        aggregator = getattr(model, "aggregator", None)
-        global_blocks = getattr(aggregator, "global_blocks", None)
-        if aggregator is None or global_blocks is None:
-            raise TypeError("FastVGGT requires a VGGT model with aggregator.global_blocks")
+        global_blocks, image_input_owner, patch_size, num_special_tokens = self._global_blocks(
+            model, backbone_name
+        )
+        if not global_blocks:
+            raise TypeError(f"FastVGGT found no patch-aware global blocks for {backbone_name}")
         if start >= len(global_blocks):
             raise ValueError(
                 f"FASTVGGT_MERGE_START={start} is outside the {len(global_blocks)} global blocks"
@@ -129,15 +205,16 @@ class FastVGGTInferenceAdapter(InferenceCompressionAdapter):
             if index < start or not hasattr(block, "attn"):
                 continue
             attn = block.attn
-            required = ("qkv", "q_norm", "k_norm", "num_heads", "head_dim", "proj", "proj_drop")
+            required = ("qkv", "num_heads", "proj", "proj_drop")
             missing = [name for name in required if not hasattr(attn, name)]
             if missing:
-                raise TypeError(f"VGGT global block {index} attention is missing {missing}")
+                raise TypeError(
+                    f"{backbone_name} global block {index} attention is missing {missing}"
+                )
             attn._fastvggt_merge_ratio = ratio
+            attn._fastvggt_num_special_tokens = num_special_tokens
             attn.forward = types.MethodType(_fast_attention_forward, attn)
             patched.append(attn)
-
-        patch_size = int(getattr(aggregator, "patch_size", 14))
 
         def _sync_patch_grid(_module: nn.Module, args: tuple[Any, ...]) -> None:
             if not args or not torch.is_tensor(args[0]):
@@ -149,7 +226,7 @@ class FastVGGTInferenceAdapter(InferenceCompressionAdapter):
                 attn._fastvggt_patch_height = patch_height
                 attn._fastvggt_patch_width = patch_width
 
-        aggregator.register_forward_pre_hook(_sync_patch_grid)
+        image_input_owner.register_forward_pre_hook(_sync_patch_grid)
         record = config.as_record()
         record["merged_lora_linears"] = merged_count
         model._inference_compression = record

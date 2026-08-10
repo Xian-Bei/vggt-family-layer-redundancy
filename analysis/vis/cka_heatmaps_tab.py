@@ -171,7 +171,7 @@ def build_cka_heatmaps_tab(
     with gr.Tab(tab_title, id=tab_id) as tab_cka:
         gr.Markdown(f"## {heading}")
         with gr.Row():
-            with gr.Column(scale=1, min_width=220):
+            with gr.Column(scale=1, min_width=220, elem_classes=["control-column"]):
                 cka_token_region = gr.Radio(
                     label="Token",
                     choices=token_region_names or ["special"],

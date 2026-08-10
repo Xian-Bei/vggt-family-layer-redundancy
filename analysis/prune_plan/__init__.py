@@ -334,6 +334,7 @@ def expand_pruning_strategy_keys(
         "ours": ("ours_single", "ours_double"),
         "cosine": ("cosine_single", "cosine_double"),
         "inv_mse": ("inv_mse_single", "inv_mse_double"),
+        "cca": ("cca_single", "cca_double"),
         "replaceme": ("replaceme_single", "replaceme_double"),
     }
     out: List[str] = []

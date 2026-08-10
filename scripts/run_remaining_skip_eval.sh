@@ -53,18 +53,6 @@ if [[ "${DEVICE}" != cuda && "${DEVICE}" != cuda:* ]]; then
   exit 1
 fi
 
-truthy() {
-  [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
-}
-
-run_progress_command() {
-  if truthy "${COMPACT_LOG:-0}"; then
-    "$@" >/dev/null
-  else
-    "$@"
-  fi
-}
-
 run_one_dataset() {
   local dataset="$1"
   local data_root="$2"
@@ -114,7 +102,7 @@ run_one_dataset() {
     echo "== remaining_skip_eval dataset=${output_dataset:-${dataset}${split:+_${split}}} backbone=${backbone} prune_plan=${PRUNE_PLAN_NAME} max_span=${REMAINING_SKIP_EVAL_MAX_SPAN} resume=${REMAINING_SKIP_EVAL_RESUME} =="
   fi
 
-  run_progress_command python -m analysis.redundancy.remaining_skip_gt_eval_v3 "${extra[@]}"
+  run_command python -m analysis.redundancy.remaining_skip_gt_eval_v3 "${extra[@]}"
 }
 
 run_dataset_key() {

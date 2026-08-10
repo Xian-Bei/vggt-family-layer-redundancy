@@ -19,7 +19,7 @@ RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
 MAX_SCENES="${MAX_SCENES:-0}"
 DEVICE="${DEVICE:-cuda}"
 MAX_TOKENS="${MAX_TOKENS:-0}"
-METRICS="${METRICS:-cka,cosine,angular,inv_mse}"
+METRICS="${METRICS:-cka,cosine,angular,inv_mse,cca}"
 MAX_SPAN="${MAX_SPAN:-0}"
 SIM_TOKEN_REGIONS="${SIM_TOKEN_REGIONS:-special,patch,all}"
 REDUNDANCY_SEED="${REDUNDANCY_SEED:-0}"
@@ -27,18 +27,6 @@ REDUNDANCY_SEED="${REDUNDANCY_SEED:-0}"
 # shellcheck source=scripts/run_backbones_lib.sh
 source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 parse_backbones_list
-
-truthy() {
-  [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
-}
-
-run_progress_command() {
-  if truthy "${COMPACT_LOG:-0}"; then
-    "$@" >/dev/null
-  else
-    "$@"
-  fi
-}
 
 parse_dataset_list "${RUN}" "RUN" "${DATASET_KEYS[@]}"
 RUN_LIST=("${PARSED_DATASETS[@]}")
@@ -105,7 +93,7 @@ run_one_dataset() {
   else
     echo "== cache v3 dataset=${dataset}${split:+_${split}}${output_dataset:+ -> ${output_dataset}} backbone=${backbone} save_cache=${save_cache} skip_redundancy=${SKIP_REDUNDANCY} prune_plan_root=${PRUNE_PLAN_ROOT:-<off>} prune_plan_name=${PRUNE_PLAN_NAME:-<auto>} recovery_plan_name=${RECOVERY_PLAN_NAME:-<auto>} =="
   fi
-  run_progress_command python -m analysis.redundancy.cache_redundancy_v3 \
+  run_command python -m analysis.redundancy.cache_redundancy_v3 \
     --experiment "${backbone}" \
     --dataset "${dataset}" \
     "${output_dataset_args[@]}" \

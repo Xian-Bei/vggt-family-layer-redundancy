@@ -18,6 +18,28 @@
 : "${ROOT_NUSCENES:=data/nuscenes}"
 : "${ROOT_WAYMO:=data/waymo}"
 
+truthy() {
+  [[ "${1:-}" == "1" || "${1:-}" == "true" || "${1:-}" == "yes" ]]
+}
+
+compact_log() {
+  truthy "${COMPACT_LOG:-0}"
+}
+
+stage_log() {
+  if compact_log; then
+    printf '\n[%s] %s\n' "$1" "$2"
+  fi
+}
+
+run_command() {
+  if compact_log; then
+    "$@" >/dev/null
+  else
+    "$@"
+  fi
+}
+
 DATASET_KEYS=(
   SCANNET_DEV50
   SCANNET_TEST50

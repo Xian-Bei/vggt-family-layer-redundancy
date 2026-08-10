@@ -17,25 +17,13 @@ GT_METRIC_KEYS = (
     "comp",
     "chamfer_distance",
 )
-VALUE_MODES = frozenset({"absolute", "multiple"})
-
-
 def raw_metric_to_degradation(
     values: np.ndarray,
     *,
     metric: str,
     upper_baseline: Optional[float],
-    value_mode: str,
 ) -> np.ndarray:
-    """Convert raw metric values to a non-negative upper-relative degradation.
-
-    ``absolute`` is a direction-aware delta with upper at zero. ``multiple``
-    is a direction-aware ratio with upper at one. Values better than upper are
-    deliberately clamped to the neutral value in both modes.
-    """
-    mode = str(value_mode).strip().lower()
-    if mode not in VALUE_MODES:
-        raise ValueError(f"unsupported degradation value mode {value_mode!r}")
+    """Convert raw metric values to a non-negative upper-relative delta."""
     arr = np.asarray(values, dtype=np.float64)
     out = np.full(arr.shape, np.nan, dtype=np.float64)
     finite = np.isfinite(arr)
@@ -44,15 +32,8 @@ def raw_metric_to_degradation(
     upper = float(upper_baseline)
     if not math.isfinite(upper):
         return out
-    if mode == "absolute":
-        delta = arr[finite] - upper
-        out[finite] = np.maximum(delta, 0.0)
-        return out
-    if upper <= 0.0:
-        return out
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratio = arr[finite] / upper
-    out[finite] = np.maximum(ratio, 1.0)
+    delta = arr[finite] - upper
+    out[finite] = np.maximum(delta, 0.0)
     return out
 
 
@@ -85,66 +66,6 @@ def normalize_canonical_degradation(
     else:
         out[finite] = np.clip(out[finite] / upper, 0.0, 1.0)
     return out
-
-
-def degradation_pct_to_multiple(values: np.ndarray, *, metric: str) -> np.ndarray:
-    """Convert positive-when-worse percentages directly to degradation multiples."""
-    arr = np.asarray(values, dtype=np.float64)
-    out = np.full(arr.shape, np.nan, dtype=np.float64)
-    finite = np.isfinite(arr)
-    del metric
-    out[finite] = np.maximum(1.0, 1.0 + arr[finite] / 100.0)
-    return out
-
-
-def raw_metric_to_upper_multiple_score(
-    values: np.ndarray,
-    *,
-    metric: str,
-    upper_baseline: Optional[float],
-) -> tuple[np.ndarray, dict[str, Any]]:
-    arr = np.asarray(values, dtype=np.float64)
-    out = np.full(arr.shape, np.nan, dtype=np.float64)
-    finite = np.isfinite(arr)
-    meta: dict[str, Any] = {
-        "scale_mode": "raw_metric_upper_multiple",
-        "upper_baseline": upper_baseline,
-        "enabled": False,
-    }
-    if not np.any(finite) or upper_baseline is None:
-        meta["skip_reason"] = "no_finite_values_or_missing_upper_baseline"
-        return out, meta
-    upper = float(upper_baseline)
-    if not math.isfinite(upper) or upper <= 0.0:
-        meta["skip_reason"] = "invalid_upper_baseline"
-        return out, meta
-    converted = raw_metric_to_degradation(
-        arr,
-        metric=metric,
-        upper_baseline=upper,
-        value_mode="multiple",
-    )
-    out[finite] = converted[finite]
-    meta["enabled"] = True
-    return out, meta
-
-
-def degradation_pct_to_upper_multiple_score(
-    values: np.ndarray,
-    *,
-    metric: str,
-    upper_baseline: Optional[float],
-) -> tuple[np.ndarray, dict[str, Any]]:
-    arr = np.asarray(values, dtype=np.float64)
-    if upper_baseline is None:
-        return np.full(arr.shape, np.nan), {"enabled": False, "skip_reason": "missing_upper_baseline"}
-    upper = float(upper_baseline)
-    current = upper + arr * max(abs(upper), 1e-8) / 100.0
-    return raw_metric_to_upper_multiple_score(
-        current,
-        metric=metric,
-        upper_baseline=upper,
-    )
 
 
 def minmax_normalize_finite(values: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:

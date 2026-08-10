@@ -195,13 +195,16 @@ class IntervalPrunePlanTest(unittest.TestCase):
         ours, ours_drops = build("ours", "cka")
         cosine, cosine_drops = build("cosine", "cosine")
         inv_mse, inv_mse_drops = build("inv_mse", "inv_mse")
+        cca, cca_drops = build("cca", "cca")
         self.assertEqual(ours_drops, cosine_drops)
         self.assertEqual(ours_drops, inv_mse_drops)
+        self.assertEqual(ours_drops, cca_drops)
 
         for strategies, family, metric in (
             (ours, "ours", "cka"),
             (cosine, "cosine", "cosine"),
             (inv_mse, "inv_mse", "inv_mse"),
+            (cca, "cca", "cca"),
         ):
             self.assertEqual(
                 set(strategies),
@@ -261,10 +264,12 @@ class IntervalPrunePlanTest(unittest.TestCase):
             "cosine_double",
             "inv_mse_single",
             "inv_mse_double",
+            "cca_single",
+            "cca_double",
         }
         self.assertEqual(
             expand_pruning_strategy_keys(
-                ["gt", "ours_double", "ours", "cosine", "inv_mse"],
+                ["gt", "ours_double", "ours", "cosine", "inv_mse", "cca"],
                 available=available,
             ),
             [
@@ -276,6 +281,8 @@ class IntervalPrunePlanTest(unittest.TestCase):
                 "cosine_double",
                 "inv_mse_single",
                 "inv_mse_double",
+                "cca_single",
+                "cca_double",
             ],
         )
         self.assertEqual(
@@ -286,7 +293,7 @@ class IntervalPrunePlanTest(unittest.TestCase):
     def test_pruning_strategy_selector_preserves_requested_subset_order(self) -> None:
         self.assertEqual(
             _parse_pruning_strategies(
-                "gt,ours,cosine,inv_mse,replaceme,shortgpt,simpler,ours"
+                "gt,ours,cosine,inv_mse,cca,replaceme,shortgpt,simpler,ours"
             ),
             [
                 "gt_single",
@@ -297,6 +304,8 @@ class IntervalPrunePlanTest(unittest.TestCase):
                 "cosine_double",
                 "inv_mse_single",
                 "inv_mse_double",
+                "cca_single",
+                "cca_double",
                 "replaceme_single",
                 "replaceme_double",
                 "shortgpt",

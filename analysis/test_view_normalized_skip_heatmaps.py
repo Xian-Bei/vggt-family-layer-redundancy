@@ -24,19 +24,12 @@ class NormalizedSkipHeatmapTest(unittest.TestCase):
         )
         np.testing.assert_allclose(averaged, [2.0, 3.0])
 
-    def test_cross_dataset_normalized_mean_matches_absolute_and_multiple(self) -> None:
+    def test_cross_dataset_normalized_mean_matches_expected_retention(self) -> None:
         absolute_rows = []
-        multiple_rows = []
         for absolute_maximum in (10.0, 20.0):
             absolute = {
                 "mixed_units": {
                     metric: [0.0, absolute_maximum / 2.0, absolute_maximum]
-                    for metric in view.SKIP_GT_METRIC_KEYS
-                }
-            }
-            multiple = {
-                "mixed_units": {
-                    metric: [1.0, 1.5, 2.0]
                     for metric in view.SKIP_GT_METRIC_KEYS
                 }
             }
@@ -45,26 +38,62 @@ class NormalizedSkipHeatmapTest(unittest.TestCase):
                     absolute, value_mode="absolute", normalize_metrics=True
                 )["mixed_units"]
             )
-            multiple_rows.append(
-                view._prepare_skip_maps_for_dataset_aggregation(
-                    multiple, value_mode="multiple", normalize_metrics=True
-                )["mixed_units"]
-            )
         absolute_mean = {
             metric: view._packed_elementwise_mean([row[metric] for row in absolute_rows])
             for metric in view.SKIP_GT_METRIC_KEYS
         }
-        multiple_mean = {
-            metric: view._packed_elementwise_mean([row[metric] for row in multiple_rows])
+        absolute_display = view._skip_seven_metric_display_packed(
+            absolute_mean,
+            value_mode="absolute",
+            normalize_seven_metrics=True,
+            normalized_input=True,
+        )
+        np.testing.assert_allclose(absolute_display, [1.0, 0.5, 0.0])
+
+    def test_cross_dataset_normalized_mean_is_not_minmaxed_again(self) -> None:
+        metric_map = {
+            metric: [0.25, 0.5, 0.75]
             for metric in view.SKIP_GT_METRIC_KEYS
         }
-        absolute_display = view._skip_seven_metric_display_packed(
-            absolute_mean, value_mode="absolute", normalize_seven_metrics=True
+        display = view._skip_seven_metric_display_packed(
+            metric_map,
+            value_mode="absolute",
+            normalize_seven_metrics=True,
+            normalized_input=True,
         )
-        multiple_display = view._skip_seven_metric_display_packed(
-            multiple_mean, value_mode="multiple", normalize_seven_metrics=True
-        )
-        np.testing.assert_allclose(absolute_display, multiple_display)
+        np.testing.assert_allclose(display, [0.75, 0.5, 0.25])
+
+    def test_single_metric_heatmap_clamps_better_than_upper_before_display(self) -> None:
+        calls: list[list[float]] = []
+
+        def capture(
+            packed: list[float],
+            _num_layers: int,
+            _title: str,
+            **_kwargs: Any,
+        ) -> np.ndarray:
+            calls.append(packed)
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+        metric_map = {"ape": [-5.0, 0.0, 5.0]}
+        with patch.object(view, "_heatmap_rgb_from_packed", side_effect=capture):
+            view._render_skip_gallery(
+                metric_map,
+                2,
+                [("ape", "APE")],
+                value_mode="absolute",
+                normalize_seven_metrics=False,
+            )
+            view._render_skip_gallery(
+                metric_map,
+                2,
+                [("ape", "APE")],
+                value_mode="absolute",
+                normalize_seven_metrics=True,
+            )
+
+        np.testing.assert_allclose(calls[0], [0.0, 0.0, -5.0])
+        np.testing.assert_allclose(calls[1], [1.0, 1.0, 0.0])
 
     def test_all_renderers_use_zero_to_one_retention(self) -> None:
         calls: list[tuple[list[float], dict[str, Any]]] = []

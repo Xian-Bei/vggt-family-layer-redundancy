@@ -15,6 +15,8 @@ PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-}"
 PRUNE_PLAN_NAME="${PRUNE_PLAN_NAME:-}"
 RECOVERY_PLAN_ROOT="${RECOVERY_PLAN_ROOT:-}"
 RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
+RECOVERY_PRUNE_STRATEGY="${RECOVERY_PRUNE_STRATEGY:-}"
+RECOVERY_FORCE_RERUN="${RECOVERY_FORCE_RERUN:-0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-analysis_outputs_v3}"
 if [[ "${OUTPUT_ROOT}" = /* ]]; then
   OUTPUT_BASE="${OUTPUT_ROOT}"
@@ -41,18 +43,6 @@ source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 parse_backbones_list
 parse_dataset_list "${EVAL}" "EVAL" "${DATASET_KEYS[@]}"
 EVAL_LIST=("${PARSED_DATASETS[@]}")
-
-truthy() {
-  [[ "$1" == "1" || "$1" == "true" || "$1" == "yes" ]]
-}
-
-run_progress_command() {
-  if truthy "${COMPACT_LOG:-0}"; then
-    "$@" >/dev/null
-  else
-    "$@"
-  fi
-}
 
 PRUNE_PLAN_NAME_LIST=()
 read -r -a _PRUNE_PLAN_NAME_RAW <<< "${PRUNE_PLAN_NAME//,/ }"
@@ -96,6 +86,23 @@ supported = recovery_plan_supports_selector(
 )
 print(str(bundle.get('method', '')).strip() if supported else 'unsupported')
 "
+}
+
+recovery_output_complete() {
+  local backbone="$1"
+  local plan_root="$2"
+  local prune_plan_name="$3"
+  local recovery_plan_name="$4"
+  local out_dir="${OUTPUT_BASE}/${backbone}/recovery/${prune_plan_name}/${recovery_plan_name}"
+  if truthy "${RECOVERY_FORCE_RERUN}"; then
+    return 1
+  fi
+  python -m analysis.recovery.shared_results recovery-complete \
+    --output-dir "${out_dir}" \
+    --plan-root "${plan_root}" \
+    --backbone "${backbone}" \
+    --selector "${prune_plan_name}" \
+    --recovery-plan-name "${recovery_plan_name}"
 }
 
 run_trainable_recovery() {
@@ -159,7 +166,7 @@ p.write_text(json.dumps(jobs, indent=2))
   if [[ -n "${RECOVERY_JOBS_MANIFEST:-}" ]]; then
     session_args+=(--jobs-manifest "${RECOVERY_JOBS_MANIFEST}")
   fi
-  OUTPUT_ROOT="${OUTPUT_ROOT}" run_progress_command python -m analysis.recovery.recovery_prune_v3 \
+  OUTPUT_ROOT="${OUTPUT_ROOT}" run_command python -m analysis.recovery.recovery_prune_v3 \
     --experiment "${backbone}" \
     --dataset "${DATASETS}" \
     --backbone "${backbone}" \
@@ -193,12 +200,16 @@ eval_training_free_recovery() {
   local recovery_root="${RECOVERY_PLAN_ROOT:-${plan_root}}"
   local out_dir="${OUTPUT_BASE}/${backbone}/recovery/${prune_plan_name}/${recovery_plan_name}"
   if [[ "${#EVAL_LIST[@]}" -gt 0 ]]; then
+    printf '\n  recovery eval\n    model: %s\n    span: %s\n    recovery: %s\n    datasets: %s\n\n' \
+      "${backbone}" "${prune_plan_name#prune_span}" \
+      "${recovery_plan_name#recovery_}" "${EVAL}"
     BACKBONES="${backbone}" \
       PRUNE=1 \
       PRUNE_PLAN_ROOT="${plan_root}" \
       PRUNE_PLAN_NAME="${prune_plan_name}" \
       RECOVERY_PLAN_ROOT="${recovery_root}" \
       RECOVERY_PLAN_NAME="${recovery_plan_name}" \
+      RECOVERY_FORCE_RERUN="${RECOVERY_FORCE_RERUN}" \
       CHECKPOINT="${out_dir}/checkpoints/latest.pt" \
       MAX_SCENES="${EVAL_MAX_SCENES}" \
       DEVICE="${DEVICE}" \
@@ -220,10 +231,20 @@ for bb in "${BB_LIST[@]}"; do
   set_backend_pythonpath "${bb}"
   plan_root="${PRUNE_PLAN_ROOT:-${OUTPUT_BASE}/${bb}}"
   recovery_root="${RECOVERY_PLAN_ROOT:-${plan_root}}"
-  for prune_plan_name in "${PRUNE_PLAN_NAME_LIST[@]}"; do
+  canonical_prune_plan_names=()
+  for requested_prune_plan_name in "${PRUNE_PLAN_NAME_LIST[@]}"; do
+    prune_plan_name="$(
+      python -m analysis.recovery.shared_results canonical-selector \
+        --plan-root "${plan_root}" --selector "${requested_prune_plan_name}"
+    )"
+    if [[ " ${canonical_prune_plan_names[*]} " =~ " ${prune_plan_name} " ]]; then
+      continue
+    fi
+    canonical_prune_plan_names+=("${prune_plan_name}")
     recovery_jobs_manifest="$(mktemp "${TMPDIR:-/tmp}/lare_recovery_jobs.XXXXXX.json")"
     printf '[]\n' > "${recovery_jobs_manifest}"
     training_free_names=()
+    pending_training_free_names=()
     for recovery_plan_name in "${RECOVERY_PLAN_NAME_LIST[@]}"; do
       method="$(resolve_recovery_method "${plan_root}" "${recovery_root}" "${prune_plan_name}" "${recovery_plan_name}")"
       case "${method}" in
@@ -232,12 +253,22 @@ for bb in "${BB_LIST[@]}"; do
           continue
           ;;
         recovery_lora|recovery_train)
-          run_trainable_recovery "${bb}" "${prune_plan_name}" "${recovery_plan_name}"
+          if recovery_output_complete "${bb}" "${plan_root}" "${prune_plan_name}" "${recovery_plan_name}"; then
+            echo "   [reuse] ${bb}/${prune_plan_name}/${recovery_plan_name}"
+          else
+            run_trainable_recovery "${bb}" "${prune_plan_name}" "${recovery_plan_name}"
+          fi
+          eval_training_free_recovery "${bb}" "${prune_plan_name}" "${recovery_plan_name}"
           ;;
         recovery_linearpatch|recovery_ghost|recovery_ghost_sequential|recovery_ghost_interval|recovery_ghost_interval_sequential|recovery_replaceme_ls|recovery_replaceme_cos)
-          RECOVERY_JOBS_MANIFEST="${recovery_jobs_manifest}" \
-            run_training_free_recovery "${bb}" "${prune_plan_name}" "${recovery_plan_name}"
           training_free_names+=("${recovery_plan_name}")
+          if recovery_output_complete "${bb}" "${plan_root}" "${prune_plan_name}" "${recovery_plan_name}"; then
+            echo "   [reuse] ${bb}/${prune_plan_name}/${recovery_plan_name}"
+          else
+            RECOVERY_JOBS_MANIFEST="${recovery_jobs_manifest}" \
+              run_training_free_recovery "${bb}" "${prune_plan_name}" "${recovery_plan_name}"
+            pending_training_free_names+=("${recovery_plan_name}")
+          fi
           ;;
         *)
           echo "error: unsupported recovery method=${method} for ${recovery_plan_name}" >&2
@@ -245,21 +276,24 @@ for bb in "${BB_LIST[@]}"; do
           ;;
       esac
     done
-    if [[ "${#training_free_names[@]}" -gt 0 ]]; then
+    if [[ "${#pending_training_free_names[@]}" -gt 0 ]]; then
       RECOVERY_JOBS_MANIFEST="${recovery_jobs_manifest}" RECOVERY_SESSION_EXEC=1 \
-        run_training_free_recovery "${bb}" "${prune_plan_name}" "${training_free_names[0]}"
-      for recovery_plan_name in "${training_free_names[@]}"; do
-        eval_training_free_recovery "${bb}" "${prune_plan_name}" "${recovery_plan_name}"
-      done
+        run_training_free_recovery "${bb}" "${prune_plan_name}" "${pending_training_free_names[0]}"
     fi
+    for recovery_plan_name in "${training_free_names[@]}"; do
+      eval_training_free_recovery "${bb}" "${prune_plan_name}" "${recovery_plan_name}"
+    done
     rm -f "${recovery_jobs_manifest}"
   done
-  if ! truthy "${COMPACT_LOG:-0}"; then
-    echo "   [summary] ${OUTPUT_ROOT}/${bb}/summary_comparison.md"
-  fi
-  run_progress_command python -m analysis.eval.summary_v3 \
-    --experiment "${bb}" \
-    --prune-plan-root "${plan_root}"
+  for recovery_prune_strategy in ${RECOVERY_PRUNE_STRATEGY//,/ }; do
+    if ! truthy "${COMPACT_LOG:-0}"; then
+      echo "   [summary] ${OUTPUT_ROOT}/${bb}/summary_comparison_${recovery_prune_strategy}.md"
+    fi
+    run_command python -m analysis.eval.summary_v3 \
+      --experiment "${bb}" \
+      --prune-plan-root "${plan_root}" \
+      --recovery-prune-strategy "${recovery_prune_strategy}"
+  done
 done
 
 if ! truthy "${COMPACT_LOG:-0}"; then

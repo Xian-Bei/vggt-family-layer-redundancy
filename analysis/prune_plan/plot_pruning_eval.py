@@ -52,7 +52,7 @@ def main() -> None:
         default="all",
         help=(
             "Filter only the dataset-average plot. ours_single/ours_multi contain "
-            "GT plus the three Ours families at one structure; others contains "
+            "GT plus the four Ours families at one structure; others contains "
             "GT, Ours_CKA, and other baselines at all available structures."
         ),
     )

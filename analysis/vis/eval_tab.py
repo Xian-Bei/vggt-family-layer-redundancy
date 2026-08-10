@@ -195,7 +195,7 @@ def build_eval_tab(
             )
 
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=1, elem_classes=["control-column"]):
                 eval_scene_dd = gr.Dropdown(
                     label="Scene (or scene/seq path)",
                     choices=[],
