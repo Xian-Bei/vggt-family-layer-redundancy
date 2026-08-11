@@ -44,7 +44,7 @@ class CacheRequirements:
 
     def merge_plan(self, plan: Any, unit_ids_all: List[str], model: Any = None) -> None:
         method = str(getattr(plan, "extra", {}).get("recovery_method", ""))
-        if method in {"recovery_ghost_sequential", "recovery_ghost_interval_sequential"}:
+        if method == "recovery_ghost_interval_sequential":
             # Progressive Ghost recomputes activations from image paths.
             self.metadata_only = not self.unit_ids and not self.require_predictions
             return
@@ -473,9 +473,7 @@ def run_cache_redundancy(
                 plan_labels.append(str(plan_ref.resolve()))
                 explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
                 method = str(getattr(plan, "extra", {}).get("recovery_method", ""))
-                sequential_ghost = method in {
-                    "recovery_ghost_sequential", "recovery_ghost_interval_sequential"
-                }
+                sequential_ghost = method == "recovery_ghost_interval_sequential"
                 if explicit_ids is not None and not sequential_ghost:
                     unit_ids_filter.update(explicit_ids)
                     explicit_cache_units_used += 1
@@ -499,9 +497,7 @@ def run_cache_redundancy(
                     plan_labels.append(f"{plan_ref}+{recovery_name}")
                     explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
                     method = str(getattr(plan, "extra", {}).get("recovery_method", ""))
-                    sequential_ghost = method in {
-                        "recovery_ghost_sequential", "recovery_ghost_interval_sequential"
-                    }
+                    sequential_ghost = method == "recovery_ghost_interval_sequential"
                     if explicit_ids is not None and not sequential_ghost:
                         unit_ids_filter.update(explicit_ids)
                         explicit_cache_units_used += 1

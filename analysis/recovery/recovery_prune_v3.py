@@ -64,7 +64,6 @@ from analysis.prune_plan.recovery_plan import (
 
 DEFAULT_RECOVERY_CHUNK_ROWS = 16_384
 _DERIVED_GHOST_METHODS = {
-    "recovery_ghost_sequential",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
 }
@@ -909,7 +908,7 @@ def _fit_current_ghost_boundary(
                 "[recovery-fit]"
                 f"[boundary={boundary_index + 1}/{boundary_total}]"
                 f"[scenes={scene_index}/{total_scenes}] "
-                "method=ghost_sequential "
+                "method=ghost_interval_sequential "
                 f"source={source_unit_id} target={target_unit_id}",
                 file=sys.stderr,
                 flush=True,
@@ -1520,10 +1519,7 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
     fit_diagnostics: List[Dict[str, Any]] = []
     sequential_replaceme_results: Optional[List[Tuple[torch.Tensor, Dict[str, Any]]]] = None
     sequential_ghost_results: Optional[List[Tuple[torch.Tensor, Dict[str, Any]]]] = None
-    if method in (
-        "recovery_ghost_sequential",
-        "recovery_ghost_interval_sequential",
-    ) and len(pair_records) > 1:
+    if method == "recovery_ghost_interval_sequential" and len(pair_records) > 1:
         sequential_ghost_results = _fit_ghost_interval_sequential(
             adapter=adapter,
             hf_model=str(args.hf_model),
@@ -1572,7 +1568,6 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
             weight, diagnostics = sequential_replaceme_results[record_index]
         elif method in (
             "recovery_ghost",
-            "recovery_ghost_sequential",
             "recovery_ghost_interval",
             "recovery_ghost_interval_sequential",
             "recovery_linearpatch",

@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 RUN="${RUN:-}"
 
-EXPORT_VIS_2D="${EXPORT_VIS_2D:-1}"
+EXPORT_VIS_2D="${EXPORT_VIS_2D:-0}"
 EXPORT_VIS_3D="${EXPORT_VIS_3D:-0}"
 
 PRUNE="${PRUNE:-0,1}"
@@ -151,16 +151,6 @@ if [[ "${INFERENCE_COMPRESSION}" == "quantvggt" && -z "${QUANTVGGT_PARAMS_DIR}" 
   echo "error: QUANTVGGT_PARAMS_DIR is required for INFERENCE_COMPRESSION=quantvggt" >&2
   exit 1
 fi
-if [[ "${INFERENCE_COMPRESSION}" != "none" ]]; then
-  for bb in "${BB_LIST[@]}"; do
-    bb="${bb//[[:space:]]/}"
-    if [[ -n "${bb}" && "${bb}" != "vggt" ]]; then
-      echo "error: ${INFERENCE_COMPRESSION} inference compression only supports backbone vggt; got ${bb}" >&2
-      exit 1
-    fi
-  done
-fi
-
 compression_output_tag() {
   case "${INFERENCE_COMPRESSION}" in
     none) echo "" ;;
@@ -350,7 +340,6 @@ run_eval_dataset() {
   fi
   if (
     [[ "${mode}" == "model" ]] \
-      && [[ "${RECOVERY_RESULT_KIND}" == "recovery" ]] \
       && [[ -n "${RECOVERY_PLAN_NAME}" ]] \
       && ! truthy "${RECOVERY_FORCE_RERUN}" \
       && python -m analysis.recovery.shared_results eval-complete \
@@ -358,7 +347,7 @@ run_eval_dataset() {
         --selector "${output_plan_name}" \
         --recovery-plan-name "${RECOVERY_PLAN_NAME}"
   ); then
-    echo "   [reuse eval] ${backbone}/${output_dataset}/${output_plan_name}/${RECOVERY_PLAN_NAME}"
+    echo "   [reuse eval] kind=${RECOVERY_RESULT_KIND} ${backbone}/${output_dataset}/${output_plan_name}/${RECOVERY_PLAN_NAME} compression=${INFERENCE_COMPRESSION}"
     return 0
   fi
 

@@ -494,7 +494,7 @@ def test_ghost_interval_sequential_fits_on_progressively_modified_model() -> Non
             scenes=[{"scene_id": "dummy"}],
             device=torch.device("cuda"),
             ridge=1e-6,
-            method="recovery_ghost_sequential",
+            method="recovery_ghost_interval_sequential",
         )
 
     assert len(results) == 2
@@ -506,8 +506,8 @@ def test_ghost_interval_sequential_fits_on_progressively_modified_model() -> Non
     assert results[0][1]["boundary_index"] == 0
     assert results[1][1]["boundary_index"] == 1
     assert installed_types == [
-        "recovery_ghost_sequential",
-        "recovery_ghost_sequential",
+        "recovery_ghost_interval_sequential",
+        "recovery_ghost_interval_sequential",
     ]
 
 

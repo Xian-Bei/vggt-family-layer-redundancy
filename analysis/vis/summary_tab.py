@@ -44,7 +44,6 @@ _MODE_KIND_ORDER: Tuple[str, ...] = (
     "lower",
     "linearpatch",
     "ghost",
-    "ghost_sequential",
     "ghost_interval",
     "ghost_interval_sequential",
     "ghost_cos",

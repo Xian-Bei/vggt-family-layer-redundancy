@@ -37,7 +37,6 @@ _FUSED_TYPES = _REPLACEME_TYPES
 _COMPACTABLE_BOUNDARY_TYPES = {
     "recovery_linearpatch",
     "recovery_ghost",
-    "recovery_ghost_sequential",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
 }

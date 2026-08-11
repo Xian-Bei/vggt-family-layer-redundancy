@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -13,6 +15,7 @@ from analysis.prune_plan.eval_plots import (
     GT_MEAN_METRICS,
     METRIC_HEADERS,
     RECOVERY_METRIC_GRID,
+    STRATEGY_PLOT_COLORS,
     add_recovery_comparison_strategies,
     collect_pruning_eval_payload,
     collect_recovery_eval_payload,
@@ -20,6 +23,12 @@ from analysis.prune_plan.eval_plots import (
     strategy_plot_dashes,
     strategy_plot_linestyle,
     strategy_plot_marker,
+)
+from analysis.prune_plan import (
+    bundle_plan_records,
+    bundle_strategy_records,
+    load_prune_plan_bundle,
+    physical_pruning_selector_from_record,
 )
 from analysis.vis.recovery_overview_tab import (
     _BASELINE_STRATEGIES,
@@ -33,9 +42,23 @@ from analysis.vis.recovery_overview_tab import (
 from analysis.vis.dataset_average_warning import format_incomplete_average_warning
 
 
-_BACKBONE_COLORS = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b")
+_PRUNING_OVERVIEW_COLOR_KEYS = (
+    "ours",
+    "gt",
+    "replaceme",
+    "inv_mse",
+    "cosine",
+    "cca",
+    "shortgpt",
+    "simpler",
+)
+_BACKBONE_COLORS = tuple(
+    STRATEGY_PLOT_COLORS[key] for key in _PRUNING_OVERVIEW_COLOR_KEYS
+)
 _PRUNE_STRATEGY_FAMILIES = ("gt", "ours")
+_MIN_PRUNE_STRATEGY = "min"
 _PRUNE_STRUCTURES = ("single", "double")
+_TESTTIME_MARKERS = ("X", "D", "P", "*", "h", "v", "<", ">")
 
 
 def _is_no_recovery_strategy(strategy_key: str) -> bool:
@@ -76,6 +99,122 @@ def _selected_dataset(payload: Dict[str, Any], dataset: str) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _strategy_selectors_by_drop(root: Path, strategy: str) -> Dict[int, str]:
+    bundle = load_prune_plan_bundle(Path(root))
+    strategy_record = bundle_strategy_records(bundle).get(str(strategy), {})
+    points = strategy_record.get("points", {}) if isinstance(strategy_record, dict) else {}
+    plans = bundle_plan_records(bundle)
+    selected: Dict[int, str] = {}
+    for drop_key, plan_name in points.items() if isinstance(points, dict) else ():
+        if not str(drop_key).isdigit():
+            continue
+        record = plans.get(str(plan_name))
+        if not isinstance(record, dict):
+            continue
+        selected[int(drop_key)] = physical_pruning_selector_from_record(record)
+    return selected
+
+
+def _load_testtime_points(
+    root: Path,
+    *,
+    recovery_method: str,
+    prune_strategy: str,
+    dataset: str,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Load test-time summaries matching one recovery and pruning configuration."""
+    root = Path(root)
+    method_roots = {
+        path.parent.parent.parent.name: path
+        for path in root.glob(f"*/eval/testtime/{recovery_method}")
+        if path.is_dir()
+    }
+    if not method_roots:
+        return [], []
+    selectors_by_drop = _strategy_selectors_by_drop(root, prune_strategy)
+    if not selectors_by_drop:
+        return [], []
+    if dataset == "mean":
+        expected_datasets = tuple(sorted(method_roots))
+    elif dataset in _DATASET_AVERAGE_GROUPS:
+        expected_datasets = tuple(_DATASET_AVERAGE_GROUPS[dataset])
+    else:
+        expected_datasets = (dataset,)
+
+    aggregated: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+    for dataset_name in expected_datasets:
+        method_root = method_roots.get(dataset_name)
+        if method_root is None:
+            continue
+        for compression_root in sorted(path for path in method_root.iterdir() if path.is_dir()):
+            compression = compression_root.name
+            for drop_count, selector in selectors_by_drop.items():
+                summary_path = compression_root / selector / "summary.json"
+                try:
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(summary, dict):
+                    continue
+                if str(summary.get("selector", "")) != selector:
+                    continue
+                if str(summary.get("recovery_plan_name", "")) != recovery_method:
+                    continue
+                try:
+                    recorded_drop = int(summary.get("drop_count"))
+                except (TypeError, ValueError):
+                    continue
+                if recorded_drop != drop_count:
+                    continue
+                metrics = summary.get("metrics_mean", {})
+                if not isinstance(metrics, dict):
+                    continue
+                key = (compression, drop_count, selector)
+                item = aggregated.setdefault(
+                    key,
+                    {
+                        "compression": compression,
+                        "display_name": compression,
+                        "drop_count": drop_count,
+                        "selector": selector,
+                        "metric_values": {},
+                        "datasets": [],
+                    },
+                )
+                item["datasets"].append(dataset_name)
+                for metric_key, value in metrics.items():
+                    if isinstance(value, (int, float)) and np.isfinite(float(value)):
+                        item["metric_values"].setdefault(str(metric_key), []).append(float(value))
+
+    points: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    for item in sorted(
+        aggregated.values(),
+        key=lambda value: (str(value["compression"]), int(value["drop_count"])),
+    ):
+        raw_metric = {
+            key: float(np.mean(values))
+            for key, values in item.pop("metric_values").items()
+            if values
+        }
+        if not raw_metric:
+            continue
+        points.append({**item, "raw_metric": raw_metric})
+        if dataset in _DATASET_AVERAGE_GROUPS:
+            warning = format_incomplete_average_warning(
+                owner=(
+                    f"testtime / {item['compression']} / {recovery_method} / "
+                    f"{prune_strategy} / drop {item['drop_count']}"
+                ),
+                scope=dataset,
+                expected=expected_datasets,
+                available=item["datasets"],
+            )
+            if warning:
+                warnings.append(warning)
+    return points, warnings
+
+
 def _global_metric_ranges(
     payloads: Sequence[Dict[str, Any]], strategy_keys: Sequence[str]
 ) -> Dict[str, Tuple[float, float]]:
@@ -104,6 +243,15 @@ def _global_metric_ranges(
                     value = metric_value(raw, metric)
                     if value is not None and np.isfinite(value):
                         values[metric].append(float(value))
+        testtime_points = payload.get("testtime_points", ())
+        for point in testtime_points if isinstance(testtime_points, list) else ():
+            raw = point.get("raw_metric", {}) if isinstance(point, dict) else {}
+            if not isinstance(raw, dict):
+                continue
+            for metric in GT_MEAN_METRICS:
+                value = metric_value(raw, metric)
+                if value is not None and np.isfinite(value):
+                    values[metric].append(float(value))
     return {
         metric: (min(items), max(items))
         for metric, items in values.items()
@@ -123,12 +271,112 @@ def _normalized_mean(raw: Dict[str, Any], ranges: Dict[str, Tuple[float, float]]
     return float(np.mean(normalized)) if normalized else None
 
 
+def _strict_normalized_mean(
+    raw: Dict[str, Any], ranges: Dict[str, Tuple[float, float]]
+) -> float | None:
+    """Score a candidate only when all seven metrics are present."""
+    if any(metric_value(raw, metric) is None or metric not in ranges for metric in GT_MEAN_METRICS):
+        return None
+    return _normalized_mean(raw, ranges)
+
+
+def _collapse_min_prune_strategies(
+    payload: Dict[str, Any], *, method: str, structures: Sequence[str],
+    ranges: Dict[str, Tuple[float, float]] | None = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Pairwise-select GT/Ours points without mixing metrics across candidates."""
+    strategies = payload.get("strategies", {})
+    if not isinstance(strategies, dict):
+        return payload, []
+    ranges = ranges or _global_metric_ranges([payload], list(strategies))
+    selected: Dict[str, Any] = {}
+    method_keys: List[str] = []
+    for structure in structures:
+        target_method = f"{method}_min_{structure}"
+        method_keys.append(target_method)
+        winners: Dict[str, Any] = {}
+        winner_variants: Dict[str, str] = {}
+        drop_keys = {
+            str(drop_key)
+            for family in _PRUNE_STRATEGY_FAMILIES
+            for drop_key in strategies.get(
+                f"{method}_{family}_{structure}", {}
+            ).get("points", {})
+            if isinstance(strategies.get(f"{method}_{family}_{structure}"), dict)
+        }
+        for drop_key in drop_keys:
+            choices: List[Tuple[float, str, Dict[str, Any]]] = []
+            for family in _PRUNE_STRATEGY_FAMILIES:
+                variant = f"{family}_{structure}"
+                source = strategies.get(f"{method}_{variant}", {})
+                point = source.get("points", {}).get(drop_key) if isinstance(source, dict) else None
+                if not isinstance(point, dict) or not point.get("available", False):
+                    continue
+                raw = point.get("raw_metric", point.get("metrics_mean", {}))
+                score = _strict_normalized_mean(raw, ranges) if isinstance(raw, dict) else None
+                if score is not None:
+                    choices.append((score, variant, point))
+            if choices:
+                _, variant, point = min(choices, key=lambda item: (item[0], item[1]))
+                winners[drop_key] = {**deepcopy(point), "min_prune_strategy": variant}
+                winner_variants[drop_key] = variant
+        if winners:
+            selected[target_method] = {
+                "display_name": f"{method.removeprefix('recovery_')} · min_{structure}",
+                "points": winners,
+            }
+
+        baseline_points: Dict[str, Any] = {}
+        for drop_key, variant in winner_variants.items():
+            baseline = strategies.get(f"no_recovery_{variant}", {})
+            point = baseline.get("points", {}).get(drop_key) if isinstance(baseline, dict) else None
+            if isinstance(point, dict) and point.get("available", False):
+                baseline_points[drop_key] = {
+                    **deepcopy(point), "min_prune_strategy": variant,
+                }
+        if baseline_points:
+            selected[f"no_recovery_{structure}"] = {
+                "display_name": f"No recovery · {method.removeprefix('recovery_')} winner",
+                "points": baseline_points,
+            }
+
+    testtime_winners: List[Dict[str, Any]] = []
+    grouped: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = {}
+    for point in payload.get("testtime_points", ()):
+        if not isinstance(point, dict):
+            continue
+        variant = str(point.get("prune_strategy", ""))
+        structure = variant.rsplit("_", 1)[-1]
+        compression = str(point.get("compression", ""))
+        drop_count = point.get("drop_count")
+        if structure in structures and compression and isinstance(drop_count, int):
+            grouped.setdefault((structure, compression, drop_count), []).append(point)
+    for candidates in grouped.values():
+        choices = []
+        for point in candidates:
+            raw = point.get("raw_metric", {})
+            score = _strict_normalized_mean(raw, ranges) if isinstance(raw, dict) else None
+            if score is not None:
+                choices.append((score, str(point.get("prune_strategy", "")), point))
+        if choices:
+            _, _, winner = min(choices, key=lambda item: (item[0], item[1]))
+            testtime_winners.append(deepcopy(winner))
+    return {
+        **payload,
+        "strategies": selected,
+        "testtime_points": testtime_winners,
+    }, method_keys
+
+
 def _render_combined_figure(
     payloads: Sequence[Tuple[str, Dict[str, Any]]],
     *,
     method_keys: Sequence[str],
     title: str,
     show_no_recovery: bool = True,
+    total_units_by_backbone: Dict[str, int] | None = None,
+    halve_x_axis: bool = False,
+    metric_ranges: Dict[str, Tuple[float, float]] | None = None,
 ) -> Any | None:
     strategy_keys = tuple(
         dict.fromkeys(
@@ -137,11 +385,26 @@ def _render_combined_figure(
             else method_keys
         )
     )
-    ranges = _global_metric_ranges([payload for _, payload in payloads], strategy_keys)
+    ranges = metric_ranges or _global_metric_ranges(
+        [payload for _, payload in payloads], strategy_keys
+    )
     fig, axes = plt.subplots(2, 4, figsize=(29.6, 11.6), squeeze=False)
     any_data = False
     backbone_handles: List[Line2D] = []
     present_styles: Dict[str, str] = {}
+    compression_names = sorted(
+        {
+            str(point.get("compression"))
+            for _, payload in payloads
+            for point in payload.get("testtime_points", ())
+            if isinstance(point, dict) and point.get("compression")
+        }
+    )
+    compression_markers = {
+        name: _TESTTIME_MARKERS[index % len(_TESTTIME_MARKERS)]
+        for index, name in enumerate(compression_names)
+    }
+    present_compressions: Dict[str, str] = {}
 
     for backbone_idx, (backbone, payload) in enumerate(payloads):
         color = _BACKBONE_COLORS[backbone_idx % len(_BACKBONE_COLORS)]
@@ -162,7 +425,7 @@ def _render_combined_figure(
                 if not isinstance(strategy, dict):
                     continue
                 points = strategy.get("points", {})
-                xs: List[int] = []
+                xs: List[float] = []
                 ys: List[float] = []
                 for drop_key, point in sorted(
                     points.items() if isinstance(points, dict) else (),
@@ -175,10 +438,16 @@ def _render_combined_figure(
                         continue
                     value = _normalized_mean(raw, ranges) if metric == "gt_mean" else metric_value(raw, metric)
                     if value is not None:
-                        xs.append(int(drop_key))
+                        drop_count = int(drop_key)
+                        total_units = (total_units_by_backbone or {}).get(backbone)
+                        x_value = total_units - drop_count if total_units is not None else drop_count
+                        xs.append(float(x_value) / 2.0 if halve_x_axis else float(x_value))
                         ys.append(float(value))
                 if not xs:
                     continue
+                if total_units_by_backbone is not None:
+                    ordered = sorted(zip(xs, ys))
+                    xs, ys = [item[0] for item in ordered], [item[1] for item in ordered]
                 any_data = True
                 display = str(strategy.get("display_name", strategy_key))
                 present_styles.setdefault(strategy_key, display)
@@ -205,6 +474,35 @@ def _render_combined_figure(
                     alpha=state_style["alpha"],
                     zorder=state_style["zorder"] + 0.2,
                 )
+            testtime_points = payload.get("testtime_points", ())
+            for point in testtime_points if isinstance(testtime_points, list) else ():
+                if not isinstance(point, dict):
+                    continue
+                raw = point.get("raw_metric", {})
+                compression = str(point.get("compression", ""))
+                drop_count = point.get("drop_count")
+                if not isinstance(raw, dict) or not compression or not isinstance(drop_count, int):
+                    continue
+                value = _normalized_mean(raw, ranges) if metric == "gt_mean" else metric_value(raw, metric)
+                if value is None:
+                    continue
+                total_units = (total_units_by_backbone or {}).get(backbone)
+                x_value = total_units - drop_count if total_units is not None else drop_count
+                x_value = float(x_value) / 2.0 if halve_x_axis else float(x_value)
+                any_data = True
+                present_compressions.setdefault(
+                    compression, str(point.get("display_name", compression))
+                )
+                ax.scatter(
+                    [x_value], [float(value)],
+                    facecolors=color,
+                    edgecolors="black",
+                    linewidths=1.1,
+                    marker=compression_markers[compression],
+                    s=112,
+                    alpha=.98,
+                    zorder=7.0,
+                )
             if upper_value is not None:
                 ax.axhline(
                     float(upper_value),
@@ -223,7 +521,8 @@ def _render_combined_figure(
             fontsize=15,
             fontweight="bold",
         )
-        ax.set_xlabel("Dropped units", fontsize=13)
+        x_label = "Remaining layers" if total_units_by_backbone is not None else "Dropped units"
+        ax.set_xlabel(f"{x_label} ÷ 2" if halve_x_axis else x_label, fontsize=13)
         ax.tick_params(axis="both", labelsize=12)
         ax.set_xlim(left=0)
         ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=8))
@@ -252,11 +551,27 @@ def _render_combined_figure(
     upper_handle = Line2D(
         [], [], color="#333333", linestyle=":", linewidth=2.2, label="Upper"
     )
+    compression_handles = [
+        Line2D(
+            [], [], color="#333333", linestyle="None",
+            marker=compression_markers[key], markersize=9,
+            markerfacecolor="#999999", markeredgecolor="black",
+            label=f"Test-time · {label}",
+        )
+        for key, label in present_compressions.items()
+    ]
     fig.legend(
-        handles=[*backbone_handles, *style_handles, upper_handle],
+        handles=[*backbone_handles, *style_handles, *compression_handles, upper_handle],
         loc="upper center",
         bbox_to_anchor=(.5, .958),
-        ncol=max(1, min(6, len(backbone_handles) + 2)),
+        ncol=max(
+            1,
+            min(
+                6,
+                len(backbone_handles) + len(style_handles)
+                + len(compression_handles) + 1,
+            ),
+        ),
         fontsize=13,
         frameon=True,
     )
@@ -273,6 +588,9 @@ def render_recovery_backbone_comparison(
     prune_strategy: str = "ours",
     show_no_recovery: bool = True,
     prune_structures: Sequence[str] | None = None,
+    *,
+    remaining_units: bool = False,
+    halve_x_axis: bool = False,
 ) -> Tuple[List[Tuple[np.ndarray, str]], str]:
     backbones = list(dict.fromkeys(str(item) for item in (selected_backbones or ())))
     method = str(selected_method or "").strip()
@@ -281,8 +599,8 @@ def render_recovery_backbone_comparison(
     if not method:
         return [], "Select one recovery method."
     strategy_family = str(prune_strategy or "").strip().lower()
-    if strategy_family not in _PRUNE_STRATEGY_FAMILIES:
-        return [], "Prune strategy must be gt or ours."
+    if strategy_family not in (*_PRUNE_STRATEGY_FAMILIES, _MIN_PRUNE_STRATEGY):
+        return [], "Prune strategy must be gt, ours, or min."
     structures = list(
         dict.fromkeys(
             str(item).strip().lower()
@@ -292,18 +610,37 @@ def render_recovery_backbone_comparison(
     )
     if not structures:
         return [], "Select at least one pruning structure (single or double)."
-    variants = [f"{strategy_family}_{structure}" for structure in structures]
+    variants = (
+        [
+            f"{family}_{structure}"
+            for structure in structures
+            for family in _PRUNE_STRATEGY_FAMILIES
+        ]
+        if strategy_family == _MIN_PRUNE_STRATEGY
+        else [f"{strategy_family}_{structure}" for structure in structures]
+    )
     method_keys = [f"{method}_{variant}" for variant in variants]
     loaded: List[Tuple[str, Dict[str, Any]]] = []
+    total_units_by_backbone: Dict[str, int] = {}
     warnings: List[str] = []
     messages: List[str] = []
+    min_metric_ranges: Dict[str, Tuple[float, float]] | None = None
     for backbone in backbones:
         root = Path(output_root) / backbone
         try:
+            if remaining_units:
+                total_units = int(load_prune_plan_bundle(root).get("num_units", 0))
+                if total_units <= 0:
+                    raise ValueError("prune plan bundle has no positive num_units")
+                total_units_by_backbone[backbone] = total_units
             pruning = collect_pruning_eval_payload(experiment_root=root, prune_plan_root=root)
-            merged: Dict[str, Any] = {"upper_average": {}, "strategies": {}}
+            merged: Dict[str, Any] = {
+                "upper_average": {}, "strategies": {}, "testtime_points": []
+            }
+            seen_testtime: set[Tuple[str, int, str]] = set()
             missing_variants: List[str] = []
-            for variant, structure in zip(variants, structures):
+            for variant in variants:
+                structure = variant.rsplit("_", 1)[-1]
                 recovery = collect_recovery_eval_payload(
                     experiment_root=root,
                     prune_strategy=variant,
@@ -352,7 +689,11 @@ def render_recovery_backbone_comparison(
                         target_key = f"{method}_{variant}"
                         display_name = f"{method.removeprefix('recovery_')} · {variant}"
                     elif str(source_key).startswith("no_recovery"):
-                        target_key = f"no_recovery_{structure}"
+                        target_key = (
+                            f"no_recovery_{variant}"
+                            if strategy_family == _MIN_PRUNE_STRATEGY
+                            else f"no_recovery_{structure}"
+                        )
                         display_name = f"No recovery · {variant}"
                     else:
                         continue
@@ -360,6 +701,24 @@ def render_recovery_backbone_comparison(
                         **strategy_payload,
                         "display_name": display_name,
                     }
+                testtime_points, testtime_warnings = _load_testtime_points(
+                    root,
+                    recovery_method=method,
+                    prune_strategy=variant,
+                    dataset=dataset,
+                )
+                warnings.extend(f"{backbone}: {warning}" for warning in testtime_warnings)
+                for point in testtime_points:
+                    point = {**point, "prune_strategy": variant}
+                    identity = (
+                        str(point.get("compression", "")),
+                        int(point.get("drop_count", -1)),
+                        str(point.get("selector", "")),
+                    )
+                    if identity in seen_testtime:
+                        continue
+                    seen_testtime.add(identity)
+                    merged["testtime_points"].append(point)
             if missing_variants:
                 messages.append(
                     f"{backbone}: recovery method missing for {', '.join(missing_variants)}; "
@@ -368,6 +727,24 @@ def render_recovery_backbone_comparison(
             loaded.append((backbone, merged))
         except Exception as exc:
             messages.append(f"{backbone}: {type(exc).__name__}: {exc}")
+    if strategy_family == _MIN_PRUNE_STRATEGY:
+        candidate_keys = [
+            str(key)
+            for _, payload in loaded
+            for key in payload.get("strategies", {})
+            if isinstance(payload.get("strategies", {}), dict)
+        ]
+        shared_ranges = _global_metric_ranges(
+            [payload for _, payload in loaded], candidate_keys,
+        )
+        min_metric_ranges = shared_ranges
+        collapsed: List[Tuple[str, Dict[str, Any]]] = []
+        for backbone, payload in loaded:
+            selected_payload, method_keys = _collapse_min_prune_strategies(
+                payload, method=method, structures=structures, ranges=shared_ranges,
+            )
+            collapsed.append((backbone, selected_payload))
+        loaded = collapsed
     fig = _render_combined_figure(
         loaded, method_keys=method_keys,
         title=(
@@ -375,6 +752,9 @@ def render_recovery_backbone_comparison(
             f"{strategy_family} ({', '.join(structures)}) · {dataset}"
         ),
         show_no_recovery=bool(show_no_recovery),
+        total_units_by_backbone=total_units_by_backbone if remaining_units else None,
+        halve_x_axis=bool(halve_x_axis),
+        metric_ranges=min_metric_ranges,
     )
     if fig is None:
         return [], "\n".join([*warnings, *messages, "No matching data to plot."])
@@ -383,42 +763,98 @@ def render_recovery_backbone_comparison(
     finally:
         plt.close(fig)
     messages.append(
-        f"Rendered {len(loaded)} backbone(s) in one 2×4 figure; first 7 metrics are raw and the mean uses shared global ranges."
+        f"Rendered {len(loaded)} backbone(s) in one 2×4 figure with "
+        f"{sum(len(payload.get('testtime_points', ())) for _, payload in loaded)} matching "
+        "test-time point(s); first 7 metrics are raw and the mean uses shared global ranges."
     )
-    return [(image, "Backbone comparison")], "\n".join([*warnings, *messages])
+    caption = "Backbone comparison by remaining units" if remaining_units else "Backbone comparison"
+    return [(image, caption)], "\n".join([*warnings, *messages])
 
 
-def build_recovery_backbone_comparison_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict[str, Any]:
+def render_recovery_backbone_remaining_comparison(
+    output_root: Path,
+    selected_backbones: Sequence[str] | None,
+    selected_method: str | None,
+    dataset: str = "training average",
+    prune_strategy: str = "ours",
+    show_no_recovery: bool = True,
+    prune_structures: Sequence[str] | None = None,
+    *,
+    halve_x_axis: bool = False,
+) -> Tuple[List[Tuple[np.ndarray, str]], str]:
+    """Render the backbone comparison against units left after pruning."""
+    return render_recovery_backbone_comparison(
+        output_root,
+        selected_backbones,
+        selected_method,
+        dataset,
+        prune_strategy,
+        show_no_recovery,
+        prune_structures,
+        remaining_units=True,
+        halve_x_axis=halve_x_axis,
+    )
+
+
+def _build_recovery_backbone_comparison_tab(
+    *, blocks: gr.Blocks, output_root: Path, remaining_units: bool
+) -> Dict[str, Any]:
     backbones, methods = discover_recovery_overview_options(Path(output_root))
     datasets = discover_recovery_overview_datasets(Path(output_root))
     default_method = (
-        "recovery_ghost"
-        if "recovery_ghost" in methods
+        "recovery_ghost_interval_sequential"
+        if "recovery_ghost_interval_sequential" in methods
         else methods[0] if methods else None
     )
 
     def redraw(
         selected_backbones, selected_method, dataset, prune_strategy,
-        prune_structures, show_no_recovery,
+        prune_structures, show_no_recovery, halve_x_axis,
     ):
-        images, status_value = render_recovery_backbone_comparison(
+        renderer = (
+            render_recovery_backbone_remaining_comparison
+            if remaining_units
+            else render_recovery_backbone_comparison
+        )
+        images, status_value = renderer(
             Path(output_root), selected_backbones, selected_method, dataset,
             prune_strategy, show_no_recovery, prune_structures,
+            halve_x_axis=halve_x_axis,
         )
         return (images[0][0] if images else None), status_value
 
-    with gr.Tab("Recovery Backbone Comparison", id="recovery_backbone_comparison") as tab:
-        gr.Markdown("## Recovery Backbone Comparison")
+    tab_label = (
+        "Recovery Remaining"
+        if remaining_units
+        else "Recovery Backbone"
+    )
+    tab_id = (
+        "recovery_backbone_remaining_comparison"
+        if remaining_units
+        else "recovery_backbone_comparison"
+    )
+    with gr.Tab(tab_label, id=tab_id) as tab:
+        gr.Markdown(f"## {tab_label}")
         gr.Markdown(
             "All selected backbones share one 2×4 figure and each backbone has its own color. "
             "The first seven panels show raw metrics. The 7-metric mean normalizes every metric "
-            "with the range shared by all selected backbones before averaging."
+            "with the range shared by all selected backbones before averaging. Matching test-time "
+            "compression results are overlaid as isolated points, with marker shape identifying "
+            "the compression configuration. Min compares GT and Ours separately for single and "
+            "double pruning at every drop count, using the 7-metric mean to keep each winning "
+            "point's metrics together; No recovery follows that same winner."
+            + (
+                " The x-axis is the number of remaining units, inferred from each backbone's prune plan."
+                if remaining_units
+                else ""
+            )
         )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):
                 backbone_cb = gr.CheckboxGroup(label="Backbones", choices=backbones, value=backbones)
                 prune_strategy_dd = gr.Dropdown(
-                    label="Prune strategy", choices=list(_PRUNE_STRATEGY_FAMILIES),
+                    label="Prune strategy",
+                    choices=[*_PRUNE_STRATEGY_FAMILIES, _MIN_PRUNE_STRATEGY],
                     value="ours", multiselect=False,
                 )
                 prune_structure_cb = gr.CheckboxGroup(
@@ -438,6 +874,11 @@ def build_recovery_backbone_comparison_tab(*, blocks: gr.Blocks, output_root: Pa
                     label="Show No recovery",
                     value=True,
                 )
+                halve_x_axis_cb = gr.Checkbox(
+                    label="Divide x-axis by 2",
+                    value=False,
+                    info="Available points use even x values, so the scaled axis remains integral.",
+                )
                 refresh_btn = gr.Button("Refresh latest data", variant="primary")
                 status = gr.Textbox(label="Status", interactive=False, lines=4)
             with gr.Column(scale=5):
@@ -450,12 +891,12 @@ def build_recovery_backbone_comparison_tab(*, blocks: gr.Blocks, output_root: Pa
 
         inputs = [
             backbone_cb, method_dd, dataset_dd, prune_strategy_dd,
-            prune_structure_cb, show_no_recovery_cb,
+            prune_structure_cb, show_no_recovery_cb, halve_x_axis_cb,
         ]
         for event in (
             backbone_cb.change, method_dd.change, dataset_dd.change,
             prune_strategy_dd.change, prune_structure_cb.change,
-            show_no_recovery_cb.change,
+            show_no_recovery_cb.change, halve_x_axis_cb.change,
         ):
             event(redraw, inputs=inputs, outputs=[image, status], show_progress="minimal", trigger_mode="always_last")
         refresh_btn.click(redraw, inputs=inputs, outputs=[image, status], show_progress="minimal", trigger_mode="always_last")
@@ -466,5 +907,20 @@ def build_recovery_backbone_comparison_tab(*, blocks: gr.Blocks, output_root: Pa
         "prune_strategy_dd": prune_strategy_dd,
         "prune_structure_cb": prune_structure_cb, "dataset_dd": dataset_dd,
         "show_no_recovery_cb": show_no_recovery_cb,
+        "halve_x_axis_cb": halve_x_axis_cb,
         "image": image, "status": status,
     }
+
+
+def build_recovery_backbone_comparison_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict[str, Any]:
+    return _build_recovery_backbone_comparison_tab(
+        blocks=blocks, output_root=output_root, remaining_units=False
+    )
+
+
+def build_recovery_backbone_remaining_comparison_tab(
+    *, blocks: gr.Blocks, output_root: Path
+) -> Dict[str, Any]:
+    return _build_recovery_backbone_comparison_tab(
+        blocks=blocks, output_root=output_root, remaining_units=True
+    )

@@ -12,6 +12,7 @@ import numpy as np
 from analysis.prune_plan import PRUNE_PLAN_BUNDLE_SCHEMA_VERSION
 from analysis.schema.v3 import EvalRecordV3
 from analysis.vis.recovery_overview_tab import (
+    _minimum_strategy_plot_payload,
     build_recovery_overview_tab,
     discover_recovery_overview_datasets,
     discover_recovery_overview_options,
@@ -21,6 +22,47 @@ from analysis.vis.recovery_overview_tab import (
 
 
 class RecoveryOverviewTabTest(unittest.TestCase):
+    def test_min_uses_seven_metric_mean_then_copies_the_whole_winning_point(self) -> None:
+        metrics = ("ape", "are", "rpe_trans", "rpe_rot", "acc", "comp", "chamfer_distance")
+
+        def candidate(first: float, last: float, marker: str) -> dict:
+            normalized = {metric: first for metric in metrics}
+            normalized["chamfer_distance"] = last
+            return {
+                "strategies": {
+                    "recovery_linearpatch": {
+                        "points": {"2": {
+                            "available": True,
+                            "normalized_metric": normalized,
+                            "raw_metric": {metric: marker for metric in metrics},
+                        }}
+                    },
+                    "no_recovery": {
+                        "points": {"2": {
+                            "available": True,
+                            "normalized_metric": {metric: 0.0 for metric in metrics},
+                            "raw_metric": {
+                                metric: f"{marker}_baseline" for metric in metrics
+                            },
+                        }}
+                    },
+                }
+            }
+
+        # GT wins on six individual metrics, but Ours has the lower seven-metric mean.
+        merged = _minimum_strategy_plot_payload([
+            ("gt_single", candidate(0.4, 1.0, "gt")),
+            ("ours_single", candidate(0.5, 0.0, "ours")),
+        ])
+        point = merged["strategies"]["recovery_linearpatch"]["points"]["2"]
+        self.assertEqual(point["min_prune_strategy"], "ours_single")
+        self.assertEqual(set(point["raw_metric"].values()), {"ours"})
+        baseline = merged["strategies"][
+            "no_recovery__recovery_linearpatch"
+        ]["points"]["2"]
+        self.assertEqual(baseline["min_prune_strategy"], "ours_single")
+        self.assertEqual(set(baseline["raw_metric"].values()), {"ours_baseline"})
+
     def _write_fixture(self, root: Path) -> None:
         backbone = root / "vggt"
         backbone.mkdir(parents=True)
@@ -39,7 +81,21 @@ class RecoveryOverviewTabTest(unittest.TestCase):
                         }
                     },
                     "strategies": {
-                        "ours": {"display_name": "Ours", "points": {"2": "i1_j2"}}
+                        "ours_double": {
+                            "display_name": "Ours double", "points": {"2": "i1_j2"}
+                        },
+                        "ours_single": {
+                            "display_name": "Ours single", "points": {"2": "i1_j2"}
+                        },
+                        "gt_double": {
+                            "display_name": "GT double", "points": {"2": "i1_j2"}
+                        },
+                        "gt_single": {
+                            "display_name": "GT single", "points": {"2": "i1_j2"}
+                        },
+                        "cosine_double": {
+                            "display_name": "Cosine double", "points": {"2": "i1_j2"}
+                        },
                     },
                     "spans": {},
                 }
@@ -131,17 +187,17 @@ class RecoveryOverviewTabTest(unittest.TestCase):
             self._write_fixture(root)
             self.assertEqual(
                 discover_recovery_overview_prune_strategies(root),
-                ["ours"],
+                ["ours_double", "ours_single", "gt_double", "gt_single"],
             )
             images, status = render_recovery_overview(
                 root,
                 ["vggt"],
                 ["recovery_linearpatch"],
                 "scannet_dev50",
-                prune_strategy="ours",
+                prune_strategy="ours_double",
             )
             self.assertEqual(len(images), 1, status)
-            self.assertIn("ours", status)
+            self.assertIn("ours_double", status)
 
     def test_discovers_methods_from_recovery_plan_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,7 +234,17 @@ class RecoveryOverviewTabTest(unittest.TestCase):
                 ui = build_recovery_overview_tab(blocks=blocks, output_root=root)
             self.assertNotIn("value_mode", ui)
             self.assertIsInstance(ui["prune_strategy_dd"], gr.Dropdown)
-            self.assertEqual(ui["prune_strategy_dd"].value, "ours")
+            self.assertEqual(
+                ui["prune_strategy_dd"].choices,
+                [
+                    ("ours_double", "ours_double"),
+                    ("ours_single", "ours_single"),
+                    ("gt_double", "gt_double"),
+                    ("gt_single", "gt_single"),
+                    ("min", "min"),
+                ],
+            )
+            self.assertEqual(ui["prune_strategy_dd"].value, "ours_double")
             self.assertEqual(ui["dataset_dd"].value, "training average")
             self.assertTrue(ui["normalize_metrics"].value)
             self.assertIn(("mean", "mean"), ui["backbone_cb"].choices)

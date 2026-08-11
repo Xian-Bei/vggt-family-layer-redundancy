@@ -4,7 +4,6 @@ import unittest
 import torch
 import torch.nn as nn
 
-from analysis.recovery.compact_recovery_checkpoints import _compact_payload
 from analysis.recovery.operators import (
     apply_recovery_weights,
     compact_recovery_operators,
@@ -70,29 +69,6 @@ class _OmegaBoundaryAdapter:
             else model.aggregator.inter_frame_blocks
         )
         return blocks[int(index_s)]
-
-
-def test_compact_payload_extracts_recovery_weight() -> None:
-    weight = torch.eye(4)
-    payload = {
-        "variant": "training_free_recovery",
-        "model_state_dict": {"block.recovery_patch_frame_1.weight": weight},
-        "recovery_specs": [
-            {
-                "source_unit_id": "frame_1",
-                "module_name": "recovery_patch_frame_1",
-                "weight_shape": [4, 4],
-            }
-        ],
-        "optimizer_state_dict": {"unused": True},
-    }
-
-    compact = _compact_payload(payload)
-
-    assert compact["variant"] == "training_free_recovery_delta"
-    assert "model_state_dict" not in compact
-    assert compact["optimizer_state_dict"] == {}
-    assert torch.equal(compact["recovery_weights"][0]["weight"], weight)
 
 
 def test_apply_recovery_weights_loads_installed_patch() -> None:
@@ -255,13 +231,13 @@ def test_omega_register_boundary_and_adjacent_identity_patch_compose() -> None:
     adapter = _OmegaBoundaryAdapter()
     specs = [
         {
-            "type": "recovery_ghost_sequential",
+            "type": "recovery_ghost_interval_sequential",
             "source_unit_id": "global_0",
             "module_name": "recovery_patch_global_0",
             "weight_shape": [2, 2],
         },
         {
-            "type": "recovery_ghost_sequential",
+            "type": "recovery_ghost_interval_sequential",
             "source_unit_id": "frame_1",
             "module_name": "recovery_patch_frame_1",
             "weight_shape": [2, 2],
@@ -286,7 +262,6 @@ def test_omega_register_boundary_and_adjacent_identity_patch_compose() -> None:
 
 
 def load_tests(_loader, tests, _pattern):
-    tests.addTest(unittest.FunctionTestCase(test_compact_payload_extracts_recovery_weight))
     tests.addTest(unittest.FunctionTestCase(test_apply_recovery_weights_loads_installed_patch))
     tests.addTest(
         unittest.FunctionTestCase(

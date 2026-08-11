@@ -10,7 +10,10 @@ from .cka_heatmaps_tab import build_cka_heatmaps_tab
 from .lora_tab import build_lora_tab, build_recovery_tab
 from .remaining_tab import build_remaining_tab
 from .recovery_overview_tab import build_recovery_overview_tab
-from .recovery_backbone_comparison_tab import build_recovery_backbone_comparison_tab
+from .recovery_backbone_comparison_tab import (
+    build_recovery_backbone_comparison_tab,
+    build_recovery_backbone_remaining_comparison_tab,
+)
 from .pair_tab import build_pair_tab
 from .pruning_plan_tab import build_pruning_plan_tab
 from .summary_tab import build_summary_tab
@@ -39,6 +42,7 @@ __all__ = [
     "build_recovery_tab",
     "build_recovery_overview_tab",
     "build_recovery_backbone_comparison_tab",
+    "build_recovery_backbone_remaining_comparison_tab",
     "build_pair_tab",
     "build_pruning_plan_tab",
     "build_summary_tab",

@@ -92,7 +92,7 @@ def _load_graph(
             raise ValueError(
                 f"Redundancy graph {path} uses graph_semantics={semantics!r}; "
                 f"expected {UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS!r}. "
-                "Run scripts/tmp_migrate_interval_graphs_to_pairwise_semantics.py first."
+                "Regenerate the redundancy graph with scripts/run_cache_redundancy.sh."
             )
         unit_ids = [str(value) for value in list(npz["unit_ids"])]
         similarity = np.asarray(npz[metric_key], dtype=np.float64)

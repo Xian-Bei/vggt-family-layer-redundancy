@@ -39,7 +39,6 @@ from analysis.prune_plan.build_prune_plan_v3 import (
     _strategy_from_drop_sets,
     _strategy_from_picks,
 )
-from analysis.prune_plan.migrate_lower_to_intervals import run as run_migration
 from analysis.prune_plan.triangle_prune import (
     interval_pick_from_bounds,
     scan_endpoint_linked_closed_intervals_with_candidates,
@@ -54,12 +53,9 @@ from analysis.prune_plan.visualize_triangle_prune import (
     render_similarity_gap_heatmaps,
 )
 from analysis.redundancy.similarity_v3 import (
-    CLOSED_INTERVAL_GRAPH_SEMANTICS,
-    UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS,
     unit_similarity_to_interval_score,
 )
 from analysis.triangular_heatmap import draw_symmetric_heatmap_panel
-from scripts.tmp_migrate_interval_graphs_to_pairwise_semantics import convert_payload
 
 
 def _bundle() -> dict:
@@ -725,26 +721,6 @@ class IntervalPrunePlanTest(unittest.TestCase):
             )
 
         self.assertEqual(selectors, ["i1_j1_i4_j4"])
-
-    def test_migration_maps_open_left_interval_dirs_to_closed_intervals(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            output_root = Path(td) / "analysis_outputs_v3"
-            backbone_root = output_root / "vggt"
-            backbone_root.mkdir(parents=True)
-            (backbone_root / PRUNE_PLAN_BUNDLE_FILENAME).write_text(
-                json.dumps(_bundle()),
-                encoding="utf-8",
-            )
-            source = backbone_root / "scannet_dev50" / "eval" / "lower" / "i1_j3"
-            source.mkdir(parents=True)
-            (source / "eval_record_v3.json").write_text("{}", encoding="utf-8")
-
-            moves = run_migration(output_root=output_root, backbone="vggt", commit=True)
-
-            target = backbone_root / "scannet_dev50" / "eval" / "lower" / "i2_j3"
-            self.assertEqual(moves, [(source, target)])
-            self.assertFalse(source.exists())
-            self.assertTrue((target / "eval_record_v3.json").is_file())
 
     def test_unit_similarity_to_interval_score_uses_left_boundary(self) -> None:
         sim = np.arange(25, dtype=np.float64).reshape(5, 5)
@@ -1488,39 +1464,6 @@ class IntervalPrunePlanTest(unittest.TestCase):
 
         self.assertAlmostEqual(float(scores[2]), -0.1)
         self.assertEqual(meta["paper_valid_cutoffs"], [2])
-
-    def test_tmp_migration_restores_pairwise_mean_and_scenes(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "redundancy_graph_all.npz"
-            sim = np.array(
-                [
-                    [1.0, 0.4, 0.9],
-                    [0.4, 1.0, 0.7],
-                    [0.9, 0.7, 1.0],
-                ],
-                dtype=np.float64,
-            )
-            interval = unit_similarity_to_interval_score(sim)
-            interval[0, :] = np.array([0.1, 0.2, 0.3])
-            np.savez(
-                path,
-                unit_ids=np.asarray(["u0", "u1", "u2"], dtype=object),
-                scene_ids=np.asarray(["a", "b"], dtype=object),
-                graph_semantics=np.asarray([CLOSED_INTERVAL_GRAPH_SEMANTICS]),
-                start_zero_value=np.asarray([0.0]),
-                legacy_unit_similarity_recoverable=np.asarray([True]),
-                cka_mean=interval,
-                cka_scenes=np.stack([interval, interval], axis=0),
-            )
-
-            payload = convert_payload(path)
-            self.assertEqual(
-                str(payload["graph_semantics"][0]),
-                UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS,
-            )
-            np.testing.assert_array_equal(payload["cka_mean"], sim)
-            np.testing.assert_array_equal(payload["cka_scenes"][1], sim)
-            self.assertNotIn("start_zero_value", payload)
 
     def test_load_gt_aggregate_from_pruning_interval_summaries(self) -> None:
         with tempfile.TemporaryDirectory() as td:

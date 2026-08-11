@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -16,12 +17,14 @@ from analysis.prune_plan import (
 )
 
 from analysis.prune_plan.eval_plots import (
+    GT_MEAN_METRICS,
     RECOVERY_METHOD_ORDER,
     RECOVERY_METRIC_GRID,
     _with_dataset_average,
     add_recovery_comparison_strategies,
     collect_pruning_eval_payload,
     collect_recovery_eval_payload,
+    metric_value,
     render_strategy_metric_figure,
 )
 from analysis.vis.dataset_average_warning import (
@@ -32,11 +35,8 @@ from analysis.vis.pruning_plan_tab import _mean_backbone_plot_payloads
 
 
 _BACKBONE_ORDER = ("vggt_omega", "pi3", "vggt")
-_PRUNE_STRATEGY_ORDER = (
+_PRUNE_STRATEGIES = (
     "ours_double", "ours_single", "gt_double", "gt_single",
-    "cosine_double", "cosine_single", "inv_mse_double", "inv_mse_single",
-    "cca_double", "cca_single",
-    "replaceme_double", "replaceme_single", "shortgpt", "simpler", "legacy",
 )
 _BASELINE_STRATEGIES = (
     "no_recovery_single",
@@ -45,6 +45,114 @@ _BASELINE_STRATEGIES = (
 )
 _DATASET_AVERAGE_GROUPS = DATASET_AVERAGE_GROUPS
 _MEAN_BACKBONE = "mean"
+_MIN_PRUNE_STRATEGY = "min"
+
+
+def _seven_metric_mean(point: Dict[str, Any], payload: Dict[str, Any]) -> float | None:
+    """Return the normalized seven-metric mean used to choose one whole point."""
+    normalized = point.get("normalized_metric", {})
+    if isinstance(normalized, dict):
+        values = [metric_value(normalized, metric) for metric in GT_MEAN_METRICS]
+        if all(value is not None and np.isfinite(value) for value in values):
+            return float(np.mean(values))
+    raw = point.get("raw_metric", point.get("metrics_mean", {}))
+    if not isinstance(raw, dict):
+        return None
+    bounds = payload.get("normalization_bounds", {})
+    values: List[float] = []
+    for metric in GT_MEAN_METRICS:
+        value = metric_value(raw, metric)
+        if value is None or not np.isfinite(value):
+            return None
+        metric_bounds = bounds.get(metric, {}) if isinstance(bounds, dict) else {}
+        low = metric_bounds.get("min") if isinstance(metric_bounds, dict) else None
+        high = metric_bounds.get("max") if isinstance(metric_bounds, dict) else None
+        if isinstance(low, (int, float)) and isinstance(high, (int, float)) and high > low:
+            values.append((float(value) - float(low)) / (float(high) - float(low)))
+        else:
+            values.append(float(value))
+    return float(np.mean(values))
+
+
+def _minimum_strategy_plot_payload(
+    candidates: Sequence[Tuple[str, Dict[str, Any]]],
+    *,
+    tie_no_recovery_to_winner: bool = True,
+) -> Dict[str, Any]:
+    """Select one complete strategy point per drop using its 7-metric mean."""
+    valid = [(name, payload) for name, payload in candidates if isinstance(payload, dict)]
+    if not valid:
+        return {}
+    result = deepcopy(valid[0][1])
+    result["strategies"] = {}
+    strategy_keys = {
+        str(key)
+        for _, payload in valid
+        for key in payload.get("strategies", {})
+        if isinstance(payload.get("strategies", {}), dict)
+    }
+    winner_sources: Dict[str, Dict[str, str]] = {}
+    primary_keys = (
+        {key for key in strategy_keys if not key.startswith("no_recovery")}
+        if tie_no_recovery_to_winner else strategy_keys
+    )
+    for strategy_key in primary_keys:
+        choices: Dict[str, List[Tuple[float, str, Dict[str, Any]]]] = {}
+        display_name = strategy_key
+        for source_name, payload in valid:
+            strategies = payload.get("strategies", {})
+            strategy = strategies.get(strategy_key, {}) if isinstance(strategies, dict) else {}
+            if not isinstance(strategy, dict):
+                continue
+            display_name = str(strategy.get("display_name", display_name))
+            points = strategy.get("points", {})
+            for drop_key, point in points.items() if isinstance(points, dict) else ():
+                if not isinstance(point, dict) or not point.get("available", False):
+                    continue
+                score = _seven_metric_mean(point, payload)
+                if score is not None:
+                    choices.setdefault(str(drop_key), []).append((score, source_name, point))
+        selected_points: Dict[str, Any] = {}
+        for drop_key, point_choices in choices.items():
+            _, source_name, point = min(point_choices, key=lambda item: (item[0], item[1]))
+            selected_points[drop_key] = {
+                **deepcopy(point), "min_prune_strategy": source_name,
+            }
+            winner_sources.setdefault(strategy_key, {})[drop_key] = source_name
+        if selected_points:
+            result["strategies"][strategy_key] = {
+                "display_name": display_name, "points": selected_points,
+            }
+    if tie_no_recovery_to_winner:
+        candidate_map = dict(valid)
+        for strategy_key, winners in winner_sources.items():
+            if not strategy_key.startswith("recovery_"):
+                continue
+            baseline_points: Dict[str, Any] = {}
+            for drop_key, source_name in winners.items():
+                source_strategies = candidate_map[source_name].get("strategies", {})
+                if not isinstance(source_strategies, dict):
+                    continue
+                baseline = next(
+                    (
+                        value for key, value in source_strategies.items()
+                        if str(key).startswith("no_recovery") and isinstance(value, dict)
+                    ),
+                    {},
+                )
+                point = baseline.get("points", {}).get(drop_key)
+                if isinstance(point, dict) and point.get("available", False):
+                    baseline_points[drop_key] = {
+                        **deepcopy(point), "min_prune_strategy": source_name,
+                    }
+            if baseline_points:
+                result["strategies"][f"no_recovery__{strategy_key}"] = {
+                    "display_name": (
+                        f"No recovery · {strategy_key.removeprefix('recovery_')} winner"
+                    ),
+                    "points": baseline_points,
+                }
+    return result
 
 
 def _sort_key(name: str, preferred: Sequence[str]) -> Tuple[int, str]:
@@ -102,7 +210,7 @@ def discover_recovery_overview_options(output_root: Path) -> Tuple[List[str], Li
 
 
 def discover_recovery_overview_prune_strategies(output_root: Path) -> List[str]:
-    """Discover strategy views whose selectors have shared recovery results."""
+    """Discover supported strategy views with shared recovery results."""
     root = Path(output_root)
     strategies = set()
     if root.is_dir():
@@ -135,6 +243,8 @@ def discover_recovery_overview_prune_strategies(output_root: Path) -> List[str]:
                 )
             plans = bundle_plan_records(bundle)
             for strategy, strategy_record in bundle_strategy_records(bundle).items():
+                if strategy not in _PRUNE_STRATEGIES:
+                    continue
                 points = strategy_record.get("points", {}) if isinstance(strategy_record, dict) else {}
                 selectors = set()
                 for plan_name in points.values() if isinstance(points, dict) else ():
@@ -143,7 +253,7 @@ def discover_recovery_overview_prune_strategies(output_root: Path) -> List[str]:
                         selectors.add(physical_pruning_selector_from_record(record))
                 if not available_selectors or selectors.intersection(available_selectors):
                     strategies.add(str(strategy))
-    return sorted(strategies, key=lambda name: _sort_key(name, _PRUNE_STRATEGY_ORDER))
+    return sorted(strategies, key=lambda name: _sort_key(name, _PRUNE_STRATEGIES))
 
 
 def discover_recovery_overview_datasets(output_root: Path) -> List[str]:
@@ -302,6 +412,8 @@ def render_recovery_overview(
             )
             contributor_plots: List[Dict[str, Any]] = []
             contributor_fallbacks: List[Dict[str, Any]] = []
+            contributor_candidate_plots: List[List[Tuple[str, Dict[str, Any]]]] = []
+            contributor_candidate_fallbacks: List[List[Tuple[str, Dict[str, Any]]]] = []
             skipped_profiles: List[str] = []
             for contributor in contributors:
                 backbone_root = Path(output_root) / contributor
@@ -309,77 +421,99 @@ def render_recovery_overview(
                     experiment_root=backbone_root,
                     prune_plan_root=backbone_root,
                 )
-                recovery = collect_recovery_eval_payload(
-                    experiment_root=backbone_root,
-                    prune_strategy=None if prune_strategy == "legacy" else prune_strategy,
+                strategy_candidates = (
+                    _PRUNE_STRATEGIES
+                    if prune_strategy == _MIN_PRUNE_STRATEGY
+                    else (prune_strategy,)
                 )
-                if dataset in _DATASET_AVERAGE_GROUPS:
-                    recovery_datasets = recovery.get("datasets", {})
-                    for method in methods:
-                        method_datasets = (
-                            [
-                                name
-                                for name, payload in recovery_datasets.items()
-                                if isinstance(payload, dict)
-                                and isinstance(payload.get("strategies"), dict)
-                                and method in payload["strategies"]
-                            ]
-                            if isinstance(recovery_datasets, dict)
-                            else []
-                        )
-                        warning = format_incomplete_average_warning(
-                            owner=f"{contributor} / {method}",
-                            scope=dataset,
-                            expected=_DATASET_AVERAGE_GROUPS[dataset],
-                            available=method_datasets,
-                        )
-                        if warning:
-                            warnings.append(warning)
-                recovery = add_recovery_comparison_strategies(
-                    recovery,
-                    pruning,
-                    None if prune_strategy == "legacy" else prune_strategy,
-                )
-                skipped_profiles.extend(
-                    f"{contributor}:{profile}"
-                    for profile in recovery.get("skipped_normalization_datasets", [])
-                )
-                if dataset == "mean":
-                    contributor_plot = recovery.get("dataset_average", {})
-                    title_scope = "averaged over datasets"
-                elif dataset in _DATASET_AVERAGE_GROUPS:
-                    contributor_plot = _dataset_group_average(recovery, dataset)
-                    title_scope = dataset
-                else:
-                    dataset_payloads = recovery.get("datasets", {})
-                    contributor_plot = (
-                        dataset_payloads.get(dataset, {})
-                        if isinstance(dataset_payloads, dict)
-                        else {}
+                candidate_plots: List[Tuple[str, Dict[str, Any]]] = []
+                candidate_fallbacks: List[Tuple[str, Dict[str, Any]]] = []
+                for candidate in strategy_candidates:
+                    recovery = collect_recovery_eval_payload(
+                        experiment_root=backbone_root,
+                        prune_strategy=None if candidate == "legacy" else candidate,
                     )
-                    title_scope = dataset
-                contributor_plots.append(contributor_plot)
+                    if dataset in _DATASET_AVERAGE_GROUPS:
+                        recovery_datasets = recovery.get("datasets", {})
+                        for method in methods:
+                            method_datasets = (
+                                [
+                                    name for name, payload in recovery_datasets.items()
+                                    if isinstance(payload, dict)
+                                    and isinstance(payload.get("strategies"), dict)
+                                    and method in payload["strategies"]
+                                ] if isinstance(recovery_datasets, dict) else []
+                            )
+                            warning = format_incomplete_average_warning(
+                                owner=f"{contributor} / {method} / {candidate}",
+                                scope=dataset,
+                                expected=_DATASET_AVERAGE_GROUPS[dataset],
+                                available=method_datasets,
+                            )
+                            if warning:
+                                warnings.append(warning)
+                    recovery = add_recovery_comparison_strategies(
+                        recovery, pruning, None if candidate == "legacy" else candidate,
+                    )
+                    skipped_profiles.extend(
+                        f"{contributor}:{profile}"
+                        for profile in recovery.get("skipped_normalization_datasets", [])
+                    )
+                    if dataset == "mean":
+                        candidate_plot = recovery.get("dataset_average", {})
+                    elif dataset in _DATASET_AVERAGE_GROUPS:
+                        candidate_plot = _dataset_group_average(recovery, dataset)
+                    else:
+                        dataset_payloads = recovery.get("datasets", {})
+                        candidate_plot = (
+                            dataset_payloads.get(dataset, {})
+                            if isinstance(dataset_payloads, dict) else {}
+                        )
+                    candidate_plots.append((candidate, candidate_plot))
+                    candidate_fallbacks.append((
+                        candidate,
+                        _pruning_only_recovery_like_payload(
+                            pruning, dataset=dataset, prune_strategy=candidate,
+                        ),
+                    ))
+                contributor_candidate_plots.append(candidate_plots)
+                contributor_candidate_fallbacks.append(candidate_fallbacks)
+                title_scope = "averaged over datasets" if dataset == "mean" else dataset
+                contributor_plots.append(
+                    _minimum_strategy_plot_payload(candidate_plots)
+                    if prune_strategy == _MIN_PRUNE_STRATEGY else candidate_plots[0][1]
+                )
                 contributor_fallbacks.append(
-                    _pruning_only_recovery_like_payload(
-                        pruning,
-                        dataset=dataset,
-                        prune_strategy=prune_strategy,
-                    )
+                    _minimum_strategy_plot_payload(candidate_fallbacks)
+                    if prune_strategy == _MIN_PRUNE_STRATEGY else candidate_fallbacks[0][1]
                 )
 
-            plot_payload = (
-                _mean_backbone_plot_payloads(contributor_plots)
-                if backbone == _MEAN_BACKBONE
-                else contributor_plots[0]
-            )
+            if backbone == _MEAN_BACKBONE and prune_strategy == _MIN_PRUNE_STRATEGY:
+                plot_payload = _minimum_strategy_plot_payload([
+                    (
+                        candidate,
+                        _mean_backbone_plot_payloads([
+                            dict(candidate_list).get(candidate, {})
+                            for candidate_list in contributor_candidate_plots
+                        ]),
+                    )
+                    for candidate in _PRUNE_STRATEGIES
+                ])
+            else:
+                plot_payload = (
+                    _mean_backbone_plot_payloads(contributor_plots)
+                    if backbone == _MEAN_BACKBONE else contributor_plots[0]
+                )
             available = (
                 plot_payload.get("strategies", {})
                 if isinstance(plot_payload, dict)
                 else {}
             )
             selected = [
-                key
-                for key in (*_BASELINE_STRATEGIES, *methods)
+                key for key in available
+                if isinstance(available, dict) and str(key).startswith("no_recovery")
+            ] + [
+                key for key in methods
                 if isinstance(available, dict) and key in available
             ]
             fig = render_strategy_metric_figure(
@@ -394,11 +528,22 @@ def render_recovery_overview(
                 subplot_width=7.4,
             )
             if fig is None:
-                fallback_plot_payload = (
-                    _mean_backbone_plot_payloads(contributor_fallbacks)
-                    if backbone == _MEAN_BACKBONE
-                    else contributor_fallbacks[0]
-                )
+                if backbone == _MEAN_BACKBONE and prune_strategy == _MIN_PRUNE_STRATEGY:
+                    fallback_plot_payload = _minimum_strategy_plot_payload([
+                        (
+                            candidate,
+                            _mean_backbone_plot_payloads([
+                                dict(candidate_list).get(candidate, {})
+                                for candidate_list in contributor_candidate_fallbacks
+                            ]),
+                        )
+                        for candidate in _PRUNE_STRATEGIES
+                    ])
+                else:
+                    fallback_plot_payload = (
+                        _mean_backbone_plot_payloads(contributor_fallbacks)
+                        if backbone == _MEAN_BACKBONE else contributor_fallbacks[0]
+                    )
                 fallback_available = (
                     fallback_plot_payload.get("strategies", {})
                     if isinstance(fallback_plot_payload, dict)
@@ -452,7 +597,7 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
     backbones, methods = discover_recovery_overview_options(Path(output_root))
     datasets = discover_recovery_overview_datasets(Path(output_root))
     prune_strategies = discover_recovery_overview_prune_strategies(Path(output_root))
-    default_prune_strategy = prune_strategies[0] if prune_strategies else "legacy"
+    default_prune_strategy = prune_strategies[0] if prune_strategies else _PRUNE_STRATEGIES[0]
 
     def _redraw(
         selected_backbones: Sequence[str],
@@ -493,8 +638,12 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
         )
         prune_strategy_value = (
             prune_strategy
-            if prune_strategy in latest_prune_strategies
-            else (latest_prune_strategies[0] if latest_prune_strategies else "legacy")
+            if prune_strategy in (*_PRUNE_STRATEGIES, _MIN_PRUNE_STRATEGY)
+            else (
+                latest_prune_strategies[0]
+                if latest_prune_strategies
+                else _PRUNE_STRATEGIES[0]
+            )
         )
         gallery_value, status_value = render_recovery_overview(
             Path(output_root), backbone_value, method_value, dataset_value,
@@ -510,7 +659,10 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
                 value=method_value,
             ),
             gr.update(choices=latest_datasets, value=dataset_value),
-            gr.update(choices=latest_prune_strategies or ["legacy"], value=prune_strategy_value),
+            gr.update(
+                choices=[*_PRUNE_STRATEGIES, _MIN_PRUNE_STRATEGY],
+                value=prune_strategy_value,
+            ),
             gallery_value,
             status_value,
         )
@@ -522,6 +674,9 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
             "evaluation summaries and redraws the plots; saved PNG files are not used. "
             "The normalization control affects only individual metrics; the 7-metric "
             "mean is always normalized per metric before averaging."
+            " Choosing min selects one complete strategy per drop from the displayed "
+            "7-metric mean; individual metrics are never selected independently. Its "
+            "No recovery curve uses that same winning pruning strategy."
         )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):
@@ -532,7 +687,7 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
                 )
                 prune_strategy_dd = gr.Dropdown(
                     label="Prune strategy",
-                    choices=prune_strategies or ["legacy"],
+                    choices=[*_PRUNE_STRATEGIES, _MIN_PRUNE_STRATEGY],
                     value=default_prune_strategy,
                     multiselect=False,
                 )

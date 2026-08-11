@@ -23,28 +23,7 @@ PRUNE_STRATEGY="${PRUNE_STRATEGY:-gt_single,gt_double,ours_single,ours_double,co
 # Strategy whose plans are used by recovery at the drop lengths below.
 RECOVERY_PRUNE_STRATEGY="${RECOVERY_PRUNE_STRATEGY:-gt_single,gt_double,ours_single,ours_double}"
 RECOVERY_PRUNE_PLANS="${RECOVERY_PRUNE_PLANS:-prune_span12,prune_span14,prune_span16,prune_span18,prune_span20,prune_span22,prune_span24,prune_span26,prune_span28}"
-RECOVERY_METHODS="${RECOVERY_METHODS:-recovery_linearpatch,recovery_ghost,recovery_ghost_sequential,recovery_ghost_interval,recovery_ghost_interval_sequential,recovery_replaceme_ls,recovery_replaceme_cos}"
-RECOVERY_PRUNE_STRATEGY_LIST=()
-read -r -a _RECOVERY_PRUNE_STRATEGY_RAW <<< "${RECOVERY_PRUNE_STRATEGY//,/ }"
-for _recovery_prune_strategy in "${_RECOVERY_PRUNE_STRATEGY_RAW[@]}"; do
-  _recovery_prune_strategy="${_recovery_prune_strategy//[[:space:]]/}"
-  [[ -z "${_recovery_prune_strategy}" ]] && continue
-  case "${_recovery_prune_strategy}" in
-    gt_single|gt_double|ours_single|ours_double|cosine_single|cosine_double|inv_mse_single|inv_mse_double|cca_single|cca_double|replaceme_single|replaceme_double|shortgpt|simpler)
-      ;;
-    *)
-      echo "error: unsupported RECOVERY_PRUNE_STRATEGY entry=${_recovery_prune_strategy@Q}" >&2
-      exit 1
-      ;;
-  esac
-  if [[ ! " ${RECOVERY_PRUNE_STRATEGY_LIST[*]} " =~ " ${_recovery_prune_strategy} " ]]; then
-    RECOVERY_PRUNE_STRATEGY_LIST+=("${_recovery_prune_strategy}")
-  fi
-done
-if [[ "${#RECOVERY_PRUNE_STRATEGY_LIST[@]}" -eq 0 ]]; then
-  echo "error: RECOVERY_PRUNE_STRATEGY must contain at least one strategy" >&2
-  exit 1
-fi
+RECOVERY_METHODS="${RECOVERY_METHODS:-recovery_linearpatch,recovery_ghost,recovery_ghost_interval,recovery_ghost_interval_sequential,recovery_replaceme_ls,recovery_replaceme_cos}"
 POINT="${POINT:-13}"
 if [[ ! "${POINT}" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: POINT must be provided as a positive integer (number of layers to delete)" >&2
@@ -77,7 +56,6 @@ BACKBONES="${ALL_BACKBONES}" \
 stage_log "2/10" "Evaluate skip intervals"
 BACKBONES="${ALL_BACKBONES}" \
     EVAL_DATASET="${TRAINING_DATASETS}" \
-    SKIP_GT_EVAL_MAX_SPAN=0 \
     bash "${REPO_ROOT}/scripts/run_skip_eval.sh"
 
 
@@ -122,7 +100,6 @@ for bb in "${ALL_BACKBONES_LIST[@]}"; do
       PRUNE_PLAN_ROOT="${OUTPUT_ROOT}/${bb}" \
       PRUNE_PLAN_NAME="${base_selector}" \
       EXPECTED_DROP_COUNT="${drop_count}" \
-      REMAINING_SKIP_EVAL_MAX_SPAN=0 \
       MAX_SCENES="${MAX_SCENES}" \
       DEVICE="${DEVICE}" \
       bash "${REPO_ROOT}/scripts/run_remaining_skip_eval.sh"
@@ -277,10 +254,6 @@ run_pruning_backbone() {
       PRUNE=1 \
       PRUNE_PLAN_ROOT="${plan_root}" \
       PLAN_GROUP="${selector}" \
-      PLAN_STRATEGY="" \
-      PLAN_MIN_DROP="" \
-      PLAN_MAX_DROP="" \
-      PLAN_DROP_STEP="" \
       WRITE_SUMMARY=0 \
       MAX_SCENES="${MAX_SCENES}" \
       DEVICE="${DEVICE}" \
@@ -296,7 +269,6 @@ done
 # 8. Build recovery-plan bundles from prune_plan_all.json.
 #    Recovery plans decide cache units and either trainable units or closed-form boundary operators.
 #    Supported methods: recovery_lora, recovery_train, recovery_linearpatch, recovery_ghost,
-#    recovery_ghost_sequential,
 #    recovery_ghost_interval, recovery_ghost_interval_sequential,
 #    recovery_replaceme_ls, recovery_replaceme_cos.
 #    All recovery methods are saved in:
@@ -318,7 +290,7 @@ for bb in "${ALL_BACKBONES_LIST[@]}"; do
     fi
     max_prefix_for_method="${MAX_LORA_ANCHORS}"
     case "${method}" in
-      recovery_linearpatch|recovery_ghost|recovery_ghost_sequential|recovery_ghost_interval|recovery_ghost_interval_sequential|recovery_replaceme_ls|recovery_replaceme_cos)
+      recovery_linearpatch|recovery_ghost|recovery_ghost_interval|recovery_ghost_interval_sequential|recovery_replaceme_ls|recovery_replaceme_cos)
         max_prefix_for_method=1
         ;;
     esac
@@ -361,26 +333,14 @@ stage_log "9/10" "Cache, recover, and evaluate"
 for bb in "${ALL_BACKBONES_LIST[@]}"; do
   cache_root="${OUTPUT_ROOT}/${bb}"
   recovery_plans="$(
-    python -c "import sys; from pathlib import Path; from analysis.prune_plan.recovery_plan import list_recovery_plan_names; print(','.join(list_recovery_plan_names(Path(sys.argv[1]))))" \
-      "${cache_root}"
+    python -m analysis.recovery.shared_results recovery-plan-names \
+      --plan-root "${cache_root}"
   )"
   recovery_prune_plans="$(
-    python - "${cache_root}" "${RECOVERY_PRUNE_STRATEGY}" "${RECOVERY_PRUNE_PLANS}" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-from analysis.recovery.shared_results import selectors_for_strategies
-
-root = Path(sys.argv[1])
-strategies = [value for value in re.split(r"[\s,]+", sys.argv[2]) if value]
-requested = [value for value in re.split(r"[\s,]+", sys.argv[3]) if value]
-try:
-    selected = selectors_for_strategies(root, strategies, requested)
-except ValueError as exc:
-    raise SystemExit(f"error: {exc}") from exc
-print(",".join(selected))
-PY
+    python -m analysis.recovery.shared_results selectors-for-strategies \
+      --plan-root "${cache_root}" \
+      --strategies "${RECOVERY_PRUNE_STRATEGY}" \
+      --selectors "${RECOVERY_PRUNE_PLANS}"
   )"
   for ds in ${TRAINING_DATASETS//,/ } 7scenes_train waymo_training; do
     rm -rf "${cache_root}/${ds}/cache"
@@ -417,9 +377,14 @@ PY
 done
 
 
-# 10. Apply deployment-time compression after the best pruning + recovery
-#     models for all selected backbones and evaluate with the unchanged protocol. FastVGGT token
-#     merging and QuantVGGT fake quantization are evaluated as two alternatives.
+
+# 10. Apply deployment-time compression at the requested drop counts below.
+#     GT and Ours are both requested explicitly. Within each family and drop
+#     count, automatically select Single or Double from the lowest normalized
+#     7-metric final recovery result on TRAINING_DATASETS. Identical physical
+#     selectors are evaluated only once.
+#     FastVGGT token merging and QuantVGGT fake quantization are evaluated as
+#     two alternatives.
 #     No cache or recovery training is repeated.  Results are isolated under:
 #     <OUTPUT_ROOT>/vggt/<dataset>/eval/testtime/
 #       recovery_ghost_interval_sequential/<compression>/<selector>/
@@ -427,9 +392,33 @@ done
 #     parameters; set QUANTVGGT_PARAMS_DIR to a LaRe-aware calibration directory
 #     for the main result.
 stage_log "10/10" "Evaluate pruning + recovery + test-time compression"
-OUTPUT_ROOT="${OUTPUT_ROOT}" \
-    TESTTIME_BACKBONES="${ALL_BACKBONES}" \
-    DEVICE="${DEVICE}" \
-    MAX_SCENES="${MAX_SCENES}" \
-    TESTTIME_RUN="${TRAINING_DATASETS},${EVAL_DATASETS}" \
-    bash "${REPO_ROOT}/scripts/run_testtime_eval.sh"
+testtime_recovery_plan="recovery_ghost_interval_sequential"
+testtime_prune_strategies="ours,gt"
+for bb in "${ALL_BACKBONES_LIST[@]}"; do
+  case "${bb}" in
+    pi3)
+      testtime_prune_plans="prune_span20,prune_span22,prune_span24"
+      ;;
+    vggt_omega)
+      testtime_prune_plans="prune_span22,prune_span24,prune_span26"
+      ;;
+    vggt)
+      testtime_prune_plans="prune_span16,prune_span18,prune_span20"
+      ;;
+    *)
+      echo "error: no test-time pruning configuration for backbone=${bb@Q}" >&2
+      exit 1
+      ;;
+  esac
+
+  OUTPUT_ROOT="${OUTPUT_ROOT}" \
+      TESTTIME_BACKBONES="${bb}" \
+      TESTTIME_PRUNE_PLAN_NAME="${testtime_prune_plans}" \
+      TESTTIME_PRUNE_STRATEGY="${testtime_prune_strategies}" \
+      TESTTIME_RECOVERY_PLAN_NAME="${testtime_recovery_plan}" \
+      TESTTIME_SELECTION_DATASETS="${TRAINING_DATASETS}" \
+      DEVICE="${DEVICE}" \
+      MAX_SCENES="${MAX_SCENES}" \
+      TESTTIME_RUN="${TRAINING_DATASETS},${EVAL_DATASETS}" \
+      bash "${REPO_ROOT}/scripts/run_testtime_eval.sh"
+done

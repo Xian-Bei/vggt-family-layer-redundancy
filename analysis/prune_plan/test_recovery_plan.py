@@ -95,7 +95,6 @@ class RecoveryPlanSchemaTest(unittest.TestCase):
             methods = (
                 "recovery_linearpatch",
                 "recovery_ghost",
-                "recovery_ghost_sequential",
                 "recovery_ghost_interval",
                 "recovery_ghost_interval_sequential",
                 "recovery_replaceme_ls",
@@ -150,25 +149,26 @@ class RecoveryPlanSchemaTest(unittest.TestCase):
                 ["global_0", "frame_1", "global_1", "global_2", "frame_3"],
             )
 
-    def test_ghost_variants_use_one_boundary_per_dropped_unit_even_for_one_interval(self) -> None:
-        for method in ("recovery_ghost", "recovery_ghost_sequential"):
-            with self.subTest(method=method), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                _write_prune_all(root, start=2, end=4)
-                _write_recovery_all(root, methods={method: {"method": method}})
-                plan = compose_recovery_unit_prune_plan(
-                    prune_plan_root=root,
-                    recovery_plan_root=root,
-                    prune_selector="prune_span3",
-                    recovery_plan=method,
-                )
-                self.assertEqual(
-                    [
-                        (x["source_unit_index"], x["target_unit_index"])
-                        for x in plan.extra["recovery_boundaries"]
-                    ],
-                    [(1, 2), (2, 3), (3, 4)],
-                )
+    def test_ghost_uses_one_boundary_per_dropped_unit_even_for_one_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_prune_all(root, start=2, end=4)
+            _write_recovery_all(
+                root, methods={"recovery_ghost": {"method": "recovery_ghost"}}
+            )
+            plan = compose_recovery_unit_prune_plan(
+                prune_plan_root=root,
+                recovery_plan_root=root,
+                prune_selector="prune_span3",
+                recovery_plan="recovery_ghost",
+            )
+            self.assertEqual(
+                [
+                    (x["source_unit_index"], x["target_unit_index"])
+                    for x in plan.extra["recovery_boundaries"]
+                ],
+                [(1, 2), (2, 3), (3, 4)],
+            )
 
     def test_linearpatch_non_contiguous_plan_uses_one_boundary_per_dropped_unit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

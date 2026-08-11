@@ -495,13 +495,12 @@ class EvalPlotsTest(unittest.TestCase):
                     STRATEGY_PLOT_COLORS[key]
                     for key in (
                         "recovery_ghost",
-                        "recovery_ghost_sequential",
                         "recovery_ghost_interval",
                         "recovery_ghost_interval_sequential",
                     )
                 }
             ),
-            4,
+            3,
         )
         self.assertEqual(strategy_plot_linestyle("gt_single"), "--")
         self.assertEqual(strategy_plot_linestyle("ours_single"), "--")
@@ -745,7 +744,6 @@ class EvalPlotsTest(unittest.TestCase):
                     "gt_drop",
                     "recovery_linearpatch",
                     "recovery_ghost",
-                    "recovery_ghost_sequential",
                     "recovery_ghost_interval",
                     "recovery_ghost_interval_sequential",
                     "recovery_replaceme_ls",

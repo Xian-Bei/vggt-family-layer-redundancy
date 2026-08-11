@@ -8,9 +8,10 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 # v3 cache/eval outputs are split by dataset tag under ${OUTPUT_ROOT}/<backbone>/<dataset_tag>/...
 # Trainable recovery can consume one or more cache dataset tags and writes under
 # ${OUTPUT_ROOT}/<backbone>/<OUTPUT_KIND>/<physical_selector>/<recovery_plan>/.
-DATASETS="${DATASETS:-${DATASET:-scannet_dev50}}"
+DATASETS="${DATASETS:-${DATASET:-}}"
+EVAL="${EVAL:-}"
 EPOCHS="${EPOCHS:-5}"
-MAX_SCENES="${MAX_SCENES:-1}"
+MAX_SCENES="${MAX_SCENES:-0}"
 MAX_STEPS="${MAX_STEPS:-0}"
 
 PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-}"

@@ -6,9 +6,9 @@ cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 BACKBONES="${BACKBONES:-vggt,pi3,vggt_omega}"
-DATASETS="${DATASETS:-${DATASET:-scannet_dev50}}"
+DATASETS="${DATASETS:-${DATASET:-}}"
 EVAL="${EVAL:-}"
-MAX_SCENES="${MAX_SCENES:-1}"
+MAX_SCENES="${MAX_SCENES:-0}"
 MAX_STEPS="${MAX_STEPS:-0}"
 
 PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-}"
@@ -43,6 +43,11 @@ source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 parse_backbones_list
 parse_dataset_list "${EVAL}" "EVAL" "${DATASET_KEYS[@]}"
 EVAL_LIST=("${PARSED_DATASETS[@]}")
+
+if [[ -z "${DATASETS//[[:space:],]/}" ]]; then
+  echo "error: DATASETS is required" >&2
+  exit 1
+fi
 
 PRUNE_PLAN_NAME_LIST=()
 read -r -a _PRUNE_PLAN_NAME_RAW <<< "${PRUNE_PLAN_NAME//,/ }"
@@ -260,7 +265,7 @@ for bb in "${BB_LIST[@]}"; do
           fi
           eval_training_free_recovery "${bb}" "${prune_plan_name}" "${recovery_plan_name}"
           ;;
-        recovery_linearpatch|recovery_ghost|recovery_ghost_sequential|recovery_ghost_interval|recovery_ghost_interval_sequential|recovery_replaceme_ls|recovery_replaceme_cos)
+        recovery_linearpatch|recovery_ghost|recovery_ghost_interval|recovery_ghost_interval_sequential|recovery_replaceme_ls|recovery_replaceme_cos)
           training_free_names+=("${recovery_plan_name}")
           if recovery_output_complete "${bb}" "${plan_root}" "${prune_plan_name}" "${recovery_plan_name}"; then
             echo "   [reuse] ${bb}/${prune_plan_name}/${recovery_plan_name}"

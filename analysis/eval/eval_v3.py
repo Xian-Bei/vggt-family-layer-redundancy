@@ -37,7 +37,6 @@ from analysis.recovery.shared_results import eval_result_complete
 
 _EVAL_MODES = ("upper", "lower", "model")
 _DERIVED_GHOST_RECOVERY_NAMES = {
-    "recovery_ghost_sequential",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
 }

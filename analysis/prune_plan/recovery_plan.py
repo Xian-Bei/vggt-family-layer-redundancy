@@ -16,7 +16,6 @@ RECOVERY_PLAN_METHODS = (
     "recovery_train",
     "recovery_linearpatch",
     "recovery_ghost",
-    "recovery_ghost_sequential",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
     "recovery_replaceme_ls",
@@ -26,7 +25,6 @@ TRAINABLE_RECOVERY_METHODS = ("recovery_lora", "recovery_train")
 TRAINING_FREE_RECOVERY_METHODS = (
     "recovery_linearpatch",
     "recovery_ghost",
-    "recovery_ghost_sequential",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
     "recovery_replaceme_ls",
@@ -200,7 +198,7 @@ def _boundary_records(prune_plan: UnitPrunePlan, method: str) -> List[Dict[str, 
     intervals = _contiguous_drop_intervals(drop)
     if method in GHOST_INTERVAL_RECOVERY_METHODS:
         starts_and_ends = intervals
-    elif method in ("recovery_ghost", "recovery_ghost_sequential"):
+    elif method == "recovery_ghost":
         # Ghost replaces each removed physical unit.  Consecutive replacements
         # compose on the identity blocks installed by pruning.
         starts_and_ends = [(index, index) for index in drop]

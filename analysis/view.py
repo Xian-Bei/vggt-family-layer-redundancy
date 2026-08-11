@@ -84,6 +84,7 @@ from .vis import (
     build_pruning_plan_tab,
     build_remaining_tab,
     build_recovery_backbone_comparison_tab,
+    build_recovery_backbone_remaining_comparison_tab,
     build_recovery_overview_tab,
     build_recovery_tab,
     build_summary_tab,
@@ -7313,6 +7314,11 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             )
 
             build_recovery_backbone_comparison_tab(
+                blocks=demo,
+                output_root=Path(lora_root),
+            )
+
+            build_recovery_backbone_remaining_comparison_tab(
                 blocks=demo,
                 output_root=Path(lora_root),
             )
