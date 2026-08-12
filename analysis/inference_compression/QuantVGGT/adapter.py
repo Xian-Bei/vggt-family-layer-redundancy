@@ -70,27 +70,22 @@ def _expected_calibration_keys(block: nn.Module, quantized_type: type[nn.Module]
 
 class QuantVGGTInferenceAdapter(InferenceCompressionAdapter):
     name = "quantvggt"
-    supported_backbones = frozenset({"vggt", "pi3", "vggt_omega"})
+    # The released QuantVGGT calibration/training pipeline and the transferred
+    # W4A4 parameters target the original VGGT architecture only.  Pi3 and
+    # VGGT-Omega need backbone-aware recalibration before they can be treated as
+    # supported QuantVGGT accuracy baselines.
+    supported_backbones = frozenset({"vggt"})
 
     @staticmethod
     def _block_groups(model: nn.Module, backbone_name: str):
         """Map logical frame/global calibration indices to physical containers."""
-        if backbone_name == "pi3":
-            decoder = getattr(model, "decoder", None)
-            if decoder is None:
-                raise TypeError("QuantVGGT requires Pi3 model.decoder")
-            return (
-                ("frame", decoder, [(i, 2 * i) for i in range((len(decoder) + 1) // 2)]),
-                ("global", decoder, [(i, 2 * i + 1) for i in range(len(decoder) // 2)]),
-            )
         aggregator = getattr(model, "aggregator", None)
         if aggregator is None:
-            raise TypeError(f"QuantVGGT requires {backbone_name}.aggregator")
+            raise TypeError("QuantVGGT requires vggt.aggregator")
         frame_blocks = getattr(aggregator, "frame_blocks", None)
-        global_name = "inter_frame_blocks" if backbone_name == "vggt_omega" else "global_blocks"
-        global_blocks = getattr(aggregator, global_name, None)
+        global_blocks = getattr(aggregator, "global_blocks", None)
         if frame_blocks is None or global_blocks is None:
-            raise TypeError(f"QuantVGGT cannot find frame/global blocks for {backbone_name}")
+            raise TypeError("QuantVGGT cannot find VGGT frame/global blocks")
         return (
             ("frame", frame_blocks, [(i, i) for i in range(len(frame_blocks))]),
             ("global", global_blocks, [(i, i) for i in range(len(global_blocks))]),

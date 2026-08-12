@@ -14,6 +14,7 @@ from analysis.vis.recovery_backbone_comparison_tab import (
     _BACKBONE_COLORS,
     _global_metric_ranges,
     _collapse_min_prune_strategies,
+    _filter_testtime_to_family_winners,
     _load_testtime_points,
     _normalized_mean,
     _recovery_state_style,
@@ -26,6 +27,45 @@ from analysis.vis.recovery_backbone_comparison_tab import (
 
 
 class RecoveryBackboneComparisonTabTest(unittest.TestCase):
+    def test_testtime_filter_reuses_family_winner_selector(self) -> None:
+        payload = {
+            "testtime_points": [
+                {
+                    "compression": "fastvggt_m0_r0p9",
+                    "drop_count": 16,
+                    "selector": "i7_j22",
+                    "prune_strategy": "gt_single",
+                },
+                {
+                    "compression": "fastvggt_m0_r0p9",
+                    "drop_count": 16,
+                    "selector": "i8_j20_i41_j43",
+                    "prune_strategy": "gt_double",
+                },
+            ]
+        }
+        with patch(
+            "analysis.vis.recovery_backbone_comparison_tab.best_recovery_result",
+            return_value={"strategy": "gt_double", "selector": "i8_j20_i41_j43"},
+        ) as select:
+            filtered, failures = _filter_testtime_to_family_winners(
+                payload,
+                root=Path("/unused"),
+                recovery_method="recovery_ghost_interval_sequential",
+                families=["gt"],
+                selection_datasets=["scannet_dev50", "nuscenes_train"],
+            )
+
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            [point["selector"] for point in filtered["testtime_points"]],
+            ["i8_j20_i41_j43"],
+        )
+        self.assertEqual(
+            filtered["testtime_points"][0]["testtime_winner_families"], ["gt"]
+        )
+        self.assertEqual(select.call_args.kwargs["strategies"], ("gt_single", "gt_double"))
+
     def test_min_selects_whole_points_and_testtime_per_structure_and_drop(self) -> None:
         metrics = ("ape", "are", "rpe_trans", "rpe_rot", "acc", "comp", "chamfer_distance")
 
@@ -43,10 +83,19 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
                 "points": {"2": {"available": True, "raw_metric": raw(value, marker)}}
             }
             payload["strategies"][f"no_recovery_{variant}"] = {
-                "points": {"2": {
-                    "available": True,
-                    "raw_metric": raw(1.0 - value, marker + 10.0),
-                }}
+                "points": {
+                    "1": {
+                        "available": True,
+                        "raw_metric": raw(
+                            0.1 if variant.startswith("gt_") else 0.9,
+                            marker + 20.0,
+                        ),
+                    },
+                    "2": {
+                        "available": True,
+                        "raw_metric": raw(1.0 - value, marker + 10.0),
+                    },
+                }
             }
             payload["testtime_points"].append({
                 "compression": "fast", "drop_count": 2,
@@ -71,9 +120,15 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
         self.assertEqual(double_baseline["min_prune_strategy"], "gt_double")
         self.assertEqual(single_baseline["raw_metric"]["ape"], 11.0)
         self.assertEqual(double_baseline["raw_metric"]["ape"], 12.0)
+        single_fallback = merged["strategies"]["no_recovery_single"]["points"]["1"]
+        double_fallback = merged["strategies"]["no_recovery_double"]["points"]["1"]
+        self.assertTrue(single_fallback["no_recovery_fallback"])
+        self.assertTrue(double_fallback["no_recovery_fallback"])
+        self.assertEqual(single_fallback["min_prune_strategy"], "gt_single")
+        self.assertEqual(double_fallback["min_prune_strategy"], "gt_double")
         self.assertEqual(
             {point["prune_strategy"] for point in merged["testtime_points"]},
-            {"ours_single", "gt_double"},
+            {"gt_double"},
         )
 
     def test_testtime_loader_matches_strategy_selector_and_averages_datasets(self) -> None:

@@ -63,6 +63,29 @@ class RecoveryOverviewTabTest(unittest.TestCase):
         self.assertEqual(baseline["min_prune_strategy"], "ours_single")
         self.assertEqual(set(baseline["raw_metric"].values()), {"ours_baseline"})
 
+        candidates = [
+            ("gt_single", candidate(0.4, 1.0, "gt")),
+            ("ours_single", candidate(0.5, 0.0, "ours")),
+        ]
+        for source_name, payload in candidates:
+            fallback_value = 0.1 if source_name == "gt_single" else 0.9
+            payload["strategies"]["no_recovery"]["points"]["1"] = {
+                "available": True,
+                "normalized_metric": {
+                    metric: fallback_value for metric in metrics
+                },
+                "raw_metric": {
+                    metric: f"{source_name}_fallback" for metric in metrics
+                },
+            }
+        fallback_merged = _minimum_strategy_plot_payload(candidates)
+        fallback = fallback_merged["strategies"][
+            "no_recovery__recovery_linearpatch"
+        ]["points"]["1"]
+        self.assertTrue(fallback["no_recovery_fallback"])
+        self.assertEqual(fallback["min_prune_strategy"], "gt_single")
+        self.assertEqual(set(fallback["raw_metric"].values()), {"gt_single_fallback"})
+
     def _write_fixture(self, root: Path) -> None:
         backbone = root / "vggt"
         backbone.mkdir(parents=True)

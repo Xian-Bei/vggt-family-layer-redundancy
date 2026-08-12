@@ -30,6 +30,10 @@ from analysis.prune_plan import (
     load_prune_plan_bundle,
     physical_pruning_selector_from_record,
 )
+from analysis.recovery.shared_results import (
+    PRUNE_FAMILY_STRATEGIES,
+    best_recovery_result,
+)
 from analysis.vis.recovery_overview_tab import (
     _BASELINE_STRATEGIES,
     _DATASET_AVERAGE_GROUPS,
@@ -215,6 +219,62 @@ def _load_testtime_points(
     return points, warnings
 
 
+def _filter_testtime_to_family_winners(
+    payload: Dict[str, Any],
+    *,
+    root: Path,
+    recovery_method: str,
+    families: Sequence[str],
+    selection_datasets: Sequence[str],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Keep only selectors selected by the test-time scheduling policy."""
+    points = payload.get("testtime_points", ())
+    if not isinstance(points, list) or not points:
+        return payload, []
+    drop_counts = sorted({
+        int(point["drop_count"])
+        for point in points
+        if isinstance(point, dict) and isinstance(point.get("drop_count"), int)
+    })
+    winners: Dict[int, Dict[str, str]] = {}
+    failures: List[str] = []
+    for drop_count in drop_counts:
+        for family in families:
+            strategies = PRUNE_FAMILY_STRATEGIES.get(str(family))
+            if not strategies:
+                continue
+            try:
+                winner = best_recovery_result(
+                    Path(root),
+                    drop_count=drop_count,
+                    datasets=selection_datasets,
+                    recovery_plan_name=recovery_method,
+                    strategies=strategies,
+                )
+            except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+                failures.append(f"{family} drop {drop_count}: {exc}")
+                continue
+            winners.setdefault(drop_count, {})[str(family)] = str(winner["selector"])
+
+    filtered: List[Dict[str, Any]] = []
+    for point in points:
+        if not isinstance(point, dict) or not isinstance(point.get("drop_count"), int):
+            continue
+        drop_count = int(point["drop_count"])
+        selector = str(point.get("selector", ""))
+        matched_families = [
+            family
+            for family, winner_selector in winners.get(drop_count, {}).items()
+            if selector == winner_selector
+        ]
+        if matched_families:
+            filtered.append({
+                **point,
+                "testtime_winner_families": matched_families,
+            })
+    return {**payload, "testtime_points": filtered}, failures
+
+
 def _global_metric_ranges(
     payloads: Sequence[Dict[str, Any]], strategy_keys: Sequence[str]
 ) -> Dict[str, Tuple[float, float]]:
@@ -334,6 +394,43 @@ def _collapse_min_prune_strategies(
                 baseline_points[drop_key] = {
                     **deepcopy(point), "min_prune_strategy": variant,
                 }
+        baseline_drop_keys = {
+            str(drop_key)
+            for family in _PRUNE_STRATEGY_FAMILIES
+            for drop_key in strategies.get(
+                f"no_recovery_{family}_{structure}", {}
+            ).get("points", {})
+            if isinstance(
+                strategies.get(f"no_recovery_{family}_{structure}"), dict
+            )
+        }
+        for drop_key in baseline_drop_keys.difference(winner_variants):
+            choices: List[Tuple[float, str, Dict[str, Any]]] = []
+            for family in _PRUNE_STRATEGY_FAMILIES:
+                variant = f"{family}_{structure}"
+                baseline = strategies.get(f"no_recovery_{variant}", {})
+                point = (
+                    baseline.get("points", {}).get(drop_key)
+                    if isinstance(baseline, dict) else None
+                )
+                if not isinstance(point, dict) or not point.get("available", False):
+                    continue
+                raw = point.get("raw_metric", point.get("metrics_mean", {}))
+                score = (
+                    _strict_normalized_mean(raw, ranges)
+                    if isinstance(raw, dict) else None
+                )
+                if score is not None:
+                    choices.append((score, variant, point))
+            if choices:
+                _, variant, point = min(
+                    choices, key=lambda item: (item[0], item[1])
+                )
+                baseline_points[drop_key] = {
+                    **deepcopy(point),
+                    "min_prune_strategy": variant,
+                    "no_recovery_fallback": True,
+                }
         if baseline_points:
             selected[f"no_recovery_{structure}"] = {
                 "display_name": f"No recovery · {method.removeprefix('recovery_')} winner",
@@ -341,16 +438,14 @@ def _collapse_min_prune_strategies(
             }
 
     testtime_winners: List[Dict[str, Any]] = []
-    grouped: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = {}
+    grouped: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
     for point in payload.get("testtime_points", ()):
         if not isinstance(point, dict):
             continue
-        variant = str(point.get("prune_strategy", ""))
-        structure = variant.rsplit("_", 1)[-1]
         compression = str(point.get("compression", ""))
         drop_count = point.get("drop_count")
-        if structure in structures and compression and isinstance(drop_count, int):
-            grouped.setdefault((structure, compression, drop_count), []).append(point)
+        if compression and isinstance(drop_count, int):
+            grouped.setdefault((compression, drop_count), []).append(point)
     for candidates in grouped.values():
         choices = []
         for point in candidates:
@@ -620,6 +715,7 @@ def render_recovery_backbone_comparison(
         else [f"{strategy_family}_{structure}" for structure in structures]
     )
     method_keys = [f"{method}_{variant}" for variant in variants]
+    selection_datasets = tuple(_DATASET_AVERAGE_GROUPS["training average"])
     loaded: List[Tuple[str, Dict[str, Any]]] = []
     total_units_by_backbone: Dict[str, int] = {}
     warnings: List[str] = []
@@ -723,6 +819,23 @@ def render_recovery_backbone_comparison(
                 messages.append(
                     f"{backbone}: recovery method missing for {', '.join(missing_variants)}; "
                     "showing available pruning baselines"
+                )
+            winner_families = (
+                _PRUNE_STRATEGY_FAMILIES
+                if strategy_family == _MIN_PRUNE_STRATEGY
+                else (strategy_family,)
+            )
+            merged, winner_failures = _filter_testtime_to_family_winners(
+                merged,
+                root=root,
+                recovery_method=method,
+                families=winner_families,
+                selection_datasets=selection_datasets,
+            )
+            if winner_failures:
+                messages.append(
+                    f"{backbone}: test-time family selection skipped "
+                    + "; ".join(winner_failures)
                 )
             loaded.append((backbone, merged))
         except Exception as exc:
@@ -842,7 +955,8 @@ def _build_recovery_backbone_comparison_tab(
             "compression results are overlaid as isolated points, with marker shape identifying "
             "the compression configuration. Min compares GT and Ours separately for single and "
             "double pruning at every drop count, using the 7-metric mean to keep each winning "
-            "point's metrics together; No recovery follows that same winner."
+            "point's metrics together. No recovery follows that winner where recovery exists, "
+            "and otherwise uses its own 7-metric-mean winner."
             + (
                 " The x-axis is the number of remaining units, inferred from each backbone's prune plan."
                 if remaining_units

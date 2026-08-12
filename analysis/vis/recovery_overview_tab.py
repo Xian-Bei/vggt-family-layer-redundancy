@@ -129,6 +129,13 @@ def _minimum_strategy_plot_payload(
             if not strategy_key.startswith("recovery_"):
                 continue
             baseline_points: Dict[str, Any] = {}
+            baseline_drop_keys = {
+                str(drop_key)
+                for _, payload in valid
+                for key, baseline in payload.get("strategies", {}).items()
+                if str(key).startswith("no_recovery") and isinstance(baseline, dict)
+                for drop_key in baseline.get("points", {})
+            }
             for drop_key, source_name in winners.items():
                 source_strategies = candidate_map[source_name].get("strategies", {})
                 if not isinstance(source_strategies, dict):
@@ -144,6 +151,35 @@ def _minimum_strategy_plot_payload(
                 if isinstance(point, dict) and point.get("available", False):
                     baseline_points[drop_key] = {
                         **deepcopy(point), "min_prune_strategy": source_name,
+                    }
+            for drop_key in baseline_drop_keys.difference(winners):
+                choices: List[Tuple[float, str, Dict[str, Any]]] = []
+                for source_name, payload in valid:
+                    source_strategies = payload.get("strategies", {})
+                    if not isinstance(source_strategies, dict):
+                        continue
+                    baseline = next(
+                        (
+                            value for key, value in source_strategies.items()
+                            if str(key).startswith("no_recovery")
+                            and isinstance(value, dict)
+                        ),
+                        {},
+                    )
+                    point = baseline.get("points", {}).get(drop_key)
+                    if not isinstance(point, dict) or not point.get("available", False):
+                        continue
+                    score = _seven_metric_mean(point, payload)
+                    if score is not None:
+                        choices.append((score, source_name, point))
+                if choices:
+                    _, source_name, point = min(
+                        choices, key=lambda item: (item[0], item[1])
+                    )
+                    baseline_points[drop_key] = {
+                        **deepcopy(point),
+                        "min_prune_strategy": source_name,
+                        "no_recovery_fallback": True,
                     }
             if baseline_points:
                 result["strategies"][f"no_recovery__{strategy_key}"] = {
@@ -676,7 +712,8 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
             "mean is always normalized per metric before averaging."
             " Choosing min selects one complete strategy per drop from the displayed "
             "7-metric mean; individual metrics are never selected independently. Its "
-            "No recovery curve uses that same winning pruning strategy."
+            "No recovery curve follows that winner where recovery exists, and otherwise "
+            "uses its own 7-metric-mean winner."
         )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):

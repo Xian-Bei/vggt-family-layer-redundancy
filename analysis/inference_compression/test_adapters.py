@@ -88,7 +88,10 @@ class InferenceCompressionTests(unittest.TestCase):
         )
         for backbone in ("vggt", "pi3", "vggt_omega"):
             fast.validate_backbone(backbone)
-            quant.validate_backbone(backbone)
+        quant.validate_backbone("vggt")
+        for backbone in ("pi3", "vggt_omega"):
+            with self.assertRaises(ValueError):
+                quant.validate_backbone(backbone)
         with self.assertRaises(ValueError):
             fast.validate_backbone("unsupported")
 
@@ -180,23 +183,12 @@ class InferenceCompressionTests(unittest.TestCase):
         output = attn(torch.randn(1, 2 * (17 + 4), 8, device=_DEVICE))
         self.assertEqual(tuple(output.shape), (1, 42, 8))
 
-    def test_quant_block_group_mapping_covers_all_backbones(self):
+    def test_quant_block_group_mapping_covers_vggt(self):
         vggt = _Model()
         vggt.aggregator.frame_blocks = nn.ModuleList([_Block(), _Block()])
         groups = QuantVGGTInferenceAdapter._block_groups(vggt, "vggt")
+        self.assertEqual(groups[0][2], [(0, 0), (1, 1)])
         self.assertEqual(groups[1][2], [(0, 0)])
-
-        pi3 = nn.Module()
-        pi3.decoder = nn.ModuleList([_Block(), _Block(), _Block(), _Block()])
-        groups = QuantVGGTInferenceAdapter._block_groups(pi3, "pi3")
-        self.assertEqual(groups[0][2], [(0, 0), (1, 2)])
-        self.assertEqual(groups[1][2], [(0, 1), (1, 3)])
-
-        omega = _Model()
-        omega.aggregator.frame_blocks = nn.ModuleList([_Block()])
-        omega.aggregator.inter_frame_blocks = nn.ModuleList([_Block(), _Block()])
-        groups = QuantVGGTInferenceAdapter._block_groups(omega, "vggt_omega")
-        self.assertEqual(groups[1][2], [(0, 0), (1, 1)])
 
     def test_lora_merge_is_eval_equivalent(self):
         torch.manual_seed(7)
