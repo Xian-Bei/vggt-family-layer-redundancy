@@ -266,12 +266,21 @@ def _is_pow2(n: int) -> bool:
 
 
 def _hadamard(size: int, *, device: torch.device) -> torch.Tensor:
-    if not _is_pow2(int(size)):
-        raise ValueError(f"LinearPatch requires power-of-two channels, got {size}")
+    requested = int(size)
+    if requested <= 0:
+        raise ValueError(f"LinearPatch channels must be positive, got {size}")
+    # Sylvester Hadamard matrices exist at powers of two.  For model widths
+    # such as MapAnything's 768, construct the next matrix and orthogonalize
+    # its leading square submatrix.  Power-of-two widths retain the exact
+    # historical transform.
+    expanded = 1 << (requested - 1).bit_length()
     h = torch.tensor([[1.0, 1.0], [1.0, -1.0]], device=device, dtype=torch.float32)
-    while int(h.shape[0]) < int(size):
+    while int(h.shape[0]) < expanded:
         h = torch.kron(h, torch.tensor([[1.0, 1.0], [1.0, -1.0]], device=device, dtype=torch.float32))
-    return h / float(size) ** 0.5
+    if expanded == requested:
+        return h / float(requested) ** 0.5
+    q, _r = torch.linalg.qr(h[:requested, :requested])
+    return q
 
 
 def _pair_records(

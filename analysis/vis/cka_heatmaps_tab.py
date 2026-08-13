@@ -8,6 +8,8 @@ _BACKBONE_ORDER: Tuple[str, ...] = (
     "vggt",
     "pi3",
     "vggt_omega",
+    "mapanything",
+    "mapanything_v1",
 )
 
 _TOKEN_REGION_ORDER: Tuple[str, ...] = (
@@ -47,6 +49,8 @@ _BACKBONE_DISPLAY_NAMES = {
     "vggt": "VGGT",
     "pi3": "Pi3",
     "vggt_omega": "VGGT-Ω",
+    "mapanything": "MapAnything",
+    "mapanything_v1": "MapAnything V1",
 }
 
 _DATASET_DISPLAY_NAMES = {

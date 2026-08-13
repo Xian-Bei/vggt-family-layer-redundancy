@@ -358,24 +358,27 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
     ) -> Dict[str, Any]:
         predictions: Dict[str, Any] = {}
 
-        if getattr(model, "camera_head", None) is not None:
-            pose_enc_list = model.camera_head(aggregated_tokens_list)
-            predictions["pose_enc"] = pose_enc_list[-1]
-            predictions["pose_enc_list"] = pose_enc_list
+        # Match the official VGGT precision boundary: the aggregator inherits
+        # the caller's AMP context, while camera/depth/point heads run in fp32.
+        with torch.autocast(device_type=images.device.type, enabled=False):
+            if getattr(model, "camera_head", None) is not None:
+                pose_enc_list = model.camera_head(aggregated_tokens_list)
+                predictions["pose_enc"] = pose_enc_list[-1]
+                predictions["pose_enc_list"] = pose_enc_list
 
-        if getattr(model, "depth_head", None) is not None:
-            depth, depth_conf = model.depth_head(
-                aggregated_tokens_list, images=images, patch_start_idx=int(patch_start_idx)
-            )
-            predictions["depth"] = depth
-            predictions["depth_conf"] = depth_conf
+            if getattr(model, "depth_head", None) is not None:
+                depth, depth_conf = model.depth_head(
+                    aggregated_tokens_list, images=images, patch_start_idx=int(patch_start_idx)
+                )
+                predictions["depth"] = depth
+                predictions["depth_conf"] = depth_conf
 
-        if getattr(model, "point_head", None) is not None:
-            pts3d, pts3d_conf = model.point_head(
-                aggregated_tokens_list, images=images, patch_start_idx=int(patch_start_idx)
-            )
-            predictions["world_points"] = pts3d
-            predictions["world_points_conf"] = pts3d_conf
+            if getattr(model, "point_head", None) is not None:
+                pts3d, pts3d_conf = model.point_head(
+                    aggregated_tokens_list, images=images, patch_start_idx=int(patch_start_idx)
+                )
+                predictions["world_points"] = pts3d
+                predictions["world_points_conf"] = pts3d_conf
 
         if getattr(model, "track_head", None) is not None and query_points is not None:
             track_list, vis, conf = model.track_head(

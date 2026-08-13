@@ -7,7 +7,7 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
 
 # Default backbones for all stages. Override with BACKBONES="vggt,pi3,...".
-ALL_BACKBONES="${BACKBONES:-mapanything}"
+ALL_BACKBONES="${BACKBONES:-mapanything_v1}"
 BACKBONES="${ALL_BACKBONES}"
 parse_backbones_list
 ALL_BACKBONES_LIST=("${BB_LIST[@]}")
@@ -26,11 +26,18 @@ RECOVERY_PRUNE_PLANS="${RECOVERY_PRUNE_PLANS:-prune_span10,prune_span12,prune_sp
 RECOVERY_METHODS="${RECOVERY_METHODS:-recovery_linearpatch,recovery_ghost,recovery_ghost_interval,recovery_ghost_interval_sequential,recovery_replaceme_ls,recovery_replaceme_cos}"
 export OUTPUT_ROOT
 export COMPACT_LOG="${COMPACT_LOG:-1}"
+START_STAGE="${START_STAGE:-1}"
+END_STAGE="${END_STAGE:-9}"
+stage_enabled() {
+  local stage="$1"
+  [[ "${stage}" -ge "${START_STAGE}" && "${stage}" -le "${END_STAGE}" ]]
+}
 
 # 1. Evaluate the full pretrained model (upper bound, no pruning).
 #    Eval records are saved to:
 #    <OUTPUT_ROOT>/<backbone>/<dataset>/eval/upper/eval_record_v3.json
 #    Optional per-scene visualizations live under the same eval/upper directory.
+if stage_enabled 1; then
 stage_log "1/10" "Evaluate pretrained models"
 BACKBONES="${ALL_BACKBONES}" \
     RUN="${TRAINING_DATASETS},${EVAL_DATASETS}" \
@@ -40,6 +47,7 @@ BACKBONES="${ALL_BACKBONES}" \
     MAX_SCENES="${MAX_SCENES}" \
     DEVICE="${DEVICE}" \
     bash "${REPO_ROOT}/scripts/run_eval.sh"
+fi
 
 
 
@@ -48,16 +56,21 @@ BACKBONES="${ALL_BACKBONES}" \
 #    <OUTPUT_ROOT>/<backbone>/<dataset>/eval/pruning/iS_jE/summary.json
 #    The interval index is:
 #    <OUTPUT_ROOT>/<backbone>/<dataset>/eval/pruning/skip_eval_interval_index_v3.json
+if stage_enabled 2; then
 stage_log "2/10" "Evaluate skip intervals"
 BACKBONES="${ALL_BACKBONES}" \
     EVAL_DATASET="${TRAINING_DATASETS}" \
+    MAX_SCENES="${MAX_SCENES}" \
+    DEVICE="${DEVICE}" \
     bash "${REPO_ROOT}/scripts/run_skip_eval.sh"
+fi
 
 
 
 # 3. Compute redundancy/similarity graphs for plan-building datasets.
 #    No activation cache is saved here. Redundancy graphs are saved to:
 #    <OUTPUT_ROOT>/<backbone>/<dataset>/redundancy/redundancy_graph_<region>.npz
+if stage_enabled 3; then
 stage_log "3/10" "Compute redundancy"
 BACKBONES="${ALL_BACKBONES}" \
     RUN="${TRAINING_DATASETS}" \
@@ -68,6 +81,7 @@ BACKBONES="${ALL_BACKBONES}" \
     SKIP_REDUNDANCY=0 \
     SIM_TOKEN_REGIONS=special,patch,all \
     bash "${REPO_ROOT}/scripts/run_cache_redundancy.sh"
+fi
 
 
 
@@ -96,6 +110,7 @@ BACKBONES="${ALL_BACKBONES}" \
 #    <OUTPUT_ROOT>/<backbone>/prune_plan_all.json
 #    <OUTPUT_ROOT>/<backbone>/prune_plan_*.png
 #    Metric plots are generated only after step 7 has completed the exact plans.
+if stage_enabled 6; then
 stage_log "6/10" "Build pruning plans"
 for bb in "${ALL_BACKBONES_LIST[@]}"; do
   if compact_log; then
@@ -122,6 +137,7 @@ for bb in "${ALL_BACKBONES_LIST[@]}"; do
     --prune-plan-root "${plan_root}" \
     --viz-out-dir "${plan_root}"
 done
+fi
 
 
 
@@ -149,6 +165,7 @@ if [[ -z "${PLAN_GROUP//[[:space:],]/}" && -z "${PRUNE_STRATEGY//[[:space:],]/}"
   echo "error: PLAN_GROUP is required (e.g. PLAN_GROUP='i9_j19,i8_j20') or use PRUNE_STRATEGY+PLAN_MIN_DROP+PLAN_MAX_DROP+PLAN_DROP_STEP." >&2
   exit 1
 fi
+if stage_enabled 7; then
 stage_log "7/10" "Evaluate pruning plans"
 
 run_pruning_backbone() {
@@ -199,6 +216,7 @@ run_pruning_backbone() {
 for bb in "${ALL_BACKBONES_LIST[@]}"; do
   run_pruning_backbone "${bb}"
 done
+fi
 
 
 # 8. Build recovery-plan bundles from prune_plan_all.json.
@@ -211,6 +229,7 @@ done
 MAX_LORA_ANCHORS="${MAX_LORA_ANCHORS:-1}"
 LORA_RANK="${LORA_RANK:-32}"
 LORA_ALPHA="${LORA_ALPHA:-64}"
+if stage_enabled 8; then
 stage_log "8/10" "Build recovery plans"
 for bb in "${ALL_BACKBONES_LIST[@]}"; do
   set_backend_pythonpath "${bb}"
@@ -242,6 +261,7 @@ for bb in "${ALL_BACKBONES_LIST[@]}"; do
     done
   done
 done
+fi
 
 
 
@@ -264,6 +284,7 @@ export RECOVERY_CHUNK_ROWS="${RECOVERY_CHUNK_ROWS:-16384}"
 #    <OUTPUT_ROOT>/<backbone>/recovery_plan_<backbone>_recovery_drop.png
 #    Summary table:
 #    <OUTPUT_ROOT>/<backbone>/summary_comparison_<prune_strategy>.md
+if stage_enabled 9; then
 stage_log "9/10" "Cache, recover, and evaluate"
 for bb in "${ALL_BACKBONES_LIST[@]}"; do
   cache_root="${OUTPUT_ROOT}/${bb}"
@@ -277,9 +298,6 @@ for bb in "${ALL_BACKBONES_LIST[@]}"; do
       --strategies "${RECOVERY_PRUNE_STRATEGY}" \
       --selectors "${RECOVERY_PRUNE_PLANS}"
   )"
-  for ds in ${TRAINING_DATASETS//,/ } 7scenes_train waymo_training; do
-    rm -rf "${cache_root}/${ds}/cache"
-  done
   BACKBONES="${bb}" \
       RUN="${TRAINING_DATASETS}" \
       CACHE="${TRAINING_DATASETS}" \
@@ -298,6 +316,7 @@ for bb in "${ALL_BACKBONES_LIST[@]}"; do
       RECOVERY_PLAN_NAME="${recovery_plans}" \
       EPOCHS="${EPOCHS}" \
       MAX_SCENES="${MAX_SCENES}" \
+      EVAL_MAX_SCENES="${MAX_SCENES}" \
       EVAL_EPOCH="${EVAL_EPOCH}" \
       SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH}" \
       DEVICE="${DEVICE}" \
@@ -305,11 +324,6 @@ for bb in "${ALL_BACKBONES_LIST[@]}"; do
       EVAL="${TRAINING_DATASETS},${EVAL_DATASETS}" \
       RECOVERY_PRUNE_STRATEGY="${RECOVERY_PRUNE_STRATEGY}" \
       bash "${REPO_ROOT}/scripts/run_recovery.sh"
-
-  for ds in ${TRAINING_DATASETS//,/ } 7scenes_train waymo_training; do
-    rm -rf "${cache_root}/${ds}/cache"
-  done
 done
-
-
+fi
 

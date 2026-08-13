@@ -19,3 +19,10 @@ onnxruntime
 requests
 trimesh
 pydantic==2.10.6
+# MapAnything adaptor/runtime (the source itself is vendored as a submodule).
+uniception==0.1.7
+natsort
+orjson
+pillow-heif
+plyfile
+python-box

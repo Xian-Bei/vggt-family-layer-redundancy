@@ -34,7 +34,7 @@ from analysis.vis.dataset_average_warning import (
 from analysis.vis.pruning_plan_tab import _mean_backbone_plot_payloads
 
 
-_BACKBONE_ORDER = ("vggt_omega", "pi3", "vggt")
+_BACKBONE_ORDER = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
 _PRUNE_STRATEGIES = (
     "ours_double", "ours_single", "gt_double", "gt_single",
 )

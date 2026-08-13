@@ -634,6 +634,34 @@ def unit_index_to_unit_id(index: int) -> str:
     return f"{kind}_{layer}"
 
 
+def legacy_unit_ids(num_units: int) -> List[str]:
+    """Return the historical frame-first public unit order."""
+    return [unit_index_to_unit_id(i) for i in range(int(num_units))]
+
+
+def plan_unit_ids(plan: "UnitPrunePlan") -> List[str]:
+    """Return the plan's physical execution order, with legacy fallback."""
+    if plan.unit_ids:
+        return list(plan.unit_ids)
+    return legacy_unit_ids(plan.num_units)
+
+
+def plan_unit_id(plan: "UnitPrunePlan", index: int) -> str:
+    i = int(index)
+    ids = plan_unit_ids(plan)
+    if i < 0 or i >= len(ids):
+        raise ValueError(f"unit index out of range [0,{len(ids)}): {i}")
+    return ids[i]
+
+
+def plan_unit_kind_layer(plan: "UnitPrunePlan", index: int) -> Tuple[str, int]:
+    unit_id = plan_unit_id(plan, index)
+    kind, layer = unit_id.rsplit("_", 1)
+    if kind not in {"frame", "global"}:
+        raise ValueError(f"invalid public unit id in plan: {unit_id!r}")
+    return kind, int(layer)
+
+
 @dataclass
 class UnitLoraSpec:
     rank: int = 32
@@ -648,6 +676,7 @@ class UnitPrunePlan:
     backbone: str
     dataset: str
     num_units: int
+    unit_ids: List[str] = field(default_factory=list)
     drop: List[int] = field(default_factory=list)
     drop_length: int = 0
     lora: Dict[str, UnitLoraSpec] = field(default_factory=dict)
@@ -658,6 +687,18 @@ class UnitPrunePlan:
         n = int(self.num_units)
         if n <= 0:
             raise ValueError(f"num_units must be > 0, got {n}")
+        self.unit_ids = [str(x) for x in self.unit_ids]
+        if self.unit_ids:
+            if len(self.unit_ids) != n:
+                raise ValueError(
+                    f"len(unit_ids)={len(self.unit_ids)} does not match num_units={n}"
+                )
+            if len(set(self.unit_ids)) != len(self.unit_ids):
+                raise ValueError("unit_ids must be unique")
+            for unit_id in self.unit_ids:
+                kind, sep, layer = unit_id.rpartition("_")
+                if not sep or kind not in {"frame", "global"} or not layer.isdigit():
+                    raise ValueError(f"invalid public unit id: {unit_id!r}")
         self.drop = sorted({int(x) for x in self.drop})
         actual_drop_len = len(self.drop)
         if int(self.drop_length) != actual_drop_len:
@@ -734,6 +775,7 @@ class UnitPrunePlan:
             backbone=str(raw.get("backbone", "")),
             dataset=str(raw.get("dataset", "")),
             num_units=int(raw.get("num_units", 0)),
+            unit_ids=[str(x) for x in raw.get("unit_ids", [])],
             drop=drop_list,
             drop_length=drop_length,
             lora=lora,
@@ -777,6 +819,7 @@ def _load_named_budget_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan:
             backbone=str(bundle.get("backbone", "")),
             dataset=str(bundle.get("dataset", "")),
             num_units=int(bundle.get("num_units", 0)),
+            unit_ids=[str(x) for x in bundle.get("unit_ids", [])],
             drop=[],
             drop_length=0,
             lora={},
@@ -840,6 +883,7 @@ def _load_named_budget_prune_plan(root: Path, plan_name: str) -> UnitPrunePlan:
         backbone=str(bundle.get("backbone", "")),
         dataset=str(bundle.get("dataset", "")),
         num_units=int(bundle.get("num_units", 0)),
+        unit_ids=[str(x) for x in bundle.get("unit_ids", [])],
         drop=drop,
         drop_length=len(drop),
         lora=lora,
@@ -914,6 +958,7 @@ def _unit_prune_plan_from_interval_record(
         backbone=str(bundle.get("backbone", "")),
         dataset=str(bundle.get("dataset", "")),
         num_units=int(bundle.get("num_units", 0)),
+        unit_ids=[str(x) for x in bundle.get("unit_ids", [])],
         drop=drop,
         drop_length=len(drop),
         lora={},
@@ -951,6 +996,7 @@ def _unit_prune_plan_from_set_record(
         backbone=str(bundle.get("backbone", "")),
         dataset=str(bundle.get("dataset", "")),
         num_units=int(bundle.get("num_units", 0)),
+        unit_ids=[str(x) for x in bundle.get("unit_ids", [])],
         drop=drop,
         drop_length=drop_count,
         lora={},
@@ -1077,13 +1123,13 @@ def prune_actions_from_plan(plan: UnitPrunePlan) -> Tuple[List[PruneAction], Lis
     drop_actions: List[PruneAction] = []
     lora_actions: List[PruneAction] = []
     for idx in sorted({int(x) for x in plan.drop}):
-        drop_actions.append(PruneAction(action="drop_unit", unit_id=unit_index_to_unit_id(idx)))
+        drop_actions.append(PruneAction(action="drop_unit", unit_id=plan_unit_id(plan, idx)))
     for k, spec in sorted(plan.lora.items(), key=lambda x: int(x[0])):
         idx = int(k)
         lora_actions.append(
             PruneAction(
                 action="lora_unit",
-                unit_id=unit_index_to_unit_id(idx),
+                unit_id=plan_unit_id(plan, idx),
                 rank=int(spec.rank),
                 alpha=float(spec.alpha),
                 dropout=float(spec.dropout),
@@ -1116,7 +1162,7 @@ def drop_intervals_from_plan(
     frame_layers: set[int] = set()
     global_layers: set[int] = set()
     for idx in plan.drop:
-        kind, layer = unit_index_to_kind_layer(int(idx))
+        kind, layer = plan_unit_kind_layer(plan, int(idx))
         if kind == "frame":
             frame_layers.add(layer)
         else:
@@ -1138,7 +1184,7 @@ def triangles_from_plan_extra(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
 def lora_layers_from_plan(plan: UnitPrunePlan) -> List[int]:
     vals = []
     for k in plan.lora.keys():
-        _kind, layer = unit_index_to_kind_layer(int(k))
+        _kind, layer = plan_unit_kind_layer(plan, int(k))
         vals.append(layer)
     return sorted({int(x) for x in vals})
 

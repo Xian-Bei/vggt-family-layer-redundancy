@@ -60,12 +60,17 @@ parse_backbones_list() {
     bb="${bb//[[:space:]]/}"
     [[ -z "${bb}" ]] && continue
     case "${bb}" in
-      vggt|pi3|vggt_omega) ;;
+      map-anything) bb="mapanything" ;;
+      map-anything-v1) bb="mapanything_v1" ;;
+    esac
+    case "${bb}" in
+      vggt|pi3|vggt_omega|mapanything|mapanything_v1) ;;
       *)
-        echo "error: unsupported backbone ${bb}; expected vggt, pi3, or vggt_omega" >&2
+        echo "error: unsupported backbone ${bb}; expected vggt, pi3, vggt_omega, mapanything, or mapanything_v1" >&2
         exit 1
         ;;
     esac
+    BB_LIST[$((BB_N))]="${bb}"
     BB_N=$((BB_N + 1))
   done
   if [[ "${BB_N}" -eq 0 ]]; then

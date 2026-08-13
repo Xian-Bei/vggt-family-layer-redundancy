@@ -2937,6 +2937,7 @@ def run_build_prune_plan(
         "backbone": str(backbone),
         "dataset": str(dataset),
         "num_units": int(num_units),
+        "unit_ids": [str(x) for x in unit_ids],
         "param_accounting": param_accounting,
         "source_cache": "",
         "intervals": {

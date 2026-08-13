@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from analysis.prune_plan import UnitLoraSpec, UnitPrunePlan, load_named_prune_plan, unit_index_to_unit_id
+from analysis.prune_plan import UnitLoraSpec, UnitPrunePlan, load_named_prune_plan, plan_unit_id
 
 RECOVERY_PLAN_BUNDLE_FILENAME = "recovery_plan_all.json"
 RECOVERY_PLAN_BUNDLE_SCHEMA_VERSION = "recovery_plan_bundle_v3"
@@ -127,6 +127,7 @@ def load_recovery_plan_bundle(root: Path, name: str) -> Dict[str, Any]:
         "backbone": all_plans.get("backbone", ""),
         "dataset": all_plans.get("dataset", ""),
         "num_units": all_plans.get("num_units", 0),
+        "unit_ids": all_plans.get("unit_ids", []),
         "name": plan_name,
         **dict(entry),
     }
@@ -163,11 +164,13 @@ def _contiguous_drop_intervals(drop: List[int]) -> List[Tuple[int, int]]:
     return intervals
 
 
-def _one_boundary_record(start: int, end: int, method: str) -> Dict[str, Any]:
+def _one_boundary_record(
+    plan: UnitPrunePlan, start: int, end: int, method: str
+) -> Dict[str, Any]:
     source_index = int(start) - 1
     target_index = int(end)
-    source_id = unit_index_to_unit_id(source_index)
-    target_id = unit_index_to_unit_id(target_index)
+    source_id = plan_unit_id(plan, source_index)
+    target_id = plan_unit_id(plan, target_index)
     auxiliary = (
         [f"replaceme_residual:{source_id}"] if method in REPLACEME_RECOVERY_METHODS else []
     )
@@ -211,7 +214,7 @@ def _boundary_records(prune_plan: UnitPrunePlan, method: str) -> List[Dict[str, 
         starts_and_ends = intervals
     else:
         starts_and_ends = intervals
-    return [_one_boundary_record(start, end, method) for start, end in starts_and_ends]
+    return [_one_boundary_record(prune_plan, start, end, method) for start, end in starts_and_ends]
 
 
 def recovery_record_for_selector(
@@ -226,8 +229,12 @@ def recovery_record_for_selector(
     record["boundaries"] = records
     record["cache_unit_ids"] = sorted(
         {str(unit_id) for item in records for unit_id in item.get("cache_unit_ids", [])},
-        key=lambda unit_id: int(unit_id.split("_", 1)[1]) * 2
-        + (1 if unit_id.startswith("global_") else 0),
+        key=lambda unit_id: (
+            prune_plan.unit_ids.index(unit_id)
+            if prune_plan.unit_ids
+            else int(unit_id.split("_", 1)[1]) * 2
+            + (1 if unit_id.startswith("global_") else 0)
+        ),
     )
     record["auxiliary_cache_ids"] = sorted(
         {
@@ -304,6 +311,7 @@ def compose_recovery_unit_prune_plan(
         backbone=prune_plan.backbone,
         dataset=prune_plan.dataset,
         num_units=prune_plan.num_units,
+        unit_ids=list(prune_plan.unit_ids),
         drop=list(prune_plan.drop),
         drop_length=len(prune_plan.drop),
         lora=lora,

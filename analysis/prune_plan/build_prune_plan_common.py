@@ -58,6 +58,7 @@ def build_recovery_plan_from_interval(
     backbone: str,
     dataset: str,
     num_units: int,
+    unit_ids: Sequence[str] = (),
     source_cache: str,
 ) -> Tuple[UnitPrunePlan, List[int]]:
     """Build recovery metadata for zero-based closed-interval picks."""
@@ -104,6 +105,7 @@ def build_recovery_plan_from_interval(
         backbone=backbone,
         dataset=dataset,
         num_units=int(num_units),
+        unit_ids=[str(x) for x in unit_ids],
         drop=drop_sorted,
         drop_length=len(drop_sorted),
         lora=lora_specs,

@@ -16,6 +16,8 @@ _BACKBONE_ORDER: Tuple[str, ...] = (
     "vggt",
     "pi3",
     "vggt_omega",
+    "mapanything",
+    "mapanything_v1",
 )
 
 _DATASET_ORDER: Tuple[str, ...] = (

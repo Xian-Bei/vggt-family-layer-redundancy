@@ -101,6 +101,7 @@ def run_build_recovery_plan(
     if not isinstance(spans_raw, dict) or not spans_raw:
         raise ValueError(f"No spans in prune bundle: {prune_plan_bundle_path(prune_plan_root)}")
     num_units = int(prune_bundle.get("num_units", 0))
+    unit_ids = [str(x) for x in prune_bundle.get("unit_ids", [])]
     dataset = str(prune_bundle.get("dataset", ""))
     source_cache_s = str(source_cache or "")
 
@@ -136,6 +137,7 @@ def run_build_recovery_plan(
                 backbone=backbone,
                 dataset=dataset,
                 num_units=num_units,
+                unit_ids=unit_ids,
                 source_cache=source_cache_s,
             )
             assert model is not None
@@ -169,6 +171,7 @@ def run_build_recovery_plan(
             "backbone": str(backbone),
             "dataset": dataset,
             "num_units": num_units,
+            "unit_ids": unit_ids,
             "methods": {},
         }
     methods = bundle.setdefault("methods", {})

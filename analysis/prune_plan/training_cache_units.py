@@ -6,7 +6,7 @@ from typing import AbstractSet, Set, Tuple
 
 import torch.nn as nn
 
-from analysis.prune_plan import UnitPrunePlan, lora_layers_from_plan, unit_index_to_kind_layer, unit_index_to_unit_id
+from analysis.prune_plan import UnitPrunePlan, lora_layers_from_plan, plan_unit_id, plan_unit_kind_layer
 
 
 def layers_to_unit_ids(layers: AbstractSet[int]) -> Set[str]:
@@ -28,11 +28,11 @@ def replay_seed_spec(plan: UnitPrunePlan) -> Tuple[int, str, int]:
     if not plan.lora:
         raise ValueError("Prune plan has no lora entries; cannot derive replay seed.")
     min_u = min(int(k) for k in plan.lora.keys())
-    replay_start_layer = int(min_u) // 2
+    _min_kind, replay_start_layer = plan_unit_kind_layer(plan, min_u)
     if min_u <= 0:
         return 0, "none", int(replay_start_layer)
     seed_u = int(min_u) - 1
-    seed_kind, seed_layer = unit_index_to_kind_layer(seed_u)
+    seed_kind, seed_layer = plan_unit_kind_layer(plan, seed_u)
     return int(seed_layer), str(seed_kind), int(replay_start_layer)
 
 
@@ -96,14 +96,14 @@ def required_cache_unit_ids(plan: UnitPrunePlan, model: nn.Module) -> Set[str]:
     if str(seed_kind) == "none":
         required_units.add("layer_-1")
     else:
-        required_units.add(unit_index_to_unit_id(2 * int(seed_layer) + (0 if str(seed_kind) == "frame" else 1)))
+        required_units.add(plan_unit_id(plan, min(int(k) for k in plan.lora) - 1))
 
     # In addition to the replay predecessor, retain every LoRA unit's own output.
     for raw_index in plan.lora.keys():
         lora_index = int(raw_index)
         if lora_index < 0 or lora_index >= int(plan.num_units):
             raise ValueError(f"lora unit index out of range: {lora_index}")
-        required_units.add(unit_index_to_unit_id(lora_index))
+        required_units.add(plan_unit_id(plan, lora_index))
 
     start_layer = replay_start_layer(plan)
 
@@ -113,7 +113,7 @@ def required_cache_unit_ids(plan: UnitPrunePlan, model: nn.Module) -> Set[str]:
         t_idx = int(spec.alignment_teacher_unit_index)
         if t_idx < 0 or t_idx >= int(plan.num_units):
             raise ValueError(f"alignment_teacher_unit_index out of range: {t_idx}")
-        required_units.add(unit_index_to_unit_id(t_idx))
+        required_units.add(plan_unit_id(plan, t_idx))
 
     from analysis.backbones.registry import get_backbone
 

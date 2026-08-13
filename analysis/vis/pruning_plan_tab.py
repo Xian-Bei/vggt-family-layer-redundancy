@@ -28,7 +28,7 @@ from analysis.vis.dataset_average_warning import (
 
 GalleryItems = List[np.ndarray]
 
-_BACKBONE_ORDER = ("vggt_omega", "pi3", "vggt")
+_BACKBONE_ORDER = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
 _AVERAGE_SCOPES = ("training", "testing")
 _MEAN_BACKBONE = "mean"
 _DEFAULT_DROP_STEP = 2

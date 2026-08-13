@@ -1150,7 +1150,7 @@ def _discover_similarity_backbones(output_root: Path, *, artifact_stage: str) ->
     root = Path(output_root)
     if not root.is_dir():
         return []
-    preferred = ("vggt", "pi3", "vggt_omega")
+    preferred = ("vggt", "pi3", "vggt_omega", "mapanything", "mapanything_v1")
     discovered: List[str] = []
     for backbone_dir in root.iterdir():
         if not backbone_dir.is_dir() or backbone_dir.name.startswith("."):
@@ -4156,7 +4156,7 @@ def _preferred_stage2_scene(
 
 
 def _build_ui(controller: PairAttentionController) -> gr.Blocks:
-    backbone_display_order = ("vggt_omega", "pi3", "vggt")
+    backbone_display_order = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
 
     def backbone_display_sort_key(name: str) -> Tuple[int, str]:
         return (

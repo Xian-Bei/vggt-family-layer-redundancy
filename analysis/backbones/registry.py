@@ -15,7 +15,10 @@ def register(adapter: BackboneAdapter) -> BackboneAdapter:
 
 
 def get_backbone(name: str) -> BackboneAdapter:
-    key = name.strip().lower()
+    key = name.strip().lower().replace("-", "_")
+    key = {"map_anything": "mapanything", "map_anything_v1": "mapanything_v1"}.get(
+        key, key
+    )
     if key not in _REGISTRY:
         _load_defaults()
     if key not in _REGISTRY:
@@ -34,7 +37,10 @@ def _load_defaults() -> None:
     from .adapters.vggt_adapter import VGGTAdapter
     from .adapters.pi3_adapter import Pi3Adapter
     from .adapters.vggt_omega_adapter import VGGTOmegaAdapter
+    from .adapters.mapanything_adapter import MapAnythingAdapter, MapAnythingV1Adapter
 
     register(VGGTAdapter())
     register(Pi3Adapter())
     register(VGGTOmegaAdapter())
+    register(MapAnythingAdapter())
+    register(MapAnythingV1Adapter())

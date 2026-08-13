@@ -10,7 +10,7 @@ GalleryItems = List[Tuple[str, str]]
 RunsByBackbone = Dict[str, Dict[str, List[str]]]
 _DEFAULT_PLOT_GROUP = "all_prune_spans"
 _DEFAULT_RECOVERY_VIEW = "strategy_comparison"
-_BACKBONE_ORDER = ("vggt", "pi3", "vggt_omega")
+_BACKBONE_ORDER = ("vggt", "pi3", "vggt_omega", "mapanything", "mapanything_v1")
 _DATASET_ORDER = (
     "mean",
     "scannet_dev50",

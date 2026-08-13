@@ -65,6 +65,18 @@
         "kind": "huggingface_model_id",
         "value": "facebook/map-anything",
         "note": "Loaded lazily by MapAnything.from_pretrained; facebook/map-anything-apache is the Apache-2.0 checkpoint alternative."
+      },
+      "model_variants": {
+        "mapanything": {
+          "aliases": ["map-anything"],
+          "default_weight": "facebook/map-anything",
+          "information_sharing_depth": 16
+        },
+        "mapanything_v1": {
+          "aliases": ["map-anything-v1"],
+          "default_weight": "facebook/map-anything-v1",
+          "information_sharing_depth": 24
+        }
       }
     }
   }

@@ -11,6 +11,8 @@ HEATMAP_REAL_DATASETS: Tuple[str, ...] = (
 
 _BACKBONE_ORDER: Tuple[str, ...] = (
     "vggt_omega",
+    "mapanything",
+    "mapanything_v1",
     "pi3",
     "vggt",
 )
