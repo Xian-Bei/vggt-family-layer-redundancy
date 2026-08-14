@@ -138,83 +138,7 @@ class NormalizedSkipHeatmapTest(unittest.TestCase):
             self.assertEqual(kwargs["vmin"], 0.0)
             self.assertEqual(kwargs["vmax"], 1.0)
 
-    def test_heatmap_scores_use_common_finite_strict_upper_entries(self) -> None:
-        left = [999.0, 0.25, 0.5, -999.0, 0.75, 999.0]
-        right = [0.0, 0.25, np.nan, 0.0, 0.75, 0.0]
-
-        scores = view._packed_strict_upper_heatmap_scores(left, right, 3)
-
-        self.assertIsNotNone(scores)
-        assert scores is not None
-        self.assertAlmostEqual(float(scores["soft_iou"]), 1.0)
-        self.assertAlmostEqual(float(scores["soft_dice"]), 1.0)
-        self.assertAlmostEqual(float(scores["sinkhorn_2d"]), 0.0)
-        self.assertAlmostEqual(float(scores["js_divergence"]), 0.0)
-
-    def test_heatmap_scores_preserve_strength_and_spatial_distance(self) -> None:
-        # Moving mass from (0, 2) to (1, 2) costs one 2D grid cell even
-        # though those entries are two positions apart in the packed array.
-        left = [1.0, 0.0, 1.0, 1.0, 0.0, 1.0]
-        right = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0]
-
-        scores = view._packed_strict_upper_heatmap_scores(left, right, 3)
-
-        self.assertIsNotNone(scores)
-        assert scores is not None
-        self.assertAlmostEqual(float(scores["soft_iou"]), 0.0)
-        self.assertAlmostEqual(float(scores["soft_dice"]), 0.0)
-        self.assertAlmostEqual(float(scores["sinkhorn_2d"]), 1.0)
-        self.assertAlmostEqual(float(scores["js_divergence"]), 1.0)
-
-    def test_similarity_suffix_reports_horizontal_and_vertical_scores(
-        self,
-    ) -> None:
-        current = {"cka": [1.0, 0.2, 0.4, 1.0, 0.6, 1.0]}
-        retention = [1.0, 0.2, 0.4, 1.0, 0.6, 1.0]
-        original = {"cka": [1.0, 0.1, 0.2, 1.0, 0.3, 1.0]}
-
-        suffixes = view._similarity_score_suffixes(
-            current,
-            3,
-            horizontal_reference=retention,
-            vertical_reference=original,
-            sim_gamma=1.0,
-            sim_cutoff=0.0,
-        )
-
-        self.assertEqual(
-            suffixes["cka"],
-            " | H IoU=1.000 Dice=1.000 Sinkhorn=0.000 JS=0.000 · "
-            "V IoU=0.500 Dice=0.800 Sinkhorn=0.000 JS=0.000",
-        )
-
-    def test_marginal_score_compares_displayed_map_with_row_and_column_bases(
-        self,
-    ) -> None:
-        marginal = {"cka": [1.0, 0.2, 0.4, 1.0, 0.8, 1.0]}
-        row_base = [1.0, 0.2, 0.4, 1.0, 0.8, 1.0]
-        column_base = {
-            "cka": [1.0, 0.2, 0.4, 1.0, 0.8, 1.0]
-        }
-
-        suffixes = view._similarity_score_suffixes(
-            marginal,
-            3,
-            horizontal_reference=row_base,
-            vertical_reference=column_base,
-            sim_gamma=2.0,
-            sim_cutoff=0.0,
-            current_is_displayed=True,
-            vertical_reference_is_displayed=True,
-        )
-
-        self.assertEqual(
-            suffixes["cka"],
-            " | H IoU=1.000 Dice=1.000 Sinkhorn=0.000 JS=0.000 · "
-            "V IoU=1.000 Dice=1.000 Sinkhorn=0.000 JS=0.000",
-        )
-
-    def test_similarity_score_is_gallery_caption_not_raster_title(self) -> None:
+    def test_similarity_heading_is_rendered_inside_figure(self) -> None:
         rendered_titles: list[str] = []
 
         def capture(
@@ -233,10 +157,36 @@ class NormalizedSkipHeatmapTest(unittest.TestCase):
                 role_short="A",
                 sim_gamma=1.0,
                 sim_cutoff=0.0,
-                title_suffix_by_metric={
-                    "cka": " | H IoU=0.800 · V IoU=0.900"
-                },
             )
 
         self.assertEqual(rendered_titles, ["A·CKA"])
-        self.assertEqual(items[0][1], "H IoU=0.800 · V IoU=0.900")
+        self.assertIsInstance(items[0], np.ndarray)
+
+    def test_similarity_keeps_title_and_outer_axis_labels_in_figure(self) -> None:
+        rendered: list[tuple[str, bool]] = []
+
+        def capture(
+            _packed: list[float],
+            _num_layers: int,
+            title: str,
+            **kwargs: Any,
+        ) -> np.ndarray:
+            rendered.append(
+                (
+                    title,
+                    bool(kwargs["show_xlabel"] or kwargs["show_ylabel"]),
+                )
+            )
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+        with patch.object(view, "_heatmap_rgb_from_packed", side_effect=capture):
+            items = view._render_similarity_gallery(
+                {"cka": [1.0, 0.5, 1.0]},
+                2,
+                role_short="A",
+                sim_gamma=1.0,
+                sim_cutoff=0.0,
+            )
+
+        self.assertEqual(rendered, [("A·CKA", True)])
+        self.assertIsInstance(items[0], np.ndarray)

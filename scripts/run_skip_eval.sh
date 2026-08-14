@@ -46,6 +46,8 @@ run_skip_eval_dataset() {
     --max-scenes "${MAX_SCENES}"
     --max-frames "${MAX_FRAMES}"
     --max-span "${SKIP_GT_EVAL_MAX_SPAN}"
+    --score-workers "${ASYNC_SCORE_WORKERS}"
+    --score-max-pending "${ASYNC_SCORE_MAX_PENDING}"
   )
   if truthy "${SKIP_GT_EVAL_TIMING}"; then
     extra+=(--timing)
@@ -62,10 +64,11 @@ run_skip_eval_dataset() {
     if [[ "${SKIP_GT_EVAL_MAX_SPAN}" == "0" ]]; then
       span_scope="all"
     fi
-    printf '\n  skip evaluation\n    model: %s\n    spans: %s\n    dataset: %s\n\n' \
-      "${backbone}" "${span_scope}" "${output_dataset}"
+    printf '\n  skip evaluation\n    model: %s\n    spans: %s\n    score workers: %s\n    max pending: %s\n    dataset: %s\n\n' \
+      "${backbone}" "${span_scope}" "${ASYNC_SCORE_WORKERS}" \
+      "${ASYNC_SCORE_MAX_PENDING}" "${output_dataset}"
   else
-    echo "== skip_gt_eval dataset=${output_dataset} backbone=${backbone} max_span=${SKIP_GT_EVAL_MAX_SPAN} resume=${SKIP_GT_EVAL_RESUME} =="
+    echo "== skip_gt_eval dataset=${output_dataset} backbone=${backbone} max_span=${SKIP_GT_EVAL_MAX_SPAN} resume=${SKIP_GT_EVAL_RESUME} score_workers=${ASYNC_SCORE_WORKERS} max_pending=${ASYNC_SCORE_MAX_PENDING} =="
   fi
   run_command python -m analysis.redundancy.skip_gt_eval_v3 \
     "${extra[@]}"
@@ -106,7 +109,7 @@ run_dataset_key() {
 }
 
 if ! truthy "${COMPACT_LOG:-0}"; then
-  echo "== skip_gt_eval v3 backbones=${BACKBONES} (n=${BB_N}) datasets=$(join_by_comma "${EVAL_LIST[@]}") MAX_FRAMES=${MAX_FRAMES} MAX_SPAN=${SKIP_GT_EVAL_MAX_SPAN} =="
+  echo "== skip_gt_eval v3 backbones=${BACKBONES} (n=${BB_N}) datasets=$(join_by_comma "${EVAL_LIST[@]}") MAX_FRAMES=${MAX_FRAMES} MAX_SPAN=${SKIP_GT_EVAL_MAX_SPAN} SCORE_WORKERS=${ASYNC_SCORE_WORKERS} MAX_PENDING=${ASYNC_SCORE_MAX_PENDING} =="
 fi
 
 for bb in "${BB_LIST[@]}"; do

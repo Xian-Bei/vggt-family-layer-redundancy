@@ -15,9 +15,9 @@ DEVICE="${DEVICE:-cuda}"
 MAX_SCENES="${MAX_SCENES:-0}"
 PLAN_MAX_DROP="${PLAN_MAX_DROP:-18}"
 # Plan-building / train datasets used by skip-eval, redundancy, prune, remaining-*, and recovery.
-TRAINING_DATASETS="${TRAINING_DATASETS:-scannet_dev50,nuscenes_train}"
-EVAL_DATASETS="${EVAL_DATASETS:-scannet_test50,7scenes_test,nuscenes_val,waymo_validation}"
-SIM_TOKEN_REGIONS="${SIM_TOKEN_REGIONS:-special,patch,all}"
+TRAINING_DATASETS="${TRAINING_DATASETS:-nuscenes_train}"
+EVAL_DATASETS="${EVAL_DATASETS:-7scenes_test}"
+SIM_TOKEN_REGIONS="${SIM_TOKEN_REGIONS:-patch}"
 PRUNE_TOKEN_REGION="${PRUNE_TOKEN_REGION:-mean}"
 PRUNE_STRATEGY="${PRUNE_STRATEGY:-gt_single,gt_double,ours_single,ours_double,cosine_single,cosine_double,inv_mse_single,inv_mse_double,cca_single,cca_double,replaceme_single,replaceme_double,shortgpt,simpler}"
 # Strategy whose plans are used by recovery at the drop lengths below.
@@ -33,37 +33,8 @@ stage_enabled() {
   [[ "${stage}" -ge "${START_STAGE}" && "${stage}" -le "${END_STAGE}" ]]
 }
 
-# 1. Evaluate the full pretrained model (upper bound, no pruning).
-#    Eval records are saved to:
-#    <OUTPUT_ROOT>/<backbone>/<dataset>/eval/upper/eval_record_v3.json
-#    Optional per-scene visualizations live under the same eval/upper directory.
-if stage_enabled 1; then
-stage_log "1/10" "Evaluate pretrained models"
-BACKBONES="${ALL_BACKBONES}" \
-    RUN="${TRAINING_DATASETS},${EVAL_DATASETS}" \
-    EXPORT_VIS_2D=1 \
-    EXPORT_VIS_3D=1 \
-    PRUNE=0 \
-    MAX_SCENES="${MAX_SCENES}" \
-    DEVICE="${DEVICE}" \
-    bash "${REPO_ROOT}/scripts/run_eval.sh"
-fi
 
 
-
-# 2. Brute-force skip-GT sanity check on plan-building datasets.
-#    Skip-eval interval summaries are saved in i_j layout:
-#    <OUTPUT_ROOT>/<backbone>/<dataset>/eval/pruning/iS_jE/summary.json
-#    The interval index is:
-#    <OUTPUT_ROOT>/<backbone>/<dataset>/eval/pruning/skip_eval_interval_index_v3.json
-if stage_enabled 2; then
-stage_log "2/10" "Evaluate skip intervals"
-BACKBONES="${ALL_BACKBONES}" \
-    EVAL_DATASET="${TRAINING_DATASETS}" \
-    MAX_SCENES="${MAX_SCENES}" \
-    DEVICE="${DEVICE}" \
-    bash "${REPO_ROOT}/scripts/run_skip_eval.sh"
-fi
 
 
 
@@ -79,13 +50,13 @@ BACKBONES="${ALL_BACKBONES}" \
     MAX_SCENES="${MAX_SCENES}" \
     DEVICE="${DEVICE}" \
     SKIP_REDUNDANCY=0 \
-    SIM_TOKEN_REGIONS=special,patch,all \
+    SIM_TOKEN_REGIONS="${SIM_TOKEN_REGIONS}" \
     bash "${REPO_ROOT}/scripts/run_cache_redundancy.sh"
 fi
 
 
 
-
+exit 0
 
 # 6. Build the prune-only multi-strategy bundle:
 #    GT, Ours, and ReplaceMe each expose Single and Double variants. GT/Ours

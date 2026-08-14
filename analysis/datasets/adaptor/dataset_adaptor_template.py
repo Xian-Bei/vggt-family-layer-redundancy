@@ -171,3 +171,29 @@ class NewDatasetAdaptor(DatasetAdaptor):
         del backbone_adaptor, model, batch, ctx
         # TODO: implement directly or call helpers in ``analysis.datasets``.
         raise NotImplementedError
+
+    def prepare_eval_scene_cpu(
+        self,
+        backbone_adaptor: Any,
+        batch: EvalSampleBatch,
+        ctx: EvalSceneContext,
+    ) -> Any:
+        """Decode/preprocess one scene and load GT without moving tensors to CUDA.
+
+        Return a ``PreparedEvalScene`` whose ``images`` tensor is CPU FP32 and
+        contiguous. The shared preload pipeline pins that tensor before H2D.
+        Keep GT, poses, frame metadata, and scoring state on CPU.
+        """
+        del backbone_adaptor, batch, ctx
+        raise NotImplementedError
+
+    def score_eval_prediction(
+        self,
+        backbone_adaptor: Any,
+        prediction: Any,
+        prepared: Any,
+        ctx: EvalSceneContext,
+    ) -> Dict[str, float]:
+        """Score a CPU ``PredictionBundle`` against the prepared CPU state."""
+        del backbone_adaptor, prediction, prepared, ctx
+        raise NotImplementedError

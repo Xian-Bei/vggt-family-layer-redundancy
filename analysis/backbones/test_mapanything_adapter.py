@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -74,6 +75,38 @@ class MapAnythingAdapterTest(unittest.TestCase):
         self.assertEqual(registers, 2)
         torch.testing.assert_close(value[0, 0, :2], raw[0, 4:6])
         torch.testing.assert_close(value[0, 0, 2:], raw[0, :4])
+
+    def test_extract_layer_units_does_not_run_prediction_heads(self) -> None:
+        self.assertTrue(torch.cuda.is_available(), "GPU test requires CUDA")
+        adapter = MapAnythingAdapter()
+        model = _model(4).cuda().eval()
+        model._restore_original_geometric_input_config = mock.Mock()
+        model.downstream_head = mock.Mock(side_effect=AssertionError("head must not run"))
+        tokens = torch.randn(1, 13, 8, device="cuda")
+        context = {
+            "tokens": tokens,
+            "batch_size": 1,
+            "num_views": 2,
+            "patch_tokens": 4,
+            "tokens_per_view": 6,
+        }
+        captured = []
+        with (
+            mock.patch.object(adapter, "_prepare_replay_context", return_value=context),
+            mock.patch.object(adapter, "_infer", side_effect=AssertionError("infer must not run")),
+        ):
+            units, meta = adapter.extract_layer_units(
+                model,
+                torch.zeros(1, 2, 3, 28, 28, device="cuda"),
+                unit_ids={"global_0", "frame_0"},
+                layer_callback=lambda unit_id, _value: captured.append(unit_id),
+            )
+
+        self.assertEqual(set(units), {"global_0", "frame_0"})
+        self.assertEqual(captured, ["global_0", "frame_0"])
+        self.assertEqual(meta["register_token_count"], 2)
+        model.downstream_head.assert_not_called()
+        model._restore_original_geometric_input_config.assert_called_once_with()
 
     def test_ordered_and_legacy_plan_mapping(self) -> None:
         ordered = ["global_0", "frame_0", "global_1", "frame_1"]

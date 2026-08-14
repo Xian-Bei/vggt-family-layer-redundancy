@@ -213,9 +213,9 @@ class MapAnythingAdapterBase(BackboneAdapter):
         return load_driving_depth_stack_vggt(depth_paths, output_hw=output_hw)
 
     def align_7andn_gt_depth(self, view: Any, *, output_hw: Tuple[int, int]) -> Any:
-        from analysis.eval.prediction_eval import _load_7andn_gt_depth_vggt
+        from analysis.eval.prediction_eval import _load_7andn_gt_depth_mapanything
 
-        return _load_7andn_gt_depth_vggt(view, image_hw=output_hw)
+        return _load_7andn_gt_depth_mapanything(view, image_hw=output_hw)
 
     @staticmethod
     def _model_device(model: nn.Module) -> torch.device:
@@ -304,7 +304,14 @@ class MapAnythingAdapterBase(BackboneAdapter):
             raw=tensor_raw,
         )
 
-    def forward_predictions(self, model: nn.Module, images: torch.Tensor) -> PredictionBundle:
+    def forward_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        *,
+        defer_cpu_geometry: bool = False,
+    ) -> PredictionBundle:
+        del defer_cpu_geometry
         return self.prediction_bundle_from_raw({"views": self._infer(model, images)}, images)
 
     @staticmethod
@@ -480,6 +487,100 @@ class MapAnythingAdapterBase(BackboneAdapter):
             raise RuntimeError("MapAnything did not expose the layer_-1 input to global_0")
         return captures, meta, bundle, initial_tokens
 
+    def _capture_layer_units_only(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        *,
+        unit_ids: Optional[Set[str]],
+        layer_callback: Optional[Callable[[str, torch.Tensor], None]],
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any], torch.Tensor]:
+        """Capture information-sharing activations without prediction heads."""
+        from analysis.amp_policy import autocast_device_dtype
+
+        if images.dim() == 4:
+            images = images.unsqueeze(0)
+        catalog = self.layer_unit_catalog(model)
+        if not catalog:
+            raise RuntimeError("MapAnything information-sharing transformer has no blocks")
+        wanted = unit_ids if unit_ids is not None else {unit.unit_id for unit in catalog}
+        wanted_indices = [
+            self._physical_index(unit.unit_id)
+            for unit in catalog
+            if unit.unit_id in wanted
+        ]
+        last_needed = max(wanted_indices, default=-1)
+        captures: Dict[str, torch.Tensor] = {}
+        register_counts: Set[int] = set()
+        device = self._model_device(model)
+        images = images.to(device=device, dtype=torch.float32)
+
+        try:
+            with torch.inference_mode(), torch.autocast(**autocast_device_dtype(device)):
+                context = self._prepare_replay_context(model, images)
+                tokens = context["tokens"]
+                bsz = int(context["batch_size"])
+                seq_len = int(context["num_views"])
+                patch_tokens = int(context["patch_tokens"])
+                tokens_per_view = int(context["tokens_per_view"])
+                initial_tokens, initial_register_count = self._normalize_capture(
+                    "global_0",
+                    tokens,
+                    batch_size=bsz,
+                    num_frames=seq_len,
+                    patch_tokens=patch_tokens,
+                )
+                register_counts.add(initial_register_count)
+
+                for physical_index in range(last_needed + 1):
+                    tokens = self._run_replay_block(
+                        model,
+                        tokens,
+                        physical_index,
+                        batch_size=bsz,
+                        num_views=seq_len,
+                        tokens_per_view=tokens_per_view,
+                    )
+                    unit = catalog[physical_index]
+                    if unit.unit_id not in wanted:
+                        continue
+                    kind, _ = self.parse_unit_id(unit.unit_id)
+                    raw = tokens
+                    if kind == "frame":
+                        view_count = seq_len * tokens_per_view
+                        raw = tokens[:, :view_count].reshape(
+                            bsz * seq_len, tokens_per_view, int(tokens.shape[-1])
+                        )
+                    value, register_count = self._normalize_capture(
+                        unit.unit_id,
+                        raw,
+                        batch_size=bsz,
+                        num_frames=seq_len,
+                        patch_tokens=patch_tokens,
+                    )
+                    value = value.detach()
+                    captures[unit.unit_id] = value
+                    register_counts.add(register_count)
+                    if layer_callback is not None:
+                        layer_callback(unit.unit_id, value)
+        finally:
+            model._restore_original_geometric_input_config()
+
+        if len(register_counts) != 1:
+            raise RuntimeError(
+                f"Inconsistent MapAnything register counts: {sorted(register_counts)}"
+            )
+        register_count = next(iter(register_counts))
+        meta = {
+            "patch_start_idx": register_count,
+            "camera_token_count": 0,
+            "register_token_count": register_count,
+            "patch_token_count": patch_tokens,
+            "scale_token_excluded": True,
+            "unit_ids": [unit.unit_id for unit in catalog],
+        }
+        return captures, meta, initial_tokens.detach()
+
     def extract_layer_units(
         self,
         model: nn.Module,
@@ -487,12 +588,11 @@ class MapAnythingAdapterBase(BackboneAdapter):
         unit_ids: Optional[Set[str]] = None,
         layer_callback: Optional[Callable[[str, torch.Tensor], None]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
-        units, meta, _prediction, _initial = self._capture_and_predict(
+        units, meta, _initial = self._capture_layer_units_only(
             model,
             images,
             unit_ids=unit_ids,
             layer_callback=layer_callback,
-            with_prediction=False,
         )
         return units, meta
 
@@ -515,12 +615,11 @@ class MapAnythingAdapterBase(BackboneAdapter):
         )
 
     def build_initial_tokens(self, model: nn.Module, images: torch.Tensor) -> Optional[torch.Tensor]:
-        _units, _meta, _prediction, initial_tokens = self._capture_and_predict(
+        _units, _meta, initial_tokens = self._capture_layer_units_only(
             model,
             images,
             unit_ids=set(),
             layer_callback=None,
-            with_prediction=False,
         )
         return initial_tokens
 
@@ -743,7 +842,10 @@ class MapAnythingAdapterBase(BackboneAdapter):
         model: nn.Module,
         images: torch.Tensor,
         spans: Sequence[Tuple[int, int]],
+        *,
+        defer_cpu_geometry: bool = False,
     ) -> Iterable[Tuple[int, int, PredictionBundle]]:
+        del defer_cpu_geometry
         from analysis.amp_policy import autocast_device_dtype
 
         total = len(self._blocks(model))

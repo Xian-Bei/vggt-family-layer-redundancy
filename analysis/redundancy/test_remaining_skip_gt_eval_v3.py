@@ -7,6 +7,7 @@ from pathlib import Path
 
 from analysis.redundancy import skip_gt_eval_v3 as base
 from analysis.redundancy.remaining_skip_gt_eval_v3 import (
+    _build_parser,
     _load_base_prune_plan,
     _prepare_manifest_allowing_selector_alias,
     _validate_base_selector,
@@ -16,9 +17,47 @@ from analysis.redundancy.remaining_skip_layout import (
     build_remaining_span_records,
     evaluated_logical_spans,
 )
+from analysis.eval.async_pipeline import (
+    DEFAULT_ASYNC_SCORE_MAX_PENDING,
+    DEFAULT_ASYNC_SCORE_WORKERS,
+)
 
 
 class RemainingSkipSpanMappingTest(unittest.TestCase):
+    def test_async_score_cli_defaults_on_and_can_be_disabled(self) -> None:
+        required = [
+            "--dataset",
+            "scannet",
+            "--data-root",
+            "data/scans_dev50",
+            "--prune-plan-root",
+            "analysis/prune_plan",
+            "--prune-plan-name",
+            "i1_j1",
+            "--expected-drop-count",
+            "1",
+        ]
+        defaults = _build_parser().parse_args(required)
+        self.assertFalse(defaults.no_async_score)
+        self.assertEqual(defaults.score_workers, DEFAULT_ASYNC_SCORE_WORKERS)
+        self.assertEqual(
+            defaults.score_max_pending, DEFAULT_ASYNC_SCORE_MAX_PENDING
+        )
+        self.assertTrue(
+            _build_parser().parse_args([*required, "--no-async-score"]).no_async_score
+        )
+        configured = _build_parser().parse_args(
+            [
+                *required,
+                "--score-workers",
+                "6",
+                "--score-max-pending",
+                "18",
+            ]
+        )
+        self.assertEqual(configured.score_workers, 6)
+        self.assertEqual(configured.score_max_pending, 18)
+
     def test_exact_base_selector_builds_one_contiguous_plan(self) -> None:
         _validate_base_selector("i2_j4", 3)
         with self.assertRaisesRegex(ValueError, "drops 3 units, expected 2"):

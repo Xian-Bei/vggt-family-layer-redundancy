@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from analysis.backbones.contracts import EvalSceneContext
-from analysis.datasets.contracts import DatasetAdaptor, EvalSampleBatch, PreparedSkipEvalScene
+from analysis.datasets.contracts import DatasetAdaptor, EvalSampleBatch, PreparedEvalScene
 from analysis.eval.scannet_eval import (
     discover_scannet_scenes,
     load_scene_images,
@@ -109,23 +109,23 @@ class ScanNetAdaptor(DatasetAdaptor):
             ctx,
         )
 
-    def prepare_skip_eval_scene(
+    def prepare_eval_scene_cpu(
         self,
         backbone_adaptor: Any,
         batch: EvalSampleBatch,
         ctx: EvalSceneContext,
-    ) -> PreparedSkipEvalScene:
+    ) -> PreparedEvalScene:
         from analysis.datasets import eval_impl
 
-        return eval_impl.prepare_scannet_skip_scene(
-            backbone_adaptor, batch, ctx.device, ctx.profile
+        return eval_impl.prepare_scannet_eval_scene_cpu(
+            backbone_adaptor, batch, ctx.profile
         )
 
-    def score_skip_eval_prediction(
+    def score_eval_prediction(
         self,
         backbone_adaptor: Any,
         prediction: Any,
-        prepared: PreparedSkipEvalScene,
+        prepared: PreparedEvalScene,
         ctx: EvalSceneContext,
     ) -> Dict[str, float]:
         from analysis.datasets import eval_impl

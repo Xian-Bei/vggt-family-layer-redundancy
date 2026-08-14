@@ -25,12 +25,16 @@ class EvalSampleBatch:
 
 
 @dataclass
-class PreparedSkipEvalScene:
-    """Scene-local inputs and GT state reused across all skip spans."""
+class PreparedEvalScene:
+    """Scene-local model images and CPU GT state reused during evaluation."""
 
     scene_id: str
     images: Any
     state: Dict[str, Any] = field(default_factory=dict)
+
+
+# Backward-compatible name used by skip-eval callers and external adaptors.
+PreparedSkipEvalScene = PreparedEvalScene
 
 
 class DatasetAdaptor(ABC):
@@ -70,24 +74,52 @@ class DatasetAdaptor(ABC):
         del backbone_adaptor, model, batch, ctx
         raise NotImplementedError(f"{self.name} does not implement evaluate_scene")
 
+    def prepare_eval_scene_cpu(
+        self,
+        backbone_adaptor: Any,
+        batch: EvalSampleBatch,
+        ctx: Any,
+    ) -> PreparedEvalScene:
+        del backbone_adaptor, batch, ctx
+        raise NotImplementedError(
+            f"{self.name} does not implement CPU eval scene preparation"
+        )
+
+    def score_eval_prediction(
+        self,
+        backbone_adaptor: Any,
+        prediction: Any,
+        prepared: PreparedEvalScene,
+        ctx: Any,
+    ) -> Dict[str, float]:
+        del backbone_adaptor, prediction, prepared, ctx
+        raise NotImplementedError(
+            f"{self.name} does not implement eval prediction scoring"
+        )
+
     def prepare_skip_eval_scene(
         self,
         backbone_adaptor: Any,
         batch: EvalSampleBatch,
         ctx: Any,
-    ) -> PreparedSkipEvalScene:
-        del backbone_adaptor, batch, ctx
-        raise NotImplementedError(f"{self.name} does not implement skip-eval scene preparation")
+    ) -> PreparedEvalScene:
+        """Compatibility wrapper that stages the CPU-prepared images synchronously."""
+        prepared = self.prepare_eval_scene_cpu(backbone_adaptor, batch, ctx)
+        images = prepared.images
+        if not hasattr(images, "to"):
+            raise TypeError(f"{self.name} returned non-tensor eval images")
+        prepared.images = images.to(ctx.device)
+        return prepared
 
     def score_skip_eval_prediction(
         self,
         backbone_adaptor: Any,
         prediction: Any,
-        prepared: PreparedSkipEvalScene,
+        prepared: PreparedEvalScene,
         ctx: Any,
     ) -> Dict[str, float]:
-        del backbone_adaptor, prediction, prepared, ctx
-        raise NotImplementedError(f"{self.name} does not implement skip-eval prediction scoring")
+        """Compatibility wrapper for the shared evaluation scorer."""
+        return self.score_eval_prediction(backbone_adaptor, prediction, prepared, ctx)
 
     @abstractmethod
     def eval_profile(self) -> DatasetEvalProfile:

@@ -168,7 +168,13 @@ class PruningPlanTabTest(unittest.TestCase):
             )
             self.assertEqual(len(gallery), 16, status)
             self.assertIn("plots=16/16", status)
-            self.assertTrue(all(isinstance(image, np.ndarray) for image in gallery))
+            self.assertTrue(
+                all(
+                    isinstance(image[0] if isinstance(image, tuple) else image, np.ndarray)
+                    for image in gallery
+                )
+            )
+            self.assertTrue(any(isinstance(image, tuple) for image in gallery))
 
     def test_live_plots_default_to_drop_step_two(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,7 +369,8 @@ class PruningPlanTabTest(unittest.TestCase):
                 ui = build_pruning_plan_tab(blocks=blocks, output_root=root)
             self.assertIsInstance(ui["scope_cb"], gr.CheckboxGroup)
             self.assertIsInstance(ui["backbone_dd"], gr.CheckboxGroup)
-            self.assertIn(("mean", "mean"), ui["backbone_dd"].choices)
+            self.assertIn(("Mean", "mean"), ui["backbone_dd"].choices)
+            self.assertIn(("π³", "pi3"), ui["backbone_dd"].choices)
             self.assertEqual(ui["backbone_dd"].value, ["mean", "pi3", "vggt"])
             self.assertTrue(ui["scope_cb"].interactive)
             self.assertEqual(ui["scope_cb"].type, "value")

@@ -6,6 +6,7 @@ import sys
 
 from .eval_tab import build_eval_tab
 from .brute_force_tab import build_brute_force_tab
+from .backbone_efficiency_tab import build_backbone_efficiency_tab
 from .cka_heatmaps_tab import build_cka_heatmaps_tab
 from .lora_tab import build_lora_tab, build_recovery_tab
 from .remaining_tab import build_remaining_tab
@@ -34,6 +35,7 @@ HEATMAP_REAL_DATASETS = _similarity_metrics_module.HEATMAP_REAL_DATASETS
 
 __all__ = [
     "build_cka_heatmaps_tab",
+    "build_backbone_efficiency_tab",
     "build_brute_force_tab",
     "build_eval_tab",
     "build_heatmaps_tab",

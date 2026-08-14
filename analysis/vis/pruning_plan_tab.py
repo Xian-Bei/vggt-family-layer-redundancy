@@ -24,9 +24,13 @@ from analysis.vis.dataset_average_warning import (
     DATASET_AVERAGE_GROUPS,
     format_incomplete_average_warning,
 )
+from analysis.vis.display_names import (
+    backbone_display_name,
+    backbone_publication_sort_key,
+)
 
 
-GalleryItems = List[np.ndarray]
+GalleryItems = List[Any]
 
 _BACKBONE_ORDER = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
 _AVERAGE_SCOPES = ("training", "testing")
@@ -344,6 +348,14 @@ def render_pruning_plan_gallery(
     )
     if not selected_backbones:
         return [], "Select at least one backbone."
+    selected_backbones = sorted(
+        selected_backbones,
+        key=lambda name: (
+            (-1, "")
+            if name == _MEAN_BACKBONE
+            else backbone_publication_sort_key(name)
+        ),
+    )
     if not scopes:
         return [], "Select at least one dataset or average scope."
 
@@ -356,13 +368,13 @@ def render_pruning_plan_gallery(
     gallery: GalleryItems = []
     warnings: List[str] = []
     messages: List[str] = []
-    for selected_backbone in selected_backbones:
+    for backbone_index, selected_backbone in enumerate(selected_backbones):
         contributors = (
             available_backbones
             if selected_backbone == _MEAN_BACKBONE
             else [selected_backbone]
         )
-        for scope in scopes:
+        for scope_index, scope in enumerate(scopes):
             try:
                 contributor_plots: List[Dict[str, Any]] = []
                 dataset_labels: List[str] = []
@@ -408,7 +420,8 @@ def render_pruning_plan_gallery(
                 strategies = plot_payload.get("strategies", {})
                 strategy_keys = tuple(strategies) if isinstance(strategies, dict) else ()
                 rendered = 0
-                for plot_group, strategy_group in plot_groups:
+                scope_start = len(gallery)
+                for group_index, (plot_group, strategy_group) in enumerate(plot_groups):
                     selected = pruning_average_strategy_keys(
                         strategy_keys, strategy_group
                     )
@@ -436,7 +449,7 @@ def render_pruning_plan_gallery(
                             for key in selected
                             if key not in {"ours_single", "gt_single"}
                         )
-                    for metric_key in metric_keys:
+                    for metric_index, metric_key in enumerate(metric_keys):
                         metric_grid = (
                             PRUNING_MEAN_METRIC_GRID
                             if view_key == "overview"
@@ -445,23 +458,46 @@ def render_pruning_plan_gallery(
                         fig = render_strategy_metric_figure(
                             payload=plot_payload,
                             title=(
-                                f"{selected_backbone}: pruning strategies · "
-                                f"{_scope_label(scope)}"
-                                + (
-                                    f" · {plot_group.title()}"
-                                    if view_key == "overview"
-                                    else ""
-                                )
+                                f"{_scope_label(scope)} · "
+                                f"{plot_group.title()}"
                             ),
                             metric_grid=metric_grid,
                             strategy_keys=selected,
                             compact_pruning_legend=True,
+                            legend_fontsize=12,
                             normalize_metrics=(
                                 True
                                 if metric_key == "gt_mean"
                                 else bool(normalize_individual_metrics)
                             ),
                             strategy_style_overrides=style_overrides,
+                            show_figure_title=(
+                                backbone_index == 0
+                                and scope_index == 0
+                                if view_key == "overview"
+                                else metric_index == 0
+                            ),
+                            show_metric_titles=(
+                                backbone_index == 0 and scope_index == 0
+                            ),
+                            shared_xlabel=(
+                                "Dropped units"
+                                if backbone_index == len(selected_backbones) - 1
+                                and scope_index == len(scopes) - 1
+                                and (
+                                    view_key == "overview"
+                                    or (
+                                        group_index == len(plot_groups) - 1
+                                        and metric_index >= len(metric_keys) - 4
+                                    )
+                                )
+                                else None
+                            ),
+                            x_tick_step=2,
+                            tick_label_fontsize=13,
+                            axis_label_fontsize=15,
+                            legend_markerscale=1.5,
+                            legend_handlelength=2.8,
                         )
                         if fig is None:
                             continue
@@ -470,6 +506,12 @@ def render_pruning_plan_gallery(
                             rendered += 1
                         finally:
                             plt.close(fig)
+                if rendered:
+                    separator_index = scope_start + (rendered - 1) // 2
+                    gallery[separator_index] = (
+                        gallery[separator_index],
+                        f"{backbone_display_name(selected_backbone)} · {_scope_label(scope)}",
+                    )
                 messages.append(
                     f"{selected_backbone}/{scope}: datasets={','.join(dataset_labels)} "
                     f"| view={view_key} | plots={rendered}/{expected_plots} "
@@ -597,7 +639,13 @@ def build_pruning_plan_tab(
             normalize_individual_metrics=normalize_individual_metrics,
         )
         return (
-            gr.update(choices=[_MEAN_BACKBONE, *latest_backbones], value=backbone_value),
+            gr.update(
+                choices=[
+                    (backbone_display_name(item), item)
+                    for item in [_MEAN_BACKBONE, *latest_backbones]
+                ],
+                value=backbone_value,
+            ),
             gr.update(choices=_scope_choices(backbone_value), value=selected),
             gallery,
             status,
@@ -624,7 +672,10 @@ def build_pruning_plan_tab(
                 with gr.Column(scale=1, elem_classes=["control-column"]):
                     backbone_dd = gr.CheckboxGroup(
                         label="Backbones",
-                        choices=[_MEAN_BACKBONE, *backbones],
+                        choices=[
+                            (backbone_display_name(item), item)
+                            for item in [_MEAN_BACKBONE, *backbones]
+                        ],
                         value=[_MEAN_BACKBONE, *backbones],
                     )
                     scope_cb = gr.CheckboxGroup(
@@ -657,6 +708,7 @@ def build_pruning_plan_tab(
                 with gr.Column(scale=5):
                     gallery = gr.Gallery(
                         label=f"Live pruning-plan {view} plots",
+                        show_label=False,
                         columns=4 if detail else 3,
                         height="auto",
                         object_fit="contain",

@@ -1472,6 +1472,14 @@ def render_strategy_metric_figure(
     include_upper_anchor: bool = True,
     subplot_width: Optional[float] = None,
     strategy_style_overrides: Optional[dict[str, dict[str, Any]]] = None,
+    shared_xlabel: Optional[str] = "Dropped units",
+    show_figure_title: bool = True,
+    show_metric_titles: bool = True,
+    x_tick_step: Optional[float] = None,
+    tick_label_fontsize: float = 10.0,
+    axis_label_fontsize: float = 11.0,
+    legend_markerscale: float = 1.0,
+    legend_handlelength: float = 2.0,
 ) -> Optional[Any]:
     """Render a strategy metric figure without reading or writing a cached PNG."""
     strategies = payload.get("strategies", {})
@@ -1510,7 +1518,7 @@ def render_strategy_metric_figure(
     try:
         import matplotlib.pyplot as plt  # type: ignore
         from matplotlib.lines import Line2D  # type: ignore
-        from matplotlib.ticker import MaxNLocator  # type: ignore
+        from matplotlib.ticker import MaxNLocator, MultipleLocator  # type: ignore
     except Exception as exc:
         print(f"[warn] Could not import matplotlib for strategy eval plot: {exc}", flush=True)
         return None
@@ -1531,6 +1539,14 @@ def render_strategy_metric_figure(
     )
     any_data = False
     style_overrides = strategy_style_overrides or {}
+    normalization_states = [
+        bool(
+            normalized_view
+            or (always_normalize_metric_mean and metric_key == "gt_mean")
+        )
+        for row in metric_grid
+        for metric_key in row
+    ]
     for row_idx, row in enumerate(metric_grid):
         for col_idx, metric_key in enumerate(row):
             ax = axes[row_idx][col_idx]
@@ -1682,15 +1698,8 @@ def render_strategy_metric_figure(
                 ax.axis("off")
                 continue
             metric_title = METRIC_HEADERS.get(metric_key, metric_key)
-            if modern_scaling:
-                suffix = (
-                    "normalized metric"
-                    if metric_normalized_view
-                    else "raw metric"
-                )
-                metric_title = f"{metric_title} · {suffix}"
-            ax.set_title(metric_title, fontsize=11, fontweight="bold")
-            ax.set_xlabel("Dropped units")
+            if show_metric_titles:
+                ax.set_title(metric_title, fontsize=11, fontweight="bold")
             ax.grid(True, alpha=0.25)
             ax.set_xlim(left=0)
             if metric_key == "gt_mean":
@@ -1724,7 +1733,13 @@ def render_strategy_metric_figure(
             if axis_upper is not None:
                 ax.set_ylim(top=axis_upper)
             if all_xs:
-                ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=8))
+                if x_tick_step is not None and float(x_tick_step) > 0:
+                    ax.xaxis.set_major_locator(
+                        MultipleLocator(float(x_tick_step))
+                    )
+                else:
+                    ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=8))
+            ax.tick_params(axis="both", labelsize=float(tick_label_fontsize))
             if compact_pruning_legend:
                 method_handles = []
                 seen_families: set[str] = set()
@@ -1797,6 +1812,8 @@ def render_strategy_metric_figure(
                         loc="upper left",
                         fontsize=legend_fontsize,
                         title_fontsize=legend_fontsize,
+                        markerscale=float(legend_markerscale),
+                        handlelength=float(legend_handlelength),
                     )
                     ax.add_artist(method_legend)
                 if style_handles:
@@ -1806,6 +1823,8 @@ def render_strategy_metric_figure(
                         loc="upper left",
                         fontsize=legend_fontsize,
                         title_fontsize=legend_fontsize,
+                        markerscale=float(legend_markerscale),
+                        handlelength=float(legend_handlelength),
                     )
                     if method_handles:
                         # Keep both compact legend blocks in the upper-left
@@ -1821,12 +1840,36 @@ def render_strategy_metric_figure(
                             transform=ax.transAxes,
                         )
             else:
-                ax.legend(loc="best", fontsize=legend_fontsize)
+                ax.legend(
+                    loc="best",
+                    fontsize=legend_fontsize,
+                    markerscale=float(legend_markerscale),
+                    handlelength=float(legend_handlelength),
+                )
     if not any_data:
         plt.close(fig)
         return None
-    fig.suptitle(title, fontsize=14, fontweight="bold", y=0.995)
-    fig.tight_layout(rect=(0.01, 0.01, 0.99, 0.97), pad=0.7, h_pad=1.0, w_pad=0.8)
+    figure_title = title
+    if modern_scaling and normalization_states:
+        if all(normalization_states):
+            normalization_note = "Metrics: normalized"
+        elif not any(normalization_states):
+            normalization_note = "Metrics: raw"
+        else:
+            normalization_note = "Individual metrics: raw · 7-metric mean: normalized"
+        figure_title = f"{title}\n{normalization_note}"
+    if show_figure_title:
+        fig.suptitle(figure_title, fontsize=14, fontweight="bold", y=0.995)
+    bottom = 0.01
+    if shared_xlabel:
+        fig.supxlabel(
+            str(shared_xlabel),
+            fontsize=float(axis_label_fontsize),
+            fontweight="bold",
+        )
+        bottom = 0.035
+    top = 0.97 if show_figure_title else 0.99
+    fig.tight_layout(rect=(0.01, bottom, 0.99, top), pad=0.7, h_pad=1.0, w_pad=0.8)
     return fig
 
 

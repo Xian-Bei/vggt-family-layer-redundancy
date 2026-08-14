@@ -9,7 +9,9 @@ import gradio as gr
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.lines import Line2D
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import MultipleLocator
+
+from analysis.vis.display_names import backbone_display_name
 
 from analysis.prune_plan.eval_plots import (
     GT_MEAN_METRICS,
@@ -503,7 +505,12 @@ def _render_combined_figure(
 
     for backbone_idx, (backbone, payload) in enumerate(payloads):
         color = _BACKBONE_COLORS[backbone_idx % len(_BACKBONE_COLORS)]
-        backbone_handles.append(Line2D([], [], color=color, linewidth=2.4, label=backbone))
+        backbone_handles.append(
+            Line2D(
+                [], [], color=color, linewidth=2.4,
+                label=backbone_display_name(backbone),
+            )
+        )
         strategies = payload.get("strategies", {})
         if not isinstance(strategies, dict):
             continue
@@ -610,17 +617,15 @@ def _render_combined_figure(
 
     for panel_idx, metric in enumerate(sum((tuple(row) for row in RECOVERY_METRIC_GRID), ())):
         ax = axes.flat[panel_idx]
-        suffix = "globally normalized" if metric == "gt_mean" else "raw metric"
         ax.set_title(
-            f"{METRIC_HEADERS.get(metric, metric)} · {suffix}",
+            METRIC_HEADERS.get(metric, metric),
             fontsize=15,
             fontweight="bold",
         )
         x_label = "Remaining layers" if total_units_by_backbone is not None else "Dropped units"
-        ax.set_xlabel(f"{x_label} ÷ 2" if halve_x_axis else x_label, fontsize=13)
-        ax.tick_params(axis="both", labelsize=12)
+        ax.tick_params(axis="both", labelsize=15)
         ax.set_xlim(left=0)
-        ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=8))
+        ax.xaxis.set_major_locator(MultipleLocator(2))
         ax.grid(True, alpha=.25)
     if not any_data:
         plt.close(fig)
@@ -667,11 +672,21 @@ def _render_combined_figure(
                 + len(compression_handles) + 1,
             ),
         ),
-        fontsize=13,
+        fontsize=16,
+        markerscale=1.35,
+        handlelength=2.8,
+        handleheight=1.2,
         frameon=True,
     )
-    fig.suptitle(title, fontsize=19, fontweight="bold", y=.995)
-    fig.tight_layout(rect=(0, 0, 1, .88))
+    fig.suptitle(
+        f"{title}\nIndividual metrics: raw · 7-metric mean: globally normalized",
+        fontsize=19,
+        fontweight="bold",
+        y=.995,
+    )
+    shared_x_label = f"{x_label} ÷ 2" if halve_x_axis else x_label
+    fig.supxlabel(shared_x_label, fontsize=17, fontweight="bold")
+    fig.tight_layout(rect=(0, .035, 1, .88))
     return fig
 
 
@@ -965,7 +980,11 @@ def _build_recovery_backbone_comparison_tab(
         )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):
-                backbone_cb = gr.CheckboxGroup(label="Backbones", choices=backbones, value=backbones)
+                backbone_cb = gr.CheckboxGroup(
+                    label="Backbones",
+                    choices=[(backbone_display_name(item), item) for item in backbones],
+                    value=backbones,
+                )
                 prune_strategy_dd = gr.Dropdown(
                     label="Prune strategy",
                     choices=[*_PRUNE_STRATEGY_FAMILIES, _MIN_PRUNE_STRATEGY],

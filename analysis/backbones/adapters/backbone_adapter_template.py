@@ -209,9 +209,15 @@ class NewBackboneAdapter(BackboneAdapter):
         # TODO: return ``[B, S, P, C]`` tokens before the first public unit.
         return None
 
-    def forward_predictions(self, model: nn.Module, images: torch.Tensor) -> PredictionBundle:
+    def forward_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        *,
+        defer_cpu_geometry: bool = False,
+    ) -> PredictionBundle:
         """Run complete inference and normalize vendor raw prediction."""
-        del model, images
+        del model, images, defer_cpu_geometry
         # TODO: call the official full forward, then:
         # return self.prediction_bundle_from_raw(raw_prediction, images)
         raise NotImplementedError("run full inference")

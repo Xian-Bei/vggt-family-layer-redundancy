@@ -15,6 +15,7 @@ MAX_SCENES="${MAX_SCENES:-0}"
 REMAINING_SKIP_EVAL_MAX_SPAN="${REMAINING_SKIP_EVAL_MAX_SPAN:-0}"
 REMAINING_SKIP_EVAL_TIMING="${REMAINING_SKIP_EVAL_TIMING:-0}"
 REMAINING_SKIP_EVAL_RESUME="${REMAINING_SKIP_EVAL_RESUME:-1}"
+REMAINING_SKIP_EVAL_ASYNC_SCORE="${REMAINING_SKIP_EVAL_ASYNC_SCORE:-${ASYNC_SCORE:-1}}"
 DEVICE="${DEVICE:-cuda}"
 export OUTPUT_ROOT
 
@@ -73,6 +74,8 @@ run_one_dataset() {
     --prune-plan-root "${PRUNE_PLAN_ROOT}"
     --prune-plan-name "${PRUNE_PLAN_NAME}"
     --expected-drop-count "${EXPECTED_DROP_COUNT}"
+    --score-workers "${ASYNC_SCORE_WORKERS}"
+    --score-max-pending "${ASYNC_SCORE_MAX_PENDING}"
   )
   if [[ -n "${BASE_SELECTION_PATH//[[:space:]]/}" ]]; then
     extra+=(--base-selection-path "${BASE_SELECTION_PATH}")
@@ -89,17 +92,22 @@ run_one_dataset() {
   if ! truthy "${REMAINING_SKIP_EVAL_RESUME}"; then
     extra+=(--no-resume)
   fi
+  if ! truthy "${REMAINING_SKIP_EVAL_ASYNC_SCORE}"; then
+    extra+=(--no-async-score)
+  fi
 
   if truthy "${COMPACT_LOG:-0}"; then
     local span_scope="1-${REMAINING_SKIP_EVAL_MAX_SPAN}"
     if [[ "${REMAINING_SKIP_EVAL_MAX_SPAN}" == "0" ]]; then
       span_scope="all"
     fi
-    printf '\n  remaining skip evaluation\n    model: %s\n    prune plan: %s\n    dropped units: %s\n    spans over remaining units: %s\n    dataset: %s\n\n' \
+    printf '\n  remaining skip evaluation\n    model: %s\n    prune plan: %s\n    dropped units: %s\n    spans over remaining units: %s\n    async score: %s\n    score workers: %s\n    max pending: %s\n    dataset: %s\n\n' \
       "${backbone}" "${PRUNE_PLAN_NAME}" "${EXPECTED_DROP_COUNT}" "${span_scope}" \
+      "${REMAINING_SKIP_EVAL_ASYNC_SCORE}" "${ASYNC_SCORE_WORKERS}" \
+      "${ASYNC_SCORE_MAX_PENDING}" \
       "${output_dataset:-${dataset}${split:+_${split}}}"
   else
-    echo "== remaining_skip_eval dataset=${output_dataset:-${dataset}${split:+_${split}}} backbone=${backbone} prune_plan=${PRUNE_PLAN_NAME} max_span=${REMAINING_SKIP_EVAL_MAX_SPAN} resume=${REMAINING_SKIP_EVAL_RESUME} =="
+    echo "== remaining_skip_eval dataset=${output_dataset:-${dataset}${split:+_${split}}} backbone=${backbone} prune_plan=${PRUNE_PLAN_NAME} max_span=${REMAINING_SKIP_EVAL_MAX_SPAN} resume=${REMAINING_SKIP_EVAL_RESUME} async_score=${REMAINING_SKIP_EVAL_ASYNC_SCORE} score_workers=${ASYNC_SCORE_WORKERS} max_pending=${ASYNC_SCORE_MAX_PENDING} =="
   fi
 
   run_command python -m analysis.redundancy.remaining_skip_gt_eval_v3 "${extra[@]}"

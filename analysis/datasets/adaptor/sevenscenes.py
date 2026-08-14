@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator
 
 from analysis.backbones.contracts import EvalSceneContext
-from analysis.datasets.contracts import DatasetAdaptor, EvalSampleBatch, PreparedSkipEvalScene
+from analysis.datasets.contracts import DatasetAdaptor, EvalSampleBatch, PreparedEvalScene
 from analysis.datasets.seven_and_n_common import count_7andn_scenes, iter_7andn_scenes, load_7andn_scene
 from analysis.schema.v3 import DatasetEvalProfile, GeometryEvalProfile
 
@@ -100,11 +100,28 @@ class SevenScenesAdaptor(DatasetAdaptor):
             ctx,
         )
 
-    def prepare_skip_eval_scene(self, backbone_adaptor: Any, batch: EvalSampleBatch, ctx: EvalSceneContext) -> PreparedSkipEvalScene:
+    def prepare_eval_scene_cpu(
+        self,
+        backbone_adaptor: Any,
+        batch: EvalSampleBatch,
+        ctx: EvalSceneContext,
+    ) -> PreparedEvalScene:
         from analysis.datasets import eval_impl
-        return eval_impl.prepare_7andn_skip_scene(backbone_adaptor, batch, ctx.device, ctx.profile)
 
-    def score_skip_eval_prediction(self, backbone_adaptor: Any, prediction: Any, prepared: PreparedSkipEvalScene, ctx: EvalSceneContext) -> Dict[str, float]:
+        return eval_impl.prepare_7andn_eval_scene_cpu(
+            backbone_adaptor, batch, ctx.profile
+        )
+
+    def score_eval_prediction(
+        self,
+        backbone_adaptor: Any,
+        prediction: Any,
+        prepared: PreparedEvalScene,
+        ctx: EvalSceneContext,
+    ) -> Dict[str, float]:
         from analysis.datasets import eval_impl
+
         del backbone_adaptor
-        return eval_impl.score_7andn_skip_prediction(prediction, prepared, ctx.profile, ctx)
+        return eval_impl.score_7andn_skip_prediction(
+            prediction, prepared, ctx.profile, ctx
+        )

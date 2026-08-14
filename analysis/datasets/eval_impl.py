@@ -11,7 +11,7 @@ import torch
 
 from analysis.amp_policy import autocast_device_dtype
 from analysis.backbones.contracts import EvalSceneContext, PredictionBundle
-from analysis.datasets.contracts import PreparedSkipEvalScene
+from analysis.datasets.contracts import PreparedEvalScene
 from analysis.eval.metrics_core import (
     compute_point_metrics,
     merge_scene_metrics,
@@ -102,6 +102,57 @@ def _as_view_points_np(points: torch.Tensor, n_views: int) -> list[np.ndarray] |
     return [arr[i].reshape(-1, 3) for i in range(n)]
 
 
+def _as_view_point_maps_np(points: torch.Tensor, n_views: int) -> list[np.ndarray] | None:
+    arr = points.detach().float().cpu().numpy()
+    while arr.ndim >= 5 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 4 or arr.shape[-1] != 3:
+        return None
+    n = min(int(n_views), int(arr.shape[0]))
+    return [arr[i] for i in range(n)]
+
+
+def _resize_valid_mask(mask: np.ndarray, output_hw: tuple[int, int]) -> np.ndarray:
+    valid = np.asarray(mask, dtype=bool)
+    while valid.ndim > 2 and valid.shape[0] == 1:
+        valid = valid[0]
+    if valid.ndim != 2:
+        raise ValueError(f"Expected a 2D valid mask, got {valid.shape}")
+    target = (int(output_hw[0]), int(output_hw[1]))
+    if valid.shape == target:
+        return valid.reshape(-1)
+    import cv2
+
+    resized = cv2.resize(
+        valid.astype(np.uint8),
+        (target[1], target[0]),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    return resized.astype(bool).reshape(-1)
+
+
+def _prediction_valid_mask(
+    adapter: Any,
+    view: Dict[str, Any],
+    output_hw: tuple[int, int],
+) -> np.ndarray:
+    """Map GT depth validity into a backbone's prediction raster geometry."""
+    align = getattr(adapter, "align_7andn_gt_depth", None)
+    if callable(align):
+        depth = np.asarray(align(view, output_hw=output_hw), dtype=np.float32).squeeze()
+        if depth.shape != tuple(output_hw):
+            raise ValueError(
+                f"Aligned GT depth shape {depth.shape} != prediction shape {output_hw}"
+            )
+        return (np.isfinite(depth) & (depth > 0.0)).reshape(-1)
+    mask = view.get("valid_mask")
+    if mask is None:
+        return np.ones(int(output_hw[0]) * int(output_hw[1]), dtype=bool)
+    if torch.is_tensor(mask):
+        mask = mask.detach().cpu().numpy()
+    return _resize_valid_mask(np.asarray(mask), output_hw)
+
+
 def _as_view_conf_np(conf: torch.Tensor | None, n_views: int) -> list[np.ndarray] | None:
     if not isinstance(conf, torch.Tensor):
         return None
@@ -132,7 +183,7 @@ def _prepare_7andn_eval_batch(adapter, batch, device: torch.device):
     return scene_batch, images_b
 
 
-def prepare_scannet_skip_scene(adapter, batch, device, profile) -> PreparedSkipEvalScene:
+def prepare_scannet_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene:
     del profile
     from analysis.eval.eval_utils import load_gt_pointcloud
     from analysis.eval.scannet_eval import SceneData
@@ -143,7 +194,7 @@ def prepare_scannet_skip_scene(adapter, batch, device, profile) -> PreparedSkipE
         raise ValueError(f"ScanNet {batch.scene_id}: missing image_paths in batch meta")
     selected = SceneData(scene_id=batch.scene_id, scene_dir=scene_dir, image_paths=sel_paths)
     images = adapter.load_eval_images(sel_paths)
-    images_b = images.unsqueeze(0).float().to(device)
+    images_b = images.unsqueeze(0).float().contiguous()
 
     gt_pts, _ = load_gt_pointcloud(batch.scene_id, scene_dir.parent)
     from analysis.eval.eval_utils import load_poses
@@ -156,7 +207,7 @@ def prepare_scannet_skip_scene(adapter, batch, device, profile) -> PreparedSkipE
         for i, fid in enumerate(frame_ids)
         if int(fid) in pose_frame_to_idx
     ]
-    return PreparedSkipEvalScene(
+    return PreparedEvalScene(
         scene_id=str(batch.scene_id),
         images=images_b,
         state={
@@ -168,9 +219,15 @@ def prepare_scannet_skip_scene(adapter, batch, device, profile) -> PreparedSkipE
     )
 
 
+def prepare_scannet_skip_scene(adapter, batch, device, profile) -> PreparedEvalScene:
+    prepared = prepare_scannet_eval_scene_cpu(adapter, batch, profile)
+    prepared.images = prepared.images.to(device)
+    return prepared
+
+
 def score_scannet_skip_prediction(
     bundle: PredictionBundle,
-    prepared: PreparedSkipEvalScene,
+    prepared: PreparedEvalScene,
     profile,
     ctx: EvalSceneContext,
     *,
@@ -335,21 +392,30 @@ def eval_7andn_points_adapter(adapter, model, batch, device, profile, ctx: EvalS
         else:
             metrics.update(_nan_pose_metrics())
 
-    pred_view_chunks = _as_view_points_np(pts, len(scene_batch))
+    pred_view_maps = _as_view_point_maps_np(pts, len(scene_batch))
     conf_view_chunks = _as_view_conf_np(conf, len(scene_batch))
     pred_chunks = []
     conf_chunks = []
     gt_chunks = []
-    if pred_view_chunks is not None:
-        for j, view in enumerate(scene_batch[: len(pred_view_chunks)]):
+    if pred_view_maps is not None:
+        for j, view in enumerate(scene_batch[: len(pred_view_maps)]):
             if pose_valid_mask is not None and (j >= len(pose_valid_mask) or not bool(pose_valid_mask[j])):
                 continue
-            p_np = pred_view_chunks[j]
+            point_map = pred_view_maps[j]
+            p_np = point_map.reshape(-1, 3)
             c_np = conf_view_chunks[j] if conf_view_chunks is not None and j < len(conf_view_chunks) else None
-            # Confidence is retained only for optional visualization. Point metrics
-            # use every predicted point for every backbone.
+            # Confidence is retained only for optional visualization and never
+            # gates metrics. GT depth validity is applied independently below.
             if c_np is not None and c_np.shape[0] != p_np.shape[0]:
                 c_np = None
+            pred_valid = _prediction_valid_mask(
+                adapter,
+                view,
+                (int(point_map.shape[0]), int(point_map.shape[1])),
+            )
+            p_np = p_np[pred_valid]
+            if c_np is not None:
+                c_np = c_np[pred_valid]
             g = view.get("pts3d")
             m = view.get("valid_mask")
             if g is None:
@@ -418,9 +484,13 @@ def eval_7andn_points_adapter(adapter, model, batch, device, profile, ctx: EvalS
     return merge_scene_metrics(metrics)
 
 
-def prepare_7andn_skip_scene(adapter, batch, device, profile) -> PreparedSkipEvalScene:
+def prepare_7andn_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene:
     del profile
-    scene_batch, images = _prepare_7andn_eval_batch(adapter, batch, device)
+    scene_batch = _collate_7andn_views(batch)
+    image_paths = [str(v["instance"]) for v in scene_batch]
+    if not image_paths:
+        raise ValueError(f"7andn {batch.scene_id}: missing view instance paths")
+    images = adapter.load_eval_images(image_paths).unsqueeze(0).float().contiguous()
 
     gt_poses = np.stack(
         [v["camera_pose"].detach().float().cpu().numpy() for v in scene_batch], axis=0
@@ -429,6 +499,8 @@ def prepare_7andn_skip_scene(adapter, batch, device, profile) -> PreparedSkipEva
         gt_poses = gt_poses[:, 0]
     pose_valid = np.array([_valid_7andn_gt_c2w(p) for p in gt_poses], dtype=bool)
     gt_points_by_view: List[np.ndarray] = []
+    pred_valid_masks_by_view: List[np.ndarray] = []
+    pred_hw = (int(images.shape[-2]), int(images.shape[-1]))
     for view in scene_batch:
         gt = view.get("pts3d")
         mask = view.get("valid_mask")
@@ -439,7 +511,10 @@ def prepare_7andn_skip_scene(adapter, batch, device, profile) -> PreparedSkipEva
             if mask is not None:
                 gt_np = gt_np[mask.detach().cpu().numpy().astype(bool).reshape(-1)]
             gt_points_by_view.append(gt_np)
-    return PreparedSkipEvalScene(
+        pred_valid_masks_by_view.append(
+            _prediction_valid_mask(adapter, view, pred_hw).reshape(pred_hw)
+        )
+    return PreparedEvalScene(
         scene_id=str(batch.scene_id),
         images=images,
         state={
@@ -447,13 +522,20 @@ def prepare_7andn_skip_scene(adapter, batch, device, profile) -> PreparedSkipEva
             "gt_poses": gt_poses,
             "pose_valid": pose_valid,
             "gt_points_by_view": gt_points_by_view,
+            "pred_valid_masks_by_view": pred_valid_masks_by_view,
         },
     )
 
 
+def prepare_7andn_skip_scene(adapter, batch, device, profile) -> PreparedEvalScene:
+    prepared = prepare_7andn_eval_scene_cpu(adapter, batch, profile)
+    prepared.images = prepared.images.to(device)
+    return prepared
+
+
 def score_7andn_skip_prediction(
     bundle: PredictionBundle,
-    prepared: PreparedSkipEvalScene,
+    prepared: PreparedEvalScene,
     profile,
     ctx: EvalSceneContext,
 ) -> Dict[str, float]:
@@ -484,11 +566,19 @@ def score_7andn_skip_prediction(
 
     pred_chunks: List[np.ndarray] = []
     gt_chunks: List[np.ndarray] = []
-    pred_views = _as_view_points_np(bundle.points, len(scene_batch)) if bundle.points is not None else None
-    if pred_views is not None:
-        for j, pred_view in enumerate(pred_views):
+    pred_maps = _as_view_point_maps_np(bundle.points, len(scene_batch)) if bundle.points is not None else None
+    if pred_maps is not None:
+        stored_masks = prepared.state.get("pred_valid_masks_by_view", [])
+        for j, pred_map in enumerate(pred_maps):
             if j >= len(pose_valid) or not bool(pose_valid[j]):
                 continue
+            pred_view = pred_map.reshape(-1, 3)
+            if j < len(stored_masks):
+                pred_valid = _resize_valid_mask(
+                    stored_masks[j],
+                    (int(pred_map.shape[0]), int(pred_map.shape[1])),
+                )
+                pred_view = pred_view[pred_valid]
             pred_chunks.append(pred_view)
             gt_chunks.append(prepared.state["gt_points_by_view"][j])
     pred_all = np.concatenate(pred_chunks, axis=0) if pred_chunks else np.zeros((0, 3), dtype=np.float32)

@@ -226,9 +226,11 @@ def _find_gt_depth_path(scene_dir: Path, stem: str) -> Optional[Path]:
 
 def _7andn_depth_path_from_color(color_path: Path) -> Path:
     name = color_path.name
-    if ".color." not in name:
-        raise ValueError(f"Unexpected 7Scenes/NRGBD color path: {color_path}")
-    return color_path.parent / name.replace(".color.", ".depth.proj.")
+    if ".color." in name:
+        return color_path.parent / name.replace(".color.", ".depth.proj.")
+    if color_path.parent.name == "images" and name.startswith("img"):
+        return color_path.parent.parent / "depth" / f"depth{name[3:]}"
+    raise ValueError(f"Unexpected 7Scenes/NRGBD color path: {color_path}")
 
 
 def _read_7andn_depth_meters(path: Path) -> np.ndarray:
@@ -260,6 +262,29 @@ def _load_7andn_gt_depth_vggt(view: Dict[str, Any], image_hw: Tuple[int, int]) -
         depth = _resize_depth_nearest(depth, (rgb_h, rgb_w))
     depth = _preprocess_depth_like_vggt(depth, target_width=int(image_hw[1]), mode="crop")
     return _match_depth_hw(depth, image_hw)
+
+
+def _load_7andn_gt_depth_mapanything(
+    view: Dict[str, Any], image_hw: Tuple[int, int]
+) -> np.ndarray:
+    """Align GT depth with MapAnything fixed-mapping resize + center crop."""
+    color_path = Path(str(view["instance"]))
+    depth_path = _7andn_depth_path_from_color(color_path)
+    depth = _read_7andn_depth_meters(depth_path)
+    from mapanything.utils.cropping import crop_resize_if_necessary
+
+    with Image.open(color_path) as image:
+        image = image.convert("RGB")
+        if depth.shape != (int(image.height), int(image.width)):
+            depth = _resize_depth_nearest(depth, (int(image.height), int(image.width)))
+        _image, depth = crop_resize_if_necessary(
+            image,
+            resolution=(int(image_hw[1]), int(image_hw[0])),
+            depthmap=depth,
+        )
+    if depth is None:
+        raise RuntimeError(f"MapAnything depth preprocessing returned no depth for {color_path}")
+    return _match_depth_hw(np.asarray(depth, dtype=np.float32), image_hw)
 
 
 def _load_7andn_gt_depth_omega(view: Dict[str, Any], image_hw: Tuple[int, int]) -> np.ndarray:

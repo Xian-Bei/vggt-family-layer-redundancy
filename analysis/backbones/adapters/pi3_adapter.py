@@ -350,7 +350,14 @@ class Pi3Adapter(BackboneAdapter):
             "camera_token_count": 0,
         }
 
-    def forward_predictions(self, model: nn.Module, images: torch.Tensor) -> PredictionBundle:
+    def forward_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        *,
+        defer_cpu_geometry: bool = False,
+    ) -> PredictionBundle:
+        del defer_cpu_geometry
         if images.dim() == 4:
             images = images.unsqueeze(0)
         device = self._forward_device(model, images)
@@ -523,7 +530,10 @@ class Pi3Adapter(BackboneAdapter):
         model: nn.Module,
         images: torch.Tensor,
         spans: Sequence[Tuple[int, int]],
+        *,
+        defer_cpu_geometry: bool = False,
     ) -> Iterable[Tuple[int, int, PredictionBundle]]:
+        del defer_cpu_geometry
         from analysis.amp_policy import autocast_device_dtype
         from analysis.backbones.cache_replay.pi3 import _build_pi3_pos
 

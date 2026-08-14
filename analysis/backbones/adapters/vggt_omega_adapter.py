@@ -360,14 +360,24 @@ class VGGTOmegaAdapter(BackboneAdapter):
                     layer_callback(gid, gt)
         return out, {"patch_start_idx": int(patch_start), "camera_token_count": 1, "aggregated_concat": concat_list}
 
-    def forward_predictions(self, model: nn.Module, images: torch.Tensor) -> PredictionBundle:
+    def forward_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        *,
+        defer_cpu_geometry: bool = False,
+    ) -> PredictionBundle:
         x = self._ensure_eval_batch(images)
         if x.device.type != "cuda":
             raise RuntimeError("vggt_omega forward requires CUDA device")
 
         with torch.no_grad():
             preds = model(x)
-        return self.prediction_bundle_from_raw(dict(preds) if isinstance(preds, dict) else {}, x)
+        return self.prediction_bundle_from_raw(
+            dict(preds) if isinstance(preds, dict) else {},
+            x,
+            defer_depth_unprojection=defer_cpu_geometry,
+        )
 
     def _prediction_bundle_from_preds(self, preds: Dict[str, Any], x: torch.Tensor) -> PredictionBundle:
         return self.prediction_bundle_from_raw(dict(preds) if isinstance(preds, dict) else {}, x)
@@ -468,6 +478,7 @@ class VGGTOmegaAdapter(BackboneAdapter):
         total_units: int,
         required_layers: Set[int],
         frame_rope: Tuple[torch.Tensor, torch.Tensor],
+        defer_cpu_geometry: bool,
     ) -> PredictionBundle:
         tokens = prefix_tokens
         selected = dict(prefix_layers)
@@ -501,6 +512,12 @@ class VGGTOmegaAdapter(BackboneAdapter):
             patch_start=int(model.aggregator.patch_token_start),
             images=images,
         )
+        if defer_cpu_geometry:
+            return self.prediction_bundle_from_raw(
+                raw,
+                images,
+                defer_depth_unprojection=True,
+            )
         return self.prediction_bundle_from_raw(raw, images)
 
     def iter_skip_span_predictions(
@@ -508,6 +525,8 @@ class VGGTOmegaAdapter(BackboneAdapter):
         model: nn.Module,
         images: torch.Tensor,
         spans: Sequence[Tuple[int, int]],
+        *,
+        defer_cpu_geometry: bool = False,
     ) -> Iterable[Tuple[int, int, PredictionBundle]]:
         from analysis.amp_policy import autocast_device_dtype
         from analysis.backbones.cache_replay.vggt_family import _build_omega_frame_rope
@@ -557,6 +576,7 @@ class VGGTOmegaAdapter(BackboneAdapter):
                         total_units=total_units,
                         required_layers=required_layers,
                         frame_rope=frame_rope,
+                        defer_cpu_geometry=defer_cpu_geometry,
                     )
                 yield start_unit, end_unit, prediction
 
@@ -583,10 +603,17 @@ class VGGTOmegaAdapter(BackboneAdapter):
         self,
         raw: Dict[str, Any],
         images: torch.Tensor,
+        *,
+        defer_depth_unprojection: bool = False,
     ) -> PredictionBundle:
         from analysis.backbones.prediction import bundle_from_pose_depth
 
-        return bundle_from_pose_depth(raw=raw, images=images, backbone_name=self.name)
+        return bundle_from_pose_depth(
+            raw=raw,
+            images=images,
+            backbone_name=self.name,
+            defer_depth_unprojection=defer_depth_unprojection,
+        )
 
     def extract_layer_units_and_predictions(
         self,

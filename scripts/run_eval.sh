@@ -40,6 +40,9 @@ RECOVERY_RESULT_KIND="${RECOVERY_RESULT_KIND:-recovery}"
 MAX_SCENES="${MAX_SCENES:-0}"
 WRITE_SUMMARY="${WRITE_SUMMARY:-1}"
 RECOVERY_FORCE_RERUN="${RECOVERY_FORCE_RERUN:-0}"
+ASYNC_SCORE="${ASYNC_SCORE:-1}"
+EVAL_TIMING="${EVAL_TIMING:-0}"
+SCENE_PRELOAD="${SCENE_PRELOAD:-1}"
 
 #############################################
 
@@ -324,6 +327,8 @@ run_eval_dataset() {
     --fastvggt-merge-start "${FASTVGGT_MERGE_START}"
     --fastvggt-merge-ratio "${FASTVGGT_MERGE_RATIO}"
     --quantvggt-dtype "${QUANTVGGT_DTYPE}"
+    --score-workers "${ASYNC_SCORE_WORKERS}"
+    --score-max-pending "${ASYNC_SCORE_MAX_PENDING}"
   )
   local resolved_ckpt=""
   local recovery_root="${RECOVERY_PLAN_ROOT:-${PRUNE_PLAN_ROOT}}"
@@ -363,6 +368,15 @@ run_eval_dataset() {
   fi
   if [[ "${VIS_MAX_POINTS:-0}" -gt 0 ]]; then
     extra+=(--vis-max-points "${VIS_MAX_POINTS}")
+  fi
+  if ! truthy "${ASYNC_SCORE}"; then
+    extra+=(--no-async-score)
+  fi
+  if truthy "${EVAL_TIMING}"; then
+    extra+=(--timing)
+  fi
+  if ! truthy "${SCENE_PRELOAD}"; then
+    extra+=(--no-scene-preload)
   fi
 
   case "${mode}" in
@@ -406,6 +420,10 @@ run_eval_dataset() {
     JOB_DEVICE="${DEVICE}" JOB_MAX_SCENES="${MAX_SCENES}" \
     JOB_MAX_FRAMES="${MAX_FRAMES}" JOB_VIS_2D="${EXPORT_VIS_2D}" \
     JOB_VIS_3D="${EXPORT_VIS_3D}" JOB_VIS_POINTS="${VIS_MAX_POINTS:-0}" \
+    JOB_ASYNC_SCORE="${ASYNC_SCORE}" JOB_TIMING="${EVAL_TIMING}" \
+    JOB_SCORE_WORKERS="${ASYNC_SCORE_WORKERS}" \
+    JOB_SCORE_MAX_PENDING="${ASYNC_SCORE_MAX_PENDING}" \
+    JOB_SCENE_PRELOAD="${SCENE_PRELOAD}" \
     JOB_COMPRESSION="${INFERENCE_COMPRESSION}" JOB_FAST_START="${FASTVGGT_MERGE_START}" \
     JOB_FAST_RATIO="${FASTVGGT_MERGE_RATIO}" JOB_QUANT_DTYPE="${QUANTVGGT_DTYPE}" \
     JOB_QUANT_DIR="${QUANTVGGT_PARAMS_DIR}" python -c '
@@ -426,6 +444,11 @@ jobs.append({
     "max_scenes": int(os.environ["JOB_MAX_SCENES"]), "max_frames": int(os.environ["JOB_MAX_FRAMES"]),
     "export_vis_2d": truthy(os.environ["JOB_VIS_2D"]), "export_vis_3d": truthy(os.environ["JOB_VIS_3D"]),
     "vis_max_points": int(os.environ["JOB_VIS_POINTS"]),
+    "no_async_score": not truthy(os.environ["JOB_ASYNC_SCORE"]),
+    "score_workers": int(os.environ["JOB_SCORE_WORKERS"]),
+    "score_max_pending": int(os.environ["JOB_SCORE_MAX_PENDING"]),
+    "timing": truthy(os.environ["JOB_TIMING"]),
+    "no_scene_preload": not truthy(os.environ["JOB_SCENE_PRELOAD"]),
     "inference_compression": os.environ["JOB_COMPRESSION"],
     "fastvggt_merge_start": int(os.environ["JOB_FAST_START"]),
     "fastvggt_merge_ratio": float(os.environ["JOB_FAST_RATIO"]),
@@ -445,6 +468,8 @@ p.write_text(json.dumps(jobs, indent=2))
     if [[ -n "${RECOVERY_PLAN_NAME}" ]]; then
       printf '    recovery: %s\n' "${RECOVERY_PLAN_NAME#recovery_}"
     fi
+    printf '    score workers: %s\n    max pending: %s\n' \
+      "${ASYNC_SCORE_WORKERS}" "${ASYNC_SCORE_MAX_PENDING}"
     printf '    dataset: %s\n\n' "${output_dataset}"
   else
     echo "   [eval/${output_dataset}] ${effective_model_name}/${backbone} mode=${mode} compression=${INFERENCE_COMPRESSION}"

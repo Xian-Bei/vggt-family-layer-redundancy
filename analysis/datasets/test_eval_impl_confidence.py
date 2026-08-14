@@ -120,6 +120,78 @@ class ConfidenceIndependentPointEvalTest(unittest.TestCase):
 
         self.assertEqual(captured, {"pred_count": 6, "gt_count": 6})
 
+    def test_full_eval_applies_gt_validity_to_predicted_pixels(self) -> None:
+        bundle, scene_batch, _poses = _scene_fixture(self.device)
+        for view in scene_batch:
+            view["valid_mask"] = torch.tensor([[True, False]], device=self.device)
+        adapter = SimpleNamespace(forward_predictions=lambda _model, _images: bundle)
+        captured = {}
+
+        def point_metrics(pred, gt, *_args, **_kwargs):
+            captured["pred_count"] = int(pred.shape[0])
+            captured["gt_count"] = int(gt.shape[0])
+            return {"acc": 0.0, "comp": 0.0, "cd": 0.0}
+
+        with (
+            mock.patch.object(
+                eval_impl,
+                "_prepare_7andn_eval_batch",
+                return_value=(
+                    scene_batch,
+                    torch.zeros((1, 3, 3, 1, 2), device=self.device),
+                ),
+            ),
+            mock.patch.object(eval_impl, "_trajectory_alignment", self._alignment_result),
+            mock.patch.object(eval_impl, "compute_point_metrics", side_effect=point_metrics),
+        ):
+            eval_impl.eval_7andn_points_adapter(
+                adapter,
+                object(),
+                SimpleNamespace(scene_id="scene"),
+                self.device,
+                self.profile,
+                self.context,
+            )
+
+        self.assertEqual(captured, {"pred_count": 3, "gt_count": 3})
+
+    def test_skip_eval_applies_gt_validity_to_predicted_pixels(self) -> None:
+        bundle, scene_batch, poses = _scene_fixture(self.device)
+        valid = np.array([[True, False]], dtype=bool)
+        prepared = PreparedSkipEvalScene(
+            scene_id="scene",
+            images=torch.zeros((1, 3, 3, 1, 2), device=self.device),
+            state={
+                "scene_batch": scene_batch,
+                "gt_poses": poses,
+                "pose_valid": np.ones(3, dtype=bool),
+                "gt_points_by_view": [
+                    view["pts3d"].cpu().numpy().reshape(-1, 3)[valid.reshape(-1)]
+                    for view in scene_batch
+                ],
+                "pred_valid_masks_by_view": [valid.copy() for _view in scene_batch],
+            },
+        )
+        captured = {}
+
+        def point_metrics(pred, gt, *_args, **_kwargs):
+            captured["pred_count"] = int(pred.shape[0])
+            captured["gt_count"] = int(gt.shape[0])
+            return {"acc": 0.0, "comp": 0.0, "cd": 0.0}
+
+        with (
+            mock.patch.object(eval_impl, "_trajectory_alignment", self._alignment_result),
+            mock.patch.object(eval_impl, "compute_point_metrics", side_effect=point_metrics),
+        ):
+            eval_impl.score_7andn_skip_prediction(
+                bundle,
+                prepared,
+                self.profile,
+                self.context,
+            )
+
+        self.assertEqual(captured, {"pred_count": 3, "gt_count": 3})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import resource
 import shutil
 import sys
-from dataclasses import asdict
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -20,6 +22,16 @@ from analysis.backbones.contracts import EvalSceneContext
 from analysis.backbones.registry import get_backbone
 from analysis.datasets.batch_frames import count_eval_frames
 from analysis.datasets.registry import dataset_names, get_dataset
+from analysis.amp_policy import autocast_device_dtype
+from analysis.eval.async_pipeline import (
+    DEFAULT_ASYNC_SCORE_MAX_PENDING,
+    DEFAULT_ASYNC_SCORE_WORKERS,
+    AsyncPredictionScorePipeline,
+    AsyncScenePreloader,
+    async_score_enabled,
+    scene_preload_enabled,
+    stage_preloaded_scene_to_cuda,
+)
 from analysis.eval.metrics_core import average_metrics
 from analysis.eval.interval_results import materialize_eval_interval_result
 from analysis.inference_compression.contracts import InferenceCompressionConfig
@@ -40,6 +52,16 @@ _DERIVED_GHOST_RECOVERY_NAMES = {
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
 }
+
+
+@dataclass
+class _EvalScoreKey:
+    scene_id: str
+    batch: Any
+    prepared: Any
+    inference_start: Optional[torch.cuda.Event]
+    inference_end: Optional[torch.cuda.Event]
+    infer_peak_vram_gb: float
 
 
 def _replace_with_relative_symlink(target: Path, source: Path) -> None:
@@ -213,6 +235,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Disable tqdm progress bar; restore legacy per-line logging.",
     )
     p.add_argument(
+        "--no-async-score",
+        action="store_true",
+        help="Disable scene-level CUDA inference / CPU scoring overlap.",
+    )
+    p.add_argument(
+        "--score-workers",
+        type=int,
+        default=DEFAULT_ASYNC_SCORE_WORKERS,
+        help="Number of parallel CPU scoring workers.",
+    )
+    p.add_argument(
+        "--score-max-pending",
+        type=int,
+        default=DEFAULT_ASYNC_SCORE_MAX_PENDING,
+        help="Maximum number of staged predictions awaiting CPU scoring.",
+    )
+    p.add_argument(
+        "--timing",
+        action="store_true",
+        help="Log aggregate asynchronous evaluation pipeline timings.",
+    )
+    p.add_argument(
+        "--no-scene-preload",
+        action="store_true",
+        help="Disable one-scene CPU preparation lookahead and asynchronous H2D.",
+    )
+    p.add_argument(
         "--inference-compression",
         choices=("none", "lora_merge", "fastvggt", "quantvggt"),
         default="none",
@@ -249,6 +298,11 @@ def evaluate_model_v3(
     split: str | None = None,
     output_dataset: str | None = None,
     progress: bool = True,
+    async_score: bool = True,
+    score_workers: int = DEFAULT_ASYNC_SCORE_WORKERS,
+    score_max_pending: int = DEFAULT_ASYNC_SCORE_MAX_PENDING,
+    timing: bool = False,
+    scene_preload: bool = True,
 ) -> Path:
     """Shared evaluation entry used by stage-4 eval and training periodic eval."""
     split = ds_plugin.validate_split(split)
@@ -296,34 +350,204 @@ def evaluate_model_v3(
         if progress
         else None
     )
-    for batch in scene_source:
-        sid = batch.scene_id
+    def report_error(sid: str, exc: Exception) -> None:
+        msg = f"[warn] {sid} failed: {exc}"
         if pbar is not None:
-            pbar.set_postfix_str(sid, refresh=False)
-        try:
-            with torch.no_grad():
-                scene_metrics = ds_plugin.evaluate_scene(
-                    adapter,
-                    model,
-                    batch=batch,
-                    ctx=ctx,
-                )
-        except Exception as e:
-            msg = f"[warn] {sid} failed: {e}"
-            if pbar is not None:
-                tqdm.write(msg, file=sys.stderr)
-            else:
-                print(msg, file=sys.stderr)
-            if pbar is not None:
-                pbar.update(1)
-            continue
-        scene_metrics["num_frames"] = float(count_eval_frames(batch))
-        scene_metrics["scene_id"] = sid
+            tqdm.write(msg, file=sys.stderr)
+            pbar.update(1)
+        else:
+            print(msg, file=sys.stderr)
+
+    def write_scene_result(key: _EvalScoreKey, scene_metrics: Dict[str, float]) -> None:
+        scene_metrics["num_frames"] = float(count_eval_frames(key.batch))
+        scene_metrics["scene_id"] = key.scene_id
         rows.append(scene_metrics)
-        (out_dir / sid).mkdir(parents=True, exist_ok=True)
-        (out_dir / sid / "metrics.json").write_text(json.dumps(scene_metrics, indent=2), encoding="utf-8")
+        scene_dir = out_dir / key.scene_id
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        (scene_dir / "metrics.json").write_text(
+            json.dumps(scene_metrics, indent=2), encoding="utf-8"
+        )
         if pbar is not None:
             pbar.update(1)
+
+    async_active = (
+        async_score_enabled(async_score, device)
+        and not bool(export_vis_2d)
+        and not bool(export_vis_3d)
+    )
+    pipeline = None
+    pipeline_t0 = time.perf_counter()
+    if async_active:
+        def score_scene(
+            key: _EvalScoreKey, prediction
+        ) -> Dict[str, float]:
+            metrics = ds_plugin.score_eval_prediction(
+                adapter, prediction, key.prepared, ctx
+            )
+            if key.inference_start is None or key.inference_end is None:
+                raise RuntimeError("Async eval task is missing CUDA inference events")
+            metrics["inference_time_ms"] = float(
+                key.inference_start.elapsed_time(key.inference_end)
+            )
+            metrics["infer_peak_vram_gb"] = float(key.infer_peak_vram_gb)
+            return metrics
+
+        pipeline = AsyncPredictionScorePipeline(
+            device=device,
+            score_fn=score_scene,
+            result_fn=write_scene_result,
+            error_fn=lambda key, exc: report_error(key.scene_id, exc),
+            timing=bool(timing),
+            score_workers=score_workers,
+            max_pending=score_max_pending,
+            thread_name_prefix="eval-score",
+        )
+
+    preload_active = async_active and scene_preload_enabled(
+        scene_preload,
+        device,
+        export_vis_2d=export_vis_2d,
+        export_vis_3d=export_vis_3d,
+    )
+    preloader = None
+    h2d_stream = None
+    h2d_ms = 0.0
+    peak_vram_gib = 0.0
+    gpu_inference_events: List[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+    if preload_active:
+        preloader = AsyncScenePreloader(
+            scene_source=iter(scene_source),
+            prepare_fn=lambda batch: ds_plugin.prepare_eval_scene_cpu(
+                adapter, batch, ctx
+            ),
+        )
+        h2d_stream = torch.cuda.Stream(device=device)
+
+    scene_iterator = iter(scene_source) if preloader is None else None
+    try:
+        while True:
+            preload_item = None
+            if preloader is not None:
+                preload_item = preloader.next()
+                if preload_item is None:
+                    break
+                batch = preload_item.batch
+                if preload_item.error is not None:
+                    report_error(str(batch.scene_id), preload_item.error)
+                    continue
+            else:
+                assert scene_iterator is not None
+                try:
+                    batch = next(scene_iterator)
+                except StopIteration:
+                    break
+            sid = str(batch.scene_id)
+            if pbar is not None:
+                pbar.set_postfix_str(sid, refresh=False)
+            if pipeline is None:
+                try:
+                    with torch.no_grad():
+                        scene_metrics = ds_plugin.evaluate_scene(
+                            adapter,
+                            model,
+                            batch=batch,
+                            ctx=ctx,
+                        )
+                except Exception as e:
+                    report_error(sid, e)
+                    continue
+                key = _EvalScoreKey(
+                    scene_id=sid,
+                    batch=batch,
+                    prepared=None,
+                    inference_start=None,
+                    inference_end=None,
+                    infer_peak_vram_gb=float(scene_metrics.get("infer_peak_vram_gb", 0.0)),
+                )
+                write_scene_result(key, scene_metrics)
+                continue
+            h2d_ready = None
+            h2d_start = None
+            host_images = None
+            try:
+                if preload_item is not None:
+                    prepared = preload_item.prepared
+                    assert h2d_stream is not None
+                    h2d_ready, h2d_start, host_images = stage_preloaded_scene_to_cuda(
+                        prepared,
+                        device=device,
+                        copy_stream=h2d_stream,
+                        timing=bool(timing),
+                    )
+                else:
+                    prepared = ds_plugin.prepare_skip_eval_scene(adapter, batch, ctx)
+                torch.cuda.reset_peak_memory_stats(device.index)
+                inference_start = torch.cuda.Event(enable_timing=True)
+                inference_end = torch.cuda.Event(enable_timing=True)
+                inference_start.record(torch.cuda.current_stream(device))
+                ac_kw = autocast_device_dtype(device)
+                with torch.no_grad(), torch.autocast(**ac_kw):
+                    prediction = adapter.forward_predictions(
+                        model,
+                        prepared.images,
+                        defer_cpu_geometry=True,
+                    )
+                inference_end.record(torch.cuda.current_stream(device))
+                gpu_inference_events.append((inference_start, inference_end))
+                scene_peak_vram_gb = float(torch.cuda.max_memory_allocated(device.index)) / (
+                    1024.0**3
+                )
+                peak_vram_gib = max(peak_vram_gib, scene_peak_vram_gb)
+                key = _EvalScoreKey(
+                    scene_id=sid,
+                    batch=batch,
+                    prepared=prepared,
+                    inference_start=inference_start,
+                    inference_end=inference_end,
+                    infer_peak_vram_gb=scene_peak_vram_gb,
+                )
+                pipeline.submit(key, prediction)
+                prepared.images = None
+                del prediction
+            except Exception as e:
+                report_error(sid, e)
+            finally:
+                if h2d_ready is not None:
+                    h2d_ready.synchronize()
+                    if bool(timing) and h2d_start is not None:
+                        h2d_ms += float(h2d_start.elapsed_time(h2d_ready))
+                del host_images
+    finally:
+        try:
+            if preloader is not None:
+                preloader.close()
+        finally:
+            if pipeline is not None:
+                pipeline.close()
+
+    if bool(timing) and pipeline is not None:
+        gpu_inference_s = (
+            sum(float(start.elapsed_time(end)) for start, end in gpu_inference_events)
+            / 1000.0
+        )
+        print(
+            f"[timing] eval dataset={tagged_dataset} pipeline={time.perf_counter() - pipeline_t0:.3f}s "
+            f"iterator_load={preloader.iterator_s if preloader is not None else 0.0:.3f}s "
+            f"cpu_prepare={preloader.cpu_prepare_s if preloader is not None else 0.0:.3f}s "
+            f"preload_wait={preloader.preload_wait_s if preloader is not None else 0.0:.3f}s "
+            f"h2d={h2d_ms / 1000.0:.3f}s "
+            f"gpu_inference={gpu_inference_s:.3f}s "
+            f"d2h={pipeline.d2h_ms / 1000.0:.3f}s "
+            f"cpu_score={pipeline.score_s:.3f}s "
+            f"producer_wait={pipeline.producer_wait_s:.3f}s "
+            f"score_workers={pipeline.score_workers} "
+            f"max_pending={pipeline.max_pending_seen} "
+            f"max_lookahead={preloader.max_lookahead_seen if preloader is not None else 0} "
+            f"peak_vram={peak_vram_gib:.3f}GiB "
+            f"peak_rss={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0**2):.3f}GiB",
+            file=sys.stderr,
+            flush=True,
+        )
     if pbar is not None:
         pbar.close()
 
@@ -523,6 +747,15 @@ def main() -> None:
             split=split,
             output_dataset=job.get("output_dataset"),
             progress=not bool(job.get("no_progress", args.no_progress)),
+            async_score=not bool(job.get("no_async_score", args.no_async_score)),
+            score_workers=int(job.get("score_workers", args.score_workers)),
+            score_max_pending=int(
+                job.get("score_max_pending", args.score_max_pending)
+            ),
+            timing=bool(job.get("timing", args.timing)),
+            scene_preload=not bool(
+                job.get("no_scene_preload", args.no_scene_preload)
+            ),
         )
         if device.type == "cuda":
             torch.cuda.empty_cache()

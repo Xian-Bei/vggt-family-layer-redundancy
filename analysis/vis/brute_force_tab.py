@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Sequence
 
 import gradio as gr
 
+from analysis.vis.display_names import backbone_display_name, dataset_display_name
+
 
 def _bind_refresh(
     *,
@@ -58,7 +60,7 @@ def build_brute_force_tab(
             with gr.Column(scale=1, elem_classes=["control-column"]):
                 overview_backbone_filter = gr.CheckboxGroup(
                     label="Backbones",
-                    choices=backbones,
+                    choices=[(backbone_display_name(item), item) for item in backbones],
                     value=backbones,
                 )
                 overview_histogram = gr.Checkbox(
@@ -75,13 +77,21 @@ def build_brute_force_tab(
                 overview_rows: List[gr.Column] = []
                 for backbone in backbones:
                     with gr.Column(elem_classes=["brute-force-backbone-block"]) as row:
-                        gr.Markdown(f"### {backbone}")
+                        gr.Markdown(
+                            f"### {backbone_display_name(backbone)}",
+                            elem_classes=["backbone-separator"],
+                        )
                         gallery = gr.Gallery(
-                            label="Indoor pose · Indoor point cloud · Outdoor pose · Outdoor point cloud",
+                            label="Brute-force overview heatmaps",
+                            show_label=False,
                             columns=4,
                             height="auto",
                             object_fit="contain",
-                            elem_classes=["results-gallery", "stage2-heatmap-gallery"],
+                            elem_classes=[
+                                "results-gallery",
+                                "stage2-heatmap-gallery",
+                                "brute-force-overview-gallery",
+                            ],
                         )
                     overview_rows.append(row)
                     overview_galleries.append(gallery)
@@ -115,7 +125,7 @@ def build_brute_force_tab(
             with gr.Column(scale=1, elem_classes=["control-column"]):
                 backbone_filter = gr.CheckboxGroup(
                     label="Backbones",
-                    choices=backbones,
+                    choices=[(backbone_display_name(item), item) for item in backbones],
                     value=backbones,
                 )
                 gr.Markdown("#### Skip results")
@@ -144,18 +154,13 @@ def build_brute_force_tab(
                     value=False,
                     info="Mean includes only datasets with experiment records.",
                 )
-                similarity_dataset_filter = gr.CheckboxGroup(
-                    label="Similarity heatmaps",
-                    choices=dataset_scopes,
-                    value=["mean"],
-                )
                 colorbar_histogram = gr.Checkbox(
                     label="Show row/column mean plots",
                     value=False,
                 )
                 normalize_skip_metrics = gr.Checkbox(
                     label="Normalize individual skip metrics to [0,1]",
-                    value=True,
+                    value=False,
                     info="The 7-metric mean is always normalized per metric before averaging.",
                 )
                 info = gr.Textbox(label="Displayed scopes", interactive=False)
@@ -166,20 +171,31 @@ def build_brute_force_tab(
                 backbone_blocks: List[gr.Column] = []
                 for backbone in backbones:
                     with gr.Column(elem_classes=["brute-force-backbone-block"]) as backbone_block:
-                        gr.Markdown(f"### {backbone}")
+                        gr.Markdown(
+                            f"### {backbone_display_name(backbone)}",
+                            elem_classes=["backbone-separator"],
+                        )
                         for mode in stage2_modes:
                             for dataset in dataset_scopes:
-                                for label in (
-                                    f"{mode} · {dataset} · pose",
-                                    f"{mode} · {dataset} · point cloud + 7-metric mean",
-                                ):
+                                for row_index, label in enumerate((
+                                    f"{mode} · {dataset} · pose heatmaps",
+                                    f"{mode} · {dataset} · point-cloud heatmaps",
+                                )):
                                     with gr.Row(
                                         elem_classes=["stage2-gallery-row"],
                                         equal_height=False,
                                     ):
                                         with gr.Column(scale=1, min_width=280) as row_col:
+                                            if row_index == 0:
+                                                gr.Markdown(
+                                                    f"#### {dataset_display_name(dataset)}",
+                                                    elem_classes=[
+                                                        "brute-force-dataset-heading"
+                                                    ],
+                                                )
                                             gallery = gr.Gallery(
                                                 label=label,
+                                                show_label=False,
                                                 columns=4,
                                                 height="auto",
                                                 object_fit="contain",
@@ -187,38 +203,21 @@ def build_brute_force_tab(
                                                     "results-gallery",
                                                     "stage2-heatmap-gallery",
                                                     "brute-force-detail-gallery",
+                                                    *(
+                                                        ["brute-force-dataset-start"]
+                                                        if row_index == 0
+                                                        else []
+                                                    ),
                                                 ],
                                             )
                                     row_cols.append(row_col)
                                     galleries.append(gallery)
-                        for dataset in dataset_scopes:
-                            with gr.Row(
-                                elem_classes=["stage2-gallery-row"],
-                                equal_height=False,
-                            ):
-                                with gr.Column(scale=1, min_width=280) as similarity_row_col:
-                                    similarity_gallery = gr.Gallery(
-                                        label=f"Similarity · {dataset} · token mean",
-                                        columns=4,
-                                        rows=1,
-                                        height="auto",
-                                        object_fit="contain",
-                                        elem_classes=[
-                                            "results-gallery",
-                                            "stage2-heatmap-gallery",
-                                            "brute-force-detail-gallery",
-                                            "brute-force-similarity-gallery",
-                                        ],
-                                    )
-                            row_cols.append(similarity_row_col)
-                            galleries.append(similarity_gallery)
                     backbone_blocks.append(backbone_block)
 
         inputs = [
             backbone_filter,
             *skip_dataset_checks,
             skip_mean_check,
-            similarity_dataset_filter,
             colorbar_histogram,
             normalize_skip_metrics,
         ]
@@ -253,7 +252,6 @@ def build_brute_force_tab(
                     (checkbox.change, False)
                     for checkbox in [*skip_dataset_checks, skip_mean_check]
                 ],
-                (similarity_dataset_filter.change, False),
                 (colorbar_histogram.change, False),
                 (normalize_skip_metrics.change, False),
                 (detail_tab.select, True),

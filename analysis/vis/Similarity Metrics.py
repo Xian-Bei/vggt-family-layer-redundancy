@@ -4,17 +4,22 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import gradio as gr
 
+from analysis.vis.display_names import (
+    backbone_display_name,
+    backbone_publication_sort_key,
+)
+
 HEATMAP_REAL_DATASETS: Tuple[str, ...] = (
     "nuscenes_train",
     "scannet_dev50",
 )
 
-_BACKBONE_ORDER: Tuple[str, ...] = (
-    "vggt_omega",
-    "mapanything",
-    "mapanything_v1",
-    "pi3",
-    "vggt",
+SIMILARITY_COLUMN_LABELS: Tuple[str, ...] = (
+    "7-Metric Normalized Retention",
+    "M·CKA",
+    "M·Cosine",
+    "M·CCA",
+    "M·Inv_MSE",
 )
 
 _DATASET_ORDER: Tuple[str, ...] = (
@@ -33,16 +38,6 @@ _DATASET_ORDER: Tuple[str, ...] = (
     "nuscenes_train",
     "waymo_training",
 )
-
-
-def _backbone_sort_key(name: str) -> Tuple[int, str]:
-    key = str(name or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if key == "vggtomega":
-        key = "vggt_omega"
-    try:
-        return (_BACKBONE_ORDER.index(key), key)
-    except ValueError:
-        return (len(_BACKBONE_ORDER), key)
 
 
 def _dataset_sort_key(name: str) -> Tuple[int, str]:
@@ -73,7 +68,10 @@ def build_heatmaps_tab(
     heatmaps_resolve_filters_cb: Any,
     refresh_stage2_full_cb: Any,
 ) -> Dict[str, Any]:
-    sorted_backbone_choices = sorted([str(x) for x in backbone_choices], key=_backbone_sort_key)
+    sorted_backbone_choices = sorted(
+        [str(x) for x in backbone_choices],
+        key=backbone_publication_sort_key,
+    )
     allowed_datasets = {"min", "mean", *HEATMAP_REAL_DATASETS}
     sorted_dataset_choices = sorted(
         [str(x) for x in dataset_choices if str(x) in allowed_datasets],
@@ -95,21 +93,16 @@ def build_heatmaps_tab(
             "**Show remaining** adds remaining-vs-full versions of only the "
             "7-metric mean and similarity maps, plus marginal 7-metric mean "
             "and similarity maps rebased by the first prune interval's "
-            "`1 - similarity` degradation, clipped to `[0,1]`. "
-            "Heatmap captions report strict-upper **Soft IoU**, **Soft Dice**, "
-            "GPU **2D Sinkhorn distance**, and **Jensen–Shannon divergence (JS)**. "
-            "**H** compares "
-            "each non-first column with the first column in the same row; "
-            "**V** compares each non-first row with the first row in the same column. "
-            "Diagonal and NaN entries are excluded; Sinkhorn is measured in layer-grid cells. "
-            "IoU/Dice are similarities (higher is closer), while Sinkhorn/JS are distances "
-            "(lower is closer)."
+            "`1 - similarity` degradation, clipped to `[0,1]`."
         )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):
                 stage2_backbone_filter = gr.CheckboxGroup(
                     label="Backbones",
-                    choices=sorted_backbone_choices,
+                    choices=[
+                        (backbone_display_name(item), item)
+                        for item in sorted_backbone_choices
+                    ],
                     value=sorted_backbone_choices,
                 )
                 stage2_dataset_dd = gr.Dropdown(
@@ -177,7 +170,11 @@ def build_heatmaps_tab(
                         f"{mode}: hidden sim min",
                     )):
                         visible = index == 2
-                        gallery_classes = ["results-gallery", "stage2-heatmap-gallery"]
+                        gallery_classes = [
+                            "results-gallery",
+                            "stage2-heatmap-gallery",
+                            "similarity-metrics-gallery",
+                        ]
                         with gr.Row(
                             elem_classes=["stage2-gallery-row"],
                             equal_height=False,
@@ -186,12 +183,25 @@ def build_heatmaps_tab(
                             with gr.Column(scale=1, min_width=280) as row_body:
                                 gal = gr.Gallery(
                                     label=label,
+                                    show_label=False,
                                     columns=5 if visible else 4,
                                     height="auto",
                                     object_fit="contain",
                                     visible=visible,
                                     elem_classes=gallery_classes,
                                 )
+                                if visible:
+                                    with gr.Row(
+                                        elem_classes=["similarity-column-label-row"],
+                                        equal_height=True,
+                                    ):
+                                        for column_label in SIMILARITY_COLUMN_LABELS:
+                                            gr.Markdown(
+                                                column_label,
+                                                elem_classes=[
+                                                    "similarity-column-label"
+                                                ],
+                                            )
                             stage2_row_body_cols.append(row_body)
                             stage2_mode_galleries.append(gal)
 

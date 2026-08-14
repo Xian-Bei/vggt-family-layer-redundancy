@@ -155,7 +155,14 @@ class BackboneAdapter(ABC):
         """Return {unit_id: activation tensor} and metadata (e.g. patch_start_idx)."""
 
     @abstractmethod
-    def forward_predictions(self, model: nn.Module, images: torch.Tensor) -> PredictionBundle:
+    def forward_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        *,
+        defer_cpu_geometry: bool = False,
+    ) -> PredictionBundle:
+        """Run inference, optionally deferring CPU-only geometry to the scorer."""
         ...
 
     def supports_incremental_skip_eval(self) -> bool:
@@ -167,9 +174,11 @@ class BackboneAdapter(ABC):
         model: nn.Module,
         images: torch.Tensor,
         spans: Sequence[Tuple[int, int]],
+        *,
+        defer_cpu_geometry: bool = False,
     ) -> Iterable[Tuple[int, int, PredictionBundle]]:
         """Yield one normalized prediction for every requested closed unit span."""
-        del model, images, spans
+        del model, images, spans, defer_cpu_geometry
         raise NotImplementedError(
             f"Backbone {self.name!r} does not implement incremental skip evaluation"
         )

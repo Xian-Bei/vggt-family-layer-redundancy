@@ -241,7 +241,8 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
         self.assertIsNotNone(fig)
         assert fig is not None
         self.assertEqual(list(fig.axes[0].lines[0].get_xdata()), [38, 40])
-        self.assertEqual(fig.axes[0].get_xlabel(), "Remaining layers")
+        self.assertEqual(fig.axes[0].get_xlabel(), "")
+        self.assertIn("Remaining layers", [text.get_text() for text in fig.texts])
         plt.close(fig)
 
     def test_x_axis_can_be_divided_by_two(self) -> None:
@@ -267,7 +268,11 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
         self.assertIsNotNone(fig)
         assert fig is not None
         self.assertEqual(list(fig.axes[0].lines[0].get_xdata()), [19.0, 20.0])
-        self.assertEqual(fig.axes[0].get_xlabel(), "Remaining layers ÷ 2")
+        self.assertEqual(fig.axes[0].get_xlabel(), "")
+        self.assertIn(
+            "Remaining layers ÷ 2",
+            [text.get_text() for text in fig.texts],
+        )
         plt.close(fig)
 
     def test_remaining_renderer_reads_num_units_from_each_prune_bundle(self) -> None:

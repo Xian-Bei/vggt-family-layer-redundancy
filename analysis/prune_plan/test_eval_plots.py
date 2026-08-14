@@ -941,6 +941,32 @@ class EvalPlotsTest(unittest.TestCase):
         assert legend is not None
         self.assertEqual(legend.get_texts()[0].get_fontsize(), 11.0)
 
+    def test_render_strategy_metric_figure_can_delegate_x_label_to_gallery(self) -> None:
+        fig = render_strategy_metric_figure(
+            payload={
+                "upper_average": {"ape": 1.0},
+                "strategies": {
+                    "recovery_ghost": {
+                        "display_name": "Ghost",
+                        "points": {
+                            "2": {
+                                "available": True,
+                                "drop_count": 2,
+                                "metrics_mean": {"ape": 2.0},
+                            }
+                        },
+                    }
+                },
+            },
+            title="shared gallery axis",
+            metric_grid=(("ape",),),
+            shared_xlabel=None,
+        )
+        self.assertIsNotNone(fig)
+        assert fig is not None
+        self.assertEqual(fig.axes[0].get_xlabel(), "")
+        self.assertNotIn("Dropped units", [text.get_text() for text in fig.texts])
+
     def test_metric_mean_can_stay_normalized_when_individual_metrics_are_raw(self) -> None:
         absolute = {key: 10.0 for key in GT_METRIC_KEYS}
         normalized = {key: 0.25 for key in GT_METRIC_KEYS}
@@ -974,8 +1000,10 @@ class EvalPlotsTest(unittest.TestCase):
             float(fig.axes[1].lines[-1].get_ydata()[0]),
             (0.4 + 6 * 0.25) / 7,
         )
-        self.assertIn("raw metric", fig.axes[0].get_title())
-        self.assertIn("normalized metric", fig.axes[1].get_title())
+        self.assertNotIn("raw metric", fig.axes[0].get_title())
+        self.assertNotIn("normalized metric", fig.axes[1].get_title())
+        self.assertIn("Individual metrics: raw", fig._suptitle.get_text())
+        self.assertIn("7-metric mean: normalized", fig._suptitle.get_text())
 
     def test_pruning_collector_accepts_in_memory_bundle_before_plan_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as td:

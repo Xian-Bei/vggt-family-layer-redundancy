@@ -7,10 +7,14 @@
 #   EXPORT_VIS_3D=0 # vis/pred viser NPZ for analysis.view
 #   EXPORT_VIS=1    # shorthand: enable both 2D and 3D
 #   VIS_MAX_POINTS=0
+#   ASYNC_SCORE_WORKERS=4
+#   ASYNC_SCORE_MAX_PENDING=12
 # Outputs use ${OUTPUT_ROOT}/<backbone>/<dataset>/...
 
 : "${MAX_FRAMES:=30}"
 : "${OUTPUT_ROOT:=analysis_outputs_v3}"
+: "${ASYNC_SCORE_WORKERS:=4}"
+: "${ASYNC_SCORE_MAX_PENDING:=12}"
 : "${ROOT_SCANNET_DEV50:=${SCANNET_ROOT_DEV50:-data/scans_dev50}}"
 : "${ROOT_SCANNET_TEST50:=${SCANNET_ROOT_TEST50:-data/scans_test50}}"
 : "${ROOT_7SCENES:=data/7scenes}"

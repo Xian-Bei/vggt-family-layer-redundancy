@@ -9,6 +9,11 @@ import gradio as gr
 import matplotlib.pyplot as plt
 import numpy as np
 
+from analysis.vis.display_names import (
+    backbone_display_name,
+    backbone_publication_sort_key,
+)
+
 from analysis.prune_plan import (
     bundle_plan_records,
     bundle_strategy_records,
@@ -423,7 +428,14 @@ def render_recovery_overview(
     prune_strategy: str = "",
 ) -> Tuple[List[Tuple[np.ndarray, str]], str]:
     """Reload summaries and redraw one recovery comparison figure per backbone."""
-    backbones = list(dict.fromkeys(str(name) for name in (selected_backbones or [])))
+    backbones = sorted(
+        dict.fromkeys(str(name) for name in (selected_backbones or [])),
+        key=lambda name: (
+            (-1, "")
+            if name == _MEAN_BACKBONE
+            else backbone_publication_sort_key(name)
+        ),
+    )
     methods = list(dict.fromkeys(str(name) for name in (selected_methods or [])))
     dataset = str(dataset or "training average").strip()
     prune_strategy = str(prune_strategy or "").strip()
@@ -554,14 +566,19 @@ def render_recovery_overview(
             ]
             fig = render_strategy_metric_figure(
                 payload=plot_payload,
-                title=f"{backbone}: {prune_strategy or 'legacy'} recovery · {title_scope}",
+                title=f"{backbone_display_name(backbone)}: {prune_strategy or 'legacy'} recovery · {title_scope}",
                 metric_grid=RECOVERY_METRIC_GRID,
                 strategy_keys=selected,
-                legend_fontsize=11,
+                legend_fontsize=14,
                 normalize_metrics=bool(normalize_metrics),
                 always_normalize_metric_mean=True,
                 include_upper_anchor=False,
                 subplot_width=7.4,
+                x_tick_step=2,
+                tick_label_fontsize=14,
+                axis_label_fontsize=16,
+                legend_markerscale=1.5,
+                legend_handlelength=2.8,
             )
             if fig is None:
                 if backbone == _MEAN_BACKBONE and prune_strategy == _MIN_PRUNE_STRATEGY:
@@ -592,14 +609,19 @@ def render_recovery_overview(
                 ]
                 fig = render_strategy_metric_figure(
                     payload=fallback_plot_payload,
-                    title=f"{backbone}: {prune_strategy or 'legacy'} recovery · {title_scope}",
+                    title=f"{backbone_display_name(backbone)}: {prune_strategy or 'legacy'} recovery · {title_scope}",
                     metric_grid=RECOVERY_METRIC_GRID,
                     strategy_keys=fallback_selected if fallback_selected else None,
-                    legend_fontsize=11,
+                    legend_fontsize=14,
                     normalize_metrics=bool(normalize_metrics),
                     always_normalize_metric_mean=True,
                     include_upper_anchor=False,
                     subplot_width=7.4,
+                    x_tick_step=2,
+                    tick_label_fontsize=14,
+                    axis_label_fontsize=16,
+                    legend_markerscale=1.5,
+                    legend_handlelength=2.8,
                 )
 
                 if fig is None:
@@ -612,7 +634,7 @@ def render_recovery_overview(
                     f"{backbone}: recovery missing; rendered upper + no-recovery baselines from pruning summaries"
                 )
             try:
-                gallery.append((_figure_to_rgb(fig), backbone))
+                gallery.append((_figure_to_rgb(fig), backbone_display_name(backbone)))
             finally:
                 plt.close(fig)
             missing = [method for method in methods if method not in available]
@@ -686,7 +708,13 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
             normalize_metrics, prune_strategy_value,
         )
         return (
-            gr.update(choices=[_MEAN_BACKBONE, *latest_backbones], value=backbone_value),
+            gr.update(
+                choices=[
+                    (backbone_display_name(item), item)
+                    for item in [_MEAN_BACKBONE, *latest_backbones]
+                ],
+                value=backbone_value,
+            ),
             gr.update(
                 choices=[
                     (name.removeprefix("recovery_"), name)
@@ -719,7 +747,10 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
             with gr.Column(scale=1, elem_classes=["control-column"]):
                 backbone_cb = gr.CheckboxGroup(
                     label="Backbones",
-                    choices=[_MEAN_BACKBONE, *backbones],
+                    choices=[
+                        (backbone_display_name(item), item)
+                        for item in [_MEAN_BACKBONE, *backbones]
+                    ],
                     value=[_MEAN_BACKBONE, *backbones],
                 )
                 prune_strategy_dd = gr.Dropdown(

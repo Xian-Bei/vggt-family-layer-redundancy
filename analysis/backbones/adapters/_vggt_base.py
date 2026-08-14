@@ -137,6 +137,12 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         self._assert_vendor_origin()
         VGGT = import_vggt_class()
         model = VGGT.from_pretrained(str(hf_model))
+        # LaRe reconstructs evaluation point clouds from camera + depth, so the
+        # native VGGT point head is unused in every supported workflow.  Drop
+        # the module at load time to avoid retaining its parameters or running
+        # it accidentally through an adapter path.
+        if hasattr(model, "point_head"):
+            model.point_head = None
         model = model.to(device=device)
         # Official VGGT inference keeps fp32 weights and uses autocast for mixed precision.
         if dtype is not None and dtype != torch.float32:
@@ -359,7 +365,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         predictions: Dict[str, Any] = {}
 
         # Match the official VGGT precision boundary: the aggregator inherits
-        # the caller's AMP context, while camera/depth/point heads run in fp32.
+        # the caller's AMP context, while the required camera/depth heads run in fp32.
         with torch.autocast(device_type=images.device.type, enabled=False):
             if getattr(model, "camera_head", None) is not None:
                 pose_enc_list = model.camera_head(aggregated_tokens_list)
@@ -372,13 +378,6 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
                 )
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf
-
-            if getattr(model, "point_head", None) is not None:
-                pts3d, pts3d_conf = model.point_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=int(patch_start_idx)
-                )
-                predictions["world_points"] = pts3d
-                predictions["world_points_conf"] = pts3d_conf
 
         if getattr(model, "track_head", None) is not None and query_points is not None:
             track_list, vis, conf = model.track_head(
@@ -474,14 +473,24 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         state = payload.get("model_state_dict", payload)
         model.load_state_dict(state, strict=False)
 
-    def forward_predictions(self, model: nn.Module, images: torch.Tensor) -> PredictionBundle:
+    def forward_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        *,
+        defer_cpu_geometry: bool = False,
+    ) -> PredictionBundle:
         if images.dim() == 4:
             images = images.unsqueeze(0)
         aggregated_tokens_list, patch_start_idx = model.aggregator(images)
         preds = self.run_heads_from_aggregated_tokens(
             model, aggregated_tokens_list, int(patch_start_idx), images
         )
-        return self.prediction_bundle_from_raw(dict(preds) if isinstance(preds, dict) else {}, images)
+        return self.prediction_bundle_from_raw(
+            dict(preds) if isinstance(preds, dict) else {},
+            images,
+            defer_depth_unprojection=defer_cpu_geometry,
+        )
 
     def supports_incremental_skip_eval(self) -> bool:
         return True
@@ -535,6 +544,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         required_layers: Set[int],
         pos_frame: Optional[torch.Tensor],
         pos_global: Optional[torch.Tensor],
+        defer_cpu_geometry: bool,
     ) -> PredictionBundle:
         tokens = prefix_tokens
         selected = dict(prefix_layers)
@@ -571,6 +581,12 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
             int(model.aggregator.patch_start_idx),
             images,
         )
+        if defer_cpu_geometry:
+            return self.prediction_bundle_from_raw(
+                raw,
+                images,
+                defer_depth_unprojection=True,
+            )
         return self.prediction_bundle_from_raw(raw, images)
 
     def iter_skip_span_predictions(
@@ -578,6 +594,8 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         model: nn.Module,
         images: torch.Tensor,
         spans: Sequence[Tuple[int, int]],
+        *,
+        defer_cpu_geometry: bool = False,
     ) -> Iterable[Tuple[int, int, PredictionBundle]]:
         """Stream exact VGGT span predictions while computing baseline prefixes once."""
         from analysis.amp_policy import autocast_device_dtype
@@ -636,6 +654,7 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
                         required_layers=required_layers,
                         pos_frame=pos_frame,
                         pos_global=pos_global,
+                        defer_cpu_geometry=defer_cpu_geometry,
                     )
                 yield start_unit, end_unit, prediction
 
@@ -666,10 +685,17 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
         self,
         raw: Dict[str, Any],
         images: torch.Tensor,
+        *,
+        defer_depth_unprojection: bool = False,
     ) -> PredictionBundle:
         from analysis.backbones.prediction import bundle_from_pose_depth
 
-        return bundle_from_pose_depth(raw=raw, images=images, backbone_name=self.name)
+        return bundle_from_pose_depth(
+            raw=raw,
+            images=images,
+            backbone_name=self.name,
+            defer_depth_unprojection=defer_depth_unprojection,
+        )
 
     def build_initial_tokens(self, model: nn.Module, images: torch.Tensor) -> Optional[torch.Tensor]:
         from analysis.backbones.adapters._vggt_collect import _aggregator_initial_tokens

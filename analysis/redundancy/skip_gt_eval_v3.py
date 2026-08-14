@@ -20,6 +20,12 @@ from analysis.backbones.bootstrap import apply_pythonpath
 from analysis.backbones.contracts import EvalSceneContext
 from analysis.backbones.registry import get_backbone
 from analysis.datasets.registry import dataset_names, get_dataset
+from analysis.eval.async_pipeline import (
+    DEFAULT_ASYNC_SCORE_MAX_PENDING,
+    DEFAULT_ASYNC_SCORE_WORKERS,
+    AsyncPredictionScorePipeline,
+    async_score_enabled,
+)
 from analysis.redundancy.metrics import upper_triangle_pack
 from analysis.schema.v3 import SCHEMA_VERSION, stage_dir
 
@@ -104,6 +110,23 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Discard skip-eval JSONL checkpoints and recompute all scene/span results.",
     )
+    p.add_argument(
+        "--no-async-score",
+        action="store_true",
+        help="Disable the CUDA-to-CPU scoring pipeline and score each span synchronously.",
+    )
+    p.add_argument(
+        "--score-workers",
+        type=int,
+        default=DEFAULT_ASYNC_SCORE_WORKERS,
+        help="Number of parallel CPU scoring workers.",
+    )
+    p.add_argument(
+        "--score-max-pending",
+        type=int,
+        default=DEFAULT_ASYNC_SCORE_MAX_PENDING,
+        help="Maximum number of staged predictions awaiting CPU scoring.",
+    )
     return p
 
 
@@ -133,6 +156,44 @@ def normalize_metrics(raw: Dict[str, float]) -> Dict[str, float]:
         if view_k in SKIP_EVAL_METRICS:
             out[view_k] = fv
     return out
+
+
+def create_async_skip_score_pipeline(
+    *,
+    device: torch.device,
+    dataset_plugin: Any,
+    adapter: Any,
+    prepared: Any,
+    eval_context: EvalSceneContext,
+    out_root: Path,
+    scene_id: str,
+    timing: bool,
+    score_workers: int,
+    score_max_pending: int,
+    thread_name_prefix: str,
+) -> AsyncPredictionScorePipeline:
+    """Build the shared ordered scorer used by direct and remaining skip-eval."""
+    return AsyncPredictionScorePipeline(
+        device=device,
+        score_fn=lambda _span, prediction: normalize_metrics(
+            dataset_plugin.score_skip_eval_prediction(
+                adapter, prediction, prepared, eval_context
+            )
+        ),
+        result_fn=lambda span, metric_row: _append_scene_checkpoint(
+            out_root,
+            scene_id=scene_id,
+            span=span,
+            metrics=metric_row,
+        ),
+        error_fn=lambda span, exc: _latency_log(
+            f"[warn] scene={scene_id} span={span} scoring failed: {exc}"
+        ),
+        timing=timing,
+        score_workers=score_workers,
+        max_pending=score_max_pending,
+        thread_name_prefix=thread_name_prefix,
+    )
 
 
 def metric_worse_direction(metric: str) -> Literal["lower", "higher"]:
@@ -723,6 +784,9 @@ def run_skip_gt_eval(
     progress: bool = True,
     timing: Optional[bool] = None,
     resume: bool = True,
+    async_score: bool = True,
+    score_workers: int = DEFAULT_ASYNC_SCORE_WORKERS,
+    score_max_pending: int = DEFAULT_ASYNC_SCORE_MAX_PENDING,
 ) -> Path:
     timing_on = _timing_enabled(timing)
     run_t0 = time.perf_counter()
@@ -800,7 +864,11 @@ def run_skip_gt_eval(
     _prepare_checkpoint_manifest(out_root, config=manifest_config, resume=bool(resume))
     _latency_log(
         f"[skip_gt_eval] entering scene-first loop: {total_spans} spans, "
-        f"{len(metrics)} metrics, resume={bool(resume)}, elapsed={time.perf_counter() - run_t0:.2f}s"
+        f"{len(metrics)} metrics, resume={bool(resume)}, "
+        f"async_score={async_score_enabled(async_score, torch_device)}, "
+        f"score_workers={score_workers}, "
+        f"max_pending={score_max_pending}, "
+        f"elapsed={time.perf_counter() - run_t0:.2f}s"
     )
     profile = ds_plugin.eval_profile()
     eval_ctx = EvalSceneContext(
@@ -851,6 +919,8 @@ def run_skip_gt_eval(
         scene_t0 = time.perf_counter()
         prepared = None
         span_iter = None
+        score_pipeline = None
+        gpu_timing_events: List[Tuple[torch.cuda.Event, torch.cuda.Event]] = []
         try:
             prepared = ds_plugin.prepare_skip_eval_scene(adapter, batch, eval_ctx)
             if not isinstance(prepared.images, torch.Tensor):
@@ -861,11 +931,29 @@ def run_skip_gt_eval(
             yielded: Set[Tuple[int, int]] = set()
             missing_set = set(missing)
             replay_t0 = time.perf_counter()
+            if timing_on and torch_device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(torch_device.index)
             prediction_iter = adapter.iter_skip_span_predictions(
-                model, prepared.images, missing
+                model,
+                prepared.images,
+                missing,
+                defer_cpu_geometry=async_score_enabled(async_score, torch_device),
             )
+            if async_score_enabled(async_score, torch_device):
+                score_pipeline = create_async_skip_score_pipeline(
+                    device=torch_device,
+                    dataset_plugin=ds_plugin,
+                    adapter=adapter,
+                    prepared=prepared,
+                    eval_context=eval_ctx,
+                    out_root=out_root,
+                    scene_id=sid,
+                    timing=timing_on,
+                    score_workers=score_workers,
+                    score_max_pending=score_max_pending,
+                    thread_name_prefix="skip-score",
+                )
             span_iter = tqdm(
-                prediction_iter,
                 total=len(missing),
                 desc=(
                     f"      spans ({sid})"
@@ -879,7 +967,22 @@ def run_skip_gt_eval(
                 position=1,
                 disable=not progress,
             )
-            for i, j, prediction in span_iter:
+            prediction_iterator = iter(prediction_iter)
+            while True:
+                gpu_start = gpu_end = None
+                if timing_on and torch_device.type == "cuda":
+                    gpu_start = torch.cuda.Event(enable_timing=True)
+                    gpu_end = torch.cuda.Event(enable_timing=True)
+                    gpu_start.record(torch.cuda.current_stream(torch_device))
+                try:
+                    i, j, prediction = next(prediction_iterator)
+                except StopIteration:
+                    break
+                if gpu_end is not None and gpu_start is not None:
+                    gpu_end.record(torch.cuda.current_stream(torch_device))
+                    gpu_timing_events.append((gpu_start, gpu_end))
+                if progress:
+                    span_iter.update(1)
                 span = (int(i), int(j))
                 if progress:
                     span_iter.set_postfix_str(f"({span[0]},{span[1]})", refresh=False)
@@ -888,22 +991,32 @@ def run_skip_gt_eval(
                 if span in yielded:
                     raise RuntimeError(f"Adaptor yielded duplicate skip span {span}")
                 yielded.add(span)
-                try:
-                    metric_row = normalize_metrics(
-                        ds_plugin.score_skip_eval_prediction(
-                            adapter, prediction, prepared, eval_ctx
+                if score_pipeline is not None:
+                    try:
+                        score_pipeline.submit(span, prediction)
+                    except Exception as e:
+                        _latency_log(f"[warn] scene={sid} span={span} scoring failed: {e}")
+                    finally:
+                        del prediction
+                else:
+                    try:
+                        metric_row = normalize_metrics(
+                            ds_plugin.score_skip_eval_prediction(
+                                adapter, prediction, prepared, eval_ctx
+                            )
                         )
-                    )
-                    _append_scene_checkpoint(
-                        out_root,
-                        scene_id=sid,
-                        span=span,
-                        metrics=metric_row,
-                    )
-                except Exception as e:
-                    _latency_log(f"[warn] scene={sid} span={span} scoring failed: {e}")
-                finally:
-                    del prediction
+                        _append_scene_checkpoint(
+                            out_root,
+                            scene_id=sid,
+                            span=span,
+                            metrics=metric_row,
+                        )
+                    except Exception as e:
+                        _latency_log(f"[warn] scene={sid} span={span} scoring failed: {e}")
+                    finally:
+                        del prediction
+            if score_pipeline is not None:
+                score_pipeline.close()
             span_iter.close()
             if yielded != missing_set:
                 absent = sorted(missing_set.difference(yielded))
@@ -918,13 +1031,36 @@ def run_skip_gt_eval(
                 f"prepare={prepare_s:.2f}s replay+score={replay_s:.2f}s total={scene_s:.2f}s"
             )
             if timing_on:
+                gpu_prediction_s = (
+                    sum(float(start.elapsed_time(end)) for start, end in gpu_timing_events)
+                    / 1000.0
+                )
+                d2h_s = score_pipeline.d2h_ms / 1000.0 if score_pipeline is not None else 0.0
+                cpu_score_s = score_pipeline.score_s if score_pipeline is not None else 0.0
+                producer_wait_s = (
+                    score_pipeline.producer_wait_s if score_pipeline is not None else 0.0
+                )
+                max_pending_seen = (
+                    score_pipeline.max_pending_seen if score_pipeline is not None else 0
+                )
+                peak_vram_gib = (
+                    float(torch.cuda.max_memory_allocated(torch_device.index)) / (1024.0**3)
+                    if torch_device.type == "cuda"
+                    else 0.0
+                )
                 _timing_log(
                     f"[timing] scene={sid} prepare={prepare_s:.3f}s "
-                    f"replay_score={replay_s:.3f}s total={scene_s:.3f}s"
+                    f"pipeline={replay_s:.3f}s gpu_prediction={gpu_prediction_s:.3f}s "
+                    f"d2h={d2h_s:.3f}s cpu_score={cpu_score_s:.3f}s "
+                    f"producer_wait={producer_wait_s:.3f}s "
+                    f"max_pending={max_pending_seen} peak_vram={peak_vram_gib:.3f}GiB "
+                    f"total={scene_s:.3f}s"
                 )
         except Exception as e:
             _latency_log(f"[warn] scene={sid} incremental skip eval failed: {e}")
         finally:
+            if score_pipeline is not None:
+                score_pipeline.close()
             if span_iter is not None:
                 span_iter.close()
             if prepared is not None:
@@ -978,6 +1114,9 @@ def main() -> None:
         progress=not bool(args.no_progress),
         timing=bool(args.timing) if args.timing else None,
         resume=not bool(args.no_resume),
+        async_score=not bool(args.no_async_score),
+        score_workers=int(args.score_workers),
+        score_max_pending=int(args.score_max_pending),
     )
 
 

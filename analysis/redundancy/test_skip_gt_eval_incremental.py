@@ -2,20 +2,35 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 import torch.nn as nn
 
 from analysis.backbones.adapters._vggt_base import VGGTFamilyAdapterMixin
-from analysis.backbones.contracts import PredictionBundle
+from analysis.backbones.contracts import EvalSceneContext, PredictionBundle
+from analysis.backbones.prediction import bundle_from_pose_depth
+from analysis.backbones.pose_geometry import unproject_depth_payload
+from analysis.datasets.contracts import PreparedSkipEvalScene
+from analysis.eval.async_pipeline import (
+    ASYNC_SCORE_DEFERRED_FIELDS,
+    ASYNC_SCORE_FIELDS,
+    DEFAULT_ASYNC_SCORE_MAX_PENDING,
+    DEFAULT_ASYNC_SCORE_WORKERS,
+    AsyncPredictionScorePipeline,
+    async_score_enabled,
+)
 from analysis.redundancy.skip_gt_eval_v3 import (
     _append_scene_checkpoint,
+    _build_parser,
     _finalize_skip_outputs_from_disk,
     _load_scene_checkpoint,
     _prepare_checkpoint_manifest,
     iter_unit_spans,
+    normalize_metrics,
 )
 
 
@@ -85,8 +100,14 @@ class _TestAdapter(VGGTFamilyAdapterMixin):
         del model, patch_start_idx, images, query_points
         return {"head": aggregated_tokens_list[-1]}
 
-    def prediction_bundle_from_raw(self, raw, images):
-        del images
+    def prediction_bundle_from_raw(
+        self,
+        raw,
+        images,
+        *,
+        defer_depth_unprojection=False,
+    ):
+        del images, defer_depth_unprojection
         return PredictionBundle(raw=raw)
 
 
@@ -199,6 +220,268 @@ class SkipCheckpointTest(unittest.TestCase):
             self.assertTrue((root / "i0_j0" / "summary.json").is_file())
             summary = json.loads((root / "skip_eval_summary_v3.json").read_text())
             self.assertEqual(summary["num_scenes_completed"], 1)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for async score tests")
+class AsyncScorePipelineTest(unittest.TestCase):
+    def _context(self) -> EvalSceneContext:
+        return EvalSceneContext(
+            device=torch.device("cuda"),
+            profile=object(),
+            backbone_name="test",
+            dataset_name="test",
+        )
+
+    def test_stages_only_score_fields_and_bounds_pending_work(self) -> None:
+        self.assertEqual(ASYNC_SCORE_FIELDS, ("points", "camera_poses"))
+        worker_threads = set()
+
+        def scorer(_adapter, prediction, _prepared, _ctx):
+            worker_threads.add(threading.get_ident())
+            self.assertIsNone(prediction.depth)
+            self.assertEqual(prediction.raw, {})
+            self.assertFalse(prediction.points.is_cuda)
+            self.assertTrue(prediction.points.is_pinned())
+            self.assertTrue(prediction.camera_poses.is_pinned())
+            return {"ate": float(prediction.points.reshape(-1)[0])}
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prepared = PreparedSkipEvalScene(
+                scene_id="scene",
+                images=torch.empty(0, device="cuda"),
+            )
+            pipeline = AsyncPredictionScorePipeline(
+                device=torch.device("cuda"),
+                score_fn=lambda _span, prediction: normalize_metrics(
+                    scorer(object(), prediction, prepared, self._context())
+                ),
+                result_fn=lambda span, metrics: _append_scene_checkpoint(
+                    root, scene_id="scene", span=span, metrics=metrics
+                ),
+                error_fn=lambda _span, exc: (_ for _ in ()).throw(exc),
+                timing=True,
+            )
+            for index in range(DEFAULT_ASYNC_SCORE_MAX_PENDING + 2):
+                prediction = PredictionBundle(
+                    points=torch.full((1, 2, 3), float(index), device="cuda"),
+                    camera_poses=torch.eye(4, device="cuda").reshape(1, 1, 4, 4),
+                    depth=torch.ones((64, 64), device="cuda"),
+                    raw={"not_staged": torch.ones(1, device="cuda")},
+                )
+                pipeline.submit((index, index), prediction)
+                self.assertLessEqual(
+                    len(pipeline.pending), DEFAULT_ASYNC_SCORE_MAX_PENDING
+                )
+            pipeline.close()
+            self.assertEqual(pipeline.score_workers, DEFAULT_ASYNC_SCORE_WORKERS)
+            self.assertEqual(
+                pipeline.max_pending_seen, DEFAULT_ASYNC_SCORE_MAX_PENDING
+            )
+            self.assertGreaterEqual(pipeline.d2h_ms, 0.0)
+            rows = [json.loads(line) for line in (root / "checkpoints" / "scene.jsonl").read_text().splitlines()]
+            expected = list(range(DEFAULT_ASYNC_SCORE_MAX_PENDING + 2))
+            self.assertEqual([row["span_i"] for row in rows], expected)
+            self.assertEqual(
+                [row["metrics"]["ape"] for row in rows],
+                [float(x) for x in expected],
+            )
+            self.assertGreaterEqual(len(worker_threads), 1)
+            self.assertLessEqual(len(worker_threads), DEFAULT_ASYNC_SCORE_WORKERS)
+            self.assertNotIn(threading.get_ident(), worker_threads)
+
+    def test_default_score_workers_run_configured_tasks_concurrently(self) -> None:
+        worker_threads: set[int] = set()
+        worker_lock = threading.Lock()
+        both_started = threading.Event()
+        release_workers = threading.Event()
+
+        def scorer(_key, _prediction):
+            with worker_lock:
+                worker_threads.add(threading.get_ident())
+                if len(worker_threads) == DEFAULT_ASYNC_SCORE_WORKERS:
+                    both_started.set()
+            if not release_workers.wait(timeout=5.0):
+                raise TimeoutError("score workers did not run concurrently")
+            return {"ape": 1.0}
+
+        results = []
+        pipeline = AsyncPredictionScorePipeline(
+            device=torch.device("cuda"),
+            score_fn=scorer,
+            result_fn=lambda key, metrics: results.append((key, metrics)),
+            error_fn=lambda _key, exc: (_ for _ in ()).throw(exc),
+            timing=False,
+        )
+        try:
+            for index in range(DEFAULT_ASYNC_SCORE_WORKERS):
+                pipeline.submit(
+                    index,
+                    PredictionBundle(
+                        points=torch.ones((1, 1, 3), device="cuda"),
+                        camera_poses=torch.eye(4, device="cuda").reshape(1, 1, 4, 4),
+                    ),
+                )
+            self.assertTrue(both_started.wait(timeout=5.0))
+        finally:
+            release_workers.set()
+            pipeline.close()
+        self.assertEqual(len(worker_threads), DEFAULT_ASYNC_SCORE_WORKERS)
+        self.assertEqual(
+            [key for key, _metrics in results],
+            list(range(DEFAULT_ASYNC_SCORE_WORKERS)),
+        )
+
+    def test_worker_failure_leaves_span_for_resume(self) -> None:
+        def scorer(_adapter, prediction, _prepared, _ctx):
+            value = int(prediction.points.reshape(-1)[0])
+            if value == 2:
+                raise RuntimeError("expected scoring failure")
+            return {"ate": float(value)}
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prepared = PreparedSkipEvalScene("scene", torch.empty(0, device="cuda"))
+            pipeline = AsyncPredictionScorePipeline(
+                device=torch.device("cuda"),
+                score_fn=lambda _span, prediction: normalize_metrics(
+                    scorer(object(), prediction, prepared, self._context())
+                ),
+                result_fn=lambda span, metrics: _append_scene_checkpoint(
+                    root, scene_id="scene", span=span, metrics=metrics
+                ),
+                error_fn=lambda _span, _exc: None,
+                timing=False,
+            )
+            for index in range(4):
+                pipeline.submit(
+                    (index, index),
+                    PredictionBundle(
+                        points=torch.full((1, 1, 3), float(index), device="cuda"),
+                        camera_poses=torch.eye(4, device="cuda").reshape(1, 1, 4, 4),
+                    ),
+                )
+            pipeline.close()
+            completed = _load_scene_checkpoint(root, "scene")
+            self.assertEqual(set(completed), {(0, 0), (1, 1), (3, 3)})
+
+    def test_deferred_vggt_unprojection_runs_in_cpu_worker(self) -> None:
+        self.assertEqual(
+            ASYNC_SCORE_DEFERRED_FIELDS,
+            (
+                "depth",
+                "deferred_unprojection_extrinsic",
+                "deferred_unprojection_intrinsic",
+                "camera_poses",
+            ),
+        )
+        worker_threads = set()
+        depth = torch.tensor(
+            [[[[[1.0], [2.0]], [[3.0], [4.0]]]]], device="cuda"
+        )
+        extrinsic = torch.eye(4, device="cuda")[:3].reshape(1, 1, 3, 4)
+        intrinsic = torch.tensor(
+            [[[[2.0, 0.0, 0.5], [0.0, 2.0, 0.5], [0.0, 0.0, 1.0]]]],
+            device="cuda",
+        )
+        prediction = PredictionBundle(
+            depth=depth,
+            camera_poses=torch.eye(4, device="cuda").reshape(1, 1, 4, 4),
+            raw={
+                "deferred_unprojection_backbone": "vggt",
+                "deferred_unprojection_extrinsic": extrinsic,
+                "deferred_unprojection_intrinsic": intrinsic,
+            },
+        )
+        expected = torch.from_numpy(
+            unproject_depth_payload(
+                depth.cpu(),
+                extrinsic.cpu(),
+                intrinsic.cpu(),
+                backbone="vggt",
+            )
+        ).float().unsqueeze(0)
+
+        def scorer(_key, staged):
+            worker_threads.add(threading.get_ident())
+            self.assertIsNotNone(staged.points)
+            self.assertEqual(staged.points.device.type, "cpu")
+            self.assertEqual(tuple(staged.points.shape), (1, 1, 2, 2, 3))
+            self.assertTrue(torch.equal(staged.points, expected))
+            return {"ape": float(staged.points.sum())}
+
+        results = []
+        pipeline = AsyncPredictionScorePipeline(
+            device=torch.device("cuda"),
+            score_fn=scorer,
+            result_fn=lambda key, metrics: results.append((key, metrics)),
+            error_fn=lambda _key, exc: (_ for _ in ()).throw(exc),
+            timing=True,
+        )
+        pipeline.submit((0, 0), prediction)
+        self.assertIsNone(prediction.points)
+        pipeline.close()
+        staged_slot_fields = set().union(
+            *(set(slot.tensors) for slot in pipeline.free_slots)
+        )
+        self.assertEqual(staged_slot_fields, set(ASYNC_SCORE_DEFERRED_FIELDS))
+        self.assertEqual([key for key, _metrics in results], [(0, 0)])
+        self.assertGreaterEqual(len(worker_threads), 1)
+        self.assertLessEqual(len(worker_threads), DEFAULT_ASYNC_SCORE_WORKERS)
+        self.assertNotIn(threading.get_ident(), worker_threads)
+
+    def test_vggt_bundle_defers_without_gpu_cpu_roundtrip(self) -> None:
+        depth = torch.ones((1, 1, 2, 2, 1), device="cuda")
+        pose_enc = torch.zeros((1, 1, 9), device="cuda")
+        images = torch.zeros((1, 1, 3, 2, 2), device="cuda")
+        extrinsic = torch.eye(4, device="cuda")[:3].reshape(1, 1, 3, 4)
+        intrinsic = torch.tensor(
+            [[[[2.0, 0.0, 0.5], [0.0, 2.0, 0.5], [0.0, 0.0, 1.0]]]],
+            device="cuda",
+        )
+        with mock.patch(
+            "analysis.backbones.prediction.decode_pose_enc_to_extrinsics_intrinsics",
+            return_value=(extrinsic, intrinsic),
+        ), mock.patch(
+            "analysis.backbones.prediction.unproject_depth_payload"
+        ) as unproject:
+            prediction = bundle_from_pose_depth(
+                raw={"pose_enc": pose_enc, "depth": depth},
+                images=images,
+                backbone_name="vggt",
+                defer_depth_unprojection=True,
+            )
+        unproject.assert_not_called()
+        self.assertIsNone(prediction.points)
+        self.assertIs(prediction.depth, depth)
+        self.assertIs(
+            prediction.raw["deferred_unprojection_extrinsic"], extrinsic
+        )
+        self.assertIs(
+            prediction.raw["deferred_unprojection_intrinsic"], intrinsic
+        )
+        self.assertTrue(prediction.camera_poses.is_cuda)
+
+    def test_cli_and_cpu_fallback(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--dataset",
+                "scannet",
+                "--data-root",
+                "data/scans_dev50",
+                "--no-async-score",
+                "--score-workers",
+                "5",
+                "--score-max-pending",
+                "15",
+            ]
+        )
+        self.assertTrue(args.no_async_score)
+        self.assertEqual(args.score_workers, 5)
+        self.assertEqual(args.score_max_pending, 15)
+        self.assertFalse(async_score_enabled(True, torch.device("cpu")))
+        self.assertFalse(async_score_enabled(False, torch.device("cuda")))
+        self.assertTrue(async_score_enabled(True, torch.device("cuda")))
 
 
 if __name__ == "__main__":

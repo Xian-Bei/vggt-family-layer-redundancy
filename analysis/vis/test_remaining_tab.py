@@ -19,26 +19,31 @@ class RemainingTabTest(unittest.TestCase):
 
     def test_existing_score_caption_is_flattened_for_gradio_gallery(self) -> None:
         image = np.zeros((8, 8, 3), dtype=np.uint8)
-        item = _gallery_item_with_context((image, "V: Dice=0.9"), "vggt")
+        item = _gallery_item_with_context((image, "detail"), "vggt")
 
         self.assertIs(item[0], image)
-        self.assertEqual(item[1], "vggt · V: Dice=0.9")
+        self.assertEqual(item[1], "vggt · detail")
         gr.Gallery().postprocess([item])
 
-    def test_tab_has_exactly_two_heatmap_rows(self) -> None:
+    def test_tab_has_one_two_column_row_per_backbone(self) -> None:
         with gr.Blocks():
             ui = build_remaining_tab(
                 dataset_choices=["min", "mean", "scannet_dev50"],
+                backbone_choices=["vggt_omega", "pi3"],
                 initial_dataset="mean",
-                refresh_remaining_cb=lambda *_args: ([], [], ""),
+                refresh_remaining_cb=lambda *_args: ([], [], True, True, ""),
             )
 
         self.assertEqual(ui["tab"].label, "Remaining")
         self.assertEqual(ui["dataset"].value, "mean")
-        self.assertEqual(ui["original_gallery"].label, "7-metric mean")
-        self.assertEqual(
-            ui["marginal_gallery"].label,
-            "Remaining marginal 7-metric mean",
+        self.assertEqual(len(ui["galleries"]), 2)
+        self.assertEqual(len(ui["backbone_rows"]), 2)
+        self.assertTrue(all(gallery.columns == 2 for gallery in ui["galleries"]))
+        self.assertTrue(
+            all(
+                gallery.label == "Original / marginal 7-metric mean"
+                for gallery in ui["galleries"]
+            )
         )
 
 

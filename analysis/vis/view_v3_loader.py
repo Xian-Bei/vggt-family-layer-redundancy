@@ -27,21 +27,13 @@ from analysis.schema.v3 import (
 _V3_SIM_METRIC_CANDIDATES = ("cka", "cosine", "cca", "pwcca", "inv_mse")
 
 
-def _backbone_dir_has_v3_artifacts(backbone_dir: Path) -> bool:
-    if not backbone_dir.is_dir():
-        return False
-    for ds_dir in backbone_dir.iterdir():
-        if not ds_dir.is_dir() or ds_dir.name.startswith("."):
-            continue
-        if (ds_dir / "cache" / "cache_manifest_v3.json").is_file():
-            return True
-        if redundancy_dir_has_graphs(ds_dir / "redundancy"):
-            return True
-    return False
-
-
 def discover_v3_backbones(output_root: Path) -> List[str]:
-    """List backbone folder names under ``analysis_outputs_v3/``."""
+    """List every backbone folder directly under ``analysis_outputs_v3/``.
+
+    A directory is intentionally enough to make a backbone visible.  Individual
+    tabs decide which artifacts are complete and may render empty states while a
+    run is still in progress.
+    """
     base = Path(output_root)
     if not base.is_dir():
         return []
@@ -49,8 +41,7 @@ def discover_v3_backbones(output_root: Path) -> List[str]:
     for child in sorted(base.iterdir()):
         if not child.is_dir() or child.name.startswith("."):
             continue
-        if _backbone_dir_has_v3_artifacts(child):
-            names.append(child.name)
+        names.append(child.name)
     return names
 
 
@@ -69,7 +60,7 @@ def detect_v3_backbone_root(path: Path, *, output_root: Optional[Path] = None) -
     if not rel.parts:
         return None
     candidate = root / rel.parts[0]
-    if _backbone_dir_has_v3_artifacts(candidate):
+    if candidate.is_dir() and not candidate.name.startswith("."):
         return candidate
     return None
 

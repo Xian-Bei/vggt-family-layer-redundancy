@@ -10,7 +10,7 @@ import torch
 
 from analysis.amp_policy import autocast_device_dtype
 from analysis.backbones.contracts import EvalSceneContext
-from analysis.datasets.contracts import DatasetAdaptor, EvalSampleBatch, PreparedSkipEvalScene
+from analysis.datasets.contracts import DatasetAdaptor, EvalSampleBatch, PreparedEvalScene
 from analysis.datasets.frame_selection import cap_sequence
 from analysis.eval.metrics_core import (
     compute_point_metrics,
@@ -233,20 +233,20 @@ class NuScenesAdaptor(DatasetAdaptor):
 
         return merge_scene_metrics(metrics)
 
-    def prepare_skip_eval_scene(
+    def prepare_eval_scene_cpu(
         self,
         backbone_adaptor: Any,
         batch: EvalSampleBatch,
         ctx: EvalSceneContext,
-    ) -> PreparedSkipEvalScene:
+    ) -> PreparedEvalScene:
         image_paths = [Path(p) for p in batch.meta.get("image_paths", [])]
         if not image_paths:
             raise ValueError(f"{self.name} {batch.scene_id}: missing image_paths in batch meta")
         images = backbone_adaptor.load_eval_images(image_paths)
-        images_b = images.unsqueeze(0).float().to(ctx.device)
+        images_b = images.unsqueeze(0).float().contiguous()
         gt_c2w = _load_pose_stack(batch.meta.get("pose_paths", []))
         gt_w2c = np.linalg.inv(gt_c2w) if gt_c2w.shape[0] else np.zeros((0, 4, 4), dtype=np.float64)
-        return PreparedSkipEvalScene(
+        return PreparedEvalScene(
             scene_id=str(batch.scene_id),
             images=images_b,
             state={
@@ -257,11 +257,11 @@ class NuScenesAdaptor(DatasetAdaptor):
             },
         )
 
-    def score_skip_eval_prediction(
+    def score_eval_prediction(
         self,
         backbone_adaptor: Any,
         prediction: Any,
-        prepared: PreparedSkipEvalScene,
+        prepared: PreparedEvalScene,
         ctx: EvalSceneContext,
     ) -> Dict[str, float]:
         from analysis.datasets import eval_impl

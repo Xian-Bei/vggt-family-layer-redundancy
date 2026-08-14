@@ -270,7 +270,8 @@ class RecoveryOverviewTabTest(unittest.TestCase):
             self.assertEqual(ui["prune_strategy_dd"].value, "ours_double")
             self.assertEqual(ui["dataset_dd"].value, "training average")
             self.assertTrue(ui["normalize_metrics"].value)
-            self.assertIn(("mean", "mean"), ui["backbone_cb"].choices)
+            self.assertIn(("Mean", "mean"), ui["backbone_cb"].choices)
+            self.assertIn(("VGGT", "vggt"), ui["backbone_cb"].choices)
             self.assertEqual(ui["backbone_cb"].value, ["mean", "vggt"])
 
     def test_mean_backbone_averages_shared_recovery_points(self) -> None:
