@@ -25,7 +25,7 @@ class RemainingTabTest(unittest.TestCase):
         self.assertEqual(item[1], "vggt · detail")
         gr.Gallery().postprocess([item])
 
-    def test_tab_has_one_two_column_row_per_backbone(self) -> None:
+    def test_tab_has_one_two_column_gallery_per_backbone(self) -> None:
         with gr.Blocks():
             ui = build_remaining_tab(
                 dataset_choices=["min", "mean", "scannet_dev50"],

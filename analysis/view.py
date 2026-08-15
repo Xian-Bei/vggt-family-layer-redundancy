@@ -2240,6 +2240,7 @@ def _heatmap_rgb_from_packed(
     show_colorbar_histogram: bool = False,
     colorbar_decimals: Optional[int] = 1,
     colorbar_segments: Optional[int] = 5,
+    colorbar_tick_scale: float = 1.0,
     show_xlabel: bool = True,
     show_ylabel: bool = True,
     bottom_title: str = "",
@@ -2256,13 +2257,13 @@ def _heatmap_rgb_from_packed(
     if np.any(np.isnan(arr)):
         arr = np.ma.masked_invalid(arr)
 
-    title_fs, label_fs, tick_fs = 18, 16, 14
+    title_fs, label_fs, tick_fs = 18, 26, 22
     if title_fontsize is not None:
         title_fs = float(title_fontsize)
     if label_fontsize is not None:
-        label_fs = float(label_fontsize)
+        label_fs = max(label_fs, float(label_fontsize))
     if tick_fontsize is not None:
-        tick_fs = float(tick_fontsize)
+        tick_fs = max(tick_fs, float(tick_fontsize))
     row_mean_ax: Optional[plt.Axes] = None
     column_mean_ax: Optional[plt.Axes] = None
     colorbar_ax: Optional[plt.Axes] = None
@@ -2273,7 +2274,11 @@ def _heatmap_rgb_from_packed(
         column_mean_ax = divider.append_axes("right", size="20%", pad=0.03, sharey=ax)
         colorbar_ax = divider.append_axes("right", size="5%", pad=0.10)
     else:
-        fig, ax = plt.subplots(figsize=(9, 8))
+        # Fixed axes keep the actual square heatmap identical in size whether
+        # a shared row/column label is drawn or visually suppressed.
+        fig = plt.figure(figsize=(9, 8))
+        ax = fig.add_axes((0.13, 0.15, 0.70, 0.78))
+        colorbar_ax = fig.add_axes((0.86, 0.15, 0.035, 0.78))
     imshow_kw: Dict[str, Any] = {"cmap": cmap}
     if vmin is not None:
         imshow_kw["vmin"] = vmin
@@ -2325,8 +2330,8 @@ def _heatmap_rgb_from_packed(
         ax,
         num_layers,
         index_name="layer",
-        xlabel=None if show_xlabel else "",
-        ylabel=None if show_ylabel else "",
+        xlabel=None,
+        ylabel=None,
         label_fontsize=label_fs,
         label_fontweight="bold",
         tick_fontsize=tick_fs,
@@ -2335,6 +2340,12 @@ def _heatmap_rgb_from_packed(
         bold_tick_labels=True,
         use_major_locator=True,
     )
+    # Alpha-zero labels still participate in layout, unlike empty/hidden
+    # labels, so panels with merged labels retain exactly the same data area.
+    if not show_xlabel:
+        ax.xaxis.label.set_alpha(0.0)
+    if not show_ylabel:
+        ax.yaxis.label.set_alpha(0.0)
     cbar = (
         fig.colorbar(im, cax=colorbar_ax)
         if colorbar_ax is not None
@@ -2406,7 +2417,7 @@ def _heatmap_rgb_from_packed(
                 else None
             )
             for tick in ticks:
-                tick_val = float(tick)
+                tick_val = float(tick) * float(colorbar_tick_scale)
                 if decimals is not None:
                     labels.append(f"{tick_val:.{decimals}f}{tick_suffix}")
                 elif abs(tick_val - round(tick_val)) < 1e-9:
@@ -2429,14 +2440,10 @@ def _heatmap_rgb_from_packed(
             top=0.90,
         )
     else:
-        fig.tight_layout(
-            rect=(
-                0.035 if left_margin is None else float(left_margin),
-                0.12 if bottom_title_text else 0.02,
-                0.99,
-                0.99,
-            )
-        )
+        # The non-histogram layout uses fixed axes above. Do not run
+        # ``tight_layout`` here: it would resize panels according to which
+        # shared labels happen to contain visible text.
+        pass
     if bottom_title_text:
         fig.text(
             0.5,
@@ -3213,10 +3220,11 @@ def _render_skip_gallery(
             title,
             vmin=0.0 if normalized else None,
             vmax=1.0 if normalized else 0.0,
-            tick_suffix="",
+            tick_suffix="%" if normalized else "",
             cmap="viridis",
             show_colorbar_histogram=show_colorbar_histogram,
-            colorbar_decimals=colorbar_decimals,
+            colorbar_decimals=0 if normalized else colorbar_decimals,
+            colorbar_tick_scale=100.0 if normalized else 1.0,
             label_fontsize=label_fontsize,
             title_fontsize=title_fontsize,
             show_xlabel=True,
@@ -3241,7 +3249,6 @@ def _render_skip_seven_metric_mean(
     show_ylabel: Optional[bool] = None,
     show_title: bool = True,
     label_fontsize: Optional[float] = None,
-    publication_title: bool = False,
     title_fontsize: Optional[float] = None,
     left_margin: Optional[float] = None,
 ) -> Any:
@@ -3255,13 +3262,9 @@ def _render_skip_seven_metric_mean(
     if packed_mean is None:
         return np.full((1200, 1350, 3), 255, dtype=np.uint8)
     title = (
-        (
-            "7-Metric Normalized Retention"
-            if publication_title
-            else "7-metric normalized retention"
-        )
+        "Normalized Retention"
         if normalize_seven_metrics
-        else ("7-Metric Mean" if publication_title else "7-metric mean")
+        else "Retention"
     )
     if title_prefix:
         title = f"{title_prefix} · {title}"
@@ -3271,9 +3274,11 @@ def _render_skip_seven_metric_mean(
         title if show_title else "",
         vmin=0.0 if normalize_seven_metrics else None,
         vmax=1.0 if normalize_seven_metrics else 0.0,
-        tick_suffix="",
+        tick_suffix="%" if normalize_seven_metrics else "",
         cmap="coolwarm",
         show_colorbar_histogram=show_colorbar_histogram,
+        colorbar_decimals=0 if normalize_seven_metrics else 1,
+        colorbar_tick_scale=100.0 if normalize_seven_metrics else 1.0,
         label_fontsize=label_fontsize,
         title_fontsize=title_fontsize,
         left_margin=left_margin,
@@ -3409,9 +3414,11 @@ def _render_skip_metric_mean(
         heading if show_title else "",
         vmin=0.0 if normalize_metrics else None,
         vmax=1.0 if normalize_metrics else 0.0,
-        tick_suffix="",
+        tick_suffix="%" if normalize_metrics else "",
         cmap=cmap,
         show_colorbar_histogram=show_colorbar_histogram,
+        colorbar_decimals=0 if normalize_metrics else 1,
+        colorbar_tick_scale=100.0 if normalize_metrics else 1.0,
         label_fontsize=label_fontsize,
         show_xlabel=(not compact_annotations) if show_xlabel is None else show_xlabel,
         show_ylabel=(not compact_annotations) if show_ylabel is None else show_ylabel,
@@ -4154,7 +4161,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         sim_gamma_value: float,
         sim_cutoff_value: float,
         show_colorbar_histogram: bool,
-        show_remaining_pruning: bool,
         *,
         request_seq: Optional[int],
         force_gallery_refresh: bool,
@@ -4297,7 +4303,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             virtual_dataset,
             bool(show_colorbar_histogram),
             bool(normalize_seven_metrics),
-            bool(show_remaining_pruning),
             bool(show_column_titles),
             bool(show_xlabels),
         )
@@ -4332,40 +4337,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             show_column_titles=bool(show_column_titles),
             show_xlabels=bool(show_xlabels),
         )
-        if show_remaining_pruning:
-            remaining_notes: List[str] = []
-            for mode in stage2_modes_all:
-                skip_point = _stage2_block_keys_for_mode(mode)[2]
-                if skip_point not in galleries:
-                    continue
-                extra_images, extra_note = _heatmaps_remaining_images(
-                    backbone=render_controller.v3_backbone,
-                    dataset=render_controller.dataset,
-                    scene_id=str(scene_id),
-                    mode=mode,
-                    token_rows=t_val,
-                    value_mode=vm,
-                    percentile_clip=clip_key,
-                    sim_gamma=sim_gamma,
-                    sim_cutoff=sim_cutoff,
-                    show_colorbar_histogram=bool(show_colorbar_histogram),
-                    normalize_seven_metrics=bool(normalize_seven_metrics),
-                    expected_columns=max(
-                        1,
-                        len(galleries.get(skip_point, [])),
-                    ),
-                )
-                if extra_images:
-                    galleries[skip_point] = [
-                        *galleries.get(skip_point, []),
-                        *extra_images,
-                    ]
-                if extra_note:
-                    remaining_notes.append(extra_note)
-            if remaining_notes:
-                details += " | " + " ; ".join(dict.fromkeys(remaining_notes))
-            else:
-                details += " | remaining rows enabled"
         after_keys = set(galleries.keys())
         keys_to_update = (requested_blocks & after_keys) if force_updates else (requested_blocks - before_keys)
         if (
@@ -4450,7 +4421,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         sim_gamma_value: float,
         sim_cutoff_value: float,
         show_colorbar_histogram: bool,
-        show_remaining_pruning: bool,
         *,
         force_gallery_refresh: bool,
     ) -> Tuple[Any, ...]:
@@ -4513,7 +4483,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 sim_gamma_value,
                 sim_cutoff_value,
                 show_colorbar_histogram,
-                show_remaining_pruning,
                 request_seq=None,
                 # Always return complete gallery values to the all-backbone
                 # merger. Cached figures are reused by the scoped controller.
@@ -4688,10 +4657,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             for backbone in brute_force_backbones
         }
         overview_column_titles = (
-            "Indoor Pose Metrics Retention",
-            "Indoor Point Cloud Metrics Retention",
-            "Outdoor Pose Metrics Retention",
-            "Outdoor Point Cloud Metrics Retention",
+            "Indoor Pose Metrics\nNormalized Retention",
+            "Indoor Geometry Metrics\nNormalized Retention",
+            "Outdoor Pose Metrics\nNormalized Retention",
+            "Outdoor Geometry Metrics\nNormalized Retention",
         )
         notes: List[str] = []
         included_by_backbone_domain: Dict[Tuple[str, str], List[str]] = {}
@@ -5891,7 +5860,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                 show_xlabel=True,
                                 show_ylabel=False,
                                 label_fontsize=22,
-                                publication_title=True,
                                 title_fontsize=22,
                             )
                             images = [*pose_images, *point_images, mean_image]
@@ -6222,7 +6190,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         sim_gamma: float,
         sim_cutoff: float,
         show_colorbar_histogram: bool,
-        show_remaining_pruning: bool,
     ):
         controller.stage2_request_seq += 1
         ds_key = str(dataset).strip().lower()
@@ -6245,7 +6212,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             float(sim_gamma),
             float(sim_cutoff),
             bool(show_colorbar_histogram),
-            bool(show_remaining_pruning),
             force_gallery_refresh=True,
         )
         # tup_hm tail: info, then 6 filter controls
@@ -6277,7 +6243,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         sim_gamma: float,
         sim_cutoff: float,
         show_colorbar_histogram: bool,
-        show_remaining_pruning: bool,
     ):
         controller.stage2_request_seq += 1
         return _stage2_all_backbones_bundle(
@@ -6290,7 +6255,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             float(sim_gamma),
             float(sim_cutoff),
             bool(show_colorbar_histogram),
-            bool(show_remaining_pruning),
             force_gallery_refresh=False,
         )
 
@@ -6443,7 +6407,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             text-align: center !important;
         }
         .backbone-separator h3 {
-            margin: 10px 0 14px !important;
+            margin: 6px 0 8px !important;
             font-size: 30px !important;
             line-height: 1.15 !important;
             font-weight: 800 !important;
@@ -6468,6 +6432,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         }
         .results-gallery .grid-wrap {
             width: 100%;
+            gap: 4px !important;
+        }
+        .results-gallery [class*="grid"] {
+            gap: 4px !important;
         }
         .results-gallery figure,
         .results-gallery .thumbnail-item,
@@ -6540,7 +6508,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             display: grid !important;
             grid-template-columns: repeat(5, minmax(0, 1fr)) !important;
             width: 100% !important;
-            gap: 8px !important;
+            gap: 4px !important;
             align-items: start !important;
         }
         .similarity-column-label {
@@ -6558,9 +6526,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         }
         .remaining-column-label-row {
             display: grid !important;
-            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+            grid-template-columns: repeat(6, minmax(0, 1fr)) !important;
             width: 100% !important;
-            gap: 8px !important;
+            gap: 4px !important;
             align-items: start !important;
         }
         .remaining-column-label {
@@ -6575,6 +6543,14 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             font-size: 26px !important;
             line-height: 1.2 !important;
             font-weight: 800 !important;
+        }
+        .remaining-single-row {
+            flex-wrap: nowrap !important;
+            gap: 4px !important;
+            align-items: flex-start !important;
+        }
+        .remaining-single-row > * {
+            min-width: 0 !important;
         }
         .results-gallery button,
         .results-gallery .thumbnail-item,
@@ -7089,7 +7065,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             heatmaps_ui["stage2_sim_gamma_slider"],
             heatmaps_ui["stage2_sim_cutoff_slider"],
             heatmaps_ui["stage2_colorbar_histogram"],
-            heatmaps_ui["stage2_show_remaining"],
         ]
 
         # pair_ui["dataset_dd"].change(...)  # Pair Attention tab disabled

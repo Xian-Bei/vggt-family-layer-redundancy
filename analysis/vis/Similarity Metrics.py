@@ -15,11 +15,11 @@ HEATMAP_REAL_DATASETS: Tuple[str, ...] = (
 )
 
 SIMILARITY_COLUMN_LABELS: Tuple[str, ...] = (
-    "7-Metric Normalized Retention",
-    "M·CKA",
-    "M·Cosine",
-    "M·CCA",
-    "M·Inv_MSE",
+    "Normalized Retention",
+    "CKA",
+    "Cosine",
+    "CCA",
+    "Inv_MSE",
 )
 
 _DATASET_ORDER: Tuple[str, ...] = (
@@ -81,19 +81,10 @@ def build_heatmaps_tab(
     with gr.Tab("Similarity Metrics") as tab_stage2:
         gr.Markdown("## Similarity Metrics")
         gr.Markdown(
-            "Choose `mean` or a scene. Each skip mode shows one row containing the "
-            "**7-metric mean** followed by the four similarity heatmaps for each "
-            "selected token region and backbone. "
-            "The 7-metric mean always normalizes each metric to `[0,1]` before averaging. "
-            "Dataset **`min`**: virtual cross-dataset view (element-wise min of each dataset's `mean` "
+            "The all-metric mean always normalizes each metric to `[0,1]` before averaging. "
             "similarity; Scene locked to `mean`). "
             "Dataset **`mean`**: virtual cross-dataset view (element-wise mean of each dataset's `mean` "
             "similarity; Scene locked to `mean`). "
-            "Skip values use absolute degradation. "
-            "**Show remaining** adds remaining-vs-full versions of only the "
-            "7-metric mean and similarity maps, plus marginal 7-metric mean "
-            "and similarity maps rebased by the first prune interval's "
-            "`1 - similarity` degradation, clipped to `[0,1]`."
         )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):
@@ -140,14 +131,6 @@ def build_heatmaps_tab(
                     label="Show row/column mean plots",
                     value=False,
                 )
-                stage2_show_remaining = gr.Checkbox(
-                    label="Show remaining",
-                    value=False,
-                    info=(
-                        "For scene=mean, append remaining 7-metric mean and "
-                        "similarity maps, then marginal mean and similarity."
-                    ),
-                )
                 stage2_sim_gamma_slider = gr.State(1.0)
                 stage2_sim_cutoff_slider = gr.State(0.0)
                 stage2_info = gr.Textbox(label="Displayed counts", interactive=False)
@@ -158,10 +141,7 @@ def build_heatmaps_tab(
                     for index, label in enumerate((
                         f"{mode}: hidden pose",
                         f"{mode}: hidden depth",
-                        (
-                            f"{mode}: 7-metric mean · selected similarity maps "
-                            "· original / remaining / marginal"
-                        ),
+                        f"{mode}: 7-metric mean · selected similarity maps",
                         f"{mode}: hidden sim special",
                         f"{mode}: hidden sim camera",
                         f"{mode}: hidden sim patch",
@@ -215,7 +195,6 @@ def build_heatmaps_tab(
             stage2_sim_gamma_slider,
             stage2_sim_cutoff_slider,
             stage2_colorbar_histogram,
-            stage2_show_remaining,
         ]
         stage2_outputs = [
             *stage2_mode_galleries,
@@ -255,7 +234,6 @@ def build_heatmaps_tab(
             _bind_refresh(stage2_scene_dd.change)
             _bind_refresh(stage2_token_rows_filter.change)
             _bind_refresh(stage2_colorbar_histogram.change)
-            _bind_refresh(stage2_show_remaining.change)
             _bind_refresh(tab_stage2.select, with_trigger_mode=False)
         else:
             stage2_info.value = (
@@ -278,7 +256,6 @@ def build_heatmaps_tab(
         "stage2_sim_gamma_slider": stage2_sim_gamma_slider,
         "stage2_sim_cutoff_slider": stage2_sim_cutoff_slider,
         "stage2_colorbar_histogram": stage2_colorbar_histogram,
-        "stage2_show_remaining": stage2_show_remaining,
         "stage2_inputs": stage2_inputs,
         "stage2_outputs": stage2_outputs,
     }

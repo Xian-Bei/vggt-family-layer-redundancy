@@ -657,17 +657,6 @@ def build_pruning_plan_tab(
         tab_suffix = "detail" if detail else "overview"
         with gr.Tab(title, id=f"{tab_id}_{tab_suffix}") as tab:
             gr.Markdown(f"## {title}")
-            if detail:
-                gr.Markdown(
-                    "Each of the two strategy groups is shown as eight metric plots "
-                    "in two rows: four pose metrics, then three point-cloud metrics "
-                    "and the normalized 7-metric mean."
-                )
-            else:
-                gr.Markdown(
-                    "Each selected backbone and scope shows the two strategy groups "
-                    "using only the normalized 7-metric mean."
-                )
             with gr.Row():
                 with gr.Column(scale=1, elem_classes=["control-column"]):
                     backbone_dd = gr.CheckboxGroup(

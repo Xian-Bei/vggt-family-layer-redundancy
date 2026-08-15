@@ -11,6 +11,41 @@ import analysis.view as view
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required by repository test policy")
 class CommonHeatmapRenderingGpuTest(unittest.TestCase):
+    def test_merged_axis_labels_do_not_resize_heatmap_area(self) -> None:
+        axes = []
+        original_imshow = view.imshow_upper_triangle
+
+        def capture_imshow(ax, arr, n, **kwargs):
+            axes.append(ax)
+            return original_imshow(ax, arr, n, **kwargs)
+
+        packed = [1.0, 0.5, 1.0]
+        with mock.patch.object(
+            view,
+            "imshow_upper_triangle",
+            side_effect=capture_imshow,
+        ):
+            view._heatmap_rgb_from_packed(
+                packed,
+                2,
+                "",
+                show_xlabel=True,
+                show_ylabel=True,
+            )
+            view._heatmap_rgb_from_packed(
+                packed,
+                2,
+                "",
+                show_xlabel=False,
+                show_ylabel=False,
+            )
+
+        self.assertEqual(len(axes), 2)
+        np.testing.assert_allclose(
+            axes[0].get_position().bounds,
+            axes[1].get_position().bounds,
+        )
+
     def test_packed_heatmap_is_globally_expanded_to_full_symmetric_matrix(self) -> None:
         captured: list[np.ndarray] = []
         original_imshow = view.imshow_upper_triangle

@@ -40,10 +40,10 @@ def configure_triangle_axes(
     index_name: str,
     xlabel: Optional[str] = None,
     ylabel: Optional[str] = None,
-    tick_step: int = 2,
-    label_fontsize: Optional[float] = None,
+    tick_step: int = 4,
+    label_fontsize: Optional[float] = 16,
     label_fontweight: Optional[str] = None,
-    tick_fontsize: Optional[float] = None,
+    tick_fontsize: Optional[float] = 14,
     tick_width: Optional[float] = None,
     tick_length: Optional[float] = None,
     bold_tick_labels: bool = False,
@@ -96,8 +96,8 @@ def draw_symmetric_heatmap_panel(
     xlabel: Optional[str] = None,
     ylabel: Optional[str] = None,
     title_fontsize: float = 12,
-    tick_fontsize: float = 6,
-    colorbar_tick_fontsize: float = 7,
+    tick_fontsize: float = 14,
+    colorbar_tick_fontsize: float = 14,
 ) -> Tuple[Any, Any]:
     """Draw an upper-stored matrix as the project-standard symmetric heatmap."""
     upper = np.asarray(values, dtype=np.float64).copy()
@@ -156,6 +156,6 @@ def draw_symmetric_heatmap_panel(
         )
     colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     if str(colorbar_label).strip():
-        colorbar.set_label(str(colorbar_label), fontsize=8)
+        colorbar.set_label(str(colorbar_label), fontsize=16)
     colorbar.ax.tick_params(labelsize=float(colorbar_tick_fontsize))
     return image, colorbar

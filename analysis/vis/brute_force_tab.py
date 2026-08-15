@@ -46,16 +46,6 @@ def build_brute_force_tab(
     }
     with gr.Tab("Brute-Force Overview") as overview_tab:
         gr.Markdown("## Brute-Force Overview")
-        gr.Markdown(
-            "Each backbone is one row. The four heatmaps average, from left to right: "
-            "**indoor pose**, **indoor point cloud**, **outdoor pose**, and "
-            "**outdoor point cloud**. Indoor combines ScanNet and 7Scenes; outdoor "
-            "combines nuScenes and Waymo. Pose uses ARE, APE, RPE rotation, and RPE "
-            "translation; point cloud uses accuracy, completeness, and Chamfer distance. "
-            "Each metric is normalized to `[0,1]` before a multi-metric mean is computed. "
-            "Pose heatmaps use the viridis color scale and point-cloud heatmaps use coolwarm. "
-            "The status box lists the datasets actually included and any incomplete results."
-        )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):
                 overview_backbone_filter = gr.CheckboxGroup(
@@ -118,8 +108,7 @@ def build_brute_force_tab(
         gr.Markdown(
             "Detailed mean-scene pruning results. Each skip scope uses two rows: "
             "the four pose metrics, followed by accuracy, completeness, Chamfer "
-            "distance, and the mean of all seven metrics. Remaining-pruning "
-            "visualization is available in the **Heatmaps** tab."
+            "distance, and the mean of all seven metrics."
         )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):

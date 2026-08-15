@@ -10,8 +10,8 @@ from analysis.vis.display_names import (
 )
 
 REMAINING_COLUMN_LABELS = (
-    "7-Metric Normalized Retention",
-    "Marginal 7-Metric Mean",
+    "Normalized Retention",
+    "Marginal Normalized Retention",
 )
 
 
@@ -36,7 +36,7 @@ def build_remaining_tab(
     with gr.Tab("Remaining") as tab:
         gr.Markdown("## Remaining")
         gr.Markdown(
-            "Each backbone is one row with a shared model heading. The two columns "
+            "All backbones share one row. Each model heading spans two columns that "
             "show the original **7-metric mean** and its **remaining marginal** "
             "heatmap. Both use scene `mean`."
         )
@@ -47,33 +47,39 @@ def build_remaining_tab(
         )
         galleries = []
         backbone_rows = []
-        for backbone in backbones:
-            with gr.Column(
-                elem_classes=["publication-backbone-block"]
-            ) as backbone_row:
-                gr.Markdown(
-                    f"### {backbone_display_name(backbone)}",
-                    elem_classes=["backbone-separator"],
-                )
-                gallery = gr.Gallery(
-                    label="Original / marginal 7-metric mean",
-                    show_label=False,
-                    columns=2,
-                    height="auto",
-                    object_fit="contain",
-                    elem_classes=[
-                        "results-gallery",
-                        "stage2-heatmap-gallery",
-                        "remaining-gallery",
-                    ],
-                )
-            galleries.append(gallery)
-            backbone_rows.append(backbone_row)
+        with gr.Row(
+            elem_classes=["remaining-single-row"],
+            equal_height=True,
+        ):
+            for backbone in backbones:
+                with gr.Column(
+                    scale=2,
+                    min_width=0,
+                    elem_classes=["publication-backbone-block"],
+                ) as backbone_row:
+                    gr.Markdown(
+                        f"### {backbone_display_name(backbone)}",
+                        elem_classes=["backbone-separator"],
+                    )
+                    gallery = gr.Gallery(
+                        label="Original / marginal 7-metric mean",
+                        show_label=False,
+                        columns=2,
+                        height="auto",
+                        object_fit="contain",
+                        elem_classes=[
+                            "results-gallery",
+                            "stage2-heatmap-gallery",
+                            "remaining-gallery",
+                        ],
+                    )
+                galleries.append(gallery)
+                backbone_rows.append(backbone_row)
         with gr.Row(
             elem_classes=["remaining-column-label-row"],
             equal_height=True,
         ):
-            for column_label in REMAINING_COLUMN_LABELS:
+            for column_label in REMAINING_COLUMN_LABELS * len(backbones):
                 gr.Markdown(
                     column_label,
                     elem_classes=["remaining-column-label"],
