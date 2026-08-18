@@ -11,22 +11,30 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from analysis.vis.recovery_backbone_comparison_tab import (
+    RECOVERY_REMAINING_SUBPLOT_FONT_SIZE,
     _BACKBONE_COLORS,
     _global_metric_ranges,
     _collapse_min_prune_strategies,
     _filter_testtime_to_family_winners,
     _load_testtime_points,
     _normalized_mean,
+    _recovery_method_legend_label,
     _recovery_state_style,
     _render_combined_figure,
-    build_recovery_backbone_comparison_tab,
     build_recovery_backbone_remaining_comparison_tab,
-    render_recovery_backbone_comparison,
     render_recovery_backbone_remaining_comparison,
 )
 
 
 class RecoveryBackboneComparisonTabTest(unittest.TestCase):
+    def test_remaining_method_legend_uses_publication_name(self) -> None:
+        self.assertEqual(
+            _recovery_method_legend_label(
+                "recovery_ghost_interval_sequential"
+            ),
+            "Ours",
+        )
+
     def test_testtime_filter_reuses_family_winner_selector(self) -> None:
         payload = {
             "testtime_points": [
@@ -188,11 +196,11 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
         fig = _render_combined_figure(
             [("vggt", payload)],
             method_keys=[],
-            title="test",
             show_no_recovery=False,
         )
         self.assertIsNotNone(fig)
         assert fig is not None
+        self.assertEqual(tuple(fig.get_size_inches()), (29.6, 11.6))
         self.assertEqual(len(fig.axes[0].lines), 0)
         self.assertEqual(len(fig.axes[0].collections), 2)
         self.assertEqual(
@@ -203,8 +211,32 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
         second_path = fig.axes[0].collections[1].get_paths()[0].vertices
         self.assertFalse(np.array_equal(first_path, second_path))
         legend_labels = [text.get_text() for text in fig.legends[0].get_texts()]
-        self.assertIn("Test-time · fastvggt_m0_r0p9", legend_labels)
-        self.assertIn("Test-time · quantvggt_w4a4", legend_labels)
+        self.assertIn("FastVGGT", legend_labels)
+        self.assertIn("quantvggt_w4a4", legend_labels)
+        self.assertIsNone(fig._suptitle)
+        self.assertEqual(fig.legends[0]._ncol, len(legend_labels))
+        self.assertEqual(fig.axes[0].get_title(), "")
+        self.assertEqual(fig.axes[0].get_ylabel(), "APE (m) ↓")
+        self.assertEqual(
+            fig.axes[0].yaxis.label.get_fontsize(),
+            RECOVERY_REMAINING_SUBPLOT_FONT_SIZE,
+        )
+        self.assertTrue(fig.axes[0].yaxis.label.get_fontweight() == "bold")
+        self.assertTrue(
+            all(
+                text.get_fontsize() == RECOVERY_REMAINING_SUBPLOT_FONT_SIZE
+                for text in fig.axes[0].get_xticklabels()
+            )
+        )
+        self.assertTrue(
+            all(
+                text.get_fontsize() == RECOVERY_REMAINING_SUBPLOT_FONT_SIZE
+                for text in fig.legends[0].get_texts()
+            )
+        )
+        self.assertTrue(
+            all(text.get_fontweight() == "bold" for text in fig.legends[0].get_texts())
+        )
         plt.close(fig)
 
     def test_backbone_palette_matches_pruning_plan_overview(self) -> None:
@@ -234,7 +266,6 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
         fig = _render_combined_figure(
             [("vggt", payload)],
             method_keys=["recovery_linearpatch"],
-            title="test",
             show_no_recovery=False,
             total_units_by_backbone={"vggt": 48},
         )
@@ -260,7 +291,6 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
         fig = _render_combined_figure(
             [("vggt", payload)],
             method_keys=["recovery_linearpatch"],
-            title="test",
             show_no_recovery=False,
             total_units_by_backbone={"vggt": 48},
             halve_x_axis=True,
@@ -340,6 +370,10 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
         }
         with (
             patch(
+                "analysis.vis.recovery_backbone_comparison_tab.load_prune_plan_bundle",
+                return_value={"num_units": 48},
+            ),
+            patch(
                 "analysis.vis.recovery_backbone_comparison_tab.collect_pruning_eval_payload",
                 return_value={},
             ),
@@ -361,7 +395,7 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
             ),
             patch("analysis.vis.recovery_backbone_comparison_tab.plt.close"),
         ):
-            _, status = render_recovery_backbone_comparison(
+            _, status = render_recovery_backbone_remaining_comparison(
                 Path("/unused"),
                 ["vggt"],
                 "recovery_linearpatch",
@@ -404,7 +438,7 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
 
     def test_builder_has_single_method_and_no_normalization_control(self) -> None:
         with gr.Blocks() as blocks:
-            ui = build_recovery_backbone_comparison_tab(
+            ui = build_recovery_backbone_remaining_comparison_tab(
                 blocks=blocks, output_root="/path/that/does/not/exist"
             )
         self.assertIsInstance(ui["method_dd"], gr.Dropdown)
@@ -443,7 +477,7 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
             ),
         ):
             with gr.Blocks() as blocks:
-                ui = build_recovery_backbone_comparison_tab(
+                ui = build_recovery_backbone_remaining_comparison_tab(
                     blocks=blocks,
                     output_root="/unused",
                 )
@@ -452,7 +486,7 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
             ui["method_dd"].value,
             "recovery_ghost_interval_sequential",
         )
-        self.assertEqual(ui["tab"].label, "Recovery Backbone")
+        self.assertEqual(ui["tab"].label, "Recovery Remaining")
 
     def test_remaining_builder_has_separate_tab(self) -> None:
         with gr.Blocks() as blocks:
@@ -486,6 +520,10 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
 
         with (
             patch(
+                "analysis.vis.recovery_backbone_comparison_tab.load_prune_plan_bundle",
+                return_value={"num_units": 48},
+            ),
+            patch(
                 "analysis.vis.recovery_backbone_comparison_tab.collect_pruning_eval_payload",
                 return_value={},
             ),
@@ -507,7 +545,7 @@ class RecoveryBackboneComparisonTabTest(unittest.TestCase):
             ),
             patch("analysis.vis.recovery_backbone_comparison_tab.plt.close"),
         ):
-            render_recovery_backbone_comparison(
+            render_recovery_backbone_remaining_comparison(
                 Path("/unused"), ["vggt"], "recovery_linearpatch",
                 "scannet_dev50", "gt", True, ["single", "double"],
             )

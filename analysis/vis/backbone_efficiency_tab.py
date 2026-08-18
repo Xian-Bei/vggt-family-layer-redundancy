@@ -44,7 +44,11 @@ from analysis.vis.recovery_overview_tab import (
     discover_recovery_overview_datasets,
     discover_recovery_overview_options,
 )
-from analysis.vis.dataset_average_warning import format_incomplete_average_warning
+from analysis.vis.dataset_average_warning import (
+    dataset_display_choices,
+    dataset_display_name,
+    format_incomplete_average_warning,
+)
 
 
 _PERFORMANCE_METRICS = (
@@ -488,7 +492,8 @@ def render_backbone_efficiency(
         frameon=True,
     )
     fig.suptitle(
-        f"Backbone Efficiency · {method.removeprefix('recovery_')} · {strategy} · {dataset}",
+        f"Backbone Efficiency · {method.removeprefix('recovery_')} · "
+        f"{strategy} · {dataset_display_name(dataset)}",
         fontsize=18, fontweight="bold", y=1.07,
     )
     fig.tight_layout(rect=(0, 0, 1, .9))
@@ -546,7 +551,9 @@ def build_backbone_efficiency_tab(*, blocks: gr.Blocks, output_root: Path) -> Di
                     value=default_method, multiselect=False,
                 )
                 dataset_dd = gr.Dropdown(
-                    label="Dataset", choices=datasets, value="training average",
+                    label="Dataset",
+                    choices=dataset_display_choices(datasets),
+                    value="training average",
                     multiselect=False,
                 )
                 refresh_btn = gr.Button("Refresh latest data", variant="primary")

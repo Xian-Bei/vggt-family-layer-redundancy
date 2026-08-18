@@ -486,14 +486,30 @@ def eval_7andn_points_adapter(adapter, model, batch, device, profile, ctx: EvalS
 
 def prepare_7andn_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene:
     del profile
-    scene_batch = _collate_7andn_views(batch)
+    scene_batch = batch.images
+    if (
+        not isinstance(scene_batch, list)
+        or not scene_batch
+        or not isinstance(scene_batch[0], dict)
+    ):
+        scene_batch = _collate_7andn_views(batch)
     image_paths = [str(v["instance"]) for v in scene_batch]
     if not image_paths:
         raise ValueError(f"7andn {batch.scene_id}: missing view instance paths")
     images = adapter.load_eval_images(image_paths).unsqueeze(0).float().contiguous()
 
+    def as_float32_numpy(value: Any) -> np.ndarray:
+        if torch.is_tensor(value):
+            return value.detach().float().cpu().numpy()
+        return np.asarray(value, dtype=np.float32)
+
+    def as_bool_numpy(value: Any) -> np.ndarray:
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy().astype(bool, copy=False)
+        return np.asarray(value).astype(bool, copy=False)
+
     gt_poses = np.stack(
-        [v["camera_pose"].detach().float().cpu().numpy() for v in scene_batch], axis=0
+        [as_float32_numpy(v["camera_pose"]) for v in scene_batch], axis=0
     )
     while gt_poses.ndim > 3 and gt_poses.shape[1] == 1:
         gt_poses = gt_poses[:, 0]
@@ -507,9 +523,9 @@ def prepare_7andn_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene:
         if gt is None:
             gt_points_by_view.append(np.zeros((0, 3), dtype=np.float32))
         else:
-            gt_np = gt.detach().float().cpu().numpy().reshape(-1, 3)
+            gt_np = as_float32_numpy(gt).reshape(-1, 3)
             if mask is not None:
-                gt_np = gt_np[mask.detach().cpu().numpy().astype(bool).reshape(-1)]
+                gt_np = gt_np[as_bool_numpy(mask).reshape(-1)]
             gt_points_by_view.append(gt_np)
         pred_valid_masks_by_view.append(
             _prediction_valid_mask(adapter, view, pred_hw).reshape(pred_hw)
@@ -518,7 +534,7 @@ def prepare_7andn_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene:
         scene_id=str(batch.scene_id),
         images=images,
         state={
-            "scene_batch": scene_batch,
+            "num_views": int(len(scene_batch)),
             "gt_poses": gt_poses,
             "pose_valid": pose_valid,
             "gt_points_by_view": gt_points_by_view,
@@ -542,7 +558,13 @@ def score_7andn_skip_prediction(
     del ctx
 
     metrics: Dict[str, float] = {}
-    scene_batch = prepared.state["scene_batch"]
+    scene_batch = prepared.state.get("scene_batch")
+    num_views = int(
+        prepared.state.get(
+            "num_views",
+            len(scene_batch) if scene_batch is not None else 0,
+        )
+    )
     gt_poses = prepared.state["gt_poses"]
     pose_valid = prepared.state["pose_valid"]
     sim3_point = None
@@ -566,7 +588,7 @@ def score_7andn_skip_prediction(
 
     pred_chunks: List[np.ndarray] = []
     gt_chunks: List[np.ndarray] = []
-    pred_maps = _as_view_point_maps_np(bundle.points, len(scene_batch)) if bundle.points is not None else None
+    pred_maps = _as_view_point_maps_np(bundle.points, num_views) if bundle.points is not None else None
     if pred_maps is not None:
         stored_masks = prepared.state.get("pred_valid_masks_by_view", [])
         for j, pred_map in enumerate(pred_maps):

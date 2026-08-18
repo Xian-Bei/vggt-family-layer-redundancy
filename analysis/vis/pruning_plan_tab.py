@@ -13,6 +13,10 @@ from PIL import Image
 
 from analysis.prune_plan import load_prune_plan_bundle
 from analysis.prune_plan.eval_plots import (
+    METRIC_HEADERS,
+    PUBLICATION_METRIC_SUBPLOT_HEIGHT,
+    PUBLICATION_METRIC_SUBPLOT_WIDTH,
+    PUBLICATION_FLAT_AXES_BOX_ASPECT,
     PRUNING_METRIC_GRID,
     PRUNING_MEAN_METRIC_GRID,
     collect_pruning_eval_payload,
@@ -22,23 +26,44 @@ from analysis.prune_plan.eval_plots import (
 )
 from analysis.vis.dataset_average_warning import (
     DATASET_AVERAGE_GROUPS,
+    dataset_display_name,
     format_incomplete_average_warning,
 )
 from analysis.vis.display_names import (
     backbone_display_name,
     backbone_publication_sort_key,
 )
+from analysis.vis.composite import (
+    Cell,
+    Section,
+    compose_sections,
+    gallery_cells,
+)
+
+# Pruning Plan Overview typography and outer-label spacing (pixels).
+PRUNING_PLAN_OVERVIEW_SUBPLOT_FONT_SIZE = 18
+PRUNING_PLAN_OVERVIEW_OUTER_FONT_SIZE = 26
+PRUNING_PLAN_OVERVIEW_LEFT_LABEL_TO_IMAGE_GAP = 2
+PRUNING_PLAN_OVERVIEW_TOP_LABEL_TO_IMAGE_GAP = 2
+PRUNING_PLAN_OVERVIEW_BOTTOM_LABEL_TO_IMAGE_GAP = 0
+
+# Pruning Plan Detail typography and outer-label spacing (pixels).
+PRUNING_PLAN_DETAIL_SUBPLOT_FONT_SIZE = 18
+PRUNING_PLAN_DETAIL_OUTER_FONT_SIZE = 26
+PRUNING_PLAN_DETAIL_LEFT_LABEL_TO_IMAGE_GAP = 0
+PRUNING_PLAN_DETAIL_TOP_LABEL_TO_IMAGE_GAP = 2
+PRUNING_PLAN_DETAIL_BOTTOM_LABEL_TO_IMAGE_GAP = 0
 
 
 GalleryItems = List[Any]
 
 _BACKBONE_ORDER = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
 _AVERAGE_SCOPES = ("training", "testing")
+_MEAN_SCOPE = "mean"
 _MEAN_BACKBONE = "mean"
 _DEFAULT_DROP_STEP = 2
 _DETAIL_PLOT_GROUPS = (("ours", "ours"), ("others", "others"))
 _OVERVIEW_PLOT_GROUPS = (
-    ("single", "ours"),
     ("double", "ours"),
     ("others", "others"),
 )
@@ -51,6 +76,26 @@ _OVERVIEW_SINGLE_MUTED_STYLE = {
     "marker_alpha": 0.55,
     "marker_zorder": 1.7,
 }
+_OVERVIEW_LEGEND_LABELS = {
+    "gt": "Retention",
+    "ours": "CKA",
+    "cosine": "Cosine",
+    "inv_mse": "Inv_MSE",
+    "cca": "CCA",
+    "replaceme": "ReplaceMe",
+    "shortgpt": "ShortGPT",
+    "simpler": "SIMPLER",
+}
+_FIRST_TWO_COLUMN_LEGEND_METHOD_ORDER = (
+    "gt",
+    "ours",
+    "cosine",
+    "cca",
+    "inv_mse",
+    "replaceme",
+    "shortgpt",
+    "simpler",
+)
 _POINT_METRIC_FIELDS = (
     "metrics_mean",
     "relative_to_upper",
@@ -58,6 +103,86 @@ _POINT_METRIC_FIELDS = (
     "raw_metric",
     "normalized_metric",
 )
+
+
+def _compose_pruning_overview(value: Any) -> np.ndarray:
+    cells = gallery_cells(value)
+    # Each rendered scope contributes two plots and places its
+    # ``backbone · scope`` caption on the first one.  Turn those records into
+    # one fixed-row section so backbone names live at the left and the scope
+    # headings are drawn only once above the first row, like Brute-Force
+    # Overview.
+    records: List[Tuple[str, str, List[Cell]]] = []
+    index = 0
+    while index < len(cells):
+        cell = cells[index]
+        parts = cell.caption.rsplit(" · ", 1) if cell.caption else []
+        if len(parts) != 2:
+            index += 1
+            continue
+        block = cells[index : index + 2]
+        for item in block:
+            item.caption = ""
+        records.append((parts[0], parts[1], block))
+        index += 2
+
+    if not records:
+        raise ValueError("No pruning-plan overview plots were returned.")
+
+    backbone_labels = list(dict.fromkeys(backbone for backbone, _, _ in records))
+    scope_labels = list(dict.fromkeys(scope for _, scope, _ in records))
+    record_map = {
+        (backbone, scope): block for backbone, scope, block in records
+    }
+    fixed_rows = [
+        [
+            cell
+            for scope in scope_labels
+            for cell in record_map.get(
+                (backbone, scope), [Cell(None), Cell(None)]
+            )
+        ]
+        for backbone in backbone_labels
+    ]
+    return compose_sections(
+        [
+            Section(
+                columns=2 * len(scope_labels),
+                cells=[],
+                fixed_rows=fixed_rows,
+                row_labels=backbone_labels,
+                row_labels_bold=True,
+                group_headings=[(scope, 2) for scope in scope_labels],
+            )
+        ],
+        outer_font_size=PRUNING_PLAN_OVERVIEW_OUTER_FONT_SIZE,
+        left_label_to_image_gap=PRUNING_PLAN_OVERVIEW_LEFT_LABEL_TO_IMAGE_GAP,
+        top_label_to_image_gap=PRUNING_PLAN_OVERVIEW_TOP_LABEL_TO_IMAGE_GAP,
+        bottom_label_to_image_gap=PRUNING_PLAN_OVERVIEW_BOTTOM_LABEL_TO_IMAGE_GAP,
+    )
+
+
+def _compose_pruning_detail(value: Any) -> np.ndarray | None:
+    """Compose each 4x4 backbone/scope metric block into one image."""
+    cells = gallery_cells(value)
+    sections: List[Section] = []
+    for start in range(0, len(cells), 16):
+        block = cells[start : start + 16]
+        heading = next((cell.caption for cell in block if cell.caption), "")
+        for cell in block:
+            cell.caption = ""
+        sections.append(Section(columns=4, cells=block, heading=heading))
+    return (
+        compose_sections(
+            sections,
+            outer_font_size=PRUNING_PLAN_DETAIL_OUTER_FONT_SIZE,
+            left_label_to_image_gap=PRUNING_PLAN_DETAIL_LEFT_LABEL_TO_IMAGE_GAP,
+            top_label_to_image_gap=PRUNING_PLAN_DETAIL_TOP_LABEL_TO_IMAGE_GAP,
+            bottom_label_to_image_gap=PRUNING_PLAN_DETAIL_BOTTOM_LABEL_TO_IMAGE_GAP,
+        )
+        if sections
+        else None
+    )
 
 
 def _backbone_sort_key(name: str) -> Tuple[int, str]:
@@ -69,11 +194,21 @@ def _backbone_sort_key(name: str) -> Tuple[int, str]:
 
 
 def _scope_label(scope: str) -> str:
+    if scope == _MEAN_SCOPE:
+        return "Mean"
     if scope == "training":
-        return "Training average"
+        return "Training Dataset"
     if scope == "testing":
-        return "Testing average"
-    return str(scope)
+        return "Testing Dataset"
+    return dataset_display_name(scope)
+
+
+def _detail_metric_ylabel(metric_key: str, *, normalized: bool) -> str:
+    """Format detail metric axes with the same explicit style as overview."""
+    metric_label = METRIC_HEADERS.get(str(metric_key), str(metric_key))
+    if str(metric_key) == "gt_mean" and normalized:
+        return f"Normalized {metric_label}"
+    return metric_label
 
 
 def _bundle_training_datasets(backbone_root: Path) -> List[str]:
@@ -118,7 +253,7 @@ def discover_pruning_plan_scopes(
     backbone: str,
 ) -> List[str]:
     datasets = _result_datasets(Path(output_root) / str(backbone))
-    return [*_AVERAGE_SCOPES, *datasets]
+    return [_MEAN_SCOPE, *datasets]
 
 
 def resolve_pruning_scope_datasets(
@@ -129,6 +264,16 @@ def resolve_pruning_scope_datasets(
     backbone_root = Path(output_root) / str(backbone)
     available = _result_datasets(backbone_root)
     training = set(_bundle_training_datasets(backbone_root))
+    if scope == _MEAN_SCOPE:
+        return list(
+            dict.fromkeys(
+                dataset
+                for average_scope in _AVERAGE_SCOPES
+                for dataset in resolve_pruning_scope_datasets(
+                    output_root, backbone, average_scope
+                )
+            )
+        )
     if scope == "training":
         return [dataset for dataset in available if dataset in training]
     if scope == "testing":
@@ -334,13 +479,29 @@ def render_pruning_plan_gallery(
     view_key = str(view).strip().lower()
     if view_key not in {"overview", "detail"}:
         raise ValueError(f"Unsupported pruning-plan view: {view!r}")
+    subplot_font_size = (
+        PRUNING_PLAN_DETAIL_SUBPLOT_FONT_SIZE
+        if view_key == "detail"
+        else PRUNING_PLAN_OVERVIEW_SUBPLOT_FONT_SIZE
+    )
     detail_metrics = [metric for row in PRUNING_METRIC_GRID for metric in row]
     metric_keys = detail_metrics if view_key == "detail" else ["gt_mean"]
     plot_groups = (
         _DETAIL_PLOT_GROUPS if view_key == "detail" else _OVERVIEW_PLOT_GROUPS
     )
     expected_plots = len(plot_groups) * len(metric_keys)
-    scopes = list(dict.fromkeys(str(scope) for scope in (selected_scopes or [])))
+    requested_scopes = list(
+        dict.fromkeys(str(scope) for scope in (selected_scopes or []))
+    )
+    scopes = list(
+        dict.fromkeys(
+            expanded_scope
+            for scope in requested_scopes
+            for expanded_scope in (
+                _AVERAGE_SCOPES if scope == _MEAN_SCOPE else (scope,)
+            )
+        )
+    )
     selected_backbones = (
         [str(backbone)]
         if isinstance(backbone, str) and backbone
@@ -421,7 +582,9 @@ def render_pruning_plan_gallery(
                 strategy_keys = tuple(strategies) if isinstance(strategies, dict) else ()
                 rendered = 0
                 scope_start = len(gallery)
-                for group_index, (plot_group, strategy_group) in enumerate(plot_groups):
+                for group_index, (plot_group, strategy_group) in enumerate(
+                    plot_groups
+                ):
                     selected = pruning_average_strategy_keys(
                         strategy_keys, strategy_group
                     )
@@ -450,6 +613,11 @@ def render_pruning_plan_gallery(
                             if key not in {"ours_single", "gt_single"}
                         )
                     for metric_index, metric_key in enumerate(metric_keys):
+                        gallery_column_index = (
+                            group_index + 1
+                            if view_key == "overview"
+                            else metric_index % len(PRUNING_METRIC_GRID[0])
+                        )
                         metric_grid = (
                             PRUNING_MEAN_METRIC_GRID
                             if view_key == "overview"
@@ -464,38 +632,58 @@ def render_pruning_plan_gallery(
                             metric_grid=metric_grid,
                             strategy_keys=selected,
                             compact_pruning_legend=True,
-                            legend_fontsize=12,
+                            legend_fontsize=subplot_font_size,
+                            legend_fontweight="bold",
+                            compact_method_labels=_OVERVIEW_LEGEND_LABELS,
+                            compact_method_order=(
+                                _FIRST_TWO_COLUMN_LEGEND_METHOD_ORDER
+                                if gallery_column_index < 2
+                                else None
+                            ),
+                            compact_structure_labels=(
+                                ("Multi",)
+                                if gallery_column_index == 0
+                                else None
+                            ),
+                            combine_compact_legend=True,
                             normalize_metrics=(
                                 True
                                 if metric_key == "gt_mean"
                                 else bool(normalize_individual_metrics)
                             ),
                             strategy_style_overrides=style_overrides,
-                            show_figure_title=(
-                                backbone_index == 0
-                                and scope_index == 0
+                            show_figure_title=False,
+                            show_metric_titles=False,
+                            shared_ylabel=(
+                                "Normalized Retention"
                                 if view_key == "overview"
-                                else metric_index == 0
+                                and scope_index == 0
+                                and group_index == 0
+                                else _detail_metric_ylabel(
+                                    metric_key,
+                                    normalized=(
+                                        metric_key == "gt_mean"
+                                        or bool(normalize_individual_metrics)
+                                    ),
+                                )
+                                if view_key == "detail"
+                                else None
                             ),
-                            show_metric_titles=(
-                                backbone_index == 0 and scope_index == 0
-                            ),
+                            subplot_width=PUBLICATION_METRIC_SUBPLOT_WIDTH,
+                            subplot_box_aspect=PUBLICATION_FLAT_AXES_BOX_ASPECT,
+                            figure_height_per_row=PUBLICATION_METRIC_SUBPLOT_HEIGHT,
                             shared_xlabel=(
                                 "Dropped units"
                                 if backbone_index == len(selected_backbones) - 1
-                                and scope_index == len(scopes) - 1
                                 and (
                                     view_key == "overview"
-                                    or (
-                                        group_index == len(plot_groups) - 1
-                                        and metric_index >= len(metric_keys) - 4
-                                    )
+                                    or scope_index == len(scopes) - 1
                                 )
                                 else None
                             ),
                             x_tick_step=2,
-                            tick_label_fontsize=13,
-                            axis_label_fontsize=15,
+                            tick_label_fontsize=subplot_font_size,
+                            axis_label_fontsize=subplot_font_size,
                             legend_markerscale=1.5,
                             legend_handlelength=2.8,
                         )
@@ -540,7 +728,7 @@ def build_pruning_plan_tab(
     initial_backbone = backbones[0] if backbones else ""
     initial_scopes = discover_pruning_plan_scopes(root, initial_backbone)
     initial_selection = (
-        ["training"] if "training" in initial_scopes else initial_scopes[:1]
+        [_MEAN_SCOPE] if _MEAN_SCOPE in initial_scopes else initial_scopes[:1]
     )
 
     def _selected_real_backbones(selected: Sequence[str] | str | None) -> List[str]:
@@ -556,8 +744,8 @@ def build_pruning_plan_tab(
             for scope in discover_pruning_plan_scopes(root, backbone)
         }
         ordered = [
-            *[scope for scope in _AVERAGE_SCOPES if scope in selected_scopes],
-            *sorted(selected_scopes.difference(_AVERAGE_SCOPES)),
+            *([_MEAN_SCOPE] if _MEAN_SCOPE in selected_scopes else []),
+            *sorted(selected_scopes.difference({_MEAN_SCOPE})),
         ]
         return [
             (_scope_label(scope), scope)
@@ -571,8 +759,8 @@ def build_pruning_plan_tab(
         *,
         view: str,
         normalize_individual_metrics: bool = True,
-    ) -> Tuple[GalleryItems, str]:
-        return render_pruning_plan_gallery(
+    ) -> Tuple[Any, str]:
+        gallery, status = render_pruning_plan_gallery(
             root,
             backbone,
             selected_scopes,
@@ -580,6 +768,12 @@ def build_pruning_plan_tab(
             view=view,
             normalize_individual_metrics=normalize_individual_metrics,
         )
+        columns = (
+            4
+            if view == "detail" or _MEAN_SCOPE in list(selected_scopes or [])
+            else 2
+        )
+        return gr.update(value=gallery, columns=columns), status
 
     def _selected_scopes_after_backbone_change(
         backbone: Sequence[str],
@@ -587,7 +781,7 @@ def build_pruning_plan_tab(
     ) -> List[str]:
         scopes = [value for _, value in _scope_choices(backbone)]
         retained = [scope for scope in (selected_scopes or []) if scope in scopes]
-        return retained or (["training"] if "training" in scopes else scopes[:1])
+        return retained or ([_MEAN_SCOPE] if _MEAN_SCOPE in scopes else scopes[:1])
 
     def _backbone_changed(
         backbone: Sequence[str],
@@ -627,10 +821,10 @@ def build_pruning_plan_tab(
             for value in (backbone or [])
             if value == _MEAN_BACKBONE or value in latest_backbones
         ]
-        backbone_value = backbone_value or latest_backbones[:1]
+        backbone_value = backbone_value or [_MEAN_BACKBONE]
         scopes = [value for _, value in _scope_choices(backbone_value)]
         selected = [scope for scope in (selected_scopes or []) if scope in scopes]
-        selected = selected or (["training"] if "training" in scopes else scopes[:1])
+        selected = selected or ([_MEAN_SCOPE] if _MEAN_SCOPE in scopes else scopes[:1])
         gallery, status = _render(
             backbone_value,
             selected,
@@ -665,7 +859,7 @@ def build_pruning_plan_tab(
                             (backbone_display_name(item), item)
                             for item in [_MEAN_BACKBONE, *backbones]
                         ],
-                        value=[_MEAN_BACKBONE, *backbones],
+                        value=backbones,
                     )
                     scope_cb = gr.CheckboxGroup(
                         label="Datasets / averages (multi-select)",
@@ -673,12 +867,11 @@ def build_pruning_plan_tab(
                         value=initial_selection,
                         type="value",
                         interactive=True,
-                        info="Check one or more individual datasets, Training, or Testing.",
                     )
                     normalize_metrics = (
                         gr.Checkbox(
                             label="Normalize individual metrics to [0,1]",
-                            value=True,
+                            value=False,
                             info="The 7-metric mean is always normalized per metric.",
                         )
                         if detail
@@ -695,51 +888,54 @@ def build_pruning_plan_tab(
                         lines=5,
                     )
                 with gr.Column(scale=5):
-                    gallery = gr.Gallery(
+                    gallery = gr.Image(
                         label=f"Live pruning-plan {view} plots",
                         show_label=False,
-                        columns=4 if detail else 3,
-                        height="auto",
-                        object_fit="contain",
-                        elem_classes=[
-                            "results-gallery",
-                            "pruning-plan-gallery",
-                            (
-                                "pruning-plan-detail-gallery"
-                                if detail
-                                else "pruning-plan-overview-gallery"
-                            ),
-                        ],
+                        type="numpy",
+                        interactive=False,
+                        elem_classes=["results-media", "composite-plot-image"],
                     )
 
             if detail:
                 assert normalize_metrics is not None
 
                 def redraw(backbone, scopes, normalize, merge):
-                    return _render(
+                    images, status_value = _render(
                         backbone,
                         scopes,
                         merge,
                         view=view,
                         normalize_individual_metrics=bool(normalize),
                     )
+                    return _compose_pruning_detail(images), status_value
 
                 def backbone_changed(backbone, scopes, normalize, merge):
-                    return _backbone_changed(
+                    scope_update, images, status_value = _backbone_changed(
                         backbone,
                         scopes,
                         merge,
                         view=view,
                         normalize_individual_metrics=bool(normalize),
+                    )
+                    return (
+                        scope_update,
+                        _compose_pruning_detail(images),
+                        status_value,
                     )
 
                 def refresh(backbone, scopes, normalize, merge):
-                    return _refresh(
+                    backbone_update, scope_update, images, status_value = _refresh(
                         backbone,
                         scopes,
                         merge,
                         view=view,
                         normalize_individual_metrics=bool(normalize),
+                    )
+                    return (
+                        backbone_update,
+                        scope_update,
+                        _compose_pruning_detail(images),
+                        status_value,
                     )
 
                 inputs = [backbone_dd, scope_cb, normalize_metrics, merge_replaceme]
@@ -750,13 +946,31 @@ def build_pruning_plan_tab(
                 ]
             else:
                 def redraw(backbone, scopes, merge):
-                    return _render(backbone, scopes, merge, view=view)
+                    images, status_value = _render(
+                        backbone, scopes, merge, view=view
+                    )
+                    return _compose_pruning_overview(images), status_value
 
                 def backbone_changed(backbone, scopes, merge):
-                    return _backbone_changed(backbone, scopes, merge, view=view)
+                    scope_update, images, status_value = _backbone_changed(
+                        backbone, scopes, merge, view=view
+                    )
+                    return (
+                        scope_update,
+                        _compose_pruning_overview(images),
+                        status_value,
+                    )
 
                 def refresh(backbone, scopes, merge):
-                    return _refresh(backbone, scopes, merge, view=view)
+                    backbone_update, scope_update, images, status_value = _refresh(
+                        backbone, scopes, merge, view=view
+                    )
+                    return (
+                        backbone_update,
+                        scope_update,
+                        _compose_pruning_overview(images),
+                        status_value,
+                    )
 
                 inputs = [backbone_dd, scope_cb, merge_replaceme]
                 change_triggers = [scope_cb.change, merge_replaceme.change]

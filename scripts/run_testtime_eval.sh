@@ -17,7 +17,7 @@ TESTTIME_PRUNE_PLAN_NAME="${TESTTIME_PRUNE_PLAN_NAME:-}"
 TESTTIME_PRUNE_STRATEGY="${TESTTIME_PRUNE_STRATEGY:-}"
 TESTTIME_RECOVERY_PLAN_NAME="${TESTTIME_RECOVERY_PLAN_NAME:-}"
 TESTTIME_SELECTION_DATASETS="${TESTTIME_SELECTION_DATASETS:-}"
-TESTTIME_COMPRESSIONS="${TESTTIME_COMPRESSIONS:-quantvggt}"
+TESTTIME_COMPRESSIONS="${TESTTIME_COMPRESSIONS:-fastvggt,quantvggt}"
 TESTTIME_DRY_RUN="${TESTTIME_DRY_RUN:-0}"
 
 FASTVGGT_MERGE_START="${FASTVGGT_MERGE_START:-0}"
@@ -84,6 +84,11 @@ for compression in ${TESTTIME_COMPRESSIONS//,/ }; do
   esac
 
   for backbone in ${TESTTIME_BACKBONES//,/ }; do
+    if [[ "${compression}" == "quantvggt" && "${backbone}" != "vggt" ]]; then
+      echo "[testtime${testtime_log_suffix}] skip unsupported compression=${compression} backbone=${backbone}; supported=vggt"
+      continue
+    fi
+
     declare -A scheduled_selectors=()
     quant_params_dir="${QUANTVGGT_PARAMS_DIR}"
     if [[ "${compression}" == "quantvggt" && "${TESTTIME_DRY_RUN}" != "1" ]]; then

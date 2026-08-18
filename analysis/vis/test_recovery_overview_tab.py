@@ -12,6 +12,9 @@ import numpy as np
 from analysis.prune_plan import PRUNE_PLAN_BUNDLE_SCHEMA_VERSION
 from analysis.schema.v3 import EvalRecordV3
 from analysis.vis.recovery_overview_tab import (
+    RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
+    _compose_recovery_overview,
+    _formalize_recovery_legend_names,
     _minimum_strategy_plot_payload,
     build_recovery_overview_tab,
     discover_recovery_overview_datasets,
@@ -22,6 +25,59 @@ from analysis.vis.recovery_overview_tab import (
 
 
 class RecoveryOverviewTabTest(unittest.TestCase):
+    def test_composer_places_backbone_names_at_the_left_of_each_row(self) -> None:
+        tile = np.zeros((20, 30, 3), dtype=np.uint8)
+        with patch(
+            "analysis.vis.recovery_overview_tab.compose_sections",
+            return_value=np.zeros((1, 1, 3), dtype=np.uint8),
+        ) as compose:
+            _compose_recovery_overview([
+                (tile, "VGGT"),
+                (tile, "π³"),
+            ])
+
+        section = compose.call_args.args[0][0]
+        self.assertEqual(section.columns, 1)
+        self.assertEqual(section.row_labels, ["VGGT", "π³"])
+        self.assertEqual(len(section.fixed_rows), 2)
+        self.assertTrue(section.row_labels_bold)
+
+    def test_publication_legend_names_are_formalized(self) -> None:
+        payload = {
+            "strategies": {
+                "recovery_replaceme_ls": {"display_name": "replaceme_ls"},
+                "recovery_replaceme_cos": {"display_name": "replaceme_cos"},
+                "recovery_ghost": {"display_name": "ghost"},
+                "recovery_ghost_interval": {"display_name": "ghost_interval"},
+                "recovery_linearpatch": {"display_name": "linearpatch"},
+                "recovery_ghost_interval_sequential": {
+                    "display_name": "ghost_interval_sequential"
+                },
+                "no_recovery": {"display_name": "No recovery GT Double"},
+            }
+        }
+
+        renamed = _formalize_recovery_legend_names(payload)
+
+        self.assertEqual(
+            {
+                key: value["display_name"]
+                for key, value in renamed["strategies"].items()
+            },
+            {
+                "recovery_replaceme_ls": "ReplaceMe LS",
+                "recovery_replaceme_cos": "ReplaceMe Cos",
+                "recovery_ghost": "Ghosted",
+                "recovery_ghost_interval": "Ghosted_Interval",
+                "recovery_linearpatch": "LinearPatch",
+                "recovery_ghost_interval_sequential": "Ours",
+                "no_recovery": "No Recovery",
+            },
+        )
+        self.assertEqual(
+            payload["strategies"]["recovery_ghost"]["display_name"], "ghost"
+        )
+
     def test_min_uses_seven_metric_mean_then_copies_the_whole_winning_point(self) -> None:
         metrics = ("ape", "are", "rpe_trans", "rpe_rot", "acc", "comp", "chamfer_distance")
 
@@ -267,12 +323,12 @@ class RecoveryOverviewTabTest(unittest.TestCase):
                     ("min", "min"),
                 ],
             )
-            self.assertEqual(ui["prune_strategy_dd"].value, "ours_double")
+            self.assertEqual(ui["prune_strategy_dd"].value, "gt_double")
             self.assertEqual(ui["dataset_dd"].value, "training average")
-            self.assertTrue(ui["normalize_metrics"].value)
+            self.assertFalse(ui["normalize_metrics"].value)
             self.assertIn(("Mean", "mean"), ui["backbone_cb"].choices)
             self.assertIn(("VGGT", "vggt"), ui["backbone_cb"].choices)
-            self.assertEqual(ui["backbone_cb"].value, ["mean", "vggt"])
+            self.assertEqual(ui["backbone_cb"].value, ["vggt"])
 
     def test_mean_backbone_averages_shared_recovery_points(self) -> None:
         def plot_payload(value: float) -> dict:
@@ -390,9 +446,80 @@ class RecoveryOverviewTabTest(unittest.TestCase):
         )
         self.assertFalse(render.call_args.kwargs["include_upper_anchor"])
         self.assertEqual(render.call_args.kwargs["subplot_width"], 7.4)
+        self.assertEqual(render.call_args.kwargs["subplot_box_aspect"], 0.704)
+        self.assertEqual(render.call_args.kwargs["figure_height_per_row"], 5.8)
+        self.assertEqual(
+            render.call_args.kwargs["legend_fontsize"],
+            RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
+        )
+        self.assertEqual(render.call_args.kwargs["legend_fontweight"], "bold")
+        self.assertEqual(render.call_args.kwargs["legend_loc"], "upper left")
+        self.assertEqual(render.call_args.kwargs["upper_label"], "Full Model")
+        self.assertEqual(
+            render.call_args.kwargs["legend_order"],
+            (
+                "Full Model",
+                "No Recovery",
+                "LinearPatch",
+                "ReplaceMe LS",
+                "ReplaceMe Cos",
+                "Ghosted",
+                "Ghosted_Interval",
+                "Ours",
+            ),
+        )
+        self.assertEqual(
+            render.call_args.kwargs["tick_label_fontsize"],
+            RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
+        )
+        self.assertEqual(
+            render.call_args.kwargs["axis_label_fontsize"],
+            RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
+        )
+        self.assertFalse(render.call_args.kwargs["show_figure_title"])
+        self.assertFalse(render.call_args.kwargs["show_metric_titles"])
+        self.assertTrue(render.call_args.kwargs["metric_labels_as_ylabels"])
+        self.assertIsNone(render.call_args.kwargs["shared_xlabel"])
+        self.assertEqual(
+            render.call_args.kwargs["bottom_row_xlabel"],
+            "Dropped units",
+        )
         self.assertTrue(
             render.call_args.kwargs["always_normalize_metric_mean"]
         )
+
+    def test_drop_units_is_only_on_each_column_of_the_last_backbone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_fixture(root)
+            with patch(
+                "analysis.vis.recovery_overview_tab.render_strategy_metric_figure",
+                wraps=__import__(
+                    "analysis.vis.recovery_overview_tab",
+                    fromlist=["render_strategy_metric_figure"],
+                ).render_strategy_metric_figure,
+            ) as render:
+                render_recovery_overview(
+                    root,
+                    ["mean", "vggt"],
+                    ["recovery_linearpatch"],
+                    "scannet_dev50",
+                )
+
+            self.assertEqual(render.call_count, 2)
+            self.assertIsNone(
+                render.call_args_list[0].kwargs["bottom_row_xlabel"]
+            )
+            self.assertEqual(
+                render.call_args_list[1].kwargs["bottom_row_xlabel"],
+                "Dropped units",
+            )
+            self.assertTrue(
+                all(
+                    call.kwargs["shared_xlabel"] is None
+                    for call in render.call_args_list
+                )
+            )
 
     def test_training_average_uses_only_training_datasets(self) -> None:
         def dataset_payload(value: float) -> dict:

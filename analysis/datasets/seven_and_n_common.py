@@ -91,6 +91,9 @@ def iter_7andn_scenes(
         if not split:
             raise ValueError("7scenes requires split='train' or 'test'")
         ds_kwargs["split"] = split
+        # Select after kf_every/shuffle but before image/depth decoding.  The
+        # post-load cap below remains as a defensive invariant.
+        ds_kwargs["eval_max_frames"] = int(max_frames)
     ds = dataset_cls(**ds_kwargs)
     n = len(ds) if max_scenes <= 0 else min(len(ds), max_scenes)
     for i in range(n):

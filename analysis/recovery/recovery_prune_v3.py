@@ -521,6 +521,10 @@ def _materialize_cosine_rows(
             "cuda",
             device.index if device.index is not None else torch.cuda.current_device(),
         )
+        # Released tensors from a previous sequential boundary may still be
+        # held by PyTorch's caching allocator. Return only those unused blocks
+        # before asking the driver how much memory is actually available.
+        torch.cuda.empty_cache()
         free_bytes, total_bytes = torch.cuda.mem_get_info(indexed_device)
         reserve_bytes = max(4 * 1024**3, int(total_bytes * 0.10))
         if required_bytes + reserve_bytes <= free_bytes:

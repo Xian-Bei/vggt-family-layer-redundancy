@@ -941,6 +941,78 @@ class EvalPlotsTest(unittest.TestCase):
         assert legend is not None
         self.assertEqual(legend.get_texts()[0].get_fontsize(), 11.0)
 
+    def test_compact_legend_and_overview_axis_can_be_publication_styled(self) -> None:
+        import matplotlib.pyplot as plt
+
+        normalized = {key: 0.25 for key in GT_METRIC_KEYS}
+        strategies = {
+            key: {
+                "display_name": key,
+                "points": {
+                    "2": {
+                        "available": True,
+                        "drop_count": 2,
+                        "normalized_metric": normalized,
+                    }
+                },
+            }
+            for key in (
+                "gt_single",
+                "ours_single",
+                "inv_mse_single",
+                "cca_single",
+            )
+        }
+        fig = render_strategy_metric_figure(
+            payload={"strategies": strategies},
+            title="overview styling",
+            metric_grid=(("gt_mean",),),
+            strategy_keys=tuple(strategies),
+            compact_pruning_legend=True,
+            compact_method_labels={
+                "gt": "Retention",
+                "ours": "CKA",
+                "inv_mse": "Inv_MSE",
+                "cca": "CCA",
+            },
+            compact_method_order=("gt", "ours", "cca", "inv_mse"),
+            compact_structure_labels=("Multi",),
+            combine_compact_legend=True,
+            legend_fontsize=15,
+            legend_fontweight="bold",
+            normalize_metrics=True,
+            include_upper_anchor=False,
+            show_metric_titles=False,
+            shared_ylabel="Normalized Retention",
+            figure_height_per_row=5.2,
+        )
+        self.assertIsNotNone(fig)
+        assert fig is not None
+        try:
+            ax = fig.axes[0]
+            legends = [legend for legend in [*ax.artists, ax.get_legend()] if legend]
+            self.assertEqual(len(legends), 1)
+            self.assertEqual(legends[0].get_title().get_text(), "")
+            self.assertEqual(
+                [text.get_text() for text in legends[0].get_texts()],
+                ["Retention", "CKA", "CCA", "Inv_MSE"],
+            )
+            self.assertTrue(
+                all(
+                    text.get_fontweight() == "bold"
+                    for legend in legends
+                    for text in legend.get_texts()
+                )
+            )
+            self.assertEqual(ax.get_title(), "")
+            self.assertIn(
+                "Normalized Retention",
+                [text.get_text() for text in fig.texts],
+            )
+            self.assertAlmostEqual(fig.get_size_inches()[1], 5.2)
+        finally:
+            plt.close(fig)
+
     def test_render_strategy_metric_figure_can_delegate_x_label_to_gallery(self) -> None:
         fig = render_strategy_metric_figure(
             payload={

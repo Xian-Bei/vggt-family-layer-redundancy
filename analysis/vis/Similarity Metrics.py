@@ -8,6 +8,20 @@ from analysis.vis.display_names import (
     backbone_display_name,
     backbone_publication_sort_key,
 )
+from analysis.vis.composite import (
+    Cell,
+    Section,
+    compose_sections,
+    gallery_cells,
+    update_value,
+)
+
+# Similarity Metrics typography and outer-label spacing (pixels).
+SIMILARITY_SUBPLOT_FONT_SIZE = 22
+SIMILARITY_OUTER_FONT_SIZE = 26
+SIMILARITY_LEFT_LABEL_TO_IMAGE_GAP = 0
+SIMILARITY_TOP_LABEL_TO_IMAGE_GAP = 0
+SIMILARITY_BOTTOM_LABEL_TO_IMAGE_GAP = 0
 
 HEATMAP_REAL_DATASETS: Tuple[str, ...] = (
     "nuscenes_train",
@@ -23,7 +37,6 @@ SIMILARITY_COLUMN_LABELS: Tuple[str, ...] = (
 )
 
 _DATASET_ORDER: Tuple[str, ...] = (
-    "min",
     "mean",
     "scannet_dev50",
     "scans_dev50",
@@ -38,6 +51,37 @@ _DATASET_ORDER: Tuple[str, ...] = (
     "nuscenes_train",
     "waymo_training",
 )
+
+
+def _compose_similarity_metrics(value: Any) -> Any:
+    cells = gallery_cells(value)
+    columns = len(SIMILARITY_COLUMN_LABELS)
+    rows: List[List[Cell]] = []
+    labels: List[str] = []
+    for start in range(0, len(cells), columns):
+        row = cells[start : start + columns]
+        labels.append(next((cell.caption for cell in row if cell.caption), ""))
+        for cell in row:
+            cell.caption = ""
+        row.extend(Cell(None) for _ in range(columns - len(row)))
+        rows.append(row)
+    return compose_sections(
+        [
+            Section(
+                columns=columns,
+                cells=[],
+                fixed_rows=rows,
+                row_labels=labels,
+                row_labels_bold=True,
+                column_labels=list(SIMILARITY_COLUMN_LABELS),
+                column_labels_bold=True,
+            )
+        ],
+        outer_font_size=SIMILARITY_OUTER_FONT_SIZE,
+        left_label_to_image_gap=SIMILARITY_LEFT_LABEL_TO_IMAGE_GAP,
+        top_label_to_image_gap=SIMILARITY_TOP_LABEL_TO_IMAGE_GAP,
+        bottom_label_to_image_gap=SIMILARITY_BOTTOM_LABEL_TO_IMAGE_GAP,
+    )
 
 
 def _dataset_sort_key(name: str) -> Tuple[int, str]:
@@ -64,7 +108,6 @@ def build_heatmaps_tab(
     stage2_token_row_patch: str,
     stage2_token_row_all: str,
     stage2_token_row_mean: str,
-    stage2_token_row_min: str,
     heatmaps_resolve_filters_cb: Any,
     refresh_stage2_full_cb: Any,
 ) -> Dict[str, Any]:
@@ -72,10 +115,21 @@ def build_heatmaps_tab(
         [str(x) for x in backbone_choices],
         key=backbone_publication_sort_key,
     )
-    allowed_datasets = {"min", "mean", *HEATMAP_REAL_DATASETS}
+    allowed_datasets = {"mean", *HEATMAP_REAL_DATASETS}
     sorted_dataset_choices = sorted(
         [str(x) for x in dataset_choices if str(x) in allowed_datasets],
         key=_dataset_sort_key,
+    )
+    default_dataset = (
+        "mean"
+        if "mean" in sorted_dataset_choices
+        else (sorted_dataset_choices[0] if sorted_dataset_choices else None)
+    )
+    default_scene_ids = (
+        ["mean"] if default_dataset == "mean" else list(stage2_scene_ids)
+    )
+    default_scene = (
+        "mean" if default_dataset == "mean" else initial_stage2_scene
     )
 
     with gr.Tab("Similarity Metrics") as tab_stage2:
@@ -99,12 +153,19 @@ def build_heatmaps_tab(
                 stage2_dataset_dd = gr.Dropdown(
                     label="Dataset",
                     choices=sorted_dataset_choices,
-                    value=controller.dataset,
+                    value=default_dataset,
                 )
-                stage2_scene_dd = gr.Dropdown(label="Scene", choices=stage2_scene_ids, value=initial_stage2_scene)
+                stage2_scene_dd = gr.Dropdown(
+                    label="Scene",
+                    choices=default_scene_ids,
+                    value=default_scene,
+                    interactive=default_dataset != "mean",
+                )
                 _hm_vm, _hm_m, _hm_t, _, _hm_tc, _hm_hs, _hm_hi, _hm_po = heatmaps_resolve_filters_cb(
-                    controller, initial_stage2_scene, "absolute", None, None
+                    controller, default_scene, "absolute", None, None
                 )
+                _hm_tc = [item for item in _hm_tc if str(item) != "min"]
+                _hm_t = [item for item in _hm_t if str(item) != "min"]
                 stage2_metric_rows_filter = gr.CheckboxGroup(
                     choices=[],
                     value=[],
@@ -135,57 +196,16 @@ def build_heatmaps_tab(
                 stage2_sim_cutoff_slider = gr.State(0.0)
                 stage2_info = gr.Textbox(label="Displayed counts", interactive=False)
             with gr.Column(scale=5, elem_classes=["stage2-right"]):
-                stage2_mode_galleries: List[gr.Gallery] = []
-                stage2_row_body_cols: List[gr.Column] = []
-                for mode in stage2_modes:
-                    for index, label in enumerate((
-                        f"{mode}: hidden pose",
-                        f"{mode}: hidden depth",
-                        f"{mode}: 7-metric mean · selected similarity maps",
-                        f"{mode}: hidden sim special",
-                        f"{mode}: hidden sim camera",
-                        f"{mode}: hidden sim patch",
-                        f"{mode}: hidden sim all",
-                        f"{mode}: hidden sim mean",
-                        f"{mode}: hidden sim min",
-                    )):
-                        visible = index == 2
-                        gallery_classes = [
-                            "results-gallery",
-                            "stage2-heatmap-gallery",
-                            "similarity-metrics-gallery",
-                        ]
-                        with gr.Row(
-                            elem_classes=["stage2-gallery-row"],
-                            equal_height=False,
-                            visible=visible,
-                        ):
-                            with gr.Column(scale=1, min_width=280) as row_body:
-                                gal = gr.Gallery(
-                                    label=label,
-                                    show_label=False,
-                                    columns=5 if visible else 4,
-                                    height="auto",
-                                    object_fit="contain",
-                                    visible=visible,
-                                    elem_classes=gallery_classes,
-                                )
-                                if visible:
-                                    with gr.Row(
-                                        elem_classes=["similarity-column-label-row"],
-                                        equal_height=True,
-                                    ):
-                                        for column_label in SIMILARITY_COLUMN_LABELS:
-                                            gr.Markdown(
-                                                column_label,
-                                                elem_classes=[
-                                                    "similarity-column-label"
-                                                ],
-                                            )
-                            stage2_row_body_cols.append(row_body)
-                            stage2_mode_galleries.append(gal)
+                stage2_image = gr.Image(
+                    label="mixed_units: 7-metric mean · selected similarity maps",
+                    show_label=False,
+                    type="numpy",
+                    interactive=False,
+                    elem_classes=["results-media", "composite-plot-image"],
+                )
 
         stage2_inputs = [
+            stage2_dataset_dd,
             stage2_backbone_filter,
             stage2_scene_dd,
             stage2_value_mode,
@@ -196,9 +216,27 @@ def build_heatmaps_tab(
             stage2_sim_cutoff_slider,
             stage2_colorbar_histogram,
         ]
+        raw_gallery_count = 8 * len(stage2_modes)
+
+        def _compose_raw_result(raw: Sequence[Any]) -> Tuple[Any, ...]:
+            combined: List[Any] = []
+            for index in range(raw_gallery_count):
+                if index % 8 != 2:
+                    continue
+                value, _ = update_value(raw[index])
+                if isinstance(value, list):
+                    combined.extend(value)
+            return (
+                _compose_similarity_metrics(combined),
+                raw[raw_gallery_count * 2],
+                *raw[raw_gallery_count * 2 + 1 :],
+            )
+
+        def _compose_refresh(*args: Any) -> Tuple[Any, ...]:
+            return _compose_raw_result(refresh_stage2_full_cb(*args))
+
         stage2_outputs = [
-            *stage2_mode_galleries,
-            *stage2_row_body_cols,
+            stage2_image,
             stage2_info,
             stage2_value_mode,
             stage2_pct_clip_slider,
@@ -208,7 +246,7 @@ def build_heatmaps_tab(
             stage2_sim_cutoff_slider,
         ]
 
-        if stage2_scene_ids:
+        if default_scene_ids:
             stage2_refresh_events: List[Any] = []
 
             def _bind_refresh(
@@ -227,7 +265,7 @@ def build_heatmaps_tab(
                     kwargs["trigger_mode"] = "always_last"
                 if use_cancels and stage2_refresh_events:
                     kwargs["cancels"] = list(stage2_refresh_events)
-                event = trigger(refresh_stage2_full_cb, **kwargs)
+                event = trigger(_compose_refresh, **kwargs)
                 if track_event:
                     stage2_refresh_events.append(event)
 
@@ -246,8 +284,9 @@ def build_heatmaps_tab(
         "stage2_backbone_filter": stage2_backbone_filter,
         "stage2_dataset_dd": stage2_dataset_dd,
         "stage2_scene_dd": stage2_scene_dd,
-        "stage2_mode_galleries": stage2_mode_galleries,
-        "stage2_row_body_cols": stage2_row_body_cols,
+        "stage2_image": stage2_image,
+        "compose_refresh_result": _compose_refresh,
+        "compose_raw_result": _compose_raw_result,
         "stage2_info": stage2_info,
         "stage2_value_mode": stage2_value_mode,
         "stage2_pct_clip_slider": stage2_pct_clip_slider,

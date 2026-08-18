@@ -57,7 +57,7 @@ _DERIVED_GHOST_RECOVERY_NAMES = {
 @dataclass
 class _EvalScoreKey:
     scene_id: str
-    batch: Any
+    num_frames: int
     prepared: Any
     inference_start: Optional[torch.cuda.Event]
     inference_end: Optional[torch.cuda.Event]
@@ -359,7 +359,7 @@ def evaluate_model_v3(
             print(msg, file=sys.stderr)
 
     def write_scene_result(key: _EvalScoreKey, scene_metrics: Dict[str, float]) -> None:
-        scene_metrics["num_frames"] = float(count_eval_frames(key.batch))
+        scene_metrics["num_frames"] = float(key.num_frames)
         scene_metrics["scene_id"] = key.scene_id
         rows.append(scene_metrics)
         scene_dir = out_dir / key.scene_id
@@ -458,7 +458,7 @@ def evaluate_model_v3(
                     continue
                 key = _EvalScoreKey(
                     scene_id=sid,
-                    batch=batch,
+                    num_frames=count_eval_frames(batch),
                     prepared=None,
                     inference_start=None,
                     inference_end=None,
@@ -500,7 +500,7 @@ def evaluate_model_v3(
                 peak_vram_gib = max(peak_vram_gib, scene_peak_vram_gb)
                 key = _EvalScoreKey(
                     scene_id=sid,
-                    batch=batch,
+                    num_frames=count_eval_frames(batch),
                     prepared=prepared,
                     inference_start=inference_start,
                     inference_end=inference_end,

@@ -5,14 +5,17 @@ from pathlib import Path
 import sys
 
 from .eval_tab import build_eval_tab
-from .brute_force_tab import build_brute_force_tab
+from .brute_force_tab import (
+    BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
+    BRUTE_FORCE_OVERVIEW_SUBPLOT_FONT_SIZE,
+    build_brute_force_tab,
+    filter_brute_force_detail_datasets,
+)
 from .backbone_efficiency_tab import build_backbone_efficiency_tab
-from .cka_heatmaps_tab import build_cka_heatmaps_tab
 from .lora_tab import build_lora_tab, build_recovery_tab
-from .remaining_tab import build_remaining_tab
+from .remaining_tab import REMAINING_SUBPLOT_FONT_SIZE, build_remaining_tab
 from .recovery_overview_tab import build_recovery_overview_tab
 from .recovery_backbone_comparison_tab import (
-    build_recovery_backbone_comparison_tab,
     build_recovery_backbone_remaining_comparison_tab,
 )
 from .pair_tab import build_pair_tab
@@ -32,21 +35,25 @@ sys.modules[_similarity_metrics_name] = _similarity_metrics_module
 _similarity_metrics_spec.loader.exec_module(_similarity_metrics_module)
 build_heatmaps_tab = _similarity_metrics_module.build_heatmaps_tab
 HEATMAP_REAL_DATASETS = _similarity_metrics_module.HEATMAP_REAL_DATASETS
+SIMILARITY_SUBPLOT_FONT_SIZE = _similarity_metrics_module.SIMILARITY_SUBPLOT_FONT_SIZE
 
 __all__ = [
-    "build_cka_heatmaps_tab",
     "build_backbone_efficiency_tab",
+    "BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE",
+    "BRUTE_FORCE_OVERVIEW_SUBPLOT_FONT_SIZE",
     "build_brute_force_tab",
+    "filter_brute_force_detail_datasets",
     "build_eval_tab",
     "build_heatmaps_tab",
     "build_lora_tab",
     "build_remaining_tab",
+    "REMAINING_SUBPLOT_FONT_SIZE",
     "build_recovery_tab",
     "build_recovery_overview_tab",
-    "build_recovery_backbone_comparison_tab",
     "build_recovery_backbone_remaining_comparison_tab",
     "build_pair_tab",
     "build_pruning_plan_tab",
     "build_summary_tab",
     "HEATMAP_REAL_DATASETS",
+    "SIMILARITY_SUBPLOT_FONT_SIZE",
 ]

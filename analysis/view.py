@@ -41,6 +41,7 @@ except ImportError as exc:  # pragma: no cover - import guard for optional demo 
 
 from analysis.backbones.bootstrap import apply_pythonpath
 from analysis.backbones.registry import get_backbone
+from analysis.metric_labels import SEVEN_METRIC_LABELS
 from analysis.prune_plan import load_named_prune_plan
 from .redundancy.metrics import (
     upper_packed_to_symmetric_matrix,
@@ -58,7 +59,6 @@ from analysis.redundancy.remaining_skip_layout import (
 from analysis.redundancy.similarity_v3 import (
     REDUNDANCY_GRAPH_REGIONS,
     list_redundancy_graph_regions,
-    resolve_redundancy_graph_path,
 )
 from analysis.redundancy.skip_metric_scaling import (
     GT_METRIC_KEYS,
@@ -77,14 +77,17 @@ from .redundancy.visualize_pair_attention import (
     _reconstruct_qk,
 )
 from .vis import (
+    BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
+    BRUTE_FORCE_OVERVIEW_SUBPLOT_FONT_SIZE,
+    REMAINING_SUBPLOT_FONT_SIZE,
+    SIMILARITY_SUBPLOT_FONT_SIZE,
     build_backbone_efficiency_tab,
     build_brute_force_tab,
-    build_cka_heatmaps_tab,
+    filter_brute_force_detail_datasets,
     build_eval_tab,
     build_heatmaps_tab,
     build_pruning_plan_tab,
     build_remaining_tab,
-    build_recovery_backbone_comparison_tab,
     build_recovery_backbone_remaining_comparison_tab,
     build_recovery_overview_tab,
     build_recovery_tab,
@@ -98,7 +101,6 @@ from .vis.display_names import (
 # from .vis import build_pair_tab  # Pair Attention tab disabled
 
 OUTPUT_ROOT_DEFAULT = Path(os.environ.get("OUTPUT_ROOT", "analysis_outputs_v3"))
-
 
 def _repo_root() -> Path:
     """Project root (parent of the ``analysis`` package). ``view.py`` lives in ``analysis/``."""
@@ -195,16 +197,16 @@ SIMILARITY_METRICS: List[Tuple[str, str]] = [
 ]
 
 SKIP_MAIN_METRICS: List[Tuple[str, str]] = [
-    ("are", "ARE"),
-    ("ape", "APE"),
-    ("rpe_rot", "RPE_rot"),
-    ("rpe_trans", "RPE_trans"),
+    ("ape", SEVEN_METRIC_LABELS["ape"]),
+    ("are", SEVEN_METRIC_LABELS["are"]),
+    ("rpe_trans", SEVEN_METRIC_LABELS["rpe_trans"]),
+    ("rpe_rot", SEVEN_METRIC_LABELS["rpe_rot"]),
 ]
 
 SKIP_POINT_METRICS: List[Tuple[str, str]] = [
-    ("acc", "Accuracy"),
-    ("comp", "Completeness"),
-    ("chamfer_distance", "Chamfer"),
+    ("acc", SEVEN_METRIC_LABELS["acc"]),
+    ("comp", SEVEN_METRIC_LABELS["comp"]),
+    ("chamfer_distance", SEVEN_METRIC_LABELS["chamfer_distance"]),
 ]
 
 SKIP_GT_METRIC_KEYS = set(GT_METRIC_KEYS)
@@ -1078,14 +1080,12 @@ STAGE2_TOKEN_ROW_CAMERA = "camera"
 STAGE2_TOKEN_ROW_PATCH = "patch"
 STAGE2_TOKEN_ROW_ALL = "all"
 STAGE2_TOKEN_ROW_MEAN = "mean"
-STAGE2_TOKEN_ROW_MIN = "min"
 STAGE2_TOKEN_ROW_ORDER = [
     STAGE2_TOKEN_ROW_SPECIAL,
     STAGE2_TOKEN_ROW_CAMERA,
     STAGE2_TOKEN_ROW_PATCH,
     STAGE2_TOKEN_ROW_ALL,
     STAGE2_TOKEN_ROW_MEAN,
-    STAGE2_TOKEN_ROW_MIN,
 ]
 STAGE2_MIN_DATASET = "min"
 STAGE2_MEAN_DATASET = "mean"
@@ -1142,15 +1142,6 @@ def _discover_v3_dataset_tags(backbone_root: Path) -> List[str]:
     )
 
 
-def _discover_v3_dataset_tags_across_backbones(output_root: Path, backbones: Sequence[str]) -> List[str]:
-    tags: List[str] = []
-    for backbone in backbones:
-        for tag in _discover_v3_dataset_tags(Path(output_root) / str(backbone)):
-            if tag not in tags:
-                tags.append(tag)
-    return tags
-
-
 def _discover_v3_dataset_directories_across_backbones(
     output_root: Path,
     backbones: Sequence[str],
@@ -1170,46 +1161,6 @@ def _discover_v3_dataset_directories_across_backbones(
                 and name not in tags
             ):
                 tags.append(name)
-    return tags
-
-
-def _discover_similarity_backbones(output_root: Path, *, artifact_stage: str) -> List[str]:
-    root = Path(output_root)
-    if not root.is_dir():
-        return []
-    preferred = ("vggt", "pi3", "vggt_omega", "mapanything", "mapanything_v1")
-    discovered: List[str] = []
-    for backbone_dir in root.iterdir():
-        if not backbone_dir.is_dir() or backbone_dir.name.startswith("."):
-            continue
-        if _discover_similarity_dataset_tags(
-            backbone_dir,
-            artifact_stage=artifact_stage,
-        ):
-            discovered.append(backbone_dir.name)
-    return sorted(
-        discovered,
-        key=lambda name: (
-            preferred.index(name) if name in preferred else len(preferred),
-            name,
-        ),
-    )
-
-
-def _discover_similarity_dataset_tags_across_backbones(
-    output_root: Path,
-    backbones: Sequence[str],
-    *,
-    artifact_stage: str,
-) -> List[str]:
-    tags: List[str] = []
-    for backbone in backbones:
-        for tag in _discover_similarity_dataset_tags(
-            Path(output_root) / str(backbone),
-            artifact_stage=artifact_stage,
-        ):
-            if tag not in tags:
-                tags.append(tag)
     return tags
 
 
@@ -1805,7 +1756,6 @@ def _stage2_row_visibility_flags(
                 (STAGE2_TOKEN_ROW_PATCH, "patch"),
                 (STAGE2_TOKEN_ROW_ALL, "all"),
                 (STAGE2_TOKEN_ROW_MEAN, "mean"),
-                (STAGE2_TOKEN_ROW_MIN, "min"),
             )
         )
         out.extend(
@@ -1818,7 +1768,6 @@ def _stage2_row_visibility_flags(
                 False,
                 False,
                 False,
-                False,
             ]
         )
     return out
@@ -1826,9 +1775,9 @@ def _stage2_row_visibility_flags(
 
 def _stage2_block_keys_for_mode(
     mode: str,
-) -> Tuple[str, str, str, str, str, str, str, str, str]:
-    # Heatmaps UI creates a legacy 9-slot gallery per mode:
-    #   0: hidden pose, 1: hidden depth, 2: visible combined, 3-8: hidden sim regions.
+) -> Tuple[str, str, str, str, str, str, str, str]:
+    # Heatmaps UI creates an 8-slot gallery per mode:
+    #   0: hidden pose, 1: hidden depth, 2: visible combined, 3-7: hidden sim regions.
     # Internally we only render "main/point" and sim regions, so we insert a
     # stable unused placeholder to keep indices aligned across the UI and
     # gallery-merging code.
@@ -1841,7 +1790,6 @@ def _stage2_block_keys_for_mode(
         f"sim_{mode}_patch",  # index 5
         f"sim_{mode}_all",  # index 6
         f"sim_{mode}_mean",  # index 7
-        f"sim_{mode}_min",  # index 8
     )
 
 
@@ -1868,7 +1816,6 @@ def _stage2_requested_block_keys(
             sim_patch,
             sim_all,
             sim_mean,
-            sim_min,
         ) = _stage2_block_keys_for_mode(mode)
         has_skip = mode in skip_modes
         sim_regions = similarity_regions_by_mode.get(mode, set())
@@ -1880,7 +1827,6 @@ def _stage2_requested_block_keys(
             (STAGE2_TOKEN_ROW_PATCH, "patch", sim_patch),
             (STAGE2_TOKEN_ROW_ALL, "all", sim_all),
             (STAGE2_TOKEN_ROW_MEAN, "mean", sim_mean),
-            (STAGE2_TOKEN_ROW_MIN, "min", sim_min),
         ):
             if has_skip and token in tokens and region in sim_regions:
                 requested.add(block_key)
@@ -2244,7 +2190,7 @@ def _heatmap_rgb_from_packed(
     show_xlabel: bool = True,
     show_ylabel: bool = True,
     bottom_title: str = "",
-    bottom_title_fontsize: float = 22,
+    bottom_title_fontsize: float = SIMILARITY_SUBPLOT_FONT_SIZE,
     title_fontsize: Optional[float] = None,
     left_margin: Optional[float] = None,
 ) -> np.ndarray:
@@ -2257,13 +2203,11 @@ def _heatmap_rgb_from_packed(
     if np.any(np.isnan(arr)):
         arr = np.ma.masked_invalid(arr)
 
-    title_fs, label_fs, tick_fs = 18, 26, 22
-    if title_fontsize is not None:
-        title_fs = float(title_fontsize)
-    if label_fontsize is not None:
-        label_fs = max(label_fs, float(label_fontsize))
-    if tick_fontsize is not None:
-        tick_fs = max(tick_fs, float(tick_fontsize))
+    label_fs = float(
+        SIMILARITY_SUBPLOT_FONT_SIZE if label_fontsize is None else label_fontsize
+    )
+    tick_fs = float(label_fs if tick_fontsize is None else tick_fontsize)
+    title_fs = float(label_fs if title_fontsize is None else title_fontsize)
     row_mean_ax: Optional[plt.Axes] = None
     column_mean_ax: Optional[plt.Axes] = None
     colorbar_ax: Optional[plt.Axes] = None
@@ -2372,12 +2316,18 @@ def _heatmap_rgb_from_packed(
         indices = np.arange(num_layers, dtype=np.float64)
         row_mean_ax.plot(indices, column_means, color="#2563eb", linewidth=2.0)
         row_mean_ax.set_xlim(-0.5, float(num_layers) - 0.5)
-        row_mean_ax.set_ylabel("column mean", fontweight="bold")
+        row_mean_ax.set_ylabel(
+            "column mean", fontsize=label_fs, fontweight="bold"
+        )
+        row_mean_ax.tick_params(axis="y", labelsize=tick_fs)
         row_mean_ax.tick_params(axis="x", labelbottom=False)
         row_mean_ax.grid(alpha=0.2)
         column_mean_ax.plot(row_means, indices, color="#2563eb", linewidth=2.0)
         column_mean_ax.set_ylim(-0.5, float(num_layers) - 0.5)
-        column_mean_ax.set_xlabel("row mean", fontweight="bold")
+        column_mean_ax.set_xlabel(
+            "row mean", fontsize=label_fs, fontweight="bold"
+        )
+        column_mean_ax.tick_params(axis="x", labelsize=tick_fs)
         column_mean_ax.tick_params(axis="y", labelleft=False)
         column_mean_ax.grid(alpha=0.2)
     cbar.ax.tick_params(labelsize=tick_fs, width=2.0, length=6)
@@ -2565,7 +2515,7 @@ def _prepare_skip_maps_for_dataset_aggregation(
 def _similarity_maps_with_token_aggregations(
     similarity_by_mode: Dict[str, Dict[str, Dict[str, List[float]]]],
 ) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
-    """Add token-region mean/min maps over every available token region."""
+    """Add the token-region mean over every available token region."""
     out: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
     for mode, raw_entry in similarity_by_mode.items():
         entry = {str(region): dict(metric_map) for region, metric_map in raw_entry.items()}
@@ -2580,7 +2530,6 @@ def _similarity_maps_with_token_aggregations(
             for metric_key in entry.get(region, {}).keys()
         }
         mean_map: Dict[str, List[float]] = {}
-        min_map: Dict[str, List[float]] = {}
         for metric_key in metric_keys:
             packs = [
                 entry[region][metric_key]
@@ -2589,10 +2538,8 @@ def _similarity_maps_with_token_aggregations(
             ]
             if packs:
                 mean_map[metric_key] = _packed_elementwise_mean(packs)
-                min_map[metric_key] = _packed_elementwise_min(packs)
         if mean_map:
             entry[STAGE2_TOKEN_ROW_MEAN] = mean_map
-            entry[STAGE2_TOKEN_ROW_MIN] = min_map
         out[str(mode)] = entry
     return out
 
@@ -2673,7 +2620,7 @@ def _build_cross_dataset_similarity_regions(
     sim_cutoff: float,
     aggregate: str,
 ) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
-    """Aggregate every on-disk token region over real datasets, then derive mean/min regions."""
+    """Aggregate every on-disk token region over real datasets, then derive its mean region."""
     per_dataset_maps: List[Dict[str, Dict[str, Dict[str, List[float]]]]] = []
     for ds in getattr(controller, "stage2_real_datasets", []):
         report = controller.get_similarity_report_for_dataset(ds, "mean")
@@ -2825,7 +2772,7 @@ def _render_similarity_gallery(
     show_titles: bool = True,
     show_xlabels: bool = True,
     show_ylabel: bool = True,
-    label_fontsize: Optional[float] = 22,
+    label_fontsize: Optional[float] = SIMILARITY_SUBPLOT_FONT_SIZE,
     left_margin: Optional[float] = 0.075,
 ) -> List[Any]:
     """role_short: one-letter tag, e.g. S (special) / P (patch) / A (all tokens)."""
@@ -2880,7 +2827,7 @@ def _render_similarity_marginal_gallery(
     show_titles: bool = True,
     show_xlabels: bool = True,
     show_ylabel: bool = True,
-    label_fontsize: Optional[float] = 22,
+    label_fontsize: Optional[float] = SIMILARITY_SUBPLOT_FONT_SIZE,
     left_margin: Optional[float] = 0.075,
 ) -> List[Any]:
     """Render similarity rebased by the first prune interval's ``1 - sim``."""
@@ -2968,168 +2915,6 @@ def _rebase_similarity_packed(
     ]
 
 
-_CKA_TOKEN_REGION_ORDER: Tuple[str, ...] = ("camera", "special", "all", "patch", "mean", "min")
-
-
-def _discover_cka_token_regions(
-    controller: PairAttentionController,
-    datasets: Sequence[str],
-    models: Sequence[str],
-) -> List[str]:
-    seen: set[str] = set()
-    discovered: List[str] = []
-
-    for dataset in datasets:
-        for backbone in models:
-            report_entry = controller.get_similarity_report_for_dataset(
-                str(dataset),
-                "mean",
-                backbone=str(backbone),
-            )
-            if report_entry is None:
-                continue
-            similarity_by_mode = _extract_similarity_metric_maps_by_mode(report_entry.report)
-            for mode_maps in similarity_by_mode.values():
-                if not isinstance(mode_maps, dict):
-                    continue
-                for region_name, region_map in mode_maps.items():
-                    key = str(region_name or "").strip().lower()
-                    if not key or key in seen:
-                        continue
-                    if not isinstance(region_map, dict):
-                        continue
-                    if _coerce_packed(region_map.get("cka")) is None:
-                        continue
-                    seen.add(key)
-                    discovered.append(key)
-
-    def _sort_key(name: str) -> Tuple[int, str]:
-        try:
-            return (_CKA_TOKEN_REGION_ORDER.index(name), name)
-        except ValueError:
-            return (len(_CKA_TOKEN_REGION_ORDER), name)
-
-    if discovered:
-        for aggregate in (STAGE2_TOKEN_ROW_MEAN, STAGE2_TOKEN_ROW_MIN):
-            if aggregate not in seen:
-                discovered.append(aggregate)
-    return sorted(discovered, key=_sort_key)
-
-
-def _discover_graph_cka_token_regions(
-    *,
-    output_root: Path,
-    datasets: Sequence[str],
-    models: Sequence[str],
-    artifact_stage: str,
-) -> List[str]:
-    discovered: set[str] = set()
-    for backbone in models:
-        for dataset in datasets:
-            graph_dir = (
-                Path(output_root)
-                / str(backbone)
-                / str(dataset)
-                / str(artifact_stage)
-            )
-            for region in list_redundancy_graph_regions(graph_dir):
-                path = resolve_redundancy_graph_path(graph_dir, region)
-                if path is None:
-                    continue
-                try:
-                    with np.load(path, allow_pickle=True) as graph:
-                        if "cka_mean" in graph:
-                            discovered.add(str(region))
-                except (OSError, ValueError):
-                    continue
-
-    if discovered:
-        discovered.update({STAGE2_TOKEN_ROW_MEAN, STAGE2_TOKEN_ROW_MIN})
-
-    def _sort_key(name: str) -> Tuple[int, str]:
-        try:
-            return (_CKA_TOKEN_REGION_ORDER.index(name), name)
-        except ValueError:
-            return (len(_CKA_TOKEN_REGION_ORDER), name)
-
-    return sorted(discovered, key=_sort_key)
-
-
-def _cka_detail_from_provenance(provenance: Dict[str, object]) -> str:
-    dataset_sel = str(provenance.get("dataset_selector", "") or "")
-    token_sel = str(provenance.get("token_region_selector", "") or "")
-    datasets = provenance.get("datasets", [])
-    regions_by_dataset = provenance.get("token_regions_by_dataset", {})
-    used_regions = sorted(
-        {
-            str(region)
-            for region_list in regions_by_dataset.values()
-            if isinstance(region_list, list)
-            for region in region_list
-        }
-    )
-    parts = [f"dataset={dataset_sel}", f"token={token_sel}"]
-    if used_regions:
-        parts.append(f"regions={','.join(used_regions)}")
-    if isinstance(datasets, list) and datasets:
-        parts.append(f"datasets={','.join(str(dataset) for dataset in datasets)}")
-    return " | ".join(parts)
-
-
-def _render_cka_heatmap_from_packed(
-    packed: List[float],
-    *,
-    num_layers: int,
-    sim_cutoff: float,
-) -> np.ndarray:
-    cutoff = float(np.clip(float(sim_cutoff), 0.0, 1.0))
-    if cutoff > 0.0:
-        packed = _similarity_packed_cutoff_01(packed, cutoff)
-    return _heatmap_rgb_from_packed(
-        packed,
-        num_layers,
-        "",
-        vmin=0.0,
-        vmax=1.0,
-        label_fontsize=22,
-        tick_fontsize=20,
-    )
-
-
-def _render_cka_heatmap_for_backbone(
-    *,
-    backbone: str,
-    dataset: str,
-    token_region: str,
-    sim_cutoff: float,
-    artifact_stage: str = "redundancy",
-    output_root: Path = OUTPUT_ROOT_DEFAULT,
-) -> Tuple[Optional[np.ndarray], str]:
-    region_key = str(token_region or "").strip().lower()
-    try:
-        unit_ids, sim, provenance = load_similarity(
-            experiment=str(backbone),
-            dataset=str(dataset),
-            token_region=region_key,
-            metric="cka",
-            artifact_stage=artifact_stage,
-            output_root=output_root,
-            align_dropped_units=(artifact_stage == "remaining_redundancy"),
-        )
-    except FileNotFoundError as exc:
-        return None, str(exc)
-    except (KeyError, ValueError) as exc:
-        return None, str(exc)
-
-    packed = upper_triangle_pack(torch.from_numpy(sim))
-    image = _render_cka_heatmap_from_packed(
-        packed,
-        num_layers=len(unit_ids),
-        sim_cutoff=sim_cutoff,
-    )
-    return image, _cka_detail_from_provenance(provenance)
-
-
 def _render_skip_gallery(
     skip_metric_map: Dict[str, List[float]],
     num_layers: int,
@@ -3147,6 +2932,10 @@ def _render_skip_gallery(
     label_fontsize: Optional[float] = None,
     publication_titles: bool = False,
     title_fontsize: Optional[float] = None,
+    cmap: str = "viridis",
+    show_title: bool = True,
+    show_xlabels: bool = True,
+    show_ylabel: bool = True,
 ) -> List[Any]:
     del value_mode
     images: List[np.ndarray] = []
@@ -3185,15 +2974,7 @@ def _render_skip_gallery(
                 degradation_packed,
                 sim_cutoff,
             )
-        display_metric_label = (
-            {
-                "rpe_rot": "RPE Rotation",
-                "rpe_trans": "RPE Translation",
-                "chamfer_distance": "Chamfer Distance",
-            }.get(metric_key, metric_label)
-            if publication_titles
-            else metric_label
-        )
+        display_metric_label = metric_label
         title = (
             f"{display_metric_label} {'Normalized' if publication_titles else 'normalized'}"
             if normalized
@@ -3217,18 +2998,18 @@ def _render_skip_gallery(
         image = _heatmap_rgb_from_packed(
             display_packed,
             num_layers,
-            title,
+            title if show_title else "",
             vmin=0.0 if normalized else None,
             vmax=1.0 if normalized else 0.0,
             tick_suffix="%" if normalized else "",
-            cmap="viridis",
+            cmap=str(cmap),
             show_colorbar_histogram=show_colorbar_histogram,
             colorbar_decimals=0 if normalized else colorbar_decimals,
             colorbar_tick_scale=100.0 if normalized else 1.0,
             label_fontsize=label_fontsize,
             title_fontsize=title_fontsize,
-            show_xlabel=True,
-            show_ylabel=(metric_index == 0),
+            show_xlabel=bool(show_xlabels),
+            show_ylabel=(bool(show_ylabel) and metric_index == 0),
         )
         images.append(image)
     return images
@@ -3531,12 +3312,17 @@ def _message_heatmap_rgb(
     message: str,
     *,
     bottom_title: str = "",
-    bottom_title_fontsize: float = 22,
+    bottom_title_fontsize: float = SIMILARITY_SUBPLOT_FONT_SIZE,
     figsize: Tuple[float, float] = (9, 8),
 ) -> np.ndarray:
     fig, ax = plt.subplots(figsize=figsize)
     if str(title or "").strip():
-        ax.set_title(str(title), fontsize=18, fontweight="bold", pad=12)
+        ax.set_title(
+            str(title),
+            fontsize=SIMILARITY_SUBPLOT_FONT_SIZE,
+            fontweight="bold",
+            pad=12,
+        )
     if str(message or "").strip():
         ax.text(
             0.5,
@@ -3544,7 +3330,7 @@ def _message_heatmap_rgb(
             str(message),
             ha="center",
             va="center",
-            fontsize=16,
+            fontsize=SIMILARITY_SUBPLOT_FONT_SIZE,
             color="#64748b",
             wrap=True,
             transform=ax.transAxes,
@@ -3746,7 +3532,6 @@ def _prepare_stage2_render(
                 sim_patch,
                 sim_all,
                 sim_mean,
-                sim_min,
             ) = _stage2_block_keys_for_mode(current_mode)
             if skip_point not in target_blocks:
                 continue
@@ -3757,7 +3542,6 @@ def _prepare_stage2_render(
                 sim_patch,
                 sim_all,
                 sim_mean,
-                sim_min,
             ):
                 if block_key in target_blocks:
                     similarity_images.extend(
@@ -3825,7 +3609,6 @@ def _prepare_stage2_render(
             sim_patch,
             sim_all,
             sim_mean,
-            sim_min,
         ) = _stage2_block_keys_for_mode(mode)
         if skip_main in target_blocks and skip_main not in galleries:
             galleries[skip_main] = _render_skip_gallery(
@@ -3874,6 +3657,7 @@ def _prepare_stage2_render(
                 normalize_similarity=False,
                 show_titles=show_column_titles,
                 show_xlabels=show_xlabels,
+                show_ylabel=False,
             )
         if sim_camera in target_blocks and sim_camera not in galleries:
             if not _similarity_region_has_data(sim_entry, "camera"):
@@ -3895,6 +3679,7 @@ def _prepare_stage2_render(
                 normalize_similarity=False,
                 show_titles=show_column_titles,
                 show_xlabels=show_xlabels,
+                show_ylabel=False,
             )
         if skip_point in target_blocks and skip_point not in galleries:
             galleries[skip_point] = [
@@ -3910,7 +3695,7 @@ def _prepare_stage2_render(
                     show_xlabel=show_xlabels,
                     show_ylabel=True,
                     show_title=show_column_titles,
-                    label_fontsize=22,
+                    label_fontsize=SIMILARITY_SUBPLOT_FONT_SIZE,
                     left_margin=0.075,
                 )
             ]
@@ -3934,6 +3719,7 @@ def _prepare_stage2_render(
                 normalize_similarity=False,
                 show_titles=show_column_titles,
                 show_xlabels=show_xlabels,
+                show_ylabel=False,
             )
         if sim_all in target_blocks and sim_all not in galleries:
             sim_all_maps = sim_entry.get("all", {})
@@ -3957,6 +3743,7 @@ def _prepare_stage2_render(
                 normalize_similarity=False,
                 show_titles=show_column_titles,
                 show_xlabels=show_xlabels,
+                show_ylabel=False,
             )
         if sim_mean in target_blocks and sim_mean not in galleries:
             galleries[sim_mean] = _render_similarity_gallery(
@@ -3969,18 +3756,7 @@ def _prepare_stage2_render(
                 normalize_similarity=False,
                 show_titles=show_column_titles,
                 show_xlabels=show_xlabels,
-            )
-        if sim_min in target_blocks and sim_min not in galleries:
-            galleries[sim_min] = _render_similarity_gallery(
-                sim_entry.get("min", {}),
-                num_layers,
-                role_short="m",
-                sim_gamma=sim_gamma,
-                sim_cutoff=sim_cutoff,
-                show_colorbar_histogram=show_colorbar_histogram,
-                normalize_similarity=False,
-                show_titles=show_column_titles,
-                show_xlabels=show_xlabels,
+                show_ylabel=False,
             )
     rendered = len(galleries)
     total = len(all_blocks)
@@ -4078,6 +3854,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             for token in ("scannet", "scans_", "7scenes", "nuscenes", "waymo")
         )
     ]
+    brute_force_detail_datasets = filter_brute_force_detail_datasets(
+        brute_force_datasets
+    )
     brute_force_modes: List[str] = []
     for brute_force_backbone in brute_force_backbones:
         for brute_force_dataset in brute_force_datasets:
@@ -4102,35 +3881,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             for backbone in brute_force_backbones
         )
     ]
-    n_stage2_galleries = 9 * len(stage2_modes_all)
-    cka_models = list(controller.v3_backbones)
-    cka_datasets = (
-        _discover_v3_dataset_tags_across_backbones(controller.v3_output_root, cka_models)
-        if cka_models
-        else list(stage2_real)
-    )
-    cka_token_regions = _discover_cka_token_regions(controller, cka_datasets, cka_models)
-    remaining_cka_stage = "remaining_redundancy"
-    remaining_cka_models = _discover_similarity_backbones(
-        controller.v3_output_root,
-        artifact_stage=remaining_cka_stage,
-    )
-    remaining_cka_datasets = _discover_similarity_dataset_tags_across_backbones(
-        controller.v3_output_root,
-        remaining_cka_models,
-        artifact_stage=remaining_cka_stage,
-    )
-    remaining_cka_token_regions = _discover_graph_cka_token_regions(
-        output_root=controller.v3_output_root,
-        datasets=remaining_cka_datasets,
-        models=remaining_cka_models,
-        artifact_stage=remaining_cka_stage,
-    )
+    n_stage2_galleries = 8 * len(stage2_modes_all)
     lora_root = controller.lora_root
     stage2_last_render_keys: Dict[str, Any] = {}
     dataset_switch_output_len: Dict[str, int] = {"count": 0}
-    cka_render_cache: Dict[Tuple[Any, ...], Optional[np.ndarray]] = {}
-    remaining_cka_render_cache: Dict[Tuple[Any, ...], Optional[np.ndarray]] = {}
     brute_force_controller_cache: Dict[Tuple[str, str, str], PairAttentionController] = {}
     brute_force_render_cache: Dict[Tuple[Any, ...], List[np.ndarray]] = {}
     heatmaps_controller_cache: Dict[
@@ -4502,10 +4256,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
 
         gallery_updates: List[Any] = []
         for index in range(n_stage2_galleries):
-            # Only the third slot of each legacy nine-block group is visible.
+            # Only the third slot of each eight-block group is visible.
             # Similarity block values are consumed above to build that combined
             # row and must not also be serialized to hidden galleries.
-            if index % 9 != 2:
+            if index % 8 != 2:
                 gallery_updates.append(gr.update(value=[]))
                 continue
             combined: List[Any] = []
@@ -4642,26 +4396,20 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         mode = str(brute_force_modes[0] if brute_force_modes else "mixed_units")
         vm = "absolute"
         clip = 100.0
+        # The publication overview uses one fixed source per domain.  Keep this
+        # in sync with the browser-only source summary in brute_force_tab.py.
         indoor_datasets = [
-            dataset
-            for dataset in brute_force_datasets
-            if any(token in dataset.lower() for token in ("scannet", "scans_", "7scenes"))
+            dataset for dataset in brute_force_datasets
+            if dataset == "scannet_dev50"
         ]
         outdoor_datasets = [
-            dataset
-            for dataset in brute_force_datasets
-            if any(token in dataset.lower() for token in ("nuscenes", "waymo"))
+            dataset for dataset in brute_force_datasets
+            if dataset == "nuscenes_train"
         ]
         overview_items: Dict[str, List[Optional[np.ndarray]]] = {
             backbone: [None, None, None, None]
             for backbone in brute_force_backbones
         }
-        overview_column_titles = (
-            "Indoor Pose Metrics\nNormalized Retention",
-            "Indoor Geometry Metrics\nNormalized Retention",
-            "Outdoor Pose Metrics\nNormalized Retention",
-            "Outdoor Geometry Metrics\nNormalized Retention",
-        )
         notes: List[str] = []
         included_by_backbone_domain: Dict[Tuple[str, str], List[str]] = {}
 
@@ -4670,7 +4418,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 continue
             maps_by_dataset: Dict[str, Dict[str, List[float]]] = {}
             layers_by_dataset: Dict[str, int] = {}
-            for dataset in brute_force_datasets:
+            for dataset in [*indoor_datasets, *outdoor_datasets]:
                 try:
                     scoped = _brute_force_controller(backbone, dataset)
                     skip_by_mode, _source = _build_stage2_skip_maps(
@@ -4784,7 +4532,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                 domain_label == "Indoor"
                                 and family_label == "Pose"
                             ),
-                            label_fontsize=22,
+                            label_fontsize=BRUTE_FORCE_OVERVIEW_SUBPLOT_FONT_SIZE,
                         )
                         cached = (
                             []
@@ -4809,21 +4557,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 )
                 items = [
                     (
-                        (
-                            item
-                            if item is not None
-                            else _gallery_image_only(
-                                _message_heatmap_rgb(
-                                    "",
-                                    "",
-                                    figsize=placeholder_size,
-                                )
-                            )
-                        ),
-                        overview_column_titles[index],
-                    )
-                    if backbone == last_selected_backbone
-                    else (
                         item
                         if item is not None
                         else _gallery_image_only(
@@ -4834,7 +4567,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                             )
                         )
                     )
-                    for index, item in enumerate(raw_items)
+                    for item in raw_items
                 ]
             else:
                 items = []
@@ -5230,7 +4963,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     show_xlabel=show_xlabels,
                     show_ylabel=show_ylabel,
                     show_title=show_column_titles,
-                    label_fontsize=22,
+                    label_fontsize=REMAINING_SUBPLOT_FONT_SIZE,
                     left_margin=0.075,
                 )
             )
@@ -5269,6 +5002,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     show_titles=show_column_titles,
                     show_xlabels=show_xlabels,
                     show_ylabel=show_ylabel,
+                    label_fontsize=REMAINING_SUBPLOT_FONT_SIZE,
                 )
             )
 
@@ -5298,7 +5032,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     show_xlabel=show_xlabels,
                     show_ylabel=show_ylabel,
                     show_title=show_column_titles,
-                    label_fontsize=22,
+                    label_fontsize=REMAINING_SUBPLOT_FONT_SIZE,
                     left_margin=0.075,
                 )
             )
@@ -5377,6 +5111,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     show_titles=show_column_titles,
                     show_xlabels=show_xlabels,
                     show_ylabel=show_ylabel,
+                    label_fontsize=REMAINING_SUBPLOT_FONT_SIZE,
                 )
             )
         while len(marginal_row) < column_count:
@@ -5444,10 +5179,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         normalized_input=True,
                         percentile_clip=100.0,
                         compact_annotations=True,
-                        show_xlabel=backbone_index == len(available_backbones) - 1,
-                        show_ylabel=True,
+                        show_xlabel=True,
+                        show_ylabel=backbone_index == 0,
                         show_title=False,
-                        label_fontsize=22,
+                        label_fontsize=REMAINING_SUBPLOT_FONT_SIZE,
                         left_margin=0.075,
                     )
             except Exception as exc:
@@ -5477,7 +5212,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     normalize_seven_metrics=True,
                     expected_columns=1,
                     show_column_titles=False,
-                    show_xlabels=backbone_index == len(available_backbones) - 1,
+                    show_xlabels=True,
                     show_ylabel=False,
                 )
                 if len(remaining_images) >= 2:
@@ -5513,13 +5248,30 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         # Remaining visualization lives in Similarity Metrics / Remaining tabs.
         show_remaining_pruning = False
         selected_backbone_set = {str(x) for x in (selected_backbones or [])}
-        dataset_scopes = [*brute_force_datasets, STAGE2_MEAN_DATASET]
+        dataset_scopes = list(brute_force_detail_datasets)
         valid_dataset_scopes = set(dataset_scopes)
         selected_skip_dataset_set = {
             str(x)
             for x in (selected_skip_datasets or [])
             if str(x) in valid_dataset_scopes
         }
+        selected_backbone_order = [
+            backbone
+            for backbone in brute_force_backbones
+            if backbone in selected_backbone_set
+        ]
+        selected_dataset_order = [
+            dataset
+            for dataset in dataset_scopes
+            if dataset in selected_skip_dataset_set
+        ]
+        last_selected_backbone = (
+            selected_backbone_order[-1] if selected_backbone_order else ""
+        )
+        last_selected_dataset = (
+            selected_dataset_order[-1] if selected_dataset_order else ""
+        )
+        last_mode = brute_force_modes[-1] if brute_force_modes else ""
         vm = "absolute"
         row_items: Dict[Tuple[str, str, str, str], List[np.ndarray]] = {
             (backbone, mode, dataset, row): []
@@ -5576,10 +5328,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             )
             needed_skip_datasets = {
                 dataset
-                for dataset in brute_force_datasets
+                for dataset in brute_force_detail_datasets
                 if need_all_skip_datasets or dataset in selected_skip_dataset_set
             }
-            for dataset in brute_force_datasets:
+            for dataset in brute_force_detail_datasets:
                 if dataset not in needed_skip_datasets:
                     continue
                 scope_label = f"{backbone} · {dataset}"
@@ -5689,12 +5441,12 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             if STAGE2_MEAN_DATASET in selected_skip_dataset_set:
                 completed_skip_datasets = [
                     dataset
-                    for dataset in brute_force_datasets
+                    for dataset in brute_force_detail_datasets
                     if dataset in skip_maps_by_dataset
                 ]
                 missing_skip_datasets = [
                     dataset
-                    for dataset in brute_force_datasets
+                    for dataset in brute_force_detail_datasets
                     if dataset not in skip_maps_by_dataset
                 ]
                 mean_sources = [
@@ -5716,7 +5468,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 if show_remaining_pruning:
                     remaining_mean_sources = [
                         remaining_maps_by_dataset[dataset]
-                        for dataset in brute_force_datasets
+                        for dataset in brute_force_detail_datasets
                         if dataset in remaining_maps_by_dataset
                     ]
                     remaining_mean_maps = _mean_mode_metric_maps(
@@ -5732,7 +5484,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                         )
                     marginal_mean_sources = [
                         marginal_maps_by_dataset[dataset]
-                        for dataset in brute_force_datasets
+                        for dataset in brute_force_detail_datasets
                         if dataset in marginal_maps_by_dataset
                     ]
                     marginal_mean_maps = _mean_mode_metric_maps(
@@ -5754,7 +5506,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 source_datasets = (
                     [
                         dataset
-                        for dataset in brute_force_datasets
+                        for dataset in brute_force_detail_datasets
                         if dataset in skip_maps_by_dataset
                     ]
                     if dataset_scope == STAGE2_MEAN_DATASET
@@ -5771,7 +5523,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 remaining_source_datasets = (
                     [
                         dataset
-                        for dataset in brute_force_datasets
+                        for dataset in brute_force_detail_datasets
                         if dataset in remaining_maps_by_dataset
                     ]
                     if dataset_scope == STAGE2_MEAN_DATASET
@@ -5788,7 +5540,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 marginal_source_datasets = (
                     [
                         dataset
-                        for dataset in brute_force_datasets
+                        for dataset in brute_force_detail_datasets
                         if dataset in marginal_maps_by_dataset
                     ]
                     if dataset_scope == STAGE2_MEAN_DATASET
@@ -5806,18 +5558,24 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     mode_maps = skip_by_mode.get(mode)
                     if not mode_maps or num_layers <= 0:
                         continue
+                    show_detail_xlabels = (
+                        backbone == last_selected_backbone
+                        and dataset_scope == last_selected_dataset
+                        and mode == last_mode
+                    )
                     try:
                         cache_key = (
                             backbone,
                             dataset_scope,
                             tuple(source_datasets),
                             mode,
-                            "eight_metric_detail",
+                            "seven_metric_detail",
                             vm,
                             bool(show_colorbar_histogram),
                             bool(normalize_seven_metrics),
                             bool(show_remaining_pruning),
-                            "publication_detail_titles_v2",
+                            "publication_detail_columns_v3",
+                            bool(show_detail_xlabels),
                         )
                         images = brute_force_render_cache.get(cache_key)
                         if images is None:
@@ -5831,9 +5589,13 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                 normalized_input=False,
                                 colorbar_decimals=1,
                                 compact_annotations=True,
-                                label_fontsize=22,
+                                label_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
                                 publication_titles=True,
-                                title_fontsize=22,
+                                title_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
+                                cmap="coolwarm",
+                                show_title=False,
+                                show_xlabels=show_detail_xlabels,
+                                show_ylabel=True,
                             )
                             point_images = _render_skip_gallery(
                                 mode_maps,
@@ -5845,25 +5607,34 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                 normalized_input=False,
                                 colorbar_decimals=1,
                                 compact_annotations=True,
-                                label_fontsize=22,
+                                label_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
                                 publication_titles=True,
-                                title_fontsize=22,
-                            )
-                            mean_image = _render_skip_seven_metric_mean(
-                                mode_maps,
-                                num_layers,
-                                value_mode=vm,
-                                show_colorbar_histogram=bool(show_colorbar_histogram),
-                                normalize_seven_metrics=True,
-                                normalized_input=False,
-                                compact_annotations=True,
-                                show_xlabel=True,
+                                title_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
+                                cmap="coolwarm",
+                                show_title=False,
+                                show_xlabels=show_detail_xlabels,
                                 show_ylabel=False,
-                                label_fontsize=22,
-                                title_fontsize=22,
                             )
-                            images = [*pose_images, *point_images, mean_image]
+                            images = [*pose_images, *point_images]
                             if show_remaining_pruning:
+                                # The remaining-pruning comparison is currently
+                                # disabled in this tab, but keep its legacy
+                                # eight-metric cache layout internally intact.
+                                mean_image = _render_skip_seven_metric_mean(
+                                    mode_maps,
+                                    num_layers,
+                                    value_mode=vm,
+                                    show_colorbar_histogram=bool(
+                                        show_colorbar_histogram
+                                    ),
+                                    normalize_seven_metrics=True,
+                                    normalized_input=False,
+                                    compact_annotations=True,
+                                    show_xlabel=True,
+                                    show_ylabel=False,
+                                    label_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
+                                    title_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
+                                )
                                 remaining_mode_maps = (
                                     remaining_maps_by_scope
                                     .get(dataset_scope, {})
@@ -5881,7 +5652,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                         colorbar_decimals=1,
                                         title_prefix="Remaining",
                                         compact_annotations=True,
-                                        label_fontsize=22,
+                                        label_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
                                     )
                                     remaining_point = _render_skip_gallery(
                                         remaining_mode_maps,
@@ -5894,7 +5665,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                         colorbar_decimals=1,
                                         title_prefix="Remaining",
                                         compact_annotations=True,
-                                        label_fontsize=22,
+                                        label_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
                                     )
                                     remaining_mean = _render_skip_seven_metric_mean(
                                         remaining_mode_maps,
@@ -5907,7 +5678,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                         compact_annotations=True,
                                         show_xlabel=True,
                                         show_ylabel=False,
-                                        label_fontsize=22,
+                                        label_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
                                     )
                                     images = [
                                         *pose_images,
@@ -5942,7 +5713,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                                 "Marginal vs base-pruned"
                                             ),
                                             compact_annotations=True,
-                                            label_fontsize=22,
+                                            label_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
                                         )
                                         marginal_point = _render_skip_gallery(
                                             marginal_mode_maps,
@@ -5961,7 +5732,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                                 "Marginal vs base-pruned"
                                             ),
                                             compact_annotations=True,
-                                            label_fontsize=22,
+                                            label_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
                                         )
                                         marginal_mean = (
                                             _render_skip_seven_metric_mean(
@@ -5979,7 +5750,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                                                 compact_annotations=True,
                                                 show_xlabel=True,
                                                 show_ylabel=False,
-                                                label_fontsize=22,
+                                                label_fontsize=BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE,
                                             )
                                         )
                                     if (
@@ -6017,7 +5788,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                             row_items[(backbone, mode, dataset_scope, "point")] = images[8:]
                         else:
                             row_items[(backbone, mode, dataset_scope, "pose")] = images[:4]
-                            row_items[(backbone, mode, dataset_scope, "point")] = images[4:8]
+                            row_items[(backbone, mode, dataset_scope, "point")] = images[4:7]
                         if images:
                             rendered_scope_keys.add(
                                 ("skip", backbone, dataset_scope)
@@ -6036,7 +5807,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 for dataset in dataset_scopes:
                     for row in ("pose", "point"):
                         items = row_items[(backbone, mode, dataset, row)]
-                        gallery_updates.append(gr.update(value=items, columns=4))
+                        gallery_updates.append(
+                            gr.update(value=items, columns=min(4, len(items) or 4))
+                        )
                         visible = bool(items)
                         visibility_updates.append(gr.update(visible=visible))
                         backbone_has_rows = backbone_has_rows or visible
@@ -6234,6 +6007,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         return tuple(updates)
 
     def _refresh_stage2_full(
+        dataset: str,
         selected_backbones: List[str] | None,
         scene_id: str,
         value_mode: str,
@@ -6245,6 +6019,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         show_colorbar_histogram: bool,
     ):
         controller.stage2_request_seq += 1
+        dataset_key = str(dataset or "").strip().lower()
+        if dataset_key and dataset_key != controller.dataset:
+            controller.switch_dataset(dataset_key)
         return _stage2_all_backbones_bundle(
             selected_backbones,
             scene_id,
@@ -6258,148 +6035,84 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             force_gallery_refresh=False,
         )
 
-    def _refresh_cka_heatmaps(
-        token_region: str,
-        sim_cutoff_value: float,
-        *,
-        datasets: Sequence[str] = cka_datasets,
-        models: Sequence[str] = cka_models,
-        token_regions: Sequence[str] = cka_token_regions,
-        artifact_stage: str = "redundancy",
-        render_cache: Dict[Tuple[Any, ...], Optional[np.ndarray]] = cka_render_cache,
-    ) -> Tuple[Any, ...]:
-        region = str(token_region or "").strip().lower()
-        if region not in set(token_regions):
-            region = token_regions[0] if token_regions else "special"
-        try:
-            sim_cutoff = float(sim_cutoff_value)
-        except (TypeError, ValueError):
-            sim_cutoff = 0.0
-        if not math.isfinite(sim_cutoff):
-            sim_cutoff = 0.0
-        sim_cutoff = float(np.clip(sim_cutoff, 0.0, 1.0))
-        cutoff_key = _sim_cutoff_key(sim_cutoff)
-
-        images: List[Any] = []
-        notes: List[str] = []
-        rendered = 0
-        dataset_total = len(datasets) * len(models)
-        row_mean_total = len(models)
-        display_total = dataset_total + row_mean_total
-        for backbone in models:
-            for dataset in datasets:
-                cache_key = (
-                    artifact_stage,
-                    str(dataset),
-                    str(backbone),
-                    region,
-                    cutoff_key,
-                )
-                if cache_key in render_cache:
-                    image = render_cache[cache_key]
-                    detail = "cached" if image is not None else "missing"
-                else:
-                    image, detail = _render_cka_heatmap_for_backbone(
-                        dataset=str(dataset),
-                        backbone=str(backbone),
-                        token_region=region,
-                        sim_cutoff=sim_cutoff,
-                        artifact_stage=artifact_stage,
-                        output_root=controller.v3_output_root,
-                    )
-                    render_cache[cache_key] = image
-                if image is not None:
-                    rendered += 1
-                elif len(notes) < 6:
-                    notes.append(f"{dataset}/{backbone}: {detail}")
-                images.append(image)
-
-            row_mean_cache_key = (
-                artifact_stage,
-                "mean",
-                str(backbone),
-                region,
-                cutoff_key,
-            )
-            if row_mean_cache_key in render_cache:
-                row_mean_image = render_cache[row_mean_cache_key]
-                row_mean_detail = "cached" if row_mean_image is not None else "missing"
-            else:
-                try:
-                    row_mean_dataset = ",".join(str(dataset) for dataset in datasets)
-                    row_mean_image, row_mean_detail = _render_cka_heatmap_for_backbone(
-                        dataset=row_mean_dataset,
-                        backbone=str(backbone),
-                        token_region=region,
-                        sim_cutoff=sim_cutoff,
-                        artifact_stage=artifact_stage,
-                        output_root=controller.v3_output_root,
-                    )
-                except ValueError as exc:
-                    row_mean_image, row_mean_detail = None, str(exc)
-                render_cache[row_mean_cache_key] = row_mean_image
-            if row_mean_image is not None:
-                rendered += 1
-            elif len(notes) < 6:
-                notes.append(f"mean/{backbone}: {row_mean_detail}")
-            images.append(row_mean_image)
-
-        region_label = region if region != "all" else "all-token"
-        info = (
-            f"scene=mean | token={region_label} | metric=CKA | "
-            f"rendered={rendered}/{display_total} | cutoff={cutoff_key / 1000.0:.3f}"
-        )
-        if notes:
-            info += " | " + " ; ".join(notes)
-            missing_more = display_total - rendered - len(notes)
-            if missing_more > 0:
-                info += f" ; +{missing_more} more missing cells"
-        return tuple([*images, info])
-
-    def _refresh_remaining_cka_heatmaps(
-        token_region: str,
-        sim_cutoff_value: float,
-    ) -> Tuple[Any, ...]:
-        before = _refresh_cka_heatmaps(
-            token_region,
-            sim_cutoff_value,
-            datasets=remaining_cka_datasets,
-            models=remaining_cka_models,
-            token_regions=remaining_cka_token_regions,
-            artifact_stage="redundancy",
-            render_cache=cka_render_cache,
-        )
-        after = _refresh_cka_heatmaps(
-            token_region,
-            sim_cutoff_value,
-            datasets=remaining_cka_datasets,
-            models=remaining_cka_models,
-            token_regions=remaining_cka_token_regions,
-            artifact_stage=remaining_cka_stage,
-            render_cache=remaining_cka_render_cache,
-        )
-        cell_count = len(remaining_cka_models) * (len(remaining_cka_datasets) + 1)
-        before_images = list(before[:cell_count])
-        after_images = list(after[:cell_count])
-        comparison_images: List[Any] = []
-        for cell_index in range(cell_count):
-            comparison_images.extend(
-                [before_images[cell_index], after_images[cell_index]]
-            )
-        before_info = str(before[cell_count]) if len(before) > cell_count else ""
-        after_info = str(after[cell_count]) if len(after) > cell_count else ""
-        info = f"Before pruning: {before_info} | After pruning: {after_info}"
-        return tuple([*comparison_images, info])
-
     with gr.Blocks(
         title="Results Panel",
         fill_width=True,
         css="""
+        /* Browser-only typography.  Plot typography is configured separately in
+           the Matplotlib renderers and is intentionally unaffected by this CSS. */
+        .results-tabs {
+            --panel-text-size: 0.925rem;
+            --panel-muted-size: 0.825rem;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system,
+                BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-size: var(--panel-text-size);
+            line-height: 1.5;
+        }
+        .results-tabs > .tab-wrapper {
+            min-height: 46px !important;
+            height: auto !important;
+            margin: 0 0 6px !important;
+            padding: 0 4px 6px !important;
+        }
+        .results-tabs > .tab-wrapper > .tab-container {
+            height: 42px !important;
+            gap: 2px;
+        }
+        .results-tabs > .tab-wrapper > .tab-container > button {
+            height: 40px !important;
+            padding: 0 clamp(9px, 1vw, 14px) !important;
+            font-family: inherit !important;
+            font-size: clamp(0.78rem, 0.72rem + 0.18vw, 0.9rem) !important;
+            font-weight: 600 !important;
+            line-height: 1.15 !important;
+            letter-spacing: 0.005em;
+        }
+        .results-tabs > .tab-wrapper .overflow-dropdown button {
+            padding: 8px 12px !important;
+            font-family: inherit !important;
+            font-size: 0.875rem !important;
+            font-weight: 500 !important;
+            line-height: 1.3 !important;
+        }
+        .results-tabs > .tabitem {
+            gap: 14px !important;
+        }
+        .results-tabs > .tabitem .prose {
+            font-family: inherit;
+            font-size: var(--panel-text-size);
+            line-height: 1.55;
+        }
+        .results-tabs > .tabitem .prose h2 {
+            margin: 2px 0 4px !important;
+            font-size: clamp(1.25rem, 1.05rem + 0.55vw, 1.65rem) !important;
+            line-height: 1.25 !important;
+            font-weight: 700 !important;
+            letter-spacing: -0.015em;
+        }
+        .results-tabs > .tabitem .prose h3 {
+            margin: 4px 0 6px !important;
+            font-size: clamp(1.05rem, 0.98rem + 0.25vw, 1.25rem) !important;
+            line-height: 1.3 !important;
+            font-weight: 650 !important;
+        }
+        .results-tabs > .tabitem .prose h4 {
+            margin: 4px 0 6px !important;
+            font-size: clamp(0.95rem, 0.9rem + 0.18vw, 1.1rem) !important;
+            line-height: 1.35 !important;
+            font-weight: 650 !important;
+        }
+        .results-tabs > .tabitem .prose p {
+            margin-top: 0 !important;
+            margin-bottom: 8px !important;
+        }
         /* Let result panels use the browser width while keeping control columns
            at their existing minimum width.  All extra room goes to the display. */
         .control-column {
             flex-grow: 0 !important;
             flex-shrink: 0 !important;
+            align-self: flex-start !important;
+            gap: 10px !important;
         }
         .backbone-separator,
         .backbone-separator * {
@@ -6407,10 +6120,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             text-align: center !important;
         }
         .backbone-separator h3 {
-            margin: 6px 0 8px !important;
-            font-size: 30px !important;
-            line-height: 1.15 !important;
-            font-weight: 800 !important;
+            margin: 8px 0 10px !important;
+            font-size: clamp(1.1rem, 0.98rem + 0.45vw, 1.4rem) !important;
+            line-height: 1.25 !important;
+            font-weight: 700 !important;
         }
         .brute-force-dataset-heading,
         .brute-force-dataset-heading * {
@@ -6418,10 +6131,49 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             text-align: center !important;
         }
         .brute-force-dataset-heading h4 {
-            margin: 8px 0 12px !important;
-            font-size: 26px !important;
-            line-height: 1.15 !important;
-            font-weight: 800 !important;
+            margin: 6px 0 10px !important;
+            font-size: clamp(0.95rem, 0.88rem + 0.3vw, 1.2rem) !important;
+            line-height: 1.3 !important;
+            font-weight: 650 !important;
+        }
+        .brute-force-overview-info {
+            padding: 4px 2px !important;
+        }
+        .brute-force-overview-info .prose h3 {
+            margin: 4px 0 6px !important;
+            font-size: 0.95rem !important;
+            font-weight: 700 !important;
+        }
+        .brute-force-overview-info .prose p {
+            margin-bottom: 14px !important;
+            font-size: 0.84rem !important;
+            line-height: 1.55 !important;
+        }
+        .brute-force-overview-column-label-row {
+            display: grid !important;
+            grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+            width: 100% !important;
+            gap: 4px !important;
+            align-items: stretch !important;
+            margin-bottom: 2px !important;
+        }
+        .brute-force-overview-column-label {
+            min-width: 0 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            padding: 4px 6px !important;
+            text-align: center !important;
+        }
+        .brute-force-overview-column-label .prose,
+        .brute-force-overview-column-label p {
+            width: 100% !important;
+            margin: 0 !important;
+            font-size: clamp(0.78rem, 0.72rem + 0.22vw, 0.96rem) !important;
+            font-weight: 650 !important;
+            line-height: 1.3 !important;
+            text-align: center !important;
+            overflow-wrap: anywhere !important;
         }
         .results-media, .results-gallery {
             width: 100%;
@@ -6490,19 +6242,19 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         .brute-force-overview-gallery [class*="caption"],
         .brute-force-overview-gallery figcaption,
         .brute-force-overview-gallery .caption-label {
-            font-size: 26px !important;
-            line-height: 1.2 !important;
-            font-weight: 800 !important;
-            min-height: 1.5em !important;
+            font-size: clamp(0.82rem, 0.76rem + 0.2vw, 1rem) !important;
+            line-height: 1.35 !important;
+            font-weight: 650 !important;
+            min-height: 2.7em !important;
             white-space: pre-line !important;
         }
         .similarity-metrics-gallery [class*="caption"],
         .similarity-metrics-gallery figcaption,
         .similarity-metrics-gallery .caption-label {
-            font-size: 26px !important;
-            line-height: 1.15 !important;
-            font-weight: 800 !important;
-            min-height: 1.4em !important;
+            font-size: clamp(0.8rem, 0.74rem + 0.2vw, 0.95rem) !important;
+            line-height: 1.35 !important;
+            font-weight: 650 !important;
+            min-height: 2.7em !important;
         }
         .similarity-column-label-row {
             display: grid !important;
@@ -6520,9 +6272,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             text-align: center !important;
             white-space: normal !important;
             overflow-wrap: anywhere !important;
-            font-size: 26px !important;
-            line-height: 1.2 !important;
-            font-weight: 800 !important;
+            font-size: clamp(0.78rem, 0.7rem + 0.25vw, 0.95rem) !important;
+            line-height: 1.3 !important;
+            font-weight: 650 !important;
         }
         .remaining-column-label-row {
             display: grid !important;
@@ -6540,9 +6292,9 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             text-align: center !important;
             white-space: normal !important;
             overflow-wrap: anywhere !important;
-            font-size: 26px !important;
-            line-height: 1.2 !important;
-            font-weight: 800 !important;
+            font-size: clamp(0.76rem, 0.68rem + 0.25vw, 0.92rem) !important;
+            line-height: 1.3 !important;
+            font-weight: 650 !important;
         }
         .remaining-single-row {
             flex-wrap: nowrap !important;
@@ -6557,61 +6309,16 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         .results-gallery .gallery-item {
             width: 100% !important;
         }
-        .pruning-plan-gallery.wrap,
-        .pruning-plan-gallery .grid-wrap,
-        .pruning-plan-gallery [class*="grid"] {
-            height: auto !important;
-            min-height: 0 !important;
-            max-height: none !important;
-            overflow: visible !important;
-            overflow-y: visible !important;
-        }
-        .pruning-plan-gallery .grid-wrap,
-        .pruning-plan-gallery [class*="grid"] {
-            grid-auto-flow: row !important;
-            align-content: start !important;
-        }
-        .pruning-plan-overview-gallery .grid-wrap,
-        .pruning-plan-overview-gallery [class*="grid"] {
-            grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
-        }
-        .pruning-plan-detail-gallery .grid-wrap,
-        .pruning-plan-detail-gallery [class*="grid"] {
-            grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
-        }
-        .pruning-plan-gallery button,
-        .pruning-plan-gallery .thumbnail-item,
-        .pruning-plan-gallery .gallery-item,
-        .pruning-plan-gallery [class*="thumbnail"],
-        .pruning-plan-gallery [class*="gallery-item"],
-        .pruning-plan-gallery [class*="image"],
-        .pruning-plan-gallery [class*="preview"] {
-            height: auto !important;
-            min-height: 0 !important;
-            max-height: none !important;
-            aspect-ratio: auto !important;
-            overflow: visible !important;
-        }
-        .pruning-plan-gallery img {
-            display: block !important;
-            width: 100% !important;
-            height: auto !important;
-            max-height: none !important;
-            object-fit: contain !important;
-        }
-        .pruning-plan-gallery [class*="caption"],
-        .pruning-plan-gallery figcaption,
-        .pruning-plan-gallery .caption-label,
         .recovery-overview-gallery [class*="caption"],
         .recovery-overview-gallery figcaption,
         .recovery-overview-gallery .caption-label {
             width: 100% !important;
-            font-size: 30px !important;
-            line-height: 1.15 !important;
-            font-weight: 800 !important;
+            font-size: clamp(0.82rem, 0.74rem + 0.3vw, 1.05rem) !important;
+            line-height: 1.35 !important;
+            font-weight: 650 !important;
             text-align: center !important;
             justify-content: center !important;
-            min-height: 1.4em !important;
+            min-height: 2.7em !important;
         }
         .recovery-eval-gallery.wrap,
         .lora-eval-gallery.wrap,
@@ -6727,106 +6434,10 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             max-height: none !important;
             vertical-align: bottom !important;
         }
-        .brute-force-detail-gallery.wrap,
-        .brute-force-detail-gallery .grid-wrap,
-        .brute-force-detail-gallery [class*="grid"] {
-            min-height: 0 !important;
-            height: auto !important;
-            max-height: none !important;
-            overflow: visible !important;
-        }
-        .brute-force-detail-gallery .thumbnail-item,
-        .brute-force-detail-gallery .thumbnail-small,
-        .brute-force-detail-gallery button.thumbnail-item,
-        .brute-force-detail-gallery button {
-            height: auto !important;
-            min-height: 0 !important;
-            max-height: none !important;
-            aspect-ratio: auto !important;
-        }
-        .brute-force-detail-gallery .thumbnail-item > div,
-        .brute-force-detail-gallery button > div,
-        .brute-force-detail-gallery [class*="image"],
-        .brute-force-detail-gallery [class*="preview"] {
-            height: auto !important;
-            min-height: 0 !important;
-            max-height: none !important;
-            aspect-ratio: auto !important;
-            overflow: visible !important;
-        }
         .brute-force-unavailable-dataset {
             opacity: 0.48 !important;
             filter: grayscale(1);
             pointer-events: none !important;
-        }
-        .cka-heatmap-matrix {
-            gap: 8px !important;
-            min-width: 0 !important;
-            overflow-x: hidden !important;
-        }
-        .cka-grid-row,
-        .cka-grid-header {
-            align-items: center !important;
-            flex-wrap: nowrap !important;
-            width: 100% !important;
-            min-width: 0 !important;
-        }
-        .cka-grid-row > *,
-        .cka-grid-header > * {
-            min-width: 0 !important;
-        }
-        .cka-grid-cell,
-        .cka-grid-dataset-label {
-            flex: 1 1 0 !important;
-        }
-        .cka-grid-corner,
-        .cka-grid-model-label {
-            flex: 0 0 96px !important;
-            width: 96px !important;
-        }
-        .cka-grid-model-label {
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            text-align: center !important;
-        }
-        .cka-grid-model-label .prose,
-        .cka-grid-model-label p {
-            margin: 0 !important;
-            width: 100% !important;
-            text-align: center !important;
-            font-size: 1.35rem !important;
-            line-height: 1.25 !important;
-        }
-        .cka-grid-dataset-label {
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            text-align: center !important;
-        }
-        .cka-grid-dataset-label .prose,
-        .cka-grid-dataset-label p {
-            margin: 0 !important;
-            width: 100% !important;
-            text-align: center !important;
-            font-size: clamp(0.8rem, 1.1vw, 1.1rem) !important;
-            line-height: 1.25 !important;
-            overflow-wrap: anywhere !important;
-        }
-        .cka-heatmap-image {
-            width: 100% !important;
-            min-width: 0 !important;
-        }
-        .cka-heatmap-image img,
-        .cka-heatmap-image [class*="image"] img {
-            display: block !important;
-            height: auto !important;
-            max-height: none !important;
-        }
-        .cka-heatmap-image .label-wrap,
-        .cka-heatmap-image > label,
-        .cka-heatmap-image .image-label {
-            display: none !important;
         }
         /* Pct radio option: keep visible but non-clickable when Stage1 eval is missing (structure varies by Gradio version). */
         .hm-value-mode-pct-locked .wrap label:last-of-type,
@@ -6928,9 +6539,25 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             color: #64748b;
             font-size: 15.5px;
         }
+        @media (max-width: 900px) {
+            .results-tabs > .tab-wrapper > .tab-container > button {
+                padding-inline: 9px !important;
+                font-size: 0.78rem !important;
+            }
+            .results-tabs > .tabitem {
+                gap: 10px !important;
+            }
+            .control-column {
+                width: 100% !important;
+                max-width: none !important;
+            }
+            .remaining-single-row {
+                flex-wrap: wrap !important;
+            }
+        }
         """,
     ) as demo:
-        with gr.Tabs():
+        with gr.Tabs(elem_classes=["results-tabs"]):
             # pair_ui = build_pair_tab(
             #     controller=controller,
             #     dataset_choices=dataset_choices,
@@ -6974,7 +6601,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 stage2_token_row_patch=STAGE2_TOKEN_ROW_PATCH,
                 stage2_token_row_all=STAGE2_TOKEN_ROW_ALL,
                 stage2_token_row_mean=STAGE2_TOKEN_ROW_MEAN,
-                stage2_token_row_min=STAGE2_TOKEN_ROW_MIN,
                 heatmaps_resolve_filters_cb=_heatmaps_resolve_filters,
                 refresh_stage2_full_cb=_refresh_stage2_full,
             )
@@ -6996,11 +6622,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                 output_root=Path(lora_root),
             )
 
-            build_recovery_backbone_comparison_tab(
-                blocks=demo,
-                output_root=Path(lora_root),
-            )
-
             build_recovery_backbone_remaining_comparison_tab(
                 blocks=demo,
                 output_root=Path(lora_root),
@@ -7009,14 +6630,6 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             build_backbone_efficiency_tab(
                 blocks=demo,
                 output_root=Path(lora_root),
-            )
-
-            build_cka_heatmaps_tab(
-                datasets=cka_datasets,
-                models=cka_models,
-                token_regions=cka_token_regions,
-                refresh_cka_heatmaps_cb=_refresh_cka_heatmaps,
-                tab_id="cka_heatmaps",
             )
 
             build_summary_tab(blocks=demo, output_root=OUTPUT_ROOT_DEFAULT, tab_id="eval_summary")
@@ -7043,8 +6656,7 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
         dataset_switch_outputs.extend(
             [
             heatmaps_ui["stage2_scene_dd"],
-            *heatmaps_ui["stage2_mode_galleries"],
-            *heatmaps_ui["stage2_row_body_cols"],
+            heatmaps_ui["stage2_image"],
             heatmaps_ui["stage2_info"],
             heatmaps_ui["stage2_value_mode"],
             heatmaps_ui["stage2_pct_clip_slider"],
@@ -7067,16 +6679,23 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             heatmaps_ui["stage2_colorbar_histogram"],
         ]
 
+        def _heatmaps_scope_changed_composite(*args: Any) -> Tuple[Any, ...]:
+            raw = _heatmaps_scope_changed(*args)
+            return (
+                *raw[:3],
+                *heatmaps_ui["compose_raw_result"](raw[3:]),
+            )
+
         # pair_ui["dataset_dd"].change(...)  # Pair Attention tab disabled
         heatmaps_ui["stage2_dataset_dd"].change(
-            _heatmaps_scope_changed,
+            _heatmaps_scope_changed_composite,
             inputs=scope_switch_inputs,
             outputs=dataset_switch_outputs,
             show_progress="minimal",
             trigger_mode="always_last",
         )
         heatmaps_ui["stage2_backbone_filter"].change(
-            _heatmaps_scope_changed,
+            _heatmaps_scope_changed_composite,
             inputs=scope_switch_inputs,
             outputs=dataset_switch_outputs,
             show_progress="minimal",

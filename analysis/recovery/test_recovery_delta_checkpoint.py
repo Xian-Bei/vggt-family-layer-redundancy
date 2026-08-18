@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from analysis.recovery.operators import (
+    BoundaryRecovery,
     apply_recovery_weights,
     compact_recovery_operators,
     install_recovery_modules,
@@ -93,6 +94,27 @@ def test_apply_recovery_weights_loads_installed_patch() -> None:
 
     patch_weight = model.block.recovery_patch_frame_1.weight.detach().cpu()
     assert torch.equal(patch_weight, weight)
+
+
+def test_boundary_recovery_disables_autocast_and_preserves_input_dtype() -> None:
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(7)
+    weight = torch.randn(64, 64, device=device, generator=generator)
+    patch = BoundaryRecovery(weight).to(device)
+
+    x_fp32 = torch.randn(2, 5, 64, device=device, generator=generator)
+    expected_fp32 = torch.matmul(x_fp32, weight)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        actual_fp32 = patch(x_fp32)
+    assert actual_fp32.dtype == torch.float32
+    torch.testing.assert_close(actual_fp32, expected_fp32, rtol=0.0, atol=0.0)
+
+    x_bf16 = x_fp32.to(torch.bfloat16)
+    expected_bf16 = torch.matmul(x_bf16.float(), weight).to(torch.bfloat16)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        actual_bf16 = patch(x_bf16)
+    assert actual_bf16.dtype == torch.bfloat16
+    torch.testing.assert_close(actual_bf16, expected_bf16, rtol=0.0, atol=0.0)
 
 
 def test_adjacent_dropped_unit_recovery_patches_compose_in_model_order() -> None:
@@ -263,6 +285,11 @@ def test_omega_register_boundary_and_adjacent_identity_patch_compose() -> None:
 
 def load_tests(_loader, tests, _pattern):
     tests.addTest(unittest.FunctionTestCase(test_apply_recovery_weights_loads_installed_patch))
+    tests.addTest(
+        unittest.FunctionTestCase(
+            test_boundary_recovery_disables_autocast_and_preserves_input_dtype
+        )
+    )
     tests.addTest(
         unittest.FunctionTestCase(
             test_adjacent_dropped_unit_recovery_patches_compose_in_model_order

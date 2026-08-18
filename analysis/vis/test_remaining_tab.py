@@ -25,7 +25,7 @@ class RemainingTabTest(unittest.TestCase):
         self.assertEqual(item[1], "vggt · detail")
         gr.Gallery().postprocess([item])
 
-    def test_tab_has_one_two_column_gallery_per_backbone(self) -> None:
+    def test_tab_has_one_composite_image(self) -> None:
         with gr.Blocks():
             ui = build_remaining_tab(
                 dataset_choices=["min", "mean", "scannet_dev50"],
@@ -36,15 +36,10 @@ class RemainingTabTest(unittest.TestCase):
 
         self.assertEqual(ui["tab"].label, "Remaining")
         self.assertEqual(ui["dataset"].value, "mean")
-        self.assertEqual(len(ui["galleries"]), 2)
-        self.assertEqual(len(ui["backbone_rows"]), 2)
-        self.assertTrue(all(gallery.columns == 2 for gallery in ui["galleries"]))
-        self.assertTrue(
-            all(
-                gallery.label == "Original / marginal 7-metric mean"
-                for gallery in ui["galleries"]
-            )
-        )
+        self.assertNotIn("min", ui["dataset"].choices)
+        self.assertIsInstance(ui["image"], gr.Image)
+        self.assertEqual(ui["image"].type, "numpy")
+        self.assertEqual(ui["image"].label, "Original / marginal 7-metric mean")
 
 
 if __name__ == "__main__":

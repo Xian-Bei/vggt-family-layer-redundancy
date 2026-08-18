@@ -5,7 +5,15 @@ import os.path as osp
 from collections import deque
 from base import BaseStereoViewDataset
 import dataset_utils.cropping as cropping
+from analysis.datasets.frame_selection import pick_frame_indices
 from analysis.eval.eval_utils import imread_cv2, shuffle_deque
+
+
+def _select_eval_img_idxs(img_idxs, max_frames):
+    """Apply the public 7andn frame cap before any frame is decoded."""
+    ordered = list(img_idxs)
+    selected = pick_frame_indices(len(ordered), int(max_frames))
+    return [ordered[i] for i in selected]
 
 
 class SevenScenes(BaseStereoViewDataset):
@@ -22,6 +30,7 @@ class SevenScenes(BaseStereoViewDataset):
         rebuttal=False,
         shuffle_seed=-1,
         kf_every=1,
+        eval_max_frames=0,
         *args,
         ROOT,
         **kwargs,
@@ -35,6 +44,7 @@ class SevenScenes(BaseStereoViewDataset):
         self.test_id = test_id
         self.full_video = full_video
         self.kf_every = kf_every
+        self.eval_max_frames = int(eval_max_frames)
         self.seq_id = seq_id
         self.rebuttal = rebuttal
         self.shuffle_seed = shuffle_seed
@@ -122,11 +132,15 @@ class SevenScenes(BaseStereoViewDataset):
         fx, fy, cx, cy = 525, 525, 320, 240
         intrinsics_ = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
 
-        views = []
         imgs_idxs = deque(img_idxs)
         if self.shuffle_seed >= 0:
             imgs_idxs = shuffle_deque(imgs_idxs)
+        if self.eval_max_frames > 0 and len(imgs_idxs) > self.eval_max_frames:
+            imgs_idxs = deque(
+                _select_eval_img_idxs(imgs_idxs, self.eval_max_frames)
+            )
 
+        views = []
         while len(imgs_idxs) > 0:
             im_idx = imgs_idxs.popleft()
             impath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.color.png")

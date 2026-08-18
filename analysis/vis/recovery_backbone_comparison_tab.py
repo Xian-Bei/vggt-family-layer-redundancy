@@ -12,10 +12,13 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import MultipleLocator
 
 from analysis.vis.display_names import backbone_display_name
+from analysis.vis.composite import Cell, Section, compose_sections, to_image
 
 from analysis.prune_plan.eval_plots import (
     GT_MEAN_METRICS,
     METRIC_HEADERS,
+    PUBLICATION_METRIC_SUBPLOT_HEIGHT,
+    PUBLICATION_METRIC_SUBPLOT_WIDTH,
     RECOVERY_METRIC_GRID,
     STRATEGY_PLOT_COLORS,
     add_recovery_comparison_strategies,
@@ -45,7 +48,17 @@ from analysis.vis.recovery_overview_tab import (
     discover_recovery_overview_datasets,
     discover_recovery_overview_options,
 )
-from analysis.vis.dataset_average_warning import format_incomplete_average_warning
+from analysis.vis.dataset_average_warning import (
+    dataset_display_choices,
+    format_incomplete_average_warning,
+)
+
+# Recovery Remaining typography and outer-label spacing (pixels).
+RECOVERY_REMAINING_SUBPLOT_FONT_SIZE = 18
+RECOVERY_REMAINING_OUTER_FONT_SIZE = 26
+RECOVERY_REMAINING_LEFT_LABEL_TO_IMAGE_GAP = 0
+RECOVERY_REMAINING_TOP_LABEL_TO_IMAGE_GAP = 0
+RECOVERY_REMAINING_BOTTOM_LABEL_TO_IMAGE_GAP = 0
 
 
 _PRUNING_OVERVIEW_COLOR_KEYS = (
@@ -65,6 +78,35 @@ _PRUNE_STRATEGY_FAMILIES = ("gt", "ours")
 _MIN_PRUNE_STRATEGY = "min"
 _PRUNE_STRUCTURES = ("single", "double")
 _TESTTIME_MARKERS = ("X", "D", "P", "*", "h", "v", "<", ">")
+_RECOVERY_METHOD_LEGEND_LABELS = {
+    "recovery_ghost_interval_sequential": "Ours",
+}
+_COMPRESSION_LEGEND_LABELS = {
+    "fastvggt_m0_r0p9": "FastVGGT",
+}
+
+
+def _compose_recovery_remaining(value: Any) -> np.ndarray:
+    image = to_image(value)
+    if image is None:
+        raise ValueError("No recovery-remaining image was returned.")
+    return compose_sections(
+        [Section(columns=1, cells=[Cell(image=image)])],
+        outer_font_size=RECOVERY_REMAINING_OUTER_FONT_SIZE,
+        left_label_to_image_gap=RECOVERY_REMAINING_LEFT_LABEL_TO_IMAGE_GAP,
+        top_label_to_image_gap=RECOVERY_REMAINING_TOP_LABEL_TO_IMAGE_GAP,
+        bottom_label_to_image_gap=RECOVERY_REMAINING_BOTTOM_LABEL_TO_IMAGE_GAP,
+    )
+
+
+def _recovery_method_legend_label(method: str) -> str:
+    return _RECOVERY_METHOD_LEGEND_LABELS.get(
+        str(method), str(method).removeprefix("recovery_")
+    )
+
+
+def _structure_legend_label(structure: str) -> str:
+    return "Single" if str(structure) == "single" else "Multi"
 
 
 def _is_no_recovery_strategy(strategy_key: str) -> bool:
@@ -384,7 +426,10 @@ def _collapse_min_prune_strategies(
                 winner_variants[drop_key] = variant
         if winners:
             selected[target_method] = {
-                "display_name": f"{method.removeprefix('recovery_')} · min_{structure}",
+                "display_name": (
+                    f"{_recovery_method_legend_label(method)} · "
+                    f"{_structure_legend_label(structure)}"
+                ),
                 "points": winners,
             }
 
@@ -435,7 +480,7 @@ def _collapse_min_prune_strategies(
                 }
         if baseline_points:
             selected[f"no_recovery_{structure}"] = {
-                "display_name": f"No recovery · {method.removeprefix('recovery_')} winner",
+                "display_name": f"No Recovery · {_structure_legend_label(structure)}",
                 "points": baseline_points,
             }
 
@@ -469,12 +514,14 @@ def _render_combined_figure(
     payloads: Sequence[Tuple[str, Dict[str, Any]]],
     *,
     method_keys: Sequence[str],
-    title: str,
     show_no_recovery: bool = True,
     total_units_by_backbone: Dict[str, int] | None = None,
     halve_x_axis: bool = False,
     metric_ranges: Dict[str, Tuple[float, float]] | None = None,
 ) -> Any | None:
+    axis_font_size = float(RECOVERY_REMAINING_SUBPLOT_FONT_SIZE)
+    tick_font_size = float(RECOVERY_REMAINING_SUBPLOT_FONT_SIZE)
+    legend_font_size = float(RECOVERY_REMAINING_SUBPLOT_FONT_SIZE)
     strategy_keys = tuple(
         dict.fromkeys(
             (*_BASELINE_STRATEGIES, *method_keys)
@@ -485,7 +532,15 @@ def _render_combined_figure(
     ranges = metric_ranges or _global_metric_ranges(
         [payload for _, payload in payloads], strategy_keys
     )
-    fig, axes = plt.subplots(2, 4, figsize=(29.6, 11.6), squeeze=False)
+    fig, axes = plt.subplots(
+        2,
+        4,
+        figsize=(
+            PUBLICATION_METRIC_SUBPLOT_WIDTH * 4,
+            PUBLICATION_METRIC_SUBPLOT_HEIGHT * 2,
+        ),
+        squeeze=False,
+    )
     any_data = False
     backbone_handles: List[Line2D] = []
     present_styles: Dict[str, str] = {}
@@ -617,13 +672,15 @@ def _render_combined_figure(
 
     for panel_idx, metric in enumerate(sum((tuple(row) for row in RECOVERY_METRIC_GRID), ())):
         ax = axes.flat[panel_idx]
-        ax.set_title(
+        ax.set_ylabel(
             METRIC_HEADERS.get(metric, metric),
-            fontsize=15,
+            fontsize=axis_font_size,
             fontweight="bold",
         )
         x_label = "Remaining layers" if total_units_by_backbone is not None else "Dropped units"
-        ax.tick_params(axis="both", labelsize=15)
+        ax.tick_params(
+            axis="both", labelsize=tick_font_size
+        )
         ax.set_xlim(left=0)
         ax.xaxis.set_major_locator(MultipleLocator(2))
         ax.grid(True, alpha=.25)
@@ -656,41 +713,38 @@ def _render_combined_figure(
             [], [], color="#333333", linestyle="None",
             marker=compression_markers[key], markersize=9,
             markerfacecolor="#999999", markeredgecolor="black",
-            label=f"Test-time · {label}",
+            label=_COMPRESSION_LEGEND_LABELS.get(key, label),
         )
         for key, label in present_compressions.items()
     ]
-    fig.legend(
+    legend = fig.legend(
         handles=[*backbone_handles, *style_handles, *compression_handles, upper_handle],
         loc="upper center",
         bbox_to_anchor=(.5, .958),
         ncol=max(
             1,
-            min(
-                6,
-                len(backbone_handles) + len(style_handles)
-                + len(compression_handles) + 1,
-            ),
+            len(backbone_handles) + len(style_handles)
+            + len(compression_handles) + 1,
         ),
-        fontsize=16,
+        fontsize=legend_font_size,
         markerscale=1.35,
         handlelength=2.8,
         handleheight=1.2,
         frameon=True,
     )
-    fig.suptitle(
-        f"{title}\nIndividual metrics: raw · 7-metric mean: globally normalized",
-        fontsize=19,
-        fontweight="bold",
-        y=.995,
-    )
+    for text in legend.get_texts():
+        text.set_fontweight("bold")
     shared_x_label = f"{x_label} ÷ 2" if halve_x_axis else x_label
-    fig.supxlabel(shared_x_label, fontsize=17, fontweight="bold")
-    fig.tight_layout(rect=(0, .035, 1, .88))
+    fig.supxlabel(
+        shared_x_label,
+        fontsize=axis_font_size,
+        fontweight="bold",
+    )
+    fig.tight_layout(rect=(0, .035, 1, .91))
     return fig
 
 
-def render_recovery_backbone_comparison(
+def render_recovery_backbone_remaining_comparison(
     output_root: Path,
     selected_backbones: Sequence[str] | None,
     selected_method: str | None,
@@ -699,9 +753,9 @@ def render_recovery_backbone_comparison(
     show_no_recovery: bool = True,
     prune_structures: Sequence[str] | None = None,
     *,
-    remaining_units: bool = False,
     halve_x_axis: bool = False,
 ) -> Tuple[List[Tuple[np.ndarray, str]], str]:
+    """Render the backbone comparison against units left after pruning."""
     backbones = list(dict.fromkeys(str(item) for item in (selected_backbones or ())))
     method = str(selected_method or "").strip()
     if not backbones:
@@ -739,11 +793,10 @@ def render_recovery_backbone_comparison(
     for backbone in backbones:
         root = Path(output_root) / backbone
         try:
-            if remaining_units:
-                total_units = int(load_prune_plan_bundle(root).get("num_units", 0))
-                if total_units <= 0:
-                    raise ValueError("prune plan bundle has no positive num_units")
-                total_units_by_backbone[backbone] = total_units
+            total_units = int(load_prune_plan_bundle(root).get("num_units", 0))
+            if total_units <= 0:
+                raise ValueError("prune plan bundle has no positive num_units")
+            total_units_by_backbone[backbone] = total_units
             pruning = collect_pruning_eval_payload(experiment_root=root, prune_plan_root=root)
             merged: Dict[str, Any] = {
                 "upper_average": {}, "strategies": {}, "testtime_points": []
@@ -798,14 +851,19 @@ def render_recovery_backbone_comparison(
                         continue
                     if source_key == method:
                         target_key = f"{method}_{variant}"
-                        display_name = f"{method.removeprefix('recovery_')} · {variant}"
+                        display_name = (
+                            f"{_recovery_method_legend_label(method)} · "
+                            f"{_structure_legend_label(structure)}"
+                        )
                     elif str(source_key).startswith("no_recovery"):
                         target_key = (
                             f"no_recovery_{variant}"
                             if strategy_family == _MIN_PRUNE_STRATEGY
                             else f"no_recovery_{structure}"
                         )
-                        display_name = f"No recovery · {variant}"
+                        display_name = (
+                            f"No Recovery · {_structure_legend_label(structure)}"
+                        )
                     else:
                         continue
                     merged["strategies"][target_key] = {
@@ -875,12 +933,8 @@ def render_recovery_backbone_comparison(
         loaded = collapsed
     fig = _render_combined_figure(
         loaded, method_keys=method_keys,
-        title=(
-            f"Backbone comparison: {method.removeprefix('recovery_')} · "
-            f"{strategy_family} ({', '.join(structures)}) · {dataset}"
-        ),
         show_no_recovery=bool(show_no_recovery),
-        total_units_by_backbone=total_units_by_backbone if remaining_units else None,
+        total_units_by_backbone=total_units_by_backbone,
         halve_x_axis=bool(halve_x_axis),
         metric_ranges=min_metric_ranges,
     )
@@ -895,37 +949,15 @@ def render_recovery_backbone_comparison(
         f"{sum(len(payload.get('testtime_points', ())) for _, payload in loaded)} matching "
         "test-time point(s); first 7 metrics are raw and the mean uses shared global ranges."
     )
-    caption = "Backbone comparison by remaining units" if remaining_units else "Backbone comparison"
-    return [(image, caption)], "\n".join([*warnings, *messages])
-
-
-def render_recovery_backbone_remaining_comparison(
-    output_root: Path,
-    selected_backbones: Sequence[str] | None,
-    selected_method: str | None,
-    dataset: str = "training average",
-    prune_strategy: str = "ours",
-    show_no_recovery: bool = True,
-    prune_structures: Sequence[str] | None = None,
-    *,
-    halve_x_axis: bool = False,
-) -> Tuple[List[Tuple[np.ndarray, str]], str]:
-    """Render the backbone comparison against units left after pruning."""
-    return render_recovery_backbone_comparison(
-        output_root,
-        selected_backbones,
-        selected_method,
-        dataset,
-        prune_strategy,
-        show_no_recovery,
-        prune_structures,
-        remaining_units=True,
-        halve_x_axis=halve_x_axis,
+    return [(image, "Backbone comparison by remaining units")], "\n".join(
+        [*warnings, *messages]
     )
 
 
-def _build_recovery_backbone_comparison_tab(
-    *, blocks: gr.Blocks, output_root: Path, remaining_units: bool
+def build_recovery_backbone_remaining_comparison_tab(
+    *,
+    blocks: gr.Blocks,
+    output_root: Path,
 ) -> Dict[str, Any]:
     backbones, methods = discover_recovery_overview_options(Path(output_root))
     datasets = discover_recovery_overview_datasets(Path(output_root))
@@ -939,28 +971,18 @@ def _build_recovery_backbone_comparison_tab(
         selected_backbones, selected_method, dataset, prune_strategy,
         prune_structures, show_no_recovery, halve_x_axis,
     ):
-        renderer = (
-            render_recovery_backbone_remaining_comparison
-            if remaining_units
-            else render_recovery_backbone_comparison
-        )
-        images, status_value = renderer(
+        images, status_value = render_recovery_backbone_remaining_comparison(
             Path(output_root), selected_backbones, selected_method, dataset,
             prune_strategy, show_no_recovery, prune_structures,
             halve_x_axis=halve_x_axis,
         )
-        return (images[0][0] if images else None), status_value
+        return (
+            _compose_recovery_remaining(images[0][0]) if images else None,
+            status_value,
+        )
 
-    tab_label = (
-        "Recovery Remaining"
-        if remaining_units
-        else "Recovery Backbone"
-    )
-    tab_id = (
-        "recovery_backbone_remaining_comparison"
-        if remaining_units
-        else "recovery_backbone_comparison"
-    )
+    tab_label = "Recovery Remaining"
+    tab_id = "recovery_backbone_remaining_comparison"
     with gr.Tab(tab_label, id=tab_id) as tab:
         gr.Markdown(f"## {tab_label}")
         gr.Markdown(
@@ -972,11 +994,7 @@ def _build_recovery_backbone_comparison_tab(
             "double pruning at every drop count, using the 7-metric mean to keep each winning "
             "point's metrics together. No recovery follows that winner where recovery exists, "
             "and otherwise uses its own 7-metric-mean winner."
-            + (
-                " The x-axis is the number of remaining units, inferred from each backbone's prune plan."
-                if remaining_units
-                else ""
-            )
+            + " The x-axis is the number of remaining units, inferred from each backbone's prune plan."
         )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):
@@ -1001,7 +1019,10 @@ def _build_recovery_backbone_comparison_tab(
                     value=default_method, multiselect=False,
                 )
                 dataset_dd = gr.Dropdown(
-                    label="Dataset", choices=datasets, value="training average", multiselect=False
+                    label="Dataset",
+                    choices=dataset_display_choices(datasets),
+                    value="training average",
+                    multiselect=False,
                 )
                 show_no_recovery_cb = gr.Checkbox(
                     label="Show No recovery",
@@ -1043,17 +1064,3 @@ def _build_recovery_backbone_comparison_tab(
         "halve_x_axis_cb": halve_x_axis_cb,
         "image": image, "status": status,
     }
-
-
-def build_recovery_backbone_comparison_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict[str, Any]:
-    return _build_recovery_backbone_comparison_tab(
-        blocks=blocks, output_root=output_root, remaining_units=False
-    )
-
-
-def build_recovery_backbone_remaining_comparison_tab(
-    *, blocks: gr.Blocks, output_root: Path
-) -> Dict[str, Any]:
-    return _build_recovery_backbone_comparison_tab(
-        blocks=blocks, output_root=output_root, remaining_units=True
-    )

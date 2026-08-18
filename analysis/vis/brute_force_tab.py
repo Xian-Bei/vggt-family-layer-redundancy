@@ -4,7 +4,166 @@ from typing import Any, Dict, List, Sequence
 
 import gradio as gr
 
+from analysis.metric_labels import SEVEN_METRIC_KEYS, SEVEN_METRIC_LABELS
 from analysis.vis.display_names import backbone_display_name, dataset_display_name
+from analysis.vis.composite import (
+    Cell,
+    Section,
+    compose_sections,
+    gallery_cells,
+)
+
+# Brute-Force Overview typography and outer-label spacing (pixels).
+BRUTE_FORCE_OVERVIEW_SUBPLOT_FONT_SIZE = 20
+BRUTE_FORCE_OVERVIEW_OUTER_FONT_SIZE = 26
+BRUTE_FORCE_OVERVIEW_LEFT_LABEL_TO_IMAGE_GAP = 0
+BRUTE_FORCE_OVERVIEW_TOP_LABEL_TO_IMAGE_GAP = 0
+BRUTE_FORCE_OVERVIEW_BOTTOM_LABEL_TO_IMAGE_GAP = 0
+
+# Brute-Force Detail typography and outer-label spacing (pixels).
+BRUTE_FORCE_DETAIL_SUBPLOT_FONT_SIZE = 26
+BRUTE_FORCE_DETAIL_OUTER_FONT_SIZE = 30
+BRUTE_FORCE_DETAIL_LEFT_LABEL_TO_IMAGE_GAP = 0
+BRUTE_FORCE_DETAIL_TOP_LABEL_TO_IMAGE_GAP = 0
+BRUTE_FORCE_DETAIL_BOTTOM_LABEL_TO_IMAGE_GAP = 0
+
+
+BRUTE_FORCE_OVERVIEW_COLUMN_LABELS = (
+    "Indoor Pose Metrics \n Normalized Retention",
+    "Indoor Geometry Metrics \n Normalized Retention",
+    "Outdoor Pose Metrics \n Normalized Retention",
+    "Outdoor Geometry Metrics \n Normalized Retention",
+)
+
+BRUTE_FORCE_DETAIL_COLUMN_LABELS = tuple(
+    SEVEN_METRIC_LABELS[key] for key in SEVEN_METRIC_KEYS
+)
+
+BRUTE_FORCE_DETAIL_EXCLUDED_DATASETS = {
+    "7scenes_test",
+    "nuscenes_test",
+    "waymo_validation",
+    "mean",
+}
+BRUTE_FORCE_DETAIL_DATASET_ORDER = (
+    "scannet_dev50",
+    "nuscenes_train",
+)
+
+BRUTE_FORCE_OVERVIEW_INFO = """\
+### Mean metric sources
+
+pose mean: mean(ARE, APE, RPE_rot, RPE_trans)<br>
+point-cloud mean: mean(Accuracy, Completeness, Chamfer)
+
+### Averaged datasets
+
+**vggt_omega**<br>
+&nbsp;&nbsp;indoor: scannet_dev50<br>
+&nbsp;&nbsp;outdoor: nuscenes_train
+
+**pi3**<br>
+&nbsp;&nbsp;indoor: scannet_dev50<br>
+&nbsp;&nbsp;outdoor: nuscenes_train
+
+**vggt**<br>
+&nbsp;&nbsp;indoor: scannet_dev50<br>
+&nbsp;&nbsp;outdoor: nuscenes_train
+"""
+
+
+def _compose_brute_force_overview(
+    gallery_values: Sequence[Any],
+    backbone_labels: Sequence[str],
+) -> Any:
+    columns = len(BRUTE_FORCE_OVERVIEW_COLUMN_LABELS)
+    rows = [gallery_cells(value) for value in gallery_values]
+    fixed_rows = [
+        row[:columns] + [Cell(None)] * max(0, columns - len(row))
+        for row in rows
+    ]
+    return compose_sections(
+        [
+            Section(
+                columns=columns,
+                cells=[],
+                fixed_rows=fixed_rows,
+                row_labels=list(backbone_labels),
+                row_labels_bold=True,
+                column_labels=list(BRUTE_FORCE_OVERVIEW_COLUMN_LABELS),
+                column_labels_bold=True,
+            )
+        ],
+        outer_font_size=BRUTE_FORCE_OVERVIEW_OUTER_FONT_SIZE,
+        left_label_to_image_gap=BRUTE_FORCE_OVERVIEW_LEFT_LABEL_TO_IMAGE_GAP,
+        top_label_to_image_gap=BRUTE_FORCE_OVERVIEW_TOP_LABEL_TO_IMAGE_GAP,
+        bottom_label_to_image_gap=BRUTE_FORCE_OVERVIEW_BOTTOM_LABEL_TO_IMAGE_GAP,
+    )
+
+
+def _compose_brute_force_detail(
+    gallery_values: Sequence[Any],
+    backbones: Sequence[str],
+    modes: Sequence[str],
+    datasets: Sequence[str],
+) -> Any | None:
+    """Compose one seven-metric row per backbone and dataset."""
+    value_index = 0
+    sections: List[Section] = []
+    for backbone in backbones:
+        for _mode in modes:
+            for dataset in datasets:
+                pose_cells = gallery_cells(gallery_values[value_index])
+                value_index += 1
+                point_cells = gallery_cells(gallery_values[value_index])
+                value_index += 1
+                cells = [*pose_cells[:4], *point_cells[:3]]
+                if not cells:
+                    continue
+                cells.extend(Cell(None) for _ in range(7 - len(cells)))
+                sections.append(
+                    Section(
+                        columns=7,
+                        cells=cells,
+                        heading=(
+                            f"{backbone_display_name(backbone).replace('Ω', 'Omega')} "
+                            f"{dataset_display_name(dataset)}"
+                        ),
+                        column_labels_bold=True,
+                    )
+                )
+    if not sections:
+        return None
+    sections[-1].column_labels = list(BRUTE_FORCE_DETAIL_COLUMN_LABELS)
+    sections[-1].column_labels_below = True
+    return compose_sections(
+        sections,
+        outer_font_size=BRUTE_FORCE_DETAIL_OUTER_FONT_SIZE,
+        left_label_to_image_gap=BRUTE_FORCE_DETAIL_LEFT_LABEL_TO_IMAGE_GAP,
+        top_label_to_image_gap=BRUTE_FORCE_DETAIL_TOP_LABEL_TO_IMAGE_GAP,
+        bottom_label_to_image_gap=BRUTE_FORCE_DETAIL_BOTTOM_LABEL_TO_IMAGE_GAP,
+    )
+
+
+def filter_brute_force_detail_datasets(
+    dataset_choices: Sequence[str],
+) -> List[str]:
+    """Return the dataset scopes represented by Detail UI/output rows."""
+    datasets = [
+        str(dataset)
+        for dataset in dataset_choices
+        if str(dataset).strip().lower()
+        not in BRUTE_FORCE_DETAIL_EXCLUDED_DATASETS
+    ]
+    return sorted(
+        datasets,
+        key=lambda dataset: (
+            BRUTE_FORCE_DETAIL_DATASET_ORDER.index(dataset)
+            if dataset in BRUTE_FORCE_DETAIL_DATASET_ORDER
+            else len(BRUTE_FORCE_DETAIL_DATASET_ORDER),
+            dataset,
+        ),
+    )
 
 
 def _bind_refresh(
@@ -40,7 +199,8 @@ def build_brute_force_tab(
     """Build overview and detailed brute-force pruning tabs."""
     backbones = list(dict.fromkeys(str(x) for x in backbone_choices))
     datasets = list(dict.fromkeys(str(x) for x in dataset_choices))
-    dataset_scopes = [*datasets, "mean"]
+    detail_datasets = filter_brute_force_detail_datasets(datasets)
+    dataset_scopes = list(detail_datasets)
     available_skip_datasets = {
         str(dataset) for dataset in initial_skip_datasets
     }
@@ -48,57 +208,36 @@ def build_brute_force_tab(
         gr.Markdown("## Brute-Force Overview")
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):
-                overview_backbone_filter = gr.CheckboxGroup(
-                    label="Backbones",
-                    choices=[(backbone_display_name(item), item) for item in backbones],
-                    value=backbones,
-                )
-                overview_histogram = gr.Checkbox(
-                    label="Show row/column mean plots",
-                    value=False,
-                )
-                overview_info = gr.Textbox(
-                    label="Displayed scopes",
-                    lines=10,
-                    interactive=False,
+                overview_info = gr.Markdown(
+                    BRUTE_FORCE_OVERVIEW_INFO,
+                    elem_classes=["brute-force-overview-info"],
                 )
             with gr.Column(scale=5, elem_classes=["stage2-right"]):
-                overview_galleries: List[gr.Gallery] = []
-                overview_rows: List[gr.Column] = []
-                for backbone in backbones:
-                    with gr.Column(elem_classes=["brute-force-backbone-block"]) as row:
-                        gr.Markdown(
-                            f"### {backbone_display_name(backbone)}",
-                            elem_classes=["backbone-separator"],
-                        )
-                        gallery = gr.Gallery(
-                            label="Brute-force overview heatmaps",
-                            show_label=False,
-                            columns=4,
-                            height="auto",
-                            object_fit="contain",
-                            elem_classes=[
-                                "results-gallery",
-                                "stage2-heatmap-gallery",
-                                "brute-force-overview-gallery",
-                            ],
-                        )
-                    overview_rows.append(row)
-                    overview_galleries.append(gallery)
+                overview_image = gr.Image(
+                    label="Brute-force overview heatmaps",
+                    show_label=False,
+                    type="numpy",
+                    interactive=False,
+                    elem_classes=["results-media", "composite-plot-image"],
+                )
 
-        overview_inputs = [
-            overview_backbone_filter,
-            overview_histogram,
-        ]
-        overview_outputs = [*overview_galleries, *overview_rows, overview_info]
+        overview_outputs = [overview_image]
+
+        def _refresh_overview() -> Any:
+            # Overview intentionally has no controls: it always presents every
+            # discovered backbone using the publication dataset sources.
+            raw = refresh_overview_cb(backbones, False)
+            return _compose_brute_force_overview(
+                raw[: len(backbones)],
+                [backbone_display_name(item) for item in backbones],
+            )
+
         _bind_refresh(
             tab=overview_tab,
-            inputs=overview_inputs,
+            inputs=[],
             outputs=overview_outputs,
-            refresh_cb=refresh_overview_cb,
+            refresh_cb=_refresh_overview,
             triggers=[
-                (overview_backbone_filter.change, False),
-                (overview_histogram.change, False),
                 (overview_tab.select, True),
             ],
         )
@@ -106,9 +245,8 @@ def build_brute_force_tab(
     with gr.Tab("Brute-Force Detail") as detail_tab:
         gr.Markdown("## Brute-Force Detail")
         gr.Markdown(
-            "Detailed mean-scene pruning results. Each skip scope uses two rows: "
-            "the four pose metrics, followed by accuracy, completeness, Chamfer "
-            "distance, and the mean of all seven metrics."
+            "Detailed mean-scene pruning results. Each backbone-dataset scope uses "
+            "one row containing four pose metrics and three geometry metrics."
         )
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["control-column"]):
@@ -119,7 +257,7 @@ def build_brute_force_tab(
                 )
                 gr.Markdown("#### Skip results")
                 skip_dataset_checks: List[gr.Checkbox] = []
-                for dataset in datasets:
+                for dataset in detail_datasets:
                     available = dataset in available_skip_datasets
                     skip_dataset_checks.append(
                         gr.Checkbox(
@@ -138,11 +276,6 @@ def build_brute_force_tab(
                             ),
                         )
                     )
-                skip_mean_check = gr.Checkbox(
-                    label="mean",
-                    value=False,
-                    info="Mean includes only datasets with experiment records.",
-                )
                 colorbar_histogram = gr.Checkbox(
                     label="Show row/column mean plots",
                     value=False,
@@ -150,67 +283,25 @@ def build_brute_force_tab(
                 normalize_skip_metrics = gr.Checkbox(
                     label="Normalize individual skip metrics to [0,1]",
                     value=False,
-                    info="The 7-metric mean is always normalized per metric before averaging.",
                 )
                 info = gr.Textbox(label="Displayed scopes", interactive=False)
 
             with gr.Column(scale=5, elem_classes=["stage2-right"]):
-                galleries: List[gr.Gallery] = []
-                row_cols: List[gr.Column] = []
-                backbone_blocks: List[gr.Column] = []
-                for backbone in backbones:
-                    with gr.Column(elem_classes=["brute-force-backbone-block"]) as backbone_block:
-                        gr.Markdown(
-                            f"### {backbone_display_name(backbone)}",
-                            elem_classes=["backbone-separator"],
-                        )
-                        for mode in stage2_modes:
-                            for dataset in dataset_scopes:
-                                for row_index, label in enumerate((
-                                    f"{mode} · {dataset} · pose heatmaps",
-                                    f"{mode} · {dataset} · point-cloud heatmaps",
-                                )):
-                                    with gr.Row(
-                                        elem_classes=["stage2-gallery-row"],
-                                        equal_height=False,
-                                    ):
-                                        with gr.Column(scale=1, min_width=280) as row_col:
-                                            if row_index == 0:
-                                                gr.Markdown(
-                                                    f"#### {dataset_display_name(dataset)}",
-                                                    elem_classes=[
-                                                        "brute-force-dataset-heading"
-                                                    ],
-                                                )
-                                            gallery = gr.Gallery(
-                                                label=label,
-                                                show_label=False,
-                                                columns=4,
-                                                height="auto",
-                                                object_fit="contain",
-                                                elem_classes=[
-                                                    "results-gallery",
-                                                    "stage2-heatmap-gallery",
-                                                    "brute-force-detail-gallery",
-                                                    *(
-                                                        ["brute-force-dataset-start"]
-                                                        if row_index == 0
-                                                        else []
-                                                    ),
-                                                ],
-                                            )
-                                    row_cols.append(row_col)
-                                    galleries.append(gallery)
-                    backbone_blocks.append(backbone_block)
+                detail_image = gr.Image(
+                    label="Brute-force detail heatmaps",
+                    show_label=False,
+                    type="numpy",
+                    interactive=False,
+                    elem_classes=["results-media", "composite-plot-image"],
+                )
 
         inputs = [
             backbone_filter,
             *skip_dataset_checks,
-            skip_mean_check,
             colorbar_histogram,
             normalize_skip_metrics,
         ]
-        outputs = [*galleries, *row_cols, *backbone_blocks, info]
+        outputs = [detail_image, info]
 
         def _refresh_detail_from_checkboxes(
             selected_backbones: List[str] | None,
@@ -224,10 +315,25 @@ def build_brute_force_tab(
                 for dataset, selected in zip(dataset_scopes, scope_flags)
                 if bool(selected)
             ]
-            return refresh_detail_cb(
+            raw = refresh_detail_cb(
                 selected_backbones,
                 selected_skip_datasets,
                 *detail_inputs,
+            )
+            gallery_count = (
+                len(backbones)
+                * len(stage2_modes)
+                * len(dataset_scopes)
+                * 2
+            )
+            return (
+                _compose_brute_force_detail(
+                    raw[:gallery_count],
+                    backbones,
+                    stage2_modes,
+                    dataset_scopes,
+                ),
+                raw[-1],
             )
 
         _bind_refresh(
@@ -237,10 +343,7 @@ def build_brute_force_tab(
             refresh_cb=_refresh_detail_from_checkboxes,
             triggers=[
                 (backbone_filter.change, False),
-                *[
-                    (checkbox.change, False)
-                    for checkbox in [*skip_dataset_checks, skip_mean_check]
-                ],
+                *[(checkbox.change, False) for checkbox in skip_dataset_checks],
                 (colorbar_histogram.change, False),
                 (normalize_skip_metrics.change, False),
                 (detail_tab.select, True),
@@ -250,6 +353,8 @@ def build_brute_force_tab(
     return {
         "overview_tab": overview_tab,
         "detail_tab": detail_tab,
-        "overview_galleries": overview_galleries,
-        "detail_galleries": galleries,
+        "overview_info": overview_info,
+        "detail_datasets": detail_datasets,
+        "overview_image": overview_image,
+        "detail_image": detail_image,
     }

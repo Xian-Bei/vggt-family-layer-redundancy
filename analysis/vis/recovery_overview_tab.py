@@ -23,6 +23,9 @@ from analysis.prune_plan import (
 
 from analysis.prune_plan.eval_plots import (
     GT_MEAN_METRICS,
+    PUBLICATION_METRIC_SUBPLOT_HEIGHT,
+    PUBLICATION_METRIC_SUBPLOT_WIDTH,
+    PUBLICATION_FLAT_AXES_BOX_ASPECT,
     RECOVERY_METHOD_ORDER,
     RECOVERY_METRIC_GRID,
     _with_dataset_average,
@@ -34,9 +37,23 @@ from analysis.prune_plan.eval_plots import (
 )
 from analysis.vis.dataset_average_warning import (
     DATASET_AVERAGE_GROUPS,
+    dataset_display_choices,
+    dataset_display_name,
     format_incomplete_average_warning,
 )
 from analysis.vis.pruning_plan_tab import _mean_backbone_plot_payloads
+from analysis.vis.composite import (
+    Section,
+    compose_sections,
+    gallery_cells,
+)
+
+# Recovery Overview typography and outer-label spacing (pixels).
+RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE = 18
+RECOVERY_OVERVIEW_OUTER_FONT_SIZE = 26
+RECOVERY_OVERVIEW_LEFT_LABEL_TO_IMAGE_GAP = 2
+RECOVERY_OVERVIEW_TOP_LABEL_TO_IMAGE_GAP = 0
+RECOVERY_OVERVIEW_BOTTOM_LABEL_TO_IMAGE_GAP = 0
 
 
 _BACKBONE_ORDER = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
@@ -51,6 +68,63 @@ _BASELINE_STRATEGIES = (
 _DATASET_AVERAGE_GROUPS = DATASET_AVERAGE_GROUPS
 _MEAN_BACKBONE = "mean"
 _MIN_PRUNE_STRATEGY = "min"
+_RECOVERY_LEGEND_LABELS = {
+    "recovery_replaceme_ls": "ReplaceMe LS",
+    "recovery_replaceme_cos": "ReplaceMe Cos",
+    "recovery_ghost": "Ghosted",
+    "recovery_ghost_interval": "Ghosted_Interval",
+    "recovery_linearpatch": "LinearPatch",
+    "recovery_ghost_interval_sequential": "Ours",
+}
+_RECOVERY_LEGEND_ORDER = (
+    "Full Model",
+    "No Recovery",
+    "LinearPatch",
+    "ReplaceMe LS",
+    "ReplaceMe Cos",
+    "Ghosted",
+    "Ghosted_Interval",
+    "Ours",
+)
+
+
+def _compose_recovery_overview(value: Any) -> np.ndarray:
+    cells = gallery_cells(value)
+    row_labels = [cell.caption for cell in cells]
+    for cell in cells:
+        cell.caption = ""
+    return compose_sections(
+        [
+            Section(
+                columns=1,
+                cells=[],
+                fixed_rows=[[cell] for cell in cells],
+                row_labels=row_labels,
+                row_labels_bold=True,
+            )
+        ],
+        outer_font_size=RECOVERY_OVERVIEW_OUTER_FONT_SIZE,
+        left_label_to_image_gap=RECOVERY_OVERVIEW_LEFT_LABEL_TO_IMAGE_GAP,
+        top_label_to_image_gap=RECOVERY_OVERVIEW_TOP_LABEL_TO_IMAGE_GAP,
+        bottom_label_to_image_gap=RECOVERY_OVERVIEW_BOTTOM_LABEL_TO_IMAGE_GAP,
+    )
+
+
+def _formalize_recovery_legend_names(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply publication labels without mutating collected evaluation data."""
+    result = deepcopy(payload)
+    strategies = result.get("strategies", {})
+    if not isinstance(strategies, dict):
+        return result
+    for strategy_key, strategy_payload in strategies.items():
+        if not isinstance(strategy_payload, dict):
+            continue
+        key = str(strategy_key)
+        if key.startswith("no_recovery"):
+            strategy_payload["display_name"] = "No Recovery"
+        elif key in _RECOVERY_LEGEND_LABELS:
+            strategy_payload["display_name"] = _RECOVERY_LEGEND_LABELS[key]
+    return result
 
 
 def _seven_metric_mean(point: Dict[str, Any], payload: Dict[str, Any]) -> float | None:
@@ -451,7 +525,7 @@ def render_recovery_overview(
     gallery: List[Tuple[np.ndarray, str]] = []
     warnings: List[str] = []
     messages: List[str] = []
-    for backbone in backbones:
+    for backbone_index, backbone in enumerate(backbones):
         try:
             contributors = (
                 available_backbones
@@ -526,7 +600,11 @@ def render_recovery_overview(
                     ))
                 contributor_candidate_plots.append(candidate_plots)
                 contributor_candidate_fallbacks.append(candidate_fallbacks)
-                title_scope = "averaged over datasets" if dataset == "mean" else dataset
+                title_scope = (
+                    "averaged over datasets"
+                    if dataset == "mean"
+                    else dataset_display_name(dataset)
+                )
                 contributor_plots.append(
                     _minimum_strategy_plot_payload(candidate_plots)
                     if prune_strategy == _MIN_PRUNE_STRATEGY else candidate_plots[0][1]
@@ -564,19 +642,35 @@ def render_recovery_overview(
                 key for key in methods
                 if isinstance(available, dict) and key in available
             ]
+            plot_payload = _formalize_recovery_legend_names(plot_payload)
             fig = render_strategy_metric_figure(
                 payload=plot_payload,
                 title=f"{backbone_display_name(backbone)}: {prune_strategy or 'legacy'} recovery · {title_scope}",
                 metric_grid=RECOVERY_METRIC_GRID,
                 strategy_keys=selected,
-                legend_fontsize=14,
+                legend_fontsize=RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
+                legend_fontweight="bold",
+                legend_loc="upper left",
+                upper_label="Full Model",
+                legend_order=_RECOVERY_LEGEND_ORDER,
                 normalize_metrics=bool(normalize_metrics),
                 always_normalize_metric_mean=True,
                 include_upper_anchor=False,
-                subplot_width=7.4,
+                subplot_width=PUBLICATION_METRIC_SUBPLOT_WIDTH,
+                subplot_box_aspect=PUBLICATION_FLAT_AXES_BOX_ASPECT,
+                figure_height_per_row=PUBLICATION_METRIC_SUBPLOT_HEIGHT,
+                show_figure_title=False,
+                show_metric_titles=False,
+                metric_labels_as_ylabels=True,
+                shared_xlabel=None,
+                bottom_row_xlabel=(
+                    "Dropped units"
+                    if backbone_index == len(backbones) - 1
+                    else None
+                ),
                 x_tick_step=2,
-                tick_label_fontsize=14,
-                axis_label_fontsize=16,
+                tick_label_fontsize=RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
+                axis_label_fontsize=RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
                 legend_markerscale=1.5,
                 legend_handlelength=2.8,
             )
@@ -607,19 +701,37 @@ def render_recovery_overview(
                     for key in (*_BASELINE_STRATEGIES, *methods)
                     if isinstance(fallback_available, dict) and key in fallback_available
                 ]
+                fallback_plot_payload = _formalize_recovery_legend_names(
+                    fallback_plot_payload
+                )
                 fig = render_strategy_metric_figure(
                     payload=fallback_plot_payload,
                     title=f"{backbone_display_name(backbone)}: {prune_strategy or 'legacy'} recovery · {title_scope}",
                     metric_grid=RECOVERY_METRIC_GRID,
                     strategy_keys=fallback_selected if fallback_selected else None,
-                    legend_fontsize=14,
+                    legend_fontsize=RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
+                    legend_fontweight="bold",
+                    legend_loc="upper left",
+                    upper_label="Full Model",
+                    legend_order=_RECOVERY_LEGEND_ORDER,
                     normalize_metrics=bool(normalize_metrics),
                     always_normalize_metric_mean=True,
                     include_upper_anchor=False,
-                    subplot_width=7.4,
+                    subplot_width=PUBLICATION_METRIC_SUBPLOT_WIDTH,
+                    subplot_box_aspect=PUBLICATION_FLAT_AXES_BOX_ASPECT,
+                    figure_height_per_row=PUBLICATION_METRIC_SUBPLOT_HEIGHT,
+                    show_figure_title=False,
+                    show_metric_titles=False,
+                    metric_labels_as_ylabels=True,
+                    shared_xlabel=None,
+                    bottom_row_xlabel=(
+                        "Dropped units"
+                        if backbone_index == len(backbones) - 1
+                        else None
+                    ),
                     x_tick_step=2,
-                    tick_label_fontsize=14,
-                    axis_label_fontsize=16,
+                    tick_label_fontsize=RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
+                    axis_label_fontsize=RECOVERY_OVERVIEW_SUBPLOT_FONT_SIZE,
                     legend_markerscale=1.5,
                     legend_handlelength=2.8,
                 )
@@ -642,7 +754,8 @@ def render_recovery_overview(
             if skipped_profiles:
                 suffix += f" (missing pruning profile: {', '.join(skipped_profiles)})"
             messages.append(
-                f"{backbone} / {dataset} / {prune_strategy or 'legacy'}: redrawn from current summaries "
+                f"{backbone} / {dataset_display_name(dataset)} / "
+                f"{prune_strategy or 'legacy'}: redrawn from current summaries "
                 f"| normalized={bool(normalize_metrics)}"
                 f" | backbones={','.join(contributors)}{suffix}"
             )
@@ -651,11 +764,14 @@ def render_recovery_overview(
     return gallery, "\n".join([*warnings, *messages])
 
 
-def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict[str, Any]:
+def build_recovery_overview_tab(
+    *,
+    blocks: gr.Blocks,
+    output_root: Path,
+) -> Dict[str, Any]:
     backbones, methods = discover_recovery_overview_options(Path(output_root))
     datasets = discover_recovery_overview_datasets(Path(output_root))
-    prune_strategies = discover_recovery_overview_prune_strategies(Path(output_root))
-    default_prune_strategy = prune_strategies[0] if prune_strategies else _PRUNE_STRATEGIES[0]
+    default_prune_strategy = "gt_double"
 
     def _redraw(
         selected_backbones: Sequence[str],
@@ -664,10 +780,11 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
         normalize_metrics: bool,
         prune_strategy: str,
     ):
-        return render_recovery_overview(
+        images, status_value = render_recovery_overview(
             Path(output_root), selected_backbones, selected_methods, dataset,
             normalize_metrics, prune_strategy,
         )
+        return _compose_recovery_overview(images), status_value
 
     def _refresh_options(
         selected_backbones: Sequence[str],
@@ -680,9 +797,6 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
             Path(output_root)
         )
         latest_datasets = discover_recovery_overview_datasets(Path(output_root))
-        latest_prune_strategies = discover_recovery_overview_prune_strategies(
-            Path(output_root)
-        )
         backbone_value = [
             name
             for name in (selected_backbones or [])
@@ -697,11 +811,7 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
         prune_strategy_value = (
             prune_strategy
             if prune_strategy in (*_PRUNE_STRATEGIES, _MIN_PRUNE_STRATEGY)
-            else (
-                latest_prune_strategies[0]
-                if latest_prune_strategies
-                else _PRUNE_STRATEGIES[0]
-            )
+            else "gt_double"
         )
         gallery_value, status_value = render_recovery_overview(
             Path(output_root), backbone_value, method_value, dataset_value,
@@ -722,12 +832,15 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
                 ],
                 value=method_value,
             ),
-            gr.update(choices=latest_datasets, value=dataset_value),
+            gr.update(
+                choices=dataset_display_choices(latest_datasets),
+                value=dataset_value,
+            ),
             gr.update(
                 choices=[*_PRUNE_STRATEGIES, _MIN_PRUNE_STRATEGY],
                 value=prune_strategy_value,
             ),
-            gallery_value,
+            _compose_recovery_overview(gallery_value),
             status_value,
         )
 
@@ -751,7 +864,7 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
                         (backbone_display_name(item), item)
                         for item in [_MEAN_BACKBONE, *backbones]
                     ],
-                    value=[_MEAN_BACKBONE, *backbones],
+                    value=backbones,
                 )
                 prune_strategy_dd = gr.Dropdown(
                     label="Prune strategy",
@@ -766,27 +879,26 @@ def build_recovery_overview_tab(*, blocks: gr.Blocks, output_root: Path) -> Dict
                 )
                 dataset_dd = gr.Dropdown(
                     label="Dataset",
-                    choices=datasets,
+                    choices=dataset_display_choices(datasets),
                     value="training average",
                     multiselect=False,
                 )
                 normalize_metrics = gr.Checkbox(
                     label="Normalize individual metrics to [0,1]",
-                    value=True,
+                    value=False,
                     info="The 7-metric mean is always normalized per metric.",
                 )
                 refresh_btn = gr.Button("Refresh latest data", variant="primary")
                 status = gr.Textbox(label="Status", interactive=False, lines=4)
             with gr.Column(scale=5):
-                gallery = gr.Gallery(
+                gallery = gr.Image(
                     label="Recovery comparison by backbone",
-                    columns=1,
-                    height="auto",
-                    object_fit="contain",
+                    show_label=False,
+                    type="numpy",
+                    interactive=False,
                     elem_classes=[
-                        "results-gallery",
-                        "recovery-eval-gallery",
-                        "recovery-overview-gallery",
+                        "results-media",
+                        "composite-plot-image",
                     ],
                 )
 

@@ -9,6 +9,8 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
+from analysis.metric_labels import SEVEN_METRIC_LABELS
+
 from analysis.prune_plan import (
     bundle_plan_records,
     bundle_strategy_records,
@@ -29,17 +31,16 @@ RECOVERY_METRIC_GRID = (
     ("ape", "are", "rpe_trans", "rpe_rot"),
     ("acc", "comp", "chamfer_distance", "gt_mean"),
 )
+PUBLICATION_METRIC_SUBPLOT_WIDTH = 7.4
+PUBLICATION_METRIC_SUBPLOT_HEIGHT = 5.8
+PUBLICATION_TICK_LABEL_FONTSIZE = 13.0
+PUBLICATION_AXIS_LABEL_FONTSIZE = 15.0
+PUBLICATION_LEGEND_FONTSIZE = 15.0
+PUBLICATION_FLAT_AXES_BOX_ASPECT = 0.704
 GT_MEAN_METRICS = ("ape", "are", "rpe_trans", "rpe_rot", "acc", "comp", "chamfer_distance")
 NORMALIZATION_MAX_DROP_COUNT = 24
 METRIC_HEADERS = {
-    "ape": "APE ↓",
-    "are": "ARE (deg) ↓",
-    "rpe_trans": "RPE trans ↓",
-    "rpe_rot": "RPE rot (deg) ↓",
-    "acc": "Acc ↓",
-    "comp": "Comp ↓",
-    "chamfer_distance": "CD ↓",
-    "cd": "CD ↓",
+    **SEVEN_METRIC_LABELS,
     "gt_mean": "7-metric mean ↓",
 }
 STRATEGY_PLOT_ORDER = (
@@ -1471,15 +1472,32 @@ def render_strategy_metric_figure(
     always_normalize_metric_mean: bool = False,
     include_upper_anchor: bool = True,
     subplot_width: Optional[float] = None,
+    subplot_box_aspect: Optional[float] = None,
     strategy_style_overrides: Optional[dict[str, dict[str, Any]]] = None,
     shared_xlabel: Optional[str] = "Dropped units",
+    bottom_row_xlabel: Optional[str] = None,
     show_figure_title: bool = True,
     show_metric_titles: bool = True,
+    metric_labels_as_ylabels: bool = False,
     x_tick_step: Optional[float] = None,
     tick_label_fontsize: float = 10.0,
     axis_label_fontsize: float = 11.0,
     legend_markerscale: float = 1.0,
     legend_handlelength: float = 2.0,
+    legend_fontweight: str = "normal",
+    legend_loc: str = "best",
+    upper_label: str = "upper",
+    legend_order: Optional[Sequence[str]] = None,
+    compact_method_labels: Optional[dict[str, str]] = None,
+    compact_method_order: Optional[Sequence[str]] = None,
+    compact_structure_labels: Optional[Sequence[str]] = None,
+    compact_legend_titles: tuple[str, str] = (
+        "Method (color)",
+        "Structure (line + marker)",
+    ),
+    combine_compact_legend: bool = False,
+    shared_ylabel: Optional[str] = None,
+    figure_height_per_row: float = PUBLICATION_METRIC_SUBPLOT_HEIGHT,
 ) -> Optional[Any]:
     """Render a strategy metric figure without reading or writing a cached PNG."""
     strategies = payload.get("strategies", {})
@@ -1529,16 +1547,27 @@ def render_strategy_metric_figure(
     figure_width = (
         max(1.0, float(subplot_width)) * cols
         if subplot_width is not None
-        else (7.4 if cols == 1 else 6.2 * cols)
+        else (
+            PUBLICATION_METRIC_SUBPLOT_WIDTH
+            if cols == 1
+            else 6.2 * cols
+        )
     )
     fig, axes = plt.subplots(
         rows,
         cols,
-        figsize=(figure_width, 5.8 * rows),
+        figsize=(figure_width, max(1.0, float(figure_height_per_row)) * rows),
         squeeze=False,
     )
     any_data = False
     style_overrides = strategy_style_overrides or {}
+    method_labels = compact_method_labels or PRUNING_METHOD_LABELS
+
+    def _style_legend_text(legend: Any) -> None:
+        for text in legend.get_texts():
+            text.set_fontweight(str(legend_fontweight))
+        legend.get_title().set_fontweight(str(legend_fontweight))
+
     normalization_states = [
         bool(
             normalized_view
@@ -1550,6 +1579,8 @@ def render_strategy_metric_figure(
     for row_idx, row in enumerate(metric_grid):
         for col_idx, metric_key in enumerate(row):
             ax = axes[row_idx][col_idx]
+            if subplot_box_aspect is not None:
+                ax.set_box_aspect(float(subplot_box_aspect))
             metric_normalized_view = bool(
                 normalized_view
                 or (always_normalize_metric_mean and metric_key == "gt_mean")
@@ -1576,7 +1607,7 @@ def render_strategy_metric_figure(
                     color="#333333",
                     linewidth=1.2,
                     alpha=0.7,
-                    label="upper",
+                    label=str(upper_label),
                 )
                 ax.scatter([0], [float(upper_value)], color="#333333", marker="*", s=90, zorder=4)
             all_xs: list[int] = []
@@ -1700,6 +1731,18 @@ def render_strategy_metric_figure(
             metric_title = METRIC_HEADERS.get(metric_key, metric_key)
             if show_metric_titles:
                 ax.set_title(metric_title, fontsize=11, fontweight="bold")
+            if metric_labels_as_ylabels:
+                ax.set_ylabel(
+                    metric_title,
+                    fontsize=float(axis_label_fontsize),
+                    fontweight="bold",
+                )
+            if bottom_row_xlabel and row_idx == rows - 1:
+                ax.set_xlabel(
+                    str(bottom_row_xlabel),
+                    fontsize=float(axis_label_fontsize),
+                    fontweight="bold",
+                )
             ax.grid(True, alpha=0.25)
             ax.set_xlim(left=0)
             if metric_key == "gt_mean":
@@ -1743,7 +1786,18 @@ def render_strategy_metric_figure(
             if compact_pruning_legend:
                 method_handles = []
                 seen_families: set[str] = set()
-                for strategy_key in strategies:
+                legend_strategy_keys = list(strategies)
+                if compact_method_order is not None:
+                    method_order = {
+                        str(family): index
+                        for index, family in enumerate(compact_method_order)
+                    }
+                    legend_strategy_keys.sort(
+                        key=lambda key: method_order.get(
+                            pruning_strategy_family(key), len(method_order)
+                        )
+                    )
+                for strategy_key in legend_strategy_keys:
                     family = pruning_strategy_family(strategy_key)
                     if family in seen_families:
                         continue
@@ -1758,7 +1812,7 @@ def render_strategy_metric_figure(
                             marker="o",
                             linestyle="None",
                             markersize=7,
-                            label=PRUNING_METHOD_LABELS.get(
+                            label=method_labels.get(
                                 family,
                                 str(family),
                             ),
@@ -1766,7 +1820,17 @@ def render_strategy_metric_figure(
                     )
                 style_handles = []
                 strategy_names = {str(key).lower() for key in strategies}
-                if any(strategy_is_single_interval(key) for key in strategy_names):
+                shown_structure_labels = (
+                    None
+                    if compact_structure_labels is None
+                    else {str(label) for label in compact_structure_labels}
+                )
+                if (
+                    shown_structure_labels is None
+                    or "Single" in shown_structure_labels
+                ) and any(
+                    strategy_is_single_interval(key) for key in strategy_names
+                ):
                     single_key = next(
                         key
                         for key in strategies
@@ -1794,7 +1858,10 @@ def render_strategy_metric_figure(
                     if single_dashes is not None:
                         single_handle.set_dashes(single_dashes)
                     style_handles.append(single_handle)
-                if any(
+                if (
+                    shown_structure_labels is None
+                    or "Multi" in shown_structure_labels
+                ) and any(
                     not strategy_is_single_interval(key)
                     for key in strategy_names
                 ):
@@ -1805,27 +1872,38 @@ def render_strategy_metric_figure(
                             linewidth=2.0, label="Multi",
                         )
                     )
-                if method_handles:
+                if combine_compact_legend and (method_handles or style_handles):
+                    combined_legend = ax.legend(
+                        handles=[*method_handles, *style_handles],
+                        loc="upper left",
+                        fontsize=legend_fontsize,
+                        markerscale=float(legend_markerscale),
+                        handlelength=float(legend_handlelength),
+                    )
+                    _style_legend_text(combined_legend)
+                elif method_handles:
                     method_legend = ax.legend(
                         handles=method_handles,
-                        title="Method (color)",
+                        title=str(compact_legend_titles[0]),
                         loc="upper left",
                         fontsize=legend_fontsize,
                         title_fontsize=legend_fontsize,
                         markerscale=float(legend_markerscale),
                         handlelength=float(legend_handlelength),
                     )
+                    _style_legend_text(method_legend)
                     ax.add_artist(method_legend)
-                if style_handles:
+                if style_handles and not combine_compact_legend:
                     style_legend = ax.legend(
                         handles=style_handles,
-                        title="Structure (line + marker)",
+                        title=str(compact_legend_titles[1]),
                         loc="upper left",
                         fontsize=legend_fontsize,
                         title_fontsize=legend_fontsize,
                         markerscale=float(legend_markerscale),
                         handlelength=float(legend_handlelength),
                     )
+                    _style_legend_text(style_legend)
                     if method_handles:
                         # Keep both compact legend blocks in the upper-left
                         # without drawing the structure legend over the method
@@ -1840,12 +1918,42 @@ def render_strategy_metric_figure(
                             transform=ax.transAxes,
                         )
             else:
-                ax.legend(
-                    loc="best",
+                legend_kwargs: dict[str, Any] = {}
+                if legend_order is not None:
+                    handles, labels = ax.get_legend_handles_labels()
+                    preferred = {
+                        str(label): index for index, label in enumerate(legend_order)
+                    }
+                    ordered_entries = []
+                    seen_labels: set[str] = set()
+                    for original_index, (handle, label) in enumerate(
+                        zip(handles, labels)
+                    ):
+                        label = str(label)
+                        if label in seen_labels:
+                            continue
+                        seen_labels.add(label)
+                        ordered_entries.append(
+                            (
+                                preferred.get(label, len(preferred)),
+                                original_index,
+                                handle,
+                                label,
+                            )
+                        )
+                    ordered_entries.sort(key=lambda item: (item[0], item[1]))
+                    legend_kwargs = {
+                        "handles": [item[2] for item in ordered_entries],
+                        "labels": [item[3] for item in ordered_entries],
+                    }
+                legend = ax.legend(
+                    loc=str(legend_loc),
                     fontsize=legend_fontsize,
                     markerscale=float(legend_markerscale),
                     handlelength=float(legend_handlelength),
+                    **legend_kwargs,
                 )
+                _style_legend_text(legend)
     if not any_data:
         plt.close(fig)
         return None
@@ -1868,6 +1976,12 @@ def render_strategy_metric_figure(
             fontweight="bold",
         )
         bottom = 0.035
+    if shared_ylabel:
+        fig.supylabel(
+            str(shared_ylabel),
+            fontsize=float(axis_label_fontsize),
+            fontweight="bold",
+        )
     top = 0.97 if show_figure_title else 0.99
     fig.tight_layout(rect=(0.01, bottom, 0.99, top), pad=0.7, h_pad=1.0, w_pad=0.8)
     return fig

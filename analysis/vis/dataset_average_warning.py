@@ -13,6 +13,22 @@ DATASET_AVERAGE_GROUPS: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
+_DATASET_DISPLAY_NAMES = {
+    "training average": "Training Dataset",
+    "testing average": "Testing Dataset",
+}
+
+
+def dataset_display_name(name: str) -> str:
+    """Return the user-facing name while preserving legacy result keys."""
+    value = str(name)
+    return _DATASET_DISPLAY_NAMES.get(value.strip().lower(), value)
+
+
+def dataset_display_choices(names: Collection[str]) -> list[tuple[str, str]]:
+    """Build Gradio label/value pairs for dataset selectors."""
+    return [(dataset_display_name(name), str(name)) for name in names]
+
 
 def format_incomplete_average_warning(
     *,
@@ -30,7 +46,7 @@ def format_incomplete_average_warning(
         return ""
     included_text = ", ".join(included) if included else "none"
     return (
-        f"⚠️ WARNING: {owner} / {scope} is incomplete "
+        f"⚠️ WARNING: {owner} / {dataset_display_name(scope)} is incomplete "
         f"({len(included)}/{len(expected_names)} datasets). "
         f"Missing: {', '.join(missing)}. Included: {included_text}. "
         "The displayed average uses only the available datasets."

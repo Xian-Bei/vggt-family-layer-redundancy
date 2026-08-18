@@ -95,6 +95,39 @@ class NormalizedSkipHeatmapTest(unittest.TestCase):
         np.testing.assert_allclose(calls[0], [0.0, 0.0, -5.0])
         np.testing.assert_allclose(calls[1], [1.0, 1.0, 0.0])
 
+    def test_single_metric_gallery_accepts_external_titles_and_coolwarm(self) -> None:
+        rendered: list[tuple[str, str, bool, bool]] = []
+
+        def capture(
+            _packed: list[float],
+            _num_layers: int,
+            title: str,
+            **kwargs: Any,
+        ) -> np.ndarray:
+            rendered.append(
+                (
+                    title,
+                    kwargs["cmap"],
+                    kwargs["show_xlabel"],
+                    kwargs["show_ylabel"],
+                )
+            )
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+        with patch.object(view, "_heatmap_rgb_from_packed", side_effect=capture):
+            view._render_skip_gallery(
+                {"ape": [0.0, 1.0, 2.0]},
+                2,
+                [("ape", "APE")],
+                value_mode="absolute",
+                cmap="coolwarm",
+                show_title=False,
+                show_xlabels=False,
+                show_ylabel=False,
+            )
+
+        self.assertEqual(rendered, [("", "coolwarm", False, False)])
+
     def test_all_renderers_use_zero_to_one_retention(self) -> None:
         calls: list[tuple[list[float], dict[str, Any]]] = []
 

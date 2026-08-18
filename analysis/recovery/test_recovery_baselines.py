@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from analysis.backbones.registry import get_backbone
+from analysis.recovery.activation_store import RowShard, ShardedRowStore
 from analysis.recovery.operators import fuse_replaceme_transform
 from analysis.recovery.recovery_prune_v3 import (
     _fit_boundary_weight,
@@ -22,6 +23,7 @@ from analysis.recovery.recovery_prune_v3 import (
     _forward_current_ghost_boundary,
     _hadamard,
     _load_training_scenes,
+    _materialize_cosine_rows,
     _optimize_cosine_transform,
 )
 from analysis.redundancy.cache_redundancy_v3 import (
@@ -120,6 +122,39 @@ def test_replaceme_ls_recovers_known_transform() -> None:
 
     torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
     assert diagnostics["num_rows"] == 16
+
+
+def test_replaceme_cos_clears_cuda_cache_before_capacity_check() -> None:
+    events = []
+    store = ShardedRowStore(
+        [
+            RowShard(
+                scene_id="synthetic",
+                inputs=torch.ones(2, 2),
+                desired=torch.ones(2, 2),
+            )
+        ]
+    )
+
+    def empty_cache() -> None:
+        events.append("empty_cache")
+
+    def mem_get_info(_device):
+        events.append("mem_get_info")
+        return 32 * 1024**3, 48 * 1024**3
+
+    with (
+        mock.patch("torch.cuda.empty_cache", side_effect=empty_cache),
+        mock.patch("torch.cuda.mem_get_info", side_effect=mem_get_info),
+    ):
+        inputs, desired, storage = _materialize_cosine_rows(
+            store, device=torch.device("cuda")
+        )
+
+    assert events[:2] == ["empty_cache", "mem_get_info"]
+    assert storage == "contiguous_gpu_float32"
+    assert inputs is not None and inputs.device.type == "cuda"
+    assert desired is not None and desired.device.type == "cuda"
 
 
 def test_replaceme_ls_aligns_global_register_token_residual() -> None:
@@ -576,6 +611,7 @@ def load_tests(_loader, tests, _pattern):
     for function in (
         test_replaceme_fusion_matches_residual_transform,
         test_replaceme_ls_recovers_known_transform,
+        test_replaceme_cos_clears_cuda_cache_before_capacity_check,
         test_replaceme_ls_aligns_global_register_token_residual,
         test_linearpatch_constructs_hadamard_conjugated_diagonal,
         test_replaceme_cos_improves_cosine_fit,

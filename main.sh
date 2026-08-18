@@ -13,7 +13,7 @@ parse_backbones_list
 ALL_BACKBONES_LIST=("${BB_LIST[@]}")
 DEVICE="${DEVICE:-cuda}"
 MAX_SCENES="${MAX_SCENES:-0}"
-PLAN_MAX_DROP="${PLAN_MAX_DROP:-28}"
+PLAN_MAX_DROP="${PLAN_MAX_DROP:-26}"
 # Plan-building / train datasets used by skip-eval, redundancy, prune, remaining-*, and recovery.
 TRAINING_DATASETS="${TRAINING_DATASETS:-scannet_dev50,nuscenes_train}"
 EVAL_DATASETS="${EVAL_DATASETS:-scannet_test50,7scenes_test,nuscenes_val,waymo_validation}"
@@ -22,9 +22,9 @@ PRUNE_TOKEN_REGION="${PRUNE_TOKEN_REGION:-mean}"
 PRUNE_STRATEGY="${PRUNE_STRATEGY:-gt_single,gt_double,ours_single,ours_double,cosine_single,cosine_double,inv_mse_single,inv_mse_double,cca_single,cca_double,replaceme_single,replaceme_double,shortgpt,simpler}"
 # Strategy whose plans are used by recovery at the drop lengths below.
 RECOVERY_PRUNE_STRATEGY="${RECOVERY_PRUNE_STRATEGY:-gt_single,gt_double,ours_single,ours_double}"
-RECOVERY_PRUNE_PLANS="${RECOVERY_PRUNE_PLANS:-prune_span12,prune_span14,prune_span16,prune_span18,prune_span20,prune_span22,prune_span24,prune_span26,prune_span28}"
+RECOVERY_PRUNE_PLANS="${RECOVERY_PRUNE_PLANS:-prune_span16,prune_span18,prune_span20,prune_span22,prune_span24,prune_span26}"
 RECOVERY_METHODS="${RECOVERY_METHODS:-recovery_linearpatch,recovery_ghost,recovery_ghost_interval,recovery_ghost_interval_sequential,recovery_replaceme_ls,recovery_replaceme_cos}"
-POINT="${POINT:-13}"
+POINT="${POINT:-16}"
 if [[ ! "${POINT}" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: POINT must be provided as a positive integer (number of layers to delete)" >&2
   exit 1
@@ -87,53 +87,24 @@ BACKBONES="${ALL_BACKBONES}" \
 #    The reuse/evaluation mapping is:
 #    <OUTPUT_ROOT>/<backbone>/<dataset>/eval/pruning/remaining_skip_eval_index_v3.json
 
-# stage_log "4/10" "Evaluate skip intervals after pruning"
-# for bb in "${ALL_BACKBONES_LIST[@]}"; do
-#   read -r base_selector drop_count < <(
-#     python -m analysis.prune_plan.gt_single_interval_at_point \
-#         --root "${OUTPUT_ROOT}/${bb}" \
-#         --datasets "${TRAINING_DATASETS}" \
-#         --point "${POINT}"
-#   )
-#   BACKBONES="${bb}" \
-#       RUN="${TRAINING_DATASETS}" \
-#       PRUNE_PLAN_ROOT="${OUTPUT_ROOT}/${bb}" \
-#       PRUNE_PLAN_NAME="${base_selector}" \
-#       EXPECTED_DROP_COUNT="${drop_count}" \
-#       MAX_SCENES="${MAX_SCENES}" \
-#       DEVICE="${DEVICE}" \
-#       bash "${REPO_ROOT}/scripts/run_remaining_skip_eval.sh"
-# done
+stage_log "4/10" "Evaluate skip intervals after pruning"
+for bb in "${ALL_BACKBONES_LIST[@]}"; do
+  read -r base_selector drop_count < <(
+    python -m analysis.prune_plan.gt_single_interval_at_point \
+        --root "${OUTPUT_ROOT}/${bb}" \
+        --datasets "${TRAINING_DATASETS}" \
+        --point "${POINT}"
+  )
+  BACKBONES="${bb}" \
+      RUN="${TRAINING_DATASETS}" \
+      PRUNE_PLAN_ROOT="${OUTPUT_ROOT}/${bb}" \
+      PRUNE_PLAN_NAME="${base_selector}" \
+      EXPECTED_DROP_COUNT="${drop_count}" \
+      MAX_SCENES="${MAX_SCENES}" \
+      DEVICE="${DEVICE}" \
+      bash "${REPO_ROOT}/scripts/run_remaining_skip_eval.sh"
+done
 
-# 5. Re-run inference with the step-4 manually selected model and compute
-#    remaining-layer CKA.
-#    The prune plan is applied before any dataset scene is read. Surviving-layer
-#    activations exist only in memory for the current scene and are released
-#    immediately after CKA accumulation. Only graphs and provenance are saved:
-#    <OUTPUT_ROOT>/<backbone>/<dataset>/remaining_redundancy/redundancy_graph_<region>.npz
-#    <OUTPUT_ROOT>/<backbone>/<dataset>/remaining_redundancy/manifest.json
-#    The exact base interval is reconstructed from POINT so this stage can run
-#    independently.
-
-# stage_log "5/10" "Compute remaining redundancy after pruning"
-# for bb in "${ALL_BACKBONES_LIST[@]}"; do
-#   read -r base_selector drop_count < <(
-#     python -m analysis.prune_plan.gt_single_interval_at_point \
-#         --root "${OUTPUT_ROOT}/${bb}" \
-#         --datasets "${TRAINING_DATASETS}" \
-#         --point "${POINT}"
-#   )
-#   BACKBONES="${bb}" \
-#       RUN="${TRAINING_DATASETS}" \
-#       PRUNE_PLAN_ROOT="${OUTPUT_ROOT}/${bb}" \
-#       PRUNE_PLAN_NAME="${base_selector}" \
-#       EXPECTED_DROP_COUNT="${drop_count}" \
-#       METRICS=cosine,angular,inv_mse,cca \
-#       SIM_TOKEN_REGIONS="${SIM_TOKEN_REGIONS}" \
-#       MAX_SCENES="${MAX_SCENES}" \
-#       DEVICE="${DEVICE}" \
-#       bash "${REPO_ROOT}/scripts/run_remaining_redundancy.sh"
-# done
 
 
 
@@ -392,34 +363,34 @@ done
 #     QuantVGGT defaults to the explicitly named official W4A4 transfer
 #     parameters; set QUANTVGGT_PARAMS_DIR to a LaRe-aware calibration directory
 #     for the main result.
-# stage_log "10/10" "Evaluate pruning + recovery + test-time compression"
-# testtime_recovery_plan="recovery_ghost_interval_sequential"
-# testtime_prune_strategies="ours,gt"
-# for bb in "${ALL_BACKBONES_LIST[@]}"; do
-#   case "${bb}" in
-#     pi3)
-#       testtime_prune_plans="prune_span20,prune_span22,prune_span24"
-#       ;;
-#     vggt_omega)
-#       testtime_prune_plans="prune_span22,prune_span24,prune_span26"
-#       ;;
-#     vggt)
-#       testtime_prune_plans="prune_span16,prune_span18,prune_span20"
-#       ;;
-#     *)
-#       echo "error: no test-time pruning configuration for backbone=${bb@Q}" >&2
-#       exit 1
-#       ;;
-#   esac
+stage_log "10/10" "Evaluate pruning + recovery + test-time compression"
+testtime_recovery_plan="recovery_ghost_interval_sequential"
+testtime_prune_strategies="ours,gt"
+for bb in "${ALL_BACKBONES_LIST[@]}"; do
+  case "${bb}" in
+    pi3)
+      testtime_prune_plans="prune_span20,prune_span22,prune_span24"
+      ;;
+    vggt_omega)
+      testtime_prune_plans="prune_span22,prune_span24,prune_span26"
+      ;;
+    vggt)
+      testtime_prune_plans="prune_span16,prune_span18,prune_span20"
+      ;;
+    *)
+      echo "error: no test-time pruning configuration for backbone=${bb@Q}" >&2
+      exit 1
+      ;;
+  esac
 
-#   OUTPUT_ROOT="${OUTPUT_ROOT}" \
-#       TESTTIME_BACKBONES="${bb}" \
-#       TESTTIME_PRUNE_PLAN_NAME="${testtime_prune_plans}" \
-#       TESTTIME_PRUNE_STRATEGY="${testtime_prune_strategies}" \
-#       TESTTIME_RECOVERY_PLAN_NAME="${testtime_recovery_plan}" \
-#       TESTTIME_SELECTION_DATASETS="${TRAINING_DATASETS}" \
-#       DEVICE="${DEVICE}" \
-#       MAX_SCENES="${MAX_SCENES}" \
-#       TESTTIME_RUN="${TRAINING_DATASETS},${EVAL_DATASETS}" \
-#       bash "${REPO_ROOT}/scripts/run_testtime_eval.sh"
-# done
+  OUTPUT_ROOT="${OUTPUT_ROOT}" \
+      TESTTIME_BACKBONES="${bb}" \
+      TESTTIME_PRUNE_PLAN_NAME="${testtime_prune_plans}" \
+      TESTTIME_PRUNE_STRATEGY="${testtime_prune_strategies}" \
+      TESTTIME_RECOVERY_PLAN_NAME="${testtime_recovery_plan}" \
+      TESTTIME_SELECTION_DATASETS="${TRAINING_DATASETS}" \
+      DEVICE="${DEVICE}" \
+      MAX_SCENES="${MAX_SCENES}" \
+      TESTTIME_RUN="${TRAINING_DATASETS},${EVAL_DATASETS}" \
+      bash "${REPO_ROOT}/scripts/run_testtime_eval.sh"
+done

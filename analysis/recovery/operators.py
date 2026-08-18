@@ -21,7 +21,13 @@ class BoundaryRecovery(nn.Module):
         self.register_buffer("weight", weight.detach().to(torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.matmul(x, self.weight)
+        # Recovery matrices are fitted and stored in fp32.  Keep their
+        # application in fp32 as well: the surrounding backbone forward runs
+        # under autocast, where an unguarded matmul would otherwise produce a
+        # bf16/fp16 boundary activation and change the residual-stream dtype.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            output = torch.matmul(x.to(torch.float32), self.weight.to(torch.float32))
+        return output.to(dtype=x.dtype)
 
 
 def recovery_module_name(source_unit_id: str) -> str:
