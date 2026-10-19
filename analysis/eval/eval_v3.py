@@ -5,10 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import resource
 import shutil
 import sys
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -42,7 +40,11 @@ from analysis.prune_plan import (
     load_named_prune_plan,
     resolve_prune_plan_path,
 )
-from analysis.prune_plan.recovery_plan import compose_recovery_unit_prune_plan
+from analysis.prune_plan.recovery_plan import (
+    TOKEN_GROUPED_RECOVERY_BASE_METHODS,
+    compose_recovery_unit_prune_plan,
+    recovery_method_semantics_version,
+)
 from analysis.schema.v3 import EvalRecordV3, stage_dir
 from analysis.recovery.train.checkpoint_v3 import EvalMode, apply_eval_model_structure
 from analysis.recovery.shared_results import eval_result_complete
@@ -59,9 +61,6 @@ class _EvalScoreKey:
     scene_id: str
     num_frames: int
     prepared: Any
-    inference_start: Optional[torch.cuda.Event]
-    inference_end: Optional[torch.cuda.Event]
-    infer_peak_vram_gb: float
 
 
 def _replace_with_relative_symlink(target: Path, source: Path) -> None:
@@ -81,13 +80,25 @@ def _try_link_derived_ghost_eval(
 ) -> bool:
     """Link complete Ghost evals and leave only missing dataset jobs to run."""
     recovery_name = str(args.recovery_plan_name or "")
-    if recovery_name not in _DERIVED_GHOST_RECOVERY_NAMES or not jobs:
+    pi3_token_group_alias = (
+        str(getattr(args, "backbone", "")).strip().lower() == "pi3"
+        and recovery_name in TOKEN_GROUPED_RECOVERY_BASE_METHODS
+    )
+    if pi3_token_group_alias:
+        source_recovery_name = TOKEN_GROUPED_RECOVERY_BASE_METHODS[recovery_name]
+        reason = "Pi3 exposes one patch-token group"
+    elif recovery_name in _DERIVED_GHOST_RECOVERY_NAMES:
+        source_recovery_name = "recovery_ghost"
+        reason = "single contiguous drop interval"
+    else:
+        return False
+    if not jobs:
         return False
     checkpoint = Path(args.checkpoint) if args.checkpoint else None
     if checkpoint is None or len(checkpoint.parents) < 2:
         return False
     # Recovery fitting creates this directory symlink only after confirming
-    # that the physical prune plan is one contiguous interval.
+    # exact equivalence (single-interval Ghost, or one-group Pi3).
     if not checkpoint.parent.parent.is_symlink():
         return False
 
@@ -101,11 +112,11 @@ def _try_link_derived_ghost_eval(
         target = Path(str(output_value))
         if target.name != recovery_name:
             return False
-        source = target.parent / "recovery_ghost"
+        source = target.parent / source_recovery_name
         if not eval_result_complete(
             source,
             selector=target.parent.name,
-            recovery_plan_name="recovery_ghost",
+            recovery_plan_name=source_recovery_name,
         ):
             remaining_jobs.append(job)
             continue
@@ -117,12 +128,22 @@ def _try_link_derived_ghost_eval(
             "\n  eval reuse\n"
             f"    recovery: {recovery_name.removeprefix('recovery_')}\n"
             f"    dataset: {output_dataset}\n"
-            "    source: ghost\n"
+            f"    source: {source_recovery_name.removeprefix('recovery_')}\n"
+            f"    reason: {reason}\n"
             f"    link: {target} -> {source}\n",
             file=sys.stderr,
             flush=True,
         )
     jobs[:] = remaining_jobs
+    if pi3_token_group_alias and jobs:
+        missing = ", ".join(
+            str(job.get("output_dataset") or job.get("dataset") or "<unknown>")
+            for job in jobs
+        )
+        raise FileNotFoundError(
+            f"Pi3 token-grouped eval {recovery_name!r} must reuse complete "
+            f"{source_recovery_name!r} results; missing datasets: {missing}"
+        )
     return not jobs
 
 
@@ -252,11 +273,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum number of staged predictions awaiting CPU scoring.",
     )
     p.add_argument(
-        "--timing",
-        action="store_true",
-        help="Log aggregate asynchronous evaluation pipeline timings.",
-    )
-    p.add_argument(
         "--no-scene-preload",
         action="store_true",
         help="Disable one-scene CPU preparation lookahead and asynchronous H2D.",
@@ -301,8 +317,8 @@ def evaluate_model_v3(
     async_score: bool = True,
     score_workers: int = DEFAULT_ASYNC_SCORE_WORKERS,
     score_max_pending: int = DEFAULT_ASYNC_SCORE_MAX_PENDING,
-    timing: bool = False,
     scene_preload: bool = True,
+    recovery_semantics_version: str = "",
 ) -> Path:
     """Shared evaluation entry used by stage-4 eval and training periodic eval."""
     split = ds_plugin.validate_split(split)
@@ -359,6 +375,8 @@ def evaluate_model_v3(
             print(msg, file=sys.stderr)
 
     def write_scene_result(key: _EvalScoreKey, scene_metrics: Dict[str, float]) -> None:
+        scene_metrics.pop("inference_time_ms", None)
+        scene_metrics.pop("infer_peak_vram_gb", None)
         scene_metrics["num_frames"] = float(key.num_frames)
         scene_metrics["scene_id"] = key.scene_id
         rows.append(scene_metrics)
@@ -376,28 +394,20 @@ def evaluate_model_v3(
         and not bool(export_vis_3d)
     )
     pipeline = None
-    pipeline_t0 = time.perf_counter()
     if async_active:
         def score_scene(
             key: _EvalScoreKey, prediction
         ) -> Dict[str, float]:
-            metrics = ds_plugin.score_eval_prediction(
+            return ds_plugin.score_eval_prediction(
                 adapter, prediction, key.prepared, ctx
             )
-            if key.inference_start is None or key.inference_end is None:
-                raise RuntimeError("Async eval task is missing CUDA inference events")
-            metrics["inference_time_ms"] = float(
-                key.inference_start.elapsed_time(key.inference_end)
-            )
-            metrics["infer_peak_vram_gb"] = float(key.infer_peak_vram_gb)
-            return metrics
 
         pipeline = AsyncPredictionScorePipeline(
             device=device,
             score_fn=score_scene,
             result_fn=write_scene_result,
             error_fn=lambda key, exc: report_error(key.scene_id, exc),
-            timing=bool(timing),
+            timing=False,
             score_workers=score_workers,
             max_pending=score_max_pending,
             thread_name_prefix="eval-score",
@@ -411,9 +421,6 @@ def evaluate_model_v3(
     )
     preloader = None
     h2d_stream = None
-    h2d_ms = 0.0
-    peak_vram_gib = 0.0
-    gpu_inference_events: List[tuple[torch.cuda.Event, torch.cuda.Event]] = []
     if preload_active:
         preloader = AsyncScenePreloader(
             scene_source=iter(scene_source),
@@ -460,31 +467,23 @@ def evaluate_model_v3(
                     scene_id=sid,
                     num_frames=count_eval_frames(batch),
                     prepared=None,
-                    inference_start=None,
-                    inference_end=None,
-                    infer_peak_vram_gb=float(scene_metrics.get("infer_peak_vram_gb", 0.0)),
                 )
                 write_scene_result(key, scene_metrics)
                 continue
             h2d_ready = None
-            h2d_start = None
             host_images = None
             try:
                 if preload_item is not None:
                     prepared = preload_item.prepared
                     assert h2d_stream is not None
-                    h2d_ready, h2d_start, host_images = stage_preloaded_scene_to_cuda(
+                    h2d_ready, _, host_images = stage_preloaded_scene_to_cuda(
                         prepared,
                         device=device,
                         copy_stream=h2d_stream,
-                        timing=bool(timing),
+                        timing=False,
                     )
                 else:
                     prepared = ds_plugin.prepare_skip_eval_scene(adapter, batch, ctx)
-                torch.cuda.reset_peak_memory_stats(device.index)
-                inference_start = torch.cuda.Event(enable_timing=True)
-                inference_end = torch.cuda.Event(enable_timing=True)
-                inference_start.record(torch.cuda.current_stream(device))
                 ac_kw = autocast_device_dtype(device)
                 with torch.no_grad(), torch.autocast(**ac_kw):
                     prediction = adapter.forward_predictions(
@@ -492,19 +491,10 @@ def evaluate_model_v3(
                         prepared.images,
                         defer_cpu_geometry=True,
                     )
-                inference_end.record(torch.cuda.current_stream(device))
-                gpu_inference_events.append((inference_start, inference_end))
-                scene_peak_vram_gb = float(torch.cuda.max_memory_allocated(device.index)) / (
-                    1024.0**3
-                )
-                peak_vram_gib = max(peak_vram_gib, scene_peak_vram_gb)
                 key = _EvalScoreKey(
                     scene_id=sid,
                     num_frames=count_eval_frames(batch),
                     prepared=prepared,
-                    inference_start=inference_start,
-                    inference_end=inference_end,
-                    infer_peak_vram_gb=scene_peak_vram_gb,
                 )
                 pipeline.submit(key, prediction)
                 prepared.images = None
@@ -514,8 +504,6 @@ def evaluate_model_v3(
             finally:
                 if h2d_ready is not None:
                     h2d_ready.synchronize()
-                    if bool(timing) and h2d_start is not None:
-                        h2d_ms += float(h2d_start.elapsed_time(h2d_ready))
                 del host_images
     finally:
         try:
@@ -525,29 +513,6 @@ def evaluate_model_v3(
             if pipeline is not None:
                 pipeline.close()
 
-    if bool(timing) and pipeline is not None:
-        gpu_inference_s = (
-            sum(float(start.elapsed_time(end)) for start, end in gpu_inference_events)
-            / 1000.0
-        )
-        print(
-            f"[timing] eval dataset={tagged_dataset} pipeline={time.perf_counter() - pipeline_t0:.3f}s "
-            f"iterator_load={preloader.iterator_s if preloader is not None else 0.0:.3f}s "
-            f"cpu_prepare={preloader.cpu_prepare_s if preloader is not None else 0.0:.3f}s "
-            f"preload_wait={preloader.preload_wait_s if preloader is not None else 0.0:.3f}s "
-            f"h2d={h2d_ms / 1000.0:.3f}s "
-            f"gpu_inference={gpu_inference_s:.3f}s "
-            f"d2h={pipeline.d2h_ms / 1000.0:.3f}s "
-            f"cpu_score={pipeline.score_s:.3f}s "
-            f"producer_wait={pipeline.producer_wait_s:.3f}s "
-            f"score_workers={pipeline.score_workers} "
-            f"max_pending={pipeline.max_pending_seen} "
-            f"max_lookahead={preloader.max_lookahead_seen if preloader is not None else 0} "
-            f"peak_vram={peak_vram_gib:.3f}GiB "
-            f"peak_rss={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0**2):.3f}GiB",
-            file=sys.stderr,
-            flush=True,
-        )
     if pbar is not None:
         pbar.close()
 
@@ -573,7 +538,8 @@ def evaluate_model_v3(
             ),
             "inference_compression": dict(
                 getattr(model, "_inference_compression", {"name": "none"})
-            )
+            ),
+            "recovery_semantics_version": str(recovery_semantics_version),
         },
     )
     record.save(out_dir / "eval_record_v3.json")
@@ -752,9 +718,11 @@ def main() -> None:
             score_max_pending=int(
                 job.get("score_max_pending", args.score_max_pending)
             ),
-            timing=bool(job.get("timing", args.timing)),
             scene_preload=not bool(
                 job.get("no_scene_preload", args.no_scene_preload)
+            ),
+            recovery_semantics_version=recovery_method_semantics_version(
+                str(args.recovery_plan_name or "")
             ),
         )
         if device.type == "cuda":

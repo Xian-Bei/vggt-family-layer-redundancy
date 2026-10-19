@@ -18,8 +18,11 @@ RECOVERY_PLAN_METHODS = (
     "recovery_ghost",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
+    "recovery_ghost_interval_sequential_grouped",
+    "recovery_ghost_interval_sequential_autogroup",
     "recovery_replaceme_ls",
     "recovery_replaceme_cos",
+    "recovery_streamline_ffn",
 )
 TRAINABLE_RECOVERY_METHODS = ("recovery_lora", "recovery_train")
 TRAINING_FREE_RECOVERY_METHODS = (
@@ -27,8 +30,15 @@ TRAINING_FREE_RECOVERY_METHODS = (
     "recovery_ghost",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
+    "recovery_ghost_interval_sequential_grouped",
+    "recovery_ghost_interval_sequential_autogroup",
     "recovery_replaceme_ls",
     "recovery_replaceme_cos",
+)
+LOCAL_FIT_RECOVERY_METHODS = ("recovery_streamline_ffn",)
+CACHE_FIT_RECOVERY_METHODS = (
+    *TRAINING_FREE_RECOVERY_METHODS,
+    *LOCAL_FIT_RECOVERY_METHODS,
 )
 REPLACEME_RECOVERY_METHODS = (
     "recovery_replaceme_ls",
@@ -37,9 +47,36 @@ REPLACEME_RECOVERY_METHODS = (
 GHOST_INTERVAL_RECOVERY_METHODS = (
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
+    "recovery_ghost_interval_sequential_grouped",
+    "recovery_ghost_interval_sequential_autogroup",
 )
+TOKEN_GROUPED_RECOVERY_BASE_METHODS = {
+    "recovery_ghost_interval_sequential_grouped": (
+        "recovery_ghost_interval_sequential"
+    ),
+}
+RECOVERY_METHOD_SEMANTICS_VERSIONS = {
+    "recovery_ghost_interval_sequential": (
+        "current_source_current_target_v1"
+    ),
+    "recovery_ghost_interval_sequential_grouped": (
+        "current_source_current_target_special_patch_grouped_v1"
+    ),
+    "recovery_ghost_interval_sequential_autogroup": (
+        "current_source_current_target_special_patch_autogroup_t20_v1"
+    ),
+    "recovery_replaceme_cos": "official_current_source_current_target_v1",
+    "recovery_streamline_ffn": "official_ffn_4x_relu_boundary_mse_v1",
+}
 
 _SPAN_SELECTOR_RE = re.compile(r"^prune_span(?P<span>\d+)$")
+
+
+def recovery_method_semantics_version(method: str) -> str:
+    """Return the explicit provenance version for methods with revised semantics."""
+    return RECOVERY_METHOD_SEMANTICS_VERSIONS.get(
+        str(method).strip().lower(), ""
+    )
 
 
 def execution_method(method: str) -> str:
@@ -57,7 +94,7 @@ def recovery_plan_name(*, method: str, lora_prefix: int, lora_rank: int = 0) -> 
         return f"recovery_lora_l{int(lora_prefix)}_r{int(lora_rank)}"
     if key == "recovery_train":
         return f"recovery_train_l{int(lora_prefix)}"
-    if key in TRAINING_FREE_RECOVERY_METHODS:
+    if key in CACHE_FIT_RECOVERY_METHODS:
         return key
     raise ValueError(f"unknown recovery method: {method!r}")
 
@@ -81,10 +118,10 @@ def _validate_method_entry(name: str, entry: Dict[str, Any], path: Path) -> None
     )
     if name != expected_name:
         raise ValueError(f"Recovery entry key {name!r} does not match its configuration {expected_name!r}")
-    if method in TRAINING_FREE_RECOVERY_METHODS:
+    if method in CACHE_FIT_RECOVERY_METHODS:
         unexpected = sorted(set(entry) - {"method"})
         if unexpected:
-            raise ValueError(f"Training-free recovery entry {name!r} contains redundant fields: {unexpected}")
+            raise ValueError(f"Cache-fit recovery entry {name!r} contains redundant fields: {unexpected}")
         return
     spans = entry.get("spans")
     if not isinstance(spans, dict) or not spans:
@@ -202,8 +239,8 @@ def _boundary_records(prune_plan: UnitPrunePlan, method: str) -> List[Dict[str, 
     if method in GHOST_INTERVAL_RECOVERY_METHODS:
         starts_and_ends = intervals
     elif method == "recovery_ghost":
-        # Ghost replaces each removed physical unit.  Consecutive replacements
-        # compose on the identity blocks installed by pruning.
+        # Ghost replaces each removed physical unit. Consecutive replacements
+        # stay separate so intermediate head-visible states evolve per unit.
         starts_and_ends = [(index, index) for index in drop]
     elif method == "recovery_linearpatch":
         if len(intervals) == 1:
@@ -243,7 +280,7 @@ def recovery_record_for_selector(
             for auxiliary_id in item.get("auxiliary_cache_ids", [])
         }
     )
-    if method in TRAINING_FREE_RECOVERY_METHODS:
+    if method in CACHE_FIT_RECOVERY_METHODS:
         record.update({"lora_indices": [], "train_unit_indices": [], "lora": {}})
         return record
     span = span_from_prune_selector(prune_selector)

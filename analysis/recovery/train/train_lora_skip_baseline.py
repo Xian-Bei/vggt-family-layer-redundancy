@@ -450,13 +450,13 @@ _SCANNET_KEEP_KEYS = (
     "rpe_trans",
 )
 
-# Omitted from periodic-eval history / CSV / plots (still computed inside eval helpers).
-_EVAL_HISTORY_SKIP_KEYS = frozenset({"inference_time_ms", "infer_peak_vram_gb"})
+# Periodic evaluation records accuracy metrics only.
+_EVAL_HISTORY_SKIP_KEYS: frozenset[str] = frozenset()
 
 
 # Periodic eval covers the enabled dataset tags. Two metric families:
 #   - scannet_dev50, scannet_test50 → ScanNet metrics (chamfer/ape/are/...)
-#   - 7scenes, nrgbd, nuscenes, waymo → reconstruction + trajectory (acc/comp/cd, ape/are/rpe, timing)
+#   - 7scenes, nrgbd, nuscenes, waymo → reconstruction + trajectory (acc/comp/cd, ape/are/rpe)
 # Plotting groups (`_write_eval_artifacts`) share these splits.
 EVAL_SCANNET_DATASETS = ("scannet_dev50", "scannet_test50")
 EVAL_RECON_DATASETS = ("7scenes", "nrgbd", "nuscenes", "waymo")
@@ -473,8 +473,6 @@ _RECON_KEEP_KEYS = (
     "are",
     "rpe_rot",
     "rpe_trans",
-    "inference_time_ms",
-    "infer_peak_vram_gb",
 )
 
 

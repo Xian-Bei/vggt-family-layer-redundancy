@@ -76,6 +76,16 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
 
     name: str = "vggt"
 
+    def ghost_token_group_layout(
+        self, *, patch_start_idx: int
+    ) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+        patch_start = int(patch_start_idx)
+        if patch_start <= 0:
+            return ("patch",), (0,)
+        if patch_start == 1:
+            return ("camera", "patch"), (0, 1)
+        return ("camera", "register", "patch"), (0, 1, patch_start)
+
     def capabilities(self) -> BackboneCapabilities:
         return BackboneCapabilities(
             name=self.name,
@@ -605,6 +615,13 @@ class VGGTFamilyAdapterMixin(BackboneAdapter):
             images = images.unsqueeze(0)
         if images.dim() != 5:
             raise ValueError(f"Expected skip-eval images [B,S,3,H,W], got {tuple(images.shape)}")
+        from analysis.recovery.operators import set_recovery_token_layout
+
+        set_recovery_token_layout(
+            model,
+            batch_size=int(images.shape[0]),
+            num_frames=int(images.shape[1]),
+        )
 
         unit_ids = [u.unit_id for u in self.layer_unit_catalog(model)]
         total_units = len(unit_ids)

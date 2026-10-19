@@ -25,7 +25,7 @@
     "quantvggt": {
       "component_type": "inference_compression",
       "path": "submodules/QuantVGGT",
-      "url": "git@github.com:wlfeng0509/QuantVGGT.git",
+      "url": "https://github.com/wlfeng0509/QuantVGGT.git",
       "commit": "e6e0ca8859fb5cbc7683eec6c9b4773a1a3360ed",
       "default_weight": {
         "kind": "huggingface_model_id",

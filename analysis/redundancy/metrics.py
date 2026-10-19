@@ -16,6 +16,34 @@ def upper_triangle_length(num_layers: int) -> int:
     return num_layers * (num_layers + 1) // 2
 
 
+def mask_unevaluated_upper_spans(
+    packed: List[float],
+    *,
+    num_layers: int,
+    max_span: int,
+) -> List[float]:
+    """Return packed values with spans outside the evaluation cap set to NaN."""
+    n = int(num_layers)
+    requested = int(max_span)
+    if n <= 0 or requested == 0:
+        return packed
+    cap = min(n, requested) if requested > 0 else n + requested
+    if cap >= n:
+        return packed
+    expected = upper_triangle_length(n)
+    if cap < 1 or len(packed) != expected:
+        return packed
+
+    masked = list(packed)
+    packed_index = 0
+    for start in range(n):
+        for end in range(start, n):
+            if end - start + 1 > cap:
+                masked[packed_index] = float("nan")
+            packed_index += 1
+    return masked
+
+
 def upper_triangle_pack(mat: torch.Tensor) -> List[float]:
     """Row-major upper triangle including diagonal: (0,0)…(0,L-1), (1,1)…, (L-1,L-1)."""
     L = mat.shape[0]
@@ -104,6 +132,16 @@ def sample_cosine_similarity_tensor(x: torch.Tensor, y: torch.Tensor, eps: float
 
 def sample_cosine_similarity(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
     return float(sample_cosine_similarity_tensor(x, y, eps=eps).item())
+
+
+def unit_interval_cosine_similarity(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    eps: float = 1e-8,
+) -> float:
+    """Map raw cosine similarity from ``[-1, 1]`` to ``[0, 1]``."""
+    cosine = sample_cosine_similarity_tensor(x, y, eps=eps)
+    return float(((cosine + 1.0) * 0.5).clamp(0.0, 1.0).item())
 
 
 def sample_angular_distance_tensor(
@@ -325,7 +363,10 @@ def pairwise_similarity_matrices(
             for j in range(i, num_layers):
                 t0 = time.perf_counter()
                 if "cosine" in mats:
-                    cos_v = sample_cosine_similarity(layer_tokens[i], layer_tokens[j])
+                    cos_v = unit_interval_cosine_similarity(
+                        layer_tokens[i],
+                        layer_tokens[j],
+                    )
                     mats["cosine"][i, j] = mats["cosine"][j, i] = cos_v
                     _acc("cosine", t0)
 
@@ -414,7 +455,10 @@ def paired_layer_similarity_matrices(
     for i in range(num_layers):
         t0 = time.perf_counter()
         if "cosine" in mats:
-            cos_v = sample_cosine_similarity(x_layers[i], y_layers[i])
+            cos_v = unit_interval_cosine_similarity(
+                x_layers[i],
+                y_layers[i],
+            )
             _acc("cosine", t0)
             mats["cosine"][i, i] = cos_v
 

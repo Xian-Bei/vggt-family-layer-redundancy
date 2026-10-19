@@ -49,6 +49,30 @@ class MapAnythingAdapterBase(BackboneAdapter):
 
     hf_model_id = "facebook/map-anything"
 
+    def ghost_token_group_layout(
+        self, *, patch_start_idx: int
+    ) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+        patch_start = int(patch_start_idx)
+        if patch_start <= 0:
+            return ("patch",), (0,)
+        return ("register", "patch"), (0, patch_start)
+
+    def ghost_runtime_token_group_order(
+        self, token_groups: Sequence[str]
+    ) -> Tuple[str, ...]:
+        groups = tuple(str(name) for name in token_groups)
+        order = tuple(
+            name for name in ("patch", "register", "special") if name in groups
+        )
+        if set(order) != set(groups):
+            raise ValueError(f"Unsupported MapAnything Ghost token groups: {groups}")
+        return order
+
+    def ghost_runtime_trailing_token_count(self) -> int:
+        # The global information-sharing state appends one scale token after
+        # all per-view patch/register tokens; it is excluded from public cache.
+        return 1
+
     def capabilities(self) -> BackboneCapabilities:
         return BackboneCapabilities(
             name=self.name,
@@ -667,6 +691,13 @@ class MapAnythingAdapterBase(BackboneAdapter):
         view_tokens = view_tokens.reshape(bsz, seq_len * tokens_per_view, channels)
         scale = model.scale_token.reshape(1, 1, -1).expand(bsz, 1, -1)
         tokens = info.proj_embed(torch.cat([view_tokens, scale], dim=1))
+        from analysis.recovery.operators import set_recovery_token_layout
+
+        set_recovery_token_layout(
+            model,
+            batch_size=bsz,
+            num_frames=seq_len,
+        )
 
         if bool(getattr(info, "distinguish_ref_and_non_ref_views", False)):
             ref_pe = info.view_pos_table[0].detach().reshape(1, 1, -1)

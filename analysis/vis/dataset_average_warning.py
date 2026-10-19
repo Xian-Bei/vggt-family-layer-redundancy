@@ -13,9 +13,29 @@ DATASET_AVERAGE_GROUPS: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
+# Publication views distinguish evaluation on held-out splits of the training
+# datasets from evaluation on entirely different datasets.  Keep the legacy
+# two-way groups above for tabs that still expose a single testing average.
+GENERALIZATION_DATASET_AVERAGE_GROUPS: Dict[str, Tuple[str, ...]] = {
+    "training average": DATASET_AVERAGE_GROUPS["training average"],
+    "same-dataset testing average": (
+        "scannet_test50",
+        "nuscenes_val",
+    ),
+    "cross-dataset testing average": (
+        "7scenes_test",
+        "waymo_validation",
+    ),
+}
+
 _DATASET_DISPLAY_NAMES = {
-    "training average": "Training Dataset",
-    "testing average": "Testing Dataset",
+    "training average": "Calibration\nDataset",
+    "testing average": "Testing\nDataset",
+    "same-dataset testing average": "Same-Dataset\nGeneralization",
+    "cross-dataset testing average": "Cross-Dataset\nGeneralization",
+    "four-dataset average": "Four-Dataset\nAverage",
+    "four-dataset testing average": "Four-Dataset\nTest Average",
+    "two-dataset testing average": "Two-Dataset\nTest Average",
 }
 
 

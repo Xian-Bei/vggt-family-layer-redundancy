@@ -9,28 +9,22 @@ import numpy as np
 
 from analysis.redundancy.similarity_v3 import (
     UNIT_OUTPUT_PAIRWISE_GRAPH_SEMANTICS,
-    list_redundancy_graph_regions,
     resolve_redundancy_graph_path,
 )
 from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT
 
 
-REDUNDANCY_AGGREGATIONS = frozenset({"mean", "min"})
+SPECIAL_PATCH_MEAN = "special_patch_mean"
 DATASET_LIST_AGGREGATION = "mean"
 
 
 def reduce_similarity_matrices(
     matrices: Sequence[np.ndarray],
-    reduction: str,
 ) -> np.ndarray:
     if not matrices:
         raise ValueError("Cannot aggregate an empty collection of similarity matrices")
     stack = np.stack([np.asarray(matrix, dtype=np.float64) for matrix in matrices], axis=0)
-    if reduction == "mean":
-        return np.mean(stack, axis=0)
-    if reduction == "min":
-        return np.min(stack, axis=0)
-    raise ValueError(f"Unknown aggregation {reduction!r}; expected mean or min")
+    return np.mean(stack, axis=0)
 
 
 def _unit_id_order_key(unit_id: str) -> Tuple[int, str]:
@@ -149,7 +143,7 @@ def parse_dataset_list(dataset: str) -> List[str]:
     datasets = [part.strip() for part in raw.replace(",", " ").split() if part.strip()]
     if not datasets:
         raise ValueError("Dataset is required")
-    invalid = [name for name in datasets if name.lower() in REDUNDANCY_AGGREGATIONS]
+    invalid = [name for name in datasets if name.lower() in {"mean", "min"}]
     if invalid:
         raise ValueError(
             "Dataset aggregation selectors are no longer supported: "
@@ -189,10 +183,8 @@ def load_similarity(
 
     for dataset_name in datasets:
         red_dir = Path(output_root) / experiment / dataset_name / stage_name
-        if token_selector in REDUNDANCY_AGGREGATIONS:
-            regions = list_redundancy_graph_regions(red_dir)
-            if not regions:
-                raise FileNotFoundError(f"No similarity graphs found under {red_dir}")
+        if token_selector == SPECIAL_PATCH_MEAN:
+            regions = ["special", "patch"]
         else:
             regions = [token_selector]
         region_matrices: List[np.ndarray] = []
@@ -229,15 +221,15 @@ def load_similarity(
             source_paths.append(path)
         dataset_matrix = (
             region_matrices[0]
-            if token_selector not in REDUNDANCY_AGGREGATIONS
-            else reduce_similarity_matrices(region_matrices, token_selector)
+            if len(region_matrices) == 1
+            else reduce_similarity_matrices(region_matrices)
         )
         dataset_matrices.append(dataset_matrix)
         regions_by_dataset[str(dataset_name)] = regions
 
     assert unit_ids is not None
     similarity = (
-        reduce_similarity_matrices(dataset_matrices, DATASET_LIST_AGGREGATION)
+        reduce_similarity_matrices(dataset_matrices)
         if len(dataset_matrices) > 1
         else dataset_matrices[0]
     )

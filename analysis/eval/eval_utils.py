@@ -1,6 +1,6 @@
-"""VGGT-aligned evaluation helpers (dataset IO, trajectory metrics, reconstruction).
+"""Shared evaluation helpers for dataset IO, trajectory metrics, and reconstruction.
 
-Lives under ``analysis/eval`` so evaluation code stays outside the ``vggt`` package.
+Lives under ``analysis/eval`` so evaluation code stays outside vendor packages.
 """
 
 import os
@@ -219,12 +219,14 @@ def load_gt_pointcloud(scene_id, gt_ply_dir):
     return points, colors
 
 
-def _ensure_trajectory_plot_axis_limits(ax, min_span_m: float = 5.0) -> None:
-    """Expand 2D axis limits so equal-aspect trajectory plots stay readable.
+def _ensure_trajectory_plot_axis_limits(ax, min_span_m: float = 0.1) -> None:
+    """Make 2D trajectory limits square without imposing a large world range.
 
     evo enables ``plot_xyz_realistic`` by default, which calls ``set_aspect("equal")``.
     When a trajectory is nearly 1D (e.g. straight along z), one axis span can be ~0 and
-    the saved figure becomes extremely narrow or flat.
+    the saved figure becomes extremely narrow or flat.  The small lower bound only
+    handles that degenerate case; normal trajectories use their data-driven limits
+    and therefore fill the available axes.
     """
     x0, x1 = ax.get_xlim()
     y0, y1 = ax.get_ylim()
@@ -242,7 +244,14 @@ def _ensure_trajectory_plot_axis_limits(ax, min_span_m: float = 5.0) -> None:
     ax.set_ylim(ymid - plot_radius, ymid + plot_radius)
 
 
-def eval_trajectory(poses_est, poses_gt, frame_ids, align=False, plot_trajectory: bool = True):
+def eval_trajectory(
+    poses_est,
+    poses_gt,
+    frame_ids,
+    align=False,
+    plot_trajectory: bool = True,
+    trajectory_data_path: Optional[Path] = None,
+):
     # NOTE: `poses_est`/`poses_gt` are expected to be camera-from-world (w2c) SE(3) matrices.
     # For physical consistency with point clouds in world coordinates, build trajectories from camera centers:
     #   C_world = -R^T t   where x_cam = R x_world + t.
@@ -386,6 +395,18 @@ def eval_trajectory(poses_est, poses_gt, frame_ids, align=False, plot_trajectory
     rpe_trans = rpe_transs_result.stats["rmse"]
 
     stats = {"ate": ate, "are": are, "rpe_rot": rpe_rot, "rpe_trans": rpe_trans}
+    traj_est_visual = ate_result.trajectories["traj"] if align else traj_est
+    if trajectory_data_path is not None:
+        trajectory_data_path = Path(trajectory_data_path)
+        trajectory_data_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            trajectory_data_path,
+            reference_xyz=np.asarray(traj_ref.positions_xyz, dtype=np.float64),
+            estimate_xyz=np.asarray(traj_est_visual.positions_xyz, dtype=np.float64),
+            error=np.asarray(ate_result.np_arrays["error_array"], dtype=np.float64),
+            frame_ids=np.asarray(frame_ids),
+        )
+
     pillow_image = None
     if plot_trajectory:
         # Plot trajectory graph
@@ -398,25 +419,14 @@ def eval_trajectory(poses_est, poses_gt, frame_ids, align=False, plot_trajectory
         plot.traj(ax, plot_mode, traj_ref, "--", "gray", "gt")
 
         # Use aligned trajectory for visualization
-        if align:
-            traj_est_aligned = ate_result.trajectories["traj"]
-            plot.traj_colormap(
-                ax,
-                traj_est_aligned,
-                ate_result.np_arrays["error_array"],
-                plot_mode,
-                min_map=ate_result.stats["min"],
-                max_map=ate_result.stats["max"],
-            )
-        else:
-            plot.traj_colormap(
-                ax,
-                traj_est,
-                ate_result.np_arrays["error_array"],
-                plot_mode,
-                min_map=ate_result.stats["min"],
-                max_map=ate_result.stats["max"],
-            )
+        plot.traj_colormap(
+            ax,
+            traj_est_visual,
+            ate_result.np_arrays["error_array"],
+            plot_mode,
+            min_map=ate_result.stats["min"],
+            max_map=ate_result.stats["max"],
+        )
 
         ax.legend()
         _ensure_trajectory_plot_axis_limits(ax)

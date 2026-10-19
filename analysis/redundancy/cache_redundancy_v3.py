@@ -7,7 +7,6 @@ import json
 import os
 import re
 import sys
-import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -44,10 +43,6 @@ class CacheRequirements:
 
     def merge_plan(self, plan: Any, unit_ids_all: List[str], model: Any = None) -> None:
         method = str(getattr(plan, "extra", {}).get("recovery_method", ""))
-        if method == "recovery_ghost_interval_sequential":
-            # Progressive Ghost recomputes activations from image paths.
-            self.metadata_only = not self.unit_ids and not self.require_predictions
-            return
         ids = _cache_unit_ids_from_plan_extra(plan, unit_ids_all)
         if ids is None:
             from analysis.prune_plan import required_cache_unit_ids
@@ -290,7 +285,6 @@ def _save_scene_cache(
     frame_ids: List[str],
     image_paths: List[str],
     scene_meta: Dict[str, Any],
-    infer_s: float,
     adapter,
     model,
     initial_tokens: Optional[torch.Tensor] = None,
@@ -364,7 +358,6 @@ def _save_scene_cache(
         "patch_start_idx": int(meta.get("patch_start_idx", 0)),
         "frame_ids": frame_ids,
         "image_paths": image_paths,
-        "inference_time_ms": float(infer_s * 1000.0),
         "pred_path": str(pred_path.relative_to(cache_root)) if require_predictions else None,
         "activations_device": str(next(iter(unit_map.values())).device) if unit_map else "cpu",
     }
@@ -428,10 +421,7 @@ def run_cache_redundancy(
     if save_cache:
         cache_root.mkdir(parents=True, exist_ok=True)
 
-    t_run0 = time.perf_counter()
-    t_load0 = time.perf_counter()
     model = adapter.load_pretrained(hf_model=hf, device=str(torch_device))
-    load_s = time.perf_counter() - t_load0
 
     units = adapter.layer_unit_catalog(model)
     extra = adapter.cache_manifest_extra(model)
@@ -470,22 +460,20 @@ def run_cache_redundancy(
         for plan_ref in plan_refs:
             if isinstance(plan_ref, Path):
                 plan = UnitPrunePlan.load(plan_ref)
-                plan_labels.append(str(plan_ref.resolve()))
+                plan_labels.append(str(plan_ref))
                 explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
                 method = str(getattr(plan, "extra", {}).get("recovery_method", ""))
-                sequential_ghost = method == "recovery_ghost_interval_sequential"
-                if explicit_ids is not None and not sequential_ghost:
+                if explicit_ids is not None:
                     unit_ids_filter.update(explicit_ids)
                     explicit_cache_units_used += 1
-                elif not sequential_ghost:
+                else:
                     unit_ids_filter.update(required_cache_unit_ids(plan, model))
-                if not sequential_ghost:
-                    auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
+                auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
                 requirements.require_predictions |= (
                     method in {"recovery_lora", "recovery_train"}
                     or bool(getattr(plan, "lora", {}))
                 )
-                requirements.metadata_only &= sequential_ghost
+                requirements.metadata_only = False
             else:
                 for recovery_name in recovery_names:
                     plan = compose_recovery_unit_prune_plan(
@@ -497,19 +485,17 @@ def run_cache_redundancy(
                     plan_labels.append(f"{plan_ref}+{recovery_name}")
                     explicit_ids = _cache_unit_ids_from_plan_extra(plan, unit_ids)
                     method = str(getattr(plan, "extra", {}).get("recovery_method", ""))
-                    sequential_ghost = method == "recovery_ghost_interval_sequential"
-                    if explicit_ids is not None and not sequential_ghost:
+                    if explicit_ids is not None:
                         unit_ids_filter.update(explicit_ids)
                         explicit_cache_units_used += 1
-                    elif not sequential_ghost:
+                    else:
                         unit_ids_filter.update(required_cache_unit_ids(plan, model))
-                    if not sequential_ghost:
-                        auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
+                    auxiliary_ids_filter.update(_auxiliary_ids_from_plan_extra(plan))
                     requirements.require_predictions |= (
                         method in {"recovery_lora", "recovery_train"}
                         or bool(getattr(plan, "lora", {}))
                     )
-                    requirements.metadata_only &= sequential_ghost
+                    requirements.metadata_only = False
 
         requirements.require_initial_tokens = "layer_-1" in unit_ids_filter
         requirements.unit_ids = set(unit_ids_filter) - {"layer_-1"}
@@ -517,8 +503,8 @@ def run_cache_redundancy(
 
         cache_save_policy = {
             "mode": "prune_plan_minimal_union" if len(plan_refs) > 1 else "prune_plan_minimal",
-            "prune_plan_root": str(Path(prune_plan_root).resolve()),
-            "recovery_plan_root": str(recovery_root.resolve()),
+            "prune_plan_root": str(Path(prune_plan_root)),
+            "recovery_plan_root": str(recovery_root),
             "prune_plan_selectors": plan_labels,
             "units_saved": len(unit_ids_filter),
             "units_total": len(unit_ids),
@@ -558,8 +544,6 @@ def run_cache_redundancy(
         {r: RedundancyAccumulator(metric_names, r) for r in regions} if compute_redundancy else None
     )
     scene_rows: List[Dict[str, Any]] = []
-    sum_infer_s = 0.0
-    sum_disk_s = 0.0
 
     scene_list = list(
         ds_plugin.iter_scenes(
@@ -597,9 +581,6 @@ def run_cache_redundancy(
             if metadata_only_scene
             else prepared.images.to(torch_device, non_blocking=False)
         )
-        if torch_device.type == "cuda" and not metadata_only_scene:
-            torch.cuda.synchronize(torch_device)
-        t_infer0 = time.perf_counter()
         selected_only = requirements is not None and not compute_redundancy
         if selected_only and requirements.metadata_only:
             fwd = None
@@ -634,8 +615,6 @@ def run_cache_redundancy(
             )
             unit_map, meta, pred = fwd.unit_map, fwd.meta, fwd.pred
             fwd_initial_tokens = getattr(fwd, "initial_tokens", None)
-        infer_s = time.perf_counter() - t_infer0
-        sum_infer_s += infer_s
         patch_start_idx = int(meta.get("patch_start_idx", 0))
         camera_token_count = int(meta.get("camera_token_count", 0))
 
@@ -671,7 +650,6 @@ def run_cache_redundancy(
             del by_region
 
         if save_cache:
-            t_disk0 = time.perf_counter()
             row = _save_scene_cache(
                 cache_root=cache_root,
                 scene_id=scene_id,
@@ -682,7 +660,6 @@ def run_cache_redundancy(
                 frame_ids=frame_ids,
                 image_paths=image_paths,
                 scene_meta=batch.meta,
-                infer_s=infer_s,
                 adapter=adapter,
                 model=model,
                 initial_tokens=fwd_initial_tokens,
@@ -692,7 +669,6 @@ def run_cache_redundancy(
                     requirements is None or requirements.require_predictions
                 ),
             )
-            sum_disk_s += time.perf_counter() - t_disk0
             scene_rows.append(row)
 
         del unit_map, meta, pred, fwd, fwd_initial_tokens, auxiliary_map, images
@@ -705,7 +681,6 @@ def run_cache_redundancy(
                 refresh=True,
             )
 
-    total_s = time.perf_counter() - t_run0
     out_path: Path
     if compute_redundancy:
         assert accumulators is not None
@@ -715,7 +690,6 @@ def run_cache_redundancy(
             unit_ids=unit_ids,
             accumulators=accumulators,
             token_regions=regions,
-            timing_total_s=total_s,
         )
         out_path = out_paths[0]
     else:
@@ -723,12 +697,6 @@ def run_cache_redundancy(
 
     if save_cache:
         manifest.scenes = scene_rows
-        manifest.extra["timing_seconds"] = {
-            "load": float(load_s),
-            "infer": float(sum_infer_s),
-            "disk": float(sum_disk_s),
-            "total": float(total_s),
-        }
         manifest.save(cache_root / "cache_manifest_v3.json")
         if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
             print(f"Wrote {cache_root / 'cache_manifest_v3.json'}", file=sys.stderr)
@@ -736,8 +704,8 @@ def run_cache_redundancy(
     mode = "cache-only" if skip_redundancy else "cache+redundancy"
     if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
         print(
-            f"[{mode}] scenes={len(scene_list)} load={load_s:.1f}s infer={sum_infer_s:.1f}s "
-            f"disk={sum_disk_s:.1f}s total={total_s:.1f}s save_cache={save_cache} redundancy={compute_redundancy}",
+            f"[{mode}] scenes={len(scene_list)} "
+            f"save_cache={save_cache} redundancy={compute_redundancy}",
             file=sys.stderr,
         )
     return out_path

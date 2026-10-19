@@ -169,7 +169,7 @@ def merge_scene_metrics(*parts: Dict[str, float]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for p in parts:
         for k, v in p.items():
-            if k in UNIFIED_METRIC_KEYS or k.startswith("infer_"):
+            if k in UNIFIED_METRIC_KEYS:
                 out[k] = float(v)
     return out
 

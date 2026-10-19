@@ -1,2 +1,1 @@
-"""Utilities for VGGT redundancy analysis and compression experiments."""
-
+"""Backbone-agnostic redundancy analysis and compression utilities."""

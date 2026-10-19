@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -79,6 +78,35 @@ def _transform_points_sim3(pred_points: np.ndarray, sim3: np.ndarray) -> np.ndar
     r = np.asarray(sim3[:3, :3], dtype=np.float64)
     t = np.asarray(sim3[:3, 3], dtype=np.float64)
     return (pred @ r.T) + t[None, :]
+
+
+def _transform_w2c_sim3(est_w2c: np.ndarray, sim3: np.ndarray) -> np.ndarray | None:
+    """Express predicted world-to-camera poses in the Sim(3)-aligned world.
+
+    ``sim3`` maps predicted world points/centers into the GT world.  Camera
+    orientation uses only its rotational component; scale affects centers.
+    """
+    poses = np.asarray(est_w2c, dtype=np.float64)
+    transform = np.asarray(sim3, dtype=np.float64)
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+        return None
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        return None
+    scaled_rotation = transform[:3, :3]
+    scale = float(np.cbrt(np.linalg.det(scaled_rotation)))
+    if not np.isfinite(scale) or abs(scale) < 1e-12:
+        return None
+    world_rotation = scaled_rotation / scale
+    translation = transform[:3, 3]
+    aligned = np.repeat(np.eye(4, dtype=np.float64)[None], len(poses), axis=0)
+    for index, pose in enumerate(poses):
+        rotation_cw = pose[:3, :3]
+        center = -(rotation_cw.T @ pose[:3, 3])
+        aligned_center = scaled_rotation @ center + translation
+        aligned_rotation_cw = rotation_cw @ world_rotation.T
+        aligned[index, :3, :3] = aligned_rotation_cw
+        aligned[index, :3, 3] = -(aligned_rotation_cw @ aligned_center)
+    return aligned
 
 
 def _valid_7andn_gt_c2w(c2w: np.ndarray) -> bool:
@@ -169,6 +197,57 @@ def _as_view_conf_np(conf: torch.Tensor | None, n_views: int) -> list[np.ndarray
     return [arr[i].reshape(-1) for i in range(n)]
 
 
+def _scannet_visual_attributes(
+    points: torch.Tensor,
+    images: torch.Tensor | None,
+    confidence: torch.Tensor | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Map ScanNet prediction raster order to RGB, confidence, and frame ids."""
+    point_arr = points.detach()
+    while point_arr.ndim >= 5 and point_arr.shape[0] == 1:
+        point_arr = point_arr[0]
+    if point_arr.ndim != 4 or point_arr.shape[-1] != 3:
+        return None, None, None
+    views, height, width = map(int, point_arr.shape[:3])
+    frame_indices = np.repeat(
+        np.arange(views, dtype=np.int32), height * width
+    )
+
+    colors = None
+    if isinstance(images, torch.Tensor):
+        image_tensor = images.detach().float().cpu()
+        while image_tensor.ndim >= 5 and image_tensor.shape[0] == 1:
+            image_tensor = image_tensor[0]
+        if image_tensor.ndim == 4 and image_tensor.shape[0] >= views:
+            image_tensor = image_tensor[:views]
+            if tuple(image_tensor.shape[-2:]) != (height, width):
+                image_tensor = torch.nn.functional.interpolate(
+                    image_tensor,
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            colors = (
+                image_tensor.permute(0, 2, 3, 1)
+                .clamp(0.0, 1.0)
+                .mul(255.0)
+                .round()
+                .to(torch.uint8)
+                .numpy()
+                .reshape(-1, 3)
+            )
+
+    conf_flat = None
+    if isinstance(confidence, torch.Tensor):
+        conf_arr = confidence.detach().float().cpu().numpy()
+        while conf_arr.ndim >= 4 and conf_arr.shape[0] == 1:
+            conf_arr = conf_arr[0]
+        conf_flat = conf_arr.reshape(-1)
+        if conf_flat.shape[0] != frame_indices.shape[0]:
+            conf_flat = None
+    return colors, conf_flat, frame_indices
+
+
 def _nan_point_metrics() -> Dict[str, float]:
     return {k: float("nan") for k in ("acc", "comp", "cd")}
 
@@ -196,7 +275,7 @@ def prepare_scannet_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene
     images = adapter.load_eval_images(sel_paths)
     images_b = images.unsqueeze(0).float().contiguous()
 
-    gt_pts, _ = load_gt_pointcloud(batch.scene_id, scene_dir.parent)
+    gt_pts, gt_colors = load_gt_pointcloud(batch.scene_id, scene_dir.parent)
     from analysis.eval.eval_utils import load_poses
 
     poses_gt, first_gt_pose, available = load_poses(scene_dir / "pose")
@@ -212,9 +291,11 @@ def prepare_scannet_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene
         images=images_b,
         state={
             "gt_points": gt_pts,
+            "gt_colors": gt_colors,
             "poses_gt": poses_gt,
             "first_gt_pose": first_gt_pose,
             "matched_gt": matched_gt,
+            "image_paths": sel_paths,
         },
     )
 
@@ -230,10 +311,8 @@ def score_scannet_skip_prediction(
     prepared: PreparedEvalScene,
     profile,
     ctx: EvalSceneContext,
-    *,
-    runtime_metrics: Dict[str, float] | None = None,
 ) -> Dict[str, float]:
-    metrics: Dict[str, float] = dict(runtime_metrics or {})
+    metrics: Dict[str, float] = {}
     gt_pts = prepared.state.get("gt_points")
 
     pts = bundle.points
@@ -243,25 +322,13 @@ def score_scannet_skip_prediction(
     sim3_eval = None
     frame_ids_eval: List[int] = []
     merged_points_raw: np.ndarray | None = None
+    pred_colors, pred_conf, pred_frame_indices = None, None, None
 
     if pts is not None:
         merged_points_raw = pts.detach().float().cpu().numpy().reshape(-1, 3)
-
-        if ctx.export_vis_3d and ctx.vis_save_root is not None:
-            try:
-                from analysis.vis.vis_assets import write_viser_points_npz
-
-                pred_dir = scene_vis_dir(ctx.vis_save_root, prepared.scene_id) / "vis" / "pred"
-                pred_dir.mkdir(parents=True, exist_ok=True)
-                cols = np.tile(np.array([[200, 200, 200]], dtype=np.uint8), (merged_points_raw.shape[0], 1))
-                write_viser_points_npz(
-                    pred_dir / "viser_points.npz",
-                    points=merged_points_raw.astype(np.float32),
-                    colors_uint8=cols,
-                    max_points=int(ctx.vis_max_points),
-                )
-            except Exception as e:
-                print(f"[warn] ScanNet Pi3 3D vis failed for {prepared.scene_id}: {e}", flush=True)
+        pred_colors, pred_conf, pred_frame_indices = _scannet_visual_attributes(
+            pts, prepared.images, bundle.conf
+        )
 
     poses = bundle.camera_poses
     if poses is not None:
@@ -282,14 +349,71 @@ def score_scannet_skip_prediction(
             pose_metrics, sim3_eval = _trajectory_alignment(est_w2c_eval, w2cs, frame_ids_eval)
             metrics.update(pose_metrics)
 
+    aligned_for_vis = None
     if merged_points_raw is not None and gt_pts is not None and sim3_eval is not None and len(frame_ids_eval) >= 3:
         aligned = _transform_points_sim3(merged_points_raw, sim3_eval)
         if aligned is not None:
+            aligned_for_vis = aligned.astype(np.float32, copy=False)
             metrics.update(compute_point_metrics(aligned, gt_pts, profile.geometry, use_icp=False))
         else:
             metrics.update(_nan_point_metrics())
     elif merged_points_raw is not None and gt_pts is not None:
         metrics.update(_nan_point_metrics())
+
+    if ctx.export_vis_3d and ctx.vis_save_root is not None and merged_points_raw is not None:
+        try:
+            from analysis.vis.vis_assets import write_cameras_json, write_viser_points_npz
+
+            scene_dir = scene_vis_dir(ctx.vis_save_root, prepared.scene_id)
+            pred_dir = scene_dir / "vis" / "pred"
+            gt_dir = scene_dir / "vis" / "gt"
+            pred_dir.mkdir(parents=True, exist_ok=True)
+            gt_dir.mkdir(parents=True, exist_ok=True)
+            pred_points = aligned_for_vis if aligned_for_vis is not None else merged_points_raw
+            if pred_colors is None or pred_colors.shape[0] != pred_points.shape[0]:
+                pred_colors = np.tile(
+                    np.array([[200, 200, 200]], dtype=np.uint8),
+                    (pred_points.shape[0], 1),
+                )
+            write_viser_points_npz(
+                pred_dir / "viser_points.npz",
+                points=np.asarray(pred_points, dtype=np.float32),
+                colors_uint8=pred_colors,
+                confidence=pred_conf,
+                frame_indices=pred_frame_indices,
+                max_points=int(ctx.vis_max_points),
+            )
+            if gt_pts is not None and len(gt_pts) > 0:
+                gt_colors = prepared.state.get("gt_colors")
+                if gt_colors is None or len(gt_colors) != len(gt_pts):
+                    gt_colors_u8 = np.tile(
+                        np.array([[160, 160, 160]], dtype=np.uint8),
+                        (len(gt_pts), 1),
+                    )
+                else:
+                    gt_colors_arr = np.asarray(gt_colors)
+                    if np.issubdtype(gt_colors_arr.dtype, np.floating):
+                        gt_colors_arr = gt_colors_arr * 255.0
+                    gt_colors_u8 = np.clip(gt_colors_arr, 0, 255).astype(np.uint8)
+                write_viser_points_npz(
+                    gt_dir / "viser_points_gt.npz",
+                    points=np.asarray(gt_pts, dtype=np.float32),
+                    colors_uint8=gt_colors_u8,
+                    max_points=int(ctx.vis_max_points),
+                )
+            if est_w2c is not None:
+                camera_w2c = _transform_w2c_sim3(est_w2c, sim3_eval)
+                if camera_w2c is None:
+                    camera_w2c = est_w2c
+                write_cameras_json(
+                    pred_dir / "cameras.json",
+                    scene_id=prepared.scene_id,
+                    image_paths=prepared.state.get("image_paths", []),
+                    extrinsic_cw=np.asarray(camera_w2c, dtype=np.float64),
+                    intrinsic=None,
+                )
+        except Exception as e:
+            print(f"[warn] ScanNet 3D vis failed for {prepared.scene_id}: {e}", flush=True)
 
     if ctx.export_vis_2d and est_w2c_eval is not None and w2cs is not None and ctx.vis_save_root is not None:
         save_scene_plot_2d(
@@ -307,47 +431,20 @@ def eval_scannet_points_adapter(
     adapter, model, batch, device, profile, ctx: EvalSceneContext
 ) -> Dict[str, float]:
     prepared = prepare_scannet_skip_scene(adapter, batch, device, profile)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device.index)
-    t0 = time.perf_counter()
     ac_kw = autocast_device_dtype(device)
     with torch.no_grad(), torch.autocast(**ac_kw):
         bundle = adapter.forward_predictions(model, prepared.images)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    runtime = {
-        "inference_time_ms": float((time.perf_counter() - t0) * 1000.0),
-        "infer_peak_vram_gb": (
-            float(torch.cuda.max_memory_allocated(device.index)) / (1024.0**3)
-            if device.type == "cuda"
-            else 0.0
-        ),
-    }
-    return score_scannet_skip_prediction(bundle, prepared, profile, ctx, runtime_metrics=runtime)
+    return score_scannet_skip_prediction(bundle, prepared, profile, ctx)
 
 
 def eval_7andn_points_adapter(adapter, model, batch, device, profile, ctx: EvalSceneContext) -> Dict[str, float]:
     scene_batch, imgs = _prepare_7andn_eval_batch(adapter, batch, device)
 
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device.index)
-    t0 = time.perf_counter()
     ac_kw = autocast_device_dtype(device)
     with torch.no_grad(), torch.autocast(**ac_kw):
         bundle = adapter.forward_predictions(model, imgs)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    infer_ms = (time.perf_counter() - t0) * 1000.0
-    peak_gb = 0.0
-    if device.type == "cuda":
-        peak_gb = float(torch.cuda.max_memory_allocated(device.index)) / (1024.0**3)
 
-    metrics: Dict[str, float] = {
-        "inference_time_ms": float(infer_ms),
-        "infer_peak_vram_gb": float(peak_gb),
-    }
+    metrics: Dict[str, float] = {}
     pts = bundle.points
     depth = bundle.depth
     conf = bundle.conf
@@ -484,8 +581,7 @@ def eval_7andn_points_adapter(adapter, model, batch, device, profile, ctx: EvalS
     return merge_scene_metrics(metrics)
 
 
-def prepare_7andn_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene:
-    del profile
+def prepare_7andn_inference_scene_cpu(adapter, batch) -> PreparedEvalScene:
     scene_batch = batch.images
     if (
         not isinstance(scene_batch, list)
@@ -497,6 +593,20 @@ def prepare_7andn_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene:
     if not image_paths:
         raise ValueError(f"7andn {batch.scene_id}: missing view instance paths")
     images = adapter.load_eval_images(image_paths).unsqueeze(0).float().contiguous()
+    return PreparedEvalScene(scene_id=str(batch.scene_id), images=images)
+
+
+def prepare_7andn_eval_scene_cpu(adapter, batch, profile) -> PreparedEvalScene:
+    del profile
+    scene_batch = batch.images
+    if (
+        not isinstance(scene_batch, list)
+        or not scene_batch
+        or not isinstance(scene_batch[0], dict)
+    ):
+        scene_batch = _collate_7andn_views(batch)
+    prepared = prepare_7andn_inference_scene_cpu(adapter, batch)
+    images = prepared.images
 
     def as_float32_numpy(value: Any) -> np.ndarray:
         if torch.is_tensor(value):

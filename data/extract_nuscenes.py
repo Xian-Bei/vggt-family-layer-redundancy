@@ -183,7 +183,7 @@ def extract_sparse_depth_only(
 
 def parse_args():
     ap = argparse.ArgumentParser("Extract front-camera nuScenes scenes to custom format.")
-    ap.add_argument("--data_root", default="/media/fengyi/bb/nuscenes", help="nuScenes data root")
+    ap.add_argument("--data_root", default="/media/bb/nuscenes", help="nuScenes data root")
     ap.add_argument("--target_dir", default="data/nuscenes", help="Output root")
     ap.add_argument("--version", default="v1.0-trainval", help="nuScenes version")
     ap.add_argument("--seed", type=int, default=0, help="Fixed seed for train/val scene sampling")
@@ -192,6 +192,34 @@ def parse_args():
         type=int,
         default=50,
         help="Number of scenes to sample from each of train and val",
+    )
+    ap.add_argument(
+        "--splits",
+        default="train,val",
+        help="Comma-separated splits to extract (train and/or val)",
+    )
+    ap.add_argument("--num_train_scenes", type=int, default=None)
+    ap.add_argument("--num_val_scenes", type=int, default=None)
+    ap.add_argument(
+        "--exclude_manifest",
+        action="append",
+        default=[],
+        help="selected_scenes.json whose scene names must be excluded (repeatable)",
+    )
+    ap.add_argument(
+        "--fail_if_insufficient",
+        action="store_true",
+        help="Fail instead of silently selecting fewer scenes than requested",
+    )
+    ap.add_argument(
+        "--preserve_sample_order",
+        action="store_true",
+        help="Keep deterministic RNG order in the manifest for prefix-based ablations",
+    )
+    ap.add_argument(
+        "--skip_existing",
+        action="store_true",
+        help="Skip already complete extracted scene directories",
     )
     ap.add_argument("--min_depth", type=float, default=0.1, help="Minimum valid camera Z depth in metres")
     ap.add_argument("--max_depth", type=float, default=80.0, help="Maximum valid camera Z depth in metres")
@@ -209,16 +237,83 @@ def parse_args():
     return ap.parse_args()
 
 
-def select_train_val_scenes(nusc, num_scenes_per_split: int, seed: int):
+def load_excluded_scene_names(manifest_paths):
+    excluded = set()
+    for raw_path in manifest_paths:
+        path = os.fspath(raw_path)
+        with open(path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        splits = manifest.get("splits", {})
+        if not isinstance(splits, dict):
+            raise ValueError(f"Invalid nuScenes selection manifest: {path}")
+        for names in splits.values():
+            if not isinstance(names, list):
+                raise ValueError(f"Invalid scene list in nuScenes manifest: {path}")
+            excluded.update(str(name) for name in names)
+    return excluded
+
+
+def select_train_val_scenes(
+    nusc,
+    num_scenes_per_split: int,
+    seed: int,
+    *,
+    active_splits=("train", "val"),
+    split_counts=None,
+    excluded_names=(),
+    fail_if_insufficient=False,
+    preserve_sample_order=False,
+):
     splits = create_splits_scenes()
     scene_by_name = {scene["name"]: scene for scene in nusc.scene}
+    active_splits = tuple(active_splits)
+    invalid = sorted(set(active_splits) - {"train", "val"})
+    if invalid:
+        raise ValueError(f"Unsupported nuScenes splits: {invalid}")
+    excluded_names = set(excluded_names)
+    split_counts = dict(split_counts or {})
     selected = {}
     for split in ("train", "val"):
-        names = sorted(name for name in splits[split] if name in scene_by_name)
-        n = min(int(num_scenes_per_split), len(names))
+        if split not in active_splits:
+            selected[split] = []
+            continue
+        names = sorted(
+            name
+            for name in splits[split]
+            if name in scene_by_name and name not in excluded_names
+        )
+        requested = int(split_counts.get(split, num_scenes_per_split))
+        if requested <= 0:
+            raise ValueError(f"Requested {split} scene count must be positive, got {requested}")
+        if fail_if_insufficient and len(names) < requested:
+            raise ValueError(
+                f"Not enough eligible nuScenes {split} scenes: {len(names)} < {requested}"
+            )
+        n = min(requested, len(names))
         rng = random.Random(f"{int(seed)}:{split}")
-        selected[split] = sorted(rng.sample(names, n))
+        selected[split] = rng.sample(names, n)
+        if not preserve_sample_order:
+            selected[split].sort()
     return selected
+
+
+def scene_extract_complete(target_dir, scene_name):
+    scene_dir = os.path.join(target_dir, scene_name)
+    required_dirs = [
+        os.path.join(scene_dir, "image", "CAM_FRONT"),
+        os.path.join(scene_dir, "cam2world", "CAM_FRONT"),
+        os.path.join(scene_dir, "depth_points", "CAM_FRONT"),
+        os.path.join(scene_dir, "lidar"),
+    ]
+    intrinsic = os.path.join(scene_dir, "intrinsic", "CAM_FRONT.txt")
+    return (
+        os.path.isfile(intrinsic)
+        and os.path.getsize(intrinsic) > 0
+        and all(
+            os.path.isdir(path) and any(os.scandir(path))
+            for path in required_dirs
+        )
+    )
 
 
 if __name__ == "__main__":
@@ -238,10 +333,27 @@ if __name__ == "__main__":
             if not isinstance(selected.get(split), list):
                 raise ValueError(f"Invalid selected_scenes.json split: {split}")
     else:
+        active_splits = tuple(
+            item.strip() for item in args.splits.split(",") if item.strip()
+        )
+        split_counts = {
+            "train": args.num_train_scenes
+            if args.num_train_scenes is not None
+            else args.num_scenes_per_split,
+            "val": args.num_val_scenes
+            if args.num_val_scenes is not None
+            else args.num_scenes_per_split,
+        }
+        excluded_names = load_excluded_scene_names(args.exclude_manifest)
         selected = select_train_val_scenes(
             nusc,
             num_scenes_per_split=args.num_scenes_per_split,
             seed=args.seed,
+            active_splits=active_splits,
+            split_counts=split_counts,
+            excluded_names=excluded_names,
+            fail_if_insufficient=args.fail_if_insufficient,
+            preserve_sample_order=args.preserve_sample_order,
         )
     if not args.depth_only:
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -250,6 +362,12 @@ if __name__ == "__main__":
                     "version": args.version,
                     "seed": int(args.seed),
                     "num_scenes_per_split": int(args.num_scenes_per_split),
+                    "requested_scenes": {
+                        "train": int(split_counts["train"]) if "train" in active_splits else 0,
+                        "val": int(split_counts["val"]) if "val" in active_splits else 0,
+                    },
+                    "selection_order": "seeded_random" if args.preserve_sample_order else "sorted",
+                    "exclude_manifests": [os.fspath(path) for path in args.exclude_manifest],
                     "sparse_depth": {
                         "format_version": SPARSE_DEPTH_FORMAT_VERSION,
                         "depth_type": "camera_z",
@@ -276,6 +394,9 @@ if __name__ == "__main__":
                     min_depth_samples=args.min_depth_samples,
                 )
             else:
+                if args.skip_existing and scene_extract_complete(args.target_dir, scene_name):
+                    print("Skipping complete scene ", scene_name)
+                    continue
                 extract(
                     scene_by_name[scene_name],
                     data_root=args.data_root,

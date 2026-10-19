@@ -74,7 +74,7 @@ def selected_plans(
             strategies,
             available=strategy_records.keys(),
         ):
-            strategy = str(strategy_raw).strip().lower()
+            strategy = str(strategy_raw).strip()
             strategy_record = strategy_records.get(strategy)
             if not isinstance(strategy_record, dict):
                 raise FileNotFoundError(

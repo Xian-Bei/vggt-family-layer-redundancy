@@ -9,9 +9,12 @@ import torch
 
 from analysis.prune_plan import interval_selector
 from analysis.redundancy.metrics import (
+    mask_unevaluated_upper_spans,
     upper_packed_to_symmetric_matrix,
     upper_triangle_pack,
 )
+
+
 def resolve_plan_interval(
     plan: Any,
     *,
@@ -47,6 +50,12 @@ def resolve_plan_interval(
 
 def _mode_delta_maps(report: Mapping[str, Any]) -> Dict[str, Dict[str, List[float]]]:
     output: Dict[str, Dict[str, List[float]]] = {}
+    try:
+        num_layers = int(report.get("num_layers", 0))
+        max_span = int(report.get("max_span", 0))
+    except (TypeError, ValueError):
+        num_layers = 0
+        max_span = 0
     fusion = report.get("fusion_by_mode")
     if not isinstance(fusion, Mapping):
         return output
@@ -60,10 +69,15 @@ def _mode_delta_maps(report: Mapping[str, Any]) -> Dict[str, Dict[str, List[floa
         for metric, packed in metric_maps.items():
             if not isinstance(packed, list):
                 continue
-            clean[str(metric)] = [
+            values = [
                 float(value) if value is not None else float("nan")
                 for value in packed
             ]
+            clean[str(metric)] = mask_unevaluated_upper_spans(
+                values,
+                num_layers=num_layers,
+                max_span=max_span,
+            )
         if clean:
             output[str(mode)] = clean
     return output

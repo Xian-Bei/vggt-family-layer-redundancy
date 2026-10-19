@@ -6,40 +6,32 @@ import argparse
 import math
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from analysis.metric_labels import SEVEN_METRIC_LABELS
 from analysis.prune_plan import (
+    bundle_physical_plan_records,
     bundle_plan_records,
     bundle_strategy_records,
+    canonical_pruning_strategy_key,
+    is_physical_pruning_selector,
     is_interval_selector,
     is_plan_group_name,
     load_prune_plan_bundle,
     physical_pruning_selector_from_record,
     plan_group_from_name,
     prune_plan_bundle_path,
+    strategy_interval_selectors,
 )
-from analysis.prune_plan.eval_plots import (
-    RECOVERY_METHOD_ORDER,
-    add_recovery_comparison_strategies,
-    collect_pruning_eval_payload,
-    collect_recovery_eval_payload,
-    write_recovery_eval_plots,
-)
+from analysis.prune_plan.eval_plots import RECOVERY_METHOD_ORDER
 from analysis.schema.v3 import EvalRecordV3, OUTPUT_ROOT_DEFAULT, UNIFIED_METRIC_KEYS
 
 AGG_PARAMS_KEY = "agg_params"
+DEFAULT_SUMMARY_PRUNE_STRATEGIES = ("CKA", "retention")
 
 # Paper-style column labels; arrow shows preferred direction.
 METRIC_HEADERS: Dict[str, str] = {
-    "ape": "APE ↓",
-    "are": "ARE (°) ↓",
-    "rpe_trans": "RPE trans ↓",
-    "rpe_rot": "RPE rot (°) ↓",
-    "acc": "Acc ↓",
-    "comp": "Comp ↓",
-    "cd": "CD ↓",
-    "inference_time_ms": "Time (ms) ↓",
-    "infer_peak_vram_gb": "VRAM (GB) ↓",
+    **SEVEN_METRIC_LABELS,
     AGG_PARAMS_KEY: "Block params ↓",
 }
 
@@ -66,10 +58,14 @@ def _dataset_sort_key(name: str) -> Tuple[int, str]:
 _PLAN_GROUP_SORT_RE = re.compile(r"^(?:prune_span(\d+)|plan_budget(\d+)|plan_t(\d+))$")
 _PRUNE_SPAN_RE = re.compile(r"^prune_span(\d+)$")
 _PRUNE_SPAN_PREFIX_RE = re.compile(r"^(prune_span\d+)(?:[_/].*)?$")
-_INTERVAL_LABEL_RE = re.compile(r"^i(?P<i>\d+)_j(?P<j>\d+)$")
+_PHYSICAL_SELECTOR_PATTERN = r"i\d+_j\d+(?:_i\d+_j\d+)*"
+_INTERVAL_LABEL_RE = re.compile(
+    rf"^(?P<selector>{_PHYSICAL_SELECTOR_PATTERN})$"
+)
 _GENERIC_DROP_LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*_k(?P<k>\d+)$")
 _RECOVERY_LABEL_RE = re.compile(
-    r"^(?P<prune>prune_span\d+|i\d+_j\d+|[A-Za-z][A-Za-z0-9_]*_k\d+)_(?P<recovery>recovery_.+)$"
+    rf"^(?P<prune>prune_span\d+|{_PHYSICAL_SELECTOR_PATTERN}|"
+    r"[A-Za-z][A-Za-z0-9_]*_k\d+)_(?P<recovery>recovery_.+)$"
 )
 
 
@@ -120,9 +116,18 @@ def _interval_span_from_label(label: str) -> Optional[Tuple[int, int, int]]:
     m = _INTERVAL_LABEL_RE.match(_label_base(label))
     if not m:
         return None
-    i = int(m.group("i"))
-    j = int(m.group("j"))
-    return i, j, j - i + 1
+    bounds = [
+        (int(part.group("i")), int(part.group("j")))
+        for part in re.finditer(r"i(?P<i>\d+)_j(?P<j>\d+)", m.group("selector"))
+    ]
+    if not bounds or any(start > end for start, end in bounds):
+        return None
+    dropped = {
+        index
+        for start, end in bounds
+        for index in range(start, end + 1)
+    }
+    return min(dropped), max(dropped), len(dropped)
 
 
 def _generic_drop_from_label(label: str) -> Optional[int]:
@@ -179,10 +184,6 @@ def _fmt_value(key: str, value: float) -> str:
         return "—"
     if key == AGG_PARAMS_KEY:
         return _format_param_count(int(value))
-    if key in ("inference_time_ms",):
-        return f"{value:.1f}"
-    if key in ("infer_peak_vram_gb",):
-        return f"{value:.2f}"
     return f"{value:.4f}"
 
 
@@ -225,6 +226,7 @@ def _read_aggregator_param_counts_from_bundle(
         return None, {}
 
     plan_records = bundle_plan_records(bundle)
+    physical_plan_records = bundle_physical_plan_records(bundle)
     spans = bundle.get("spans", {})
     if not isinstance(spans, dict):
         spans = {}
@@ -233,7 +235,9 @@ def _read_aggregator_param_counts_from_bundle(
     for label in labels:
         raw: Any = None
         base = _label_base(label)
-        if is_interval_selector(base) or _GENERIC_DROP_LABEL_RE.match(base):
+        if is_physical_pruning_selector(base):
+            raw = physical_plan_records.get(base)
+        elif is_interval_selector(base) or _GENERIC_DROP_LABEL_RE.match(base):
             raw = plan_records.get(base)
         if raw is None:
             span = _span_from_label(label)
@@ -319,6 +323,18 @@ def _record_label(rec: EvalRecordV3, rel_run_dir: Path) -> tuple[str, str, str]:
     extra = rec.extra if isinstance(rec.extra, dict) else {}
     parts = rel_run_dir.parts
     compression = _compression_tag(rec)
+    if parts and parts[0] == "testtime" and len(parts) >= 4:
+        recovery_plan = parts[1]
+        compression_name = compression or (
+            "" if parts[2] in ("", "none") else parts[2]
+        )
+        raw_plan = parts[3]
+        base = _recovery_label(raw_plan, recovery_plan)
+        return (
+            "model",
+            f"{base}+{compression_name}" if compression_name else base,
+            raw_plan,
+        )
     if parts and parts[0] == "recovery":
         if len(parts) >= 4 and parts[2] in RECOVERY_METHOD_ORDER:
             recovery_plan = parts[2]
@@ -355,6 +371,38 @@ def _record_label(rec: EvalRecordV3, rel_run_dir: Path) -> tuple[str, str, str]:
     return mode, f"{base}+{compression}" if compression else base, raw_plan
 
 
+def _iter_eval_record_paths(eval_root: Path) -> list[Path]:
+    """Find eval records, including logical recovery-method symlink aliases.
+
+    ``Path.rglob`` intentionally does not recurse through directory symlinks.
+    Recovery result sharing uses such links (for example, sequential ghost may
+    reuse a single-interval ghost result), and each logical method name must
+    remain visible.  Traverse only ``eval/recovery`` to a fixed depth so other
+    output trees are not followed and a malformed link cannot recurse forever.
+    """
+    records = set(Path(eval_root).rglob("eval_record_v3.json"))
+    recovery_root = Path(eval_root) / "recovery"
+    if recovery_root.is_dir():
+        pending = [(recovery_root, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            record_path = directory / "eval_record_v3.json"
+            if record_path.is_file():
+                records.add(record_path)
+            if depth >= 3:
+                continue
+            try:
+                children = directory.iterdir()
+            except OSError:
+                continue
+            pending.extend(
+                (child, depth + 1)
+                for child in children
+                if child.is_dir()
+            )
+    return sorted(records, key=lambda path: str(path))
+
+
 def _collect_by_dataset(
     root: Path,
     recovery_prune_strategy: str = "",
@@ -387,7 +435,7 @@ def _collect_by_dataset(
         if not eval_root.is_dir():
             continue
         ds_name = dataset_dir.name
-        for rec_path in eval_root.rglob("eval_record_v3.json"):
+        for rec_path in _iter_eval_record_paths(eval_root):
             run_dir = rec_path.parent
             rel_run_dir = run_dir.relative_to(eval_root)
             if rel_run_dir.parts and rel_run_dir.parts[0] == "recovery":
@@ -414,17 +462,45 @@ def _collect_by_dataset(
 def _filter_to_current_prune_spans(
     grouped: Dict[str, Dict[str, EvalRecordV3]],
     prune_plan_root: Path,
+    strategies: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, EvalRecordV3]]:
-    """Drop stale legacy plan labels when a split prune-plan bundle exists."""
+    """Keep current physical selectors, optionally limited to named strategies."""
+    requested = [str(item).strip() for item in strategies or () if str(item).strip()]
     try:
         if not prune_plan_bundle_path(prune_plan_root).is_file():
+            if not requested:
+                return grouped
+            valid_selectors: set[str] = set()
+        else:
+            bundle = load_prune_plan_bundle(prune_plan_root)
+            valid_selectors = (
+                set(
+                    strategy_interval_selectors(
+                        prune_plan_root,
+                        strategies=requested,
+                    )
+                )
+                if requested
+                else set(bundle_physical_plan_records(bundle))
+            )
+    except Exception as exc:
+        if not requested:
             return grouped
-        bundle = load_prune_plan_bundle(prune_plan_root)
-        valid_selectors = set(bundle_plan_records(bundle).keys())
-    except Exception:
-        return grouped
+        print(
+            f"[warn] Could not resolve selected pruning strategies "
+            f"{requested!r}: {exc}; keeping upper rows only.",
+            flush=True,
+        )
+        valid_selectors = set()
     if not valid_selectors:
-        return grouped
+        return {
+            ds_name: {
+                label: rec
+                for label, rec in modes.items()
+                if label == "upper" or label.startswith("upper+")
+            }
+            for ds_name, modes in grouped.items()
+        }
 
     filtered: Dict[str, Dict[str, EvalRecordV3]] = {}
     for ds_name, modes in grouped.items():
@@ -436,6 +512,42 @@ def _filter_to_current_prune_spans(
         if keep:
             filtered[ds_name] = keep
     return filtered
+
+
+def collect_summary_records(
+    experiment_root: Path,
+    *,
+    prune_plan_root: Optional[Path] = None,
+    prune_strategies: Sequence[str] = DEFAULT_SUMMARY_PRUNE_STRATEGIES,
+    recovery_prune_strategy: str = "",
+) -> Dict[str, Dict[str, EvalRecordV3]]:
+    """Collect live eval records and keep only selected physical prune plans."""
+    root = Path(experiment_root)
+    plan_root = Path(prune_plan_root) if prune_plan_root is not None else root
+    recovery_strategy = canonical_pruning_strategy_key(recovery_prune_strategy)
+    grouped = _collect_by_dataset(root, recovery_strategy)
+    return _filter_to_current_prune_spans(
+        grouped,
+        plan_root,
+        prune_strategies,
+    )
+
+
+def collect_summary_parameter_counts(
+    prune_plan_root: Path,
+    grouped: Dict[str, Dict[str, EvalRecordV3]],
+) -> Tuple[Optional[int], Dict[str, int]]:
+    """Read current upper/lower block parameter counts for collected labels."""
+    labels = sorted(
+        {
+            label
+            for modes in grouped.values()
+            for label in modes
+            if label != "upper" and not label.startswith("upper+")
+        },
+        key=_lower_label_sort_key,
+    )
+    return _read_aggregator_param_counts_from_bundle(prune_plan_root, labels)
 
 
 def _write_metric_curve_grid(
@@ -452,9 +564,8 @@ def _write_metric_curve_grid(
     metric_grid: List[List[Optional[str]]] = [
         ["ape", "are", "rpe_trans", "rpe_rot"],
         ["acc", "comp", "cd", None],
-        ["inference_time_ms", "infer_peak_vram_gb", None, None],
     ]
-    n_rows = 3
+    n_rows = 2
     n_cols = 4
 
     xs = [0] + [int(span) for span, _label, _rec in span_items]
@@ -473,7 +584,7 @@ def _write_metric_curve_grid(
                 continue
             ax.plot(xs, ys, marker="o", linewidth=1.8, markersize=4)
             ax.set_title(METRIC_HEADERS.get(key, key), fontsize=11, fontweight="bold")
-            ax.set_xlabel("Dropped units / prune span")
+            ax.set_xlabel("Dropped Layers / prune span")
             ax.grid(True, alpha=0.25)
             ax.set_xlim(left=0)
             ax.set_xticks(xs)
@@ -553,7 +664,6 @@ def _write_strategy_metric_curve_grid(
     metric_grid: List[List[Optional[str]]] = [
         ["ape", "are", "rpe_trans", "rpe_rot"],
         ["acc", "comp", "cd", None],
-        ["inference_time_ms", "infer_peak_vram_gb", None, None],
     ]
     all_drops = sorted(
         {
@@ -564,7 +674,7 @@ def _write_strategy_metric_curve_grid(
     )
     if not all_drops:
         return None
-    fig, axes = plt.subplots(3, 4, figsize=(20, 9.75), squeeze=False)
+    fig, axes = plt.subplots(2, 4, figsize=(20, 6.5), squeeze=False)
     for row_idx, row in enumerate(metric_grid):
         for col_idx, key in enumerate(row):
             ax = axes[row_idx][col_idx]
@@ -603,7 +713,7 @@ def _write_strategy_metric_curve_grid(
                 ax.axis("off")
                 continue
             ax.set_title(METRIC_HEADERS.get(key, key), fontsize=11, fontweight="bold")
-            ax.set_xlabel("Dropped units")
+            ax.set_xlabel("Dropped Layers")
             ax.grid(True, alpha=0.25)
             ax.set_xlim(left=0)
             ax.set_xticks([0] + all_drops)
@@ -638,9 +748,8 @@ def _write_recovery_strategy_comparison_grid(
     metric_grid: List[List[Optional[str]]] = [
         ["ape", "are", "rpe_trans", "rpe_rot"],
         ["acc", "comp", "cd", None],
-        ["inference_time_ms", "infer_peak_vram_gb", None, None],
     ]
-    n_rows = 3
+    n_rows = 2
     n_cols = 4
     all_spans = sorted(
         {
@@ -734,7 +843,7 @@ def _write_recovery_strategy_comparison_grid(
                 ax.axis("off")
                 continue
             ax.set_title(METRIC_HEADERS.get(key, key), fontsize=11, fontweight="bold")
-            ax.set_xlabel("Dropped units / prune span")
+            ax.set_xlabel("Dropped Layers / prune span")
             ax.grid(True, alpha=0.25)
             ax.set_xlim(left=0)
             ax.set_xticks([0] + all_spans)
@@ -927,26 +1036,47 @@ def main() -> None:
         default="",
         help="Filter shared selector-first recovery evaluations using this strategy.",
     )
+    p.add_argument(
+        "--prune-strategies",
+        default="",
+        help=(
+            "Comma/space-separated pruning strategies whose selected physical "
+            "intervals enter the summary. Defaults to the recovery strategy when "
+            "set, otherwise CKA and retention (Single + Double)."
+        ),
+    )
     args = p.parse_args()
 
     root = OUTPUT_ROOT_DEFAULT / args.experiment
-    recovery_prune_strategy = str(args.recovery_prune_strategy or "").strip()
-    grouped = _collect_by_dataset(root, recovery_prune_strategy)
-    grouped = _filter_to_current_prune_spans(grouped, Path(args.prune_plan_root))
+    recovery_prune_strategy = canonical_pruning_strategy_key(
+        args.recovery_prune_strategy or ""
+    )
+    requested_prune_strategies = [
+        item
+        for item in re.split(r"[\s,]+", str(args.prune_strategies).strip())
+        if item
+    ]
+    if not requested_prune_strategies:
+        requested_prune_strategies = (
+            [recovery_prune_strategy]
+            if recovery_prune_strategy
+            else list(DEFAULT_SUMMARY_PRUNE_STRATEGIES)
+        )
+    grouped = collect_summary_records(
+        root,
+        prune_plan_root=Path(args.prune_plan_root),
+        prune_strategies=requested_prune_strategies,
+        recovery_prune_strategy=recovery_prune_strategy,
+    )
 
     upper_agg_params: Optional[int] = None
     lower_agg_params_by_label: Dict[str, int] = {}
     if not args.skip_param_count:
-        labels = sorted(
-            {
-                k for ds in grouped.values() for k in ds.keys()
-                if k != "upper" and not k.startswith("upper+")
-            },
-            key=_lower_label_sort_key,
-        )
-        upper_agg_params, lower_agg_params_by_label = _read_aggregator_param_counts_from_bundle(
-            args.prune_plan_root,
-            labels,
+        upper_agg_params, lower_agg_params_by_label = (
+            collect_summary_parameter_counts(
+                args.prune_plan_root,
+                grouped,
+            )
         )
         if upper_agg_params is not None:
             print(
@@ -970,33 +1100,6 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content, encoding="utf-8")
     print(f"Wrote {out}")
-    pruning_payload = None
-    try:
-        pruning_payload = collect_pruning_eval_payload(
-            experiment_root=root,
-            prune_plan_root=Path(args.prune_plan_root),
-        )
-    except Exception as exc:
-        print(f"[warn] Could not collect pruning comparisons: {exc}", flush=True)
-    try:
-        recovery_payload = collect_recovery_eval_payload(
-            experiment_root=root,
-            prune_strategy=recovery_prune_strategy or None,
-        )
-        if pruning_payload is not None:
-            recovery_payload = add_recovery_comparison_strategies(
-                recovery_payload,
-                pruning_payload,
-                recovery_prune_strategy or None,
-            )
-        for plot_path in write_recovery_eval_plots(
-            experiment_root=root,
-            backbone=str(args.experiment),
-            payload=recovery_payload,
-        ):
-            print(f"Wrote {plot_path}", flush=True)
-    except Exception as exc:
-        print(f"[warn] Could not write recovery plots: {exc}", flush=True)
 
 
 if __name__ == "__main__":

@@ -166,8 +166,8 @@ data/waymo_raw/
 data/__pycache__/
 submodules/quantvggt/
 analysis_outputs*/
+main_results*/
 .gradio/
-examples/
 nouse/
 
 # Model weights / checkpoints (prevent syncing to GitHub)
@@ -206,7 +206,6 @@ nouse/
 **/ckpts/
 **/weights/
 *backup*/
-tests/
 .agents/
 .codex/
 .cursor/
@@ -218,3 +217,15 @@ tmp/
 submodules/
 paper/
 TODO*
+
+# Local research and generated release artifacts
+/private_research/
+/test_length_results/
+/release_artifacts/
+/checkpoints/
+.ruff_cache/
+
+.aws/
+
+# Sampled point clouds are intentional static webpage assets, not model weights.
+!/web/data/scenes/*.bin

@@ -1,18 +1,28 @@
 # Backbone Adaptor 公共契约
 
-本文档定义目标形态：公共流程不再按 `vggt`、`vggt_omega`、`pi3` 分支，而是只调用每个 backbone adaptor 暴露的接口。新增 backbone 时，只需要实现这些接口，并注册到 `analysis/backbones/registry.py`。FastVGGT 与 QuantVGGT 属于推理时压缩，使用 `analysis/inference_compression` 下的独立 adaptor contract。
+本文档定义当前 backbone adaptor contract。公共流程不按 `vggt`、`vggt_omega`、
+`pi3`、`mapanything` 或 `mapanything_v1` 分支，而是调用 registry 中 adaptor 暴露的
+能力。新增 backbone 时实现相应接口并注册到 `analysis/backbones/registry.py`。
+FastVGGT、LoRA Merge 与 QuantVGGT 属于推理时压缩，使用
+`analysis/inference_compression` 下的独立 contract。
 
 可复制的代码骨架见 `analysis/backbones/adapters/backbone_adapter_template.py`，逐项填充说明见 `docs/backbone_adapter_template.md`。
 
 ## 总体原则
 
-公共流程只理解三类抽象：
+公共流程主要理解以下抽象：
 
-- `LayerUnit`：统一的交替结构单元，命名为 `frame_i`、`global_i`。
+- `LayerUnitSpec`：按实际执行顺序排列的可操作单元，命名为 `frame_i`、`global_i`。
 - `PredictionBundle`：统一预测结果，包含相机、深度、点云；不支持的字段为 `None`。
-- `ReplayOps`：训练 / skip eval 回放时运行一个 frame block 或 global block 的最小操作集合。
+- `CacheForwardResult`：unit activation、metadata、prediction 与可选 initial tokens。
+- `CacheReplayEngine`：backbone-specific cache-first 训练回放。
+- `DatasetAdaptor`：scene 读取、CPU 预处理、prediction scoring 与 dataset-specific GT。
 
-backbone adaptor 负责把模型内部结构映射到这些抽象。例如 VGGT-Omega 的 `inter_frame_blocks` 映射为 `global_i`，Pi3 的 decoder 偶数/奇数 block 映射为 `frame_i/global_i`。
+backbone adaptor 负责把模型内部结构映射到这些抽象。例如 VGGT-Omega 的
+`inter_frame_blocks` 映射为 `global_i`，Pi3 decoder 映射为 `frame_i/global_i`，
+MapAnything information-sharing blocks 映射为 global-first 的 `global_i/frame_i`。
+线性 unit index 永远是 `layer_unit_catalog()` 返回列表的位置，不能从 unit 名称奇偶
+关系推导。
 
 ## 公共路径
 
@@ -77,13 +87,14 @@ def layer_unit_catalog(self, model: nn.Module) -> list[LayerUnitSpec]
 - `supports_prune`
 - `supports_lora`
 - `supports_eval`
-- `num_frame_blocks`
-- `num_global_blocks`
+- `num_frame_blocks`、`num_global_blocks`（静态数量已知时填写；动态 checkpoint 以
+  `layer_unit_catalog()` 为准）
 - 每个 `LayerUnitSpec` 包含 `unit_id`、`kind`、`index`、`module_path`、`droppable`、`lora_target`
 
 约定：
 
 - `unit_id` 只能是 `frame_i` 或 `global_i`。
+- catalog 顺序必须是实际物理执行顺序；不要求所有 backbone 都 frame-first。
 - 公共 prune plan、redundancy、cache、train 都只使用 `unit_id`，不直接访问 `model.aggregator` 或 `model.decoder`。
 
 ### 3. cache / redundancy 前向
@@ -160,6 +171,29 @@ class CacheForwardResult:
 - `extract_layer_units_and_predictions` 是可选的 fused path，用于一次 forward 同时拿 activations 和 prediction。
 - `forward_units_and_prediction` 是公共默认入口：优先调用 fused path；如果 fused path 返回 `None`，则先调用 `extract_layer_units`，再调用 `forward_predictions`。
 - `build_initial_tokens` 应由 adaptor 提供，公共 cache 脚本不应按 backbone 名手写 patch embedding。
+- `initial_tokens` 只在 adaptor 实际返回真实 unit-0 输入时使用；非 fused fallback 可以为
+  `None`，需要起点 replay 的调用者必须显式调用 `build_initial_tokens()`。
+
+### 3.1 增量 skip eval
+
+当前五个已注册 backbone 都实现 scene-local 增量 skip replay：
+
+```python
+def supports_incremental_skip_eval(self) -> bool
+
+def iter_skip_span_predictions(
+    self,
+    model: nn.Module,
+    images: torch.Tensor,
+    spans: Sequence[tuple[int, int]],
+    *,
+    defer_cpu_geometry: bool = False,
+) -> Iterable[tuple[int, int, PredictionBundle]]
+```
+
+`spans` 使用闭区间。实现可复用每个 scene 的 prefix/intermediate state，但必须逐个
+yield 与完整物理 skip 等价的标准化 prediction。公共 skip-eval 不应知道具体 replay
+循环或 block 容器。
 
 ### 4. 预测归一化
 
@@ -176,6 +210,8 @@ def forward_predictions(
     self,
     model: nn.Module,
     images: torch.Tensor,
+    *,
+    defer_cpu_geometry: bool = False,
 ) -> PredictionBundle
 
 def prediction_bundle_from_raw(
@@ -207,6 +243,8 @@ class PredictionBundle:
 - `depth`：深度图；Pi3 不预测 dense depth，返回 `None`。
 - `pose_enc`：VGGT 系列 raw pose encoding；Pi3 可以为 `None`。
 - `raw`：保留官方模型原始输出，供调试或 backbone 特定 loss 使用。
+- `defer_cpu_geometry=True`：异步 eval 可推迟 CPU-only 几何后处理，由 dataset scorer
+  在消费 prediction 时完成。
 
 推荐公共 helper：
 
@@ -220,6 +258,42 @@ def bundle_from_pose_depth(
 ```
 
 VGGT、VGGT-Omega 只需要把 raw dict 交给这个 helper。Pi3 adaptor 自己把 `points/local_points/conf/camera_poses` 填入 `PredictionBundle`，`depth=None`。
+
+### 4.1 Eval 输入与 GT 对齐
+
+模型输入预处理仍属于 backbone adaptor，因为不同官方模型的 resize、normalization、
+patch grid 和相机约定不同：
+
+```python
+def load_eval_images(
+    self,
+    image_paths: Sequence[Path | str],
+) -> torch.Tensor
+
+def load_driving_depth_stack(
+    self,
+    depth_paths: Sequence[Path | str],
+    *,
+    output_hw: tuple[int, int],
+) -> tuple[Any, int]
+
+def load_scannet_gt_depth(
+    self,
+    scene: Any,
+    *,
+    output_hw: tuple[int, int],
+) -> Any
+
+def align_7andn_gt_depth(
+    self,
+    view: Any,
+    *,
+    output_hw: tuple[int, int],
+) -> Any
+```
+
+`load_eval_images()` 返回 `[S,3,H,W]`、范围 `[0,1]` 的模型输入。dataset adaptor
+调用这些能力准备 scene，但不复制 backbone-specific resize/geometry 逻辑。
 
 ### 5. 剪枝和 LoRA
 
@@ -308,17 +382,22 @@ def cache_replay_engine(self) -> Any
 adapter = get_backbone(plan.backbone)
 engine = adapter.cache_replay_engine()
 required = adapter.required_head_layers_for_cache(model, num_layers)
-student_pred, activations = adapter.replay_student_cache_first(
+replay = engine.replay_student_cache_first(
     model,
     get_layer_cpu,
     num_layers,
-    target_layers=required,
+    alignment_capture_layers=required,
     seed_layer=seed_layer,
-    **adapter.train_replay_extra_kwargs(h=h, w=w),
+    **replay_kwargs,
 )
+student_pred = replay.pred
+activations = replay.concat_by_layer
 ```
 
-各 backbone 的差异落点在 adaptor / `analysis/backbones/cache_replay/*` 内部。公共训练代码只传 `unit_id`、cache batch、seed layer 和 target layers。
+各 backbone 的差异落点在 adaptor / `analysis/backbones/cache_replay/*` 内部。公共训练
+代码传 cache reader、skip intervals、LoRA/alignment layers、seed 与 device state，不直接
+执行 vendor blocks。MapAnything 当前没有 replay engine，因此虽支持 cache/prune/LoRA
+operation，尚不支持这条 cache-first training 路径。
 
 ### 7. 训练目标和 loss
 
@@ -338,6 +417,7 @@ def build_target_batch_from_teacher(
     *,
     images_batched: torch.Tensor,
     device: torch.device,
+    dataset_name: str = "",
 ) -> dict[str, Any]
 
 def prediction_loss(
@@ -354,57 +434,75 @@ def prediction_loss(
 - VGGT 系列：teacher 需要 `pose_enc/depth/depth_conf`，loss 是 camera + depth。
 - Pi3：teacher 需要 `points/camera_poses`，loss 是官方 Pi3 point/camera 蒸馏；`depth` 缺失是合法状态。
 
-### 8. eval
-
-公共代码：
+训练超参数和 optimizer 也由 backbone adaptor/replay engine 提供：
 
 ```python
-metrics = adapter.eval_scene(
-    model,
-    dataset_name=dataset_name,
-    batch=batch,
-    ctx=ctx,
-)
-```
+def training_config(self) -> TrainingHyperparams
 
-adaptor 接口：
-
-```python
-def eval_scene(
+def build_training_optimizer(
     self,
-    model: nn.Module,
+    trainable: Sequence[nn.Parameter],
     *,
-    dataset_name: str,
-    batch: Any,
-    ctx: EvalSceneContext,
-) -> dict[str, float]
+    config: TrainingHyperparams | None = None,
+) -> torch.optim.Optimizer
 ```
 
-返回：
+`dataset_name` 允许 adaptor 对不同 teacher target 约定做显式校验，公共 loop 不按
+backbone 或 dataset 名称复制 loss 分支。
 
-- 每个 scene 的指标 dict。
-- 公共 `eval_v3` 负责保存 `metrics.json` 和汇总 `eval_record_v3.json`。
+### 8. Eval 的职责边界
 
-推荐公共 eval 路径：
+`BackboneAdapter` 不再提供 `eval_scene()`。当前调用关系是：
 
-- 所有 backbone 先通过 `forward_predictions` 得到 `PredictionBundle`。
-- `eval_impl` 根据 `PredictionBundle` 统一计算 pose 和 point 指标。
+```python
+dataset = get_dataset(dataset_name)
+metrics = dataset.evaluate_scene(adapter, model, batch, ctx)
+```
+
+支持异步 scoring 时，dataset adaptor 将一次 scene 拆为：
+
+```python
+prepared = dataset.prepare_eval_scene_cpu(adapter, batch, ctx)
+prediction = adapter.forward_predictions(
+    model,
+    prepared.images,
+    defer_cpu_geometry=True,
+)
+metrics = dataset.score_eval_prediction(adapter, prediction, prepared, ctx)
+```
+
+职责分工：
+
+- backbone adaptor：官方图像预处理、模型 forward、`PredictionBundle`、必要的 GT resize/
+  geometry helper；
+- dataset adaptor：scene 枚举、GT state、pose/point/depth metric 与 prediction scoring；
+- `analysis.eval.eval_v3`：调度、异步 pipeline、每 scene `metrics.json` 和
+  `eval_record_v3.json`。
 
 ## 新增 backbone checklist
 
 1. 新建 `analysis/backbones/adapters/<name>_adapter.py`。
-2. 实现 `default_hf_model`、`pythonpath_entries`、`load_pretrained`。
+2. 实现 `default_hf_model`、`pythonpath_entries`、`load_pretrained` 和
+   `load_eval_images`。
 3. 实现 `layer_unit_catalog`，把内部 blocks 映射成 `frame_i/global_i`。
 4. 实现 `extract_layer_units` 或 fused `extract_layer_units_and_predictions`。
 5. 实现 `forward_predictions` 和 `prediction_bundle_from_raw`。
 6. 实现 `build_initial_tokens`，用于 `layer_-1` replay seed。
 7. 实现 `apply_prune_plan` 和 `inject_lora_plan`。
 8. 实现 `required_head_layers_for_cache`、`replay_student_cache_first`、`cache_replay_engine`，让公共训练能够从 cache seed replay。
-9. 实现 teacher target 和 prediction loss；若可复用 VGGT 系列 loss，直接委托公共 helper。
-10. 实现或复用 `eval_scene`。
-11. 在 `analysis/backbones/registry.py` 注册 adaptor。
-12. 增加最小单测：unit catalog、cache result shape、PredictionBundle 字段、prune/lora action 映射。
+9. 实现 `training_config`、optimizer、teacher target 和 prediction loss；若可复用
+   VGGT 系列 loss，委托公共 helper。
+10. 实现 `supports_incremental_skip_eval` / `iter_skip_span_predictions`，或明确保持
+    fallback 不支持状态。
+11. 根据 dataset 需求实现 driving/ScanNet/7Scenes-NRGBD GT 对齐 helper。
+12. 在 `analysis/backbones/registry.py` 注册 adaptor。
+13. 增加最小单测：unit catalog/执行顺序、cache shape、PredictionBundle、prune/LoRA、
+    incremental skip 等价性和 dataset preprocessing。
 
 ## 当前实现状态
 
-当前 `analysis/backbones/contracts.py` 已提供上述接口。公共 cache、training cache unit、cache replay registry、LoRA cache-first training、skip eval 均通过 adaptor 获取能力；直接访问 `aggregator/decoder` 的逻辑被限制在 adaptor 或 backbone-specific replay engine 内部。
+当前 `analysis/backbones/contracts.py` 已提供上述接口。公共 cache、training cache unit、
+cache replay registry、cache-first training 和 skip eval 均通过 adaptor 获取能力；
+dataset-specific eval 通过 `analysis/datasets/contracts.py` 获取能力。直接访问
+`aggregator/decoder/info_sharing` 的逻辑应限制在 adaptor 或 backbone-specific replay
+engine 内部。

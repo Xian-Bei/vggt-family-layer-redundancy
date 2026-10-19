@@ -13,7 +13,7 @@ modules belongs inside the adapter.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,7 @@ from analysis.backbones.contracts import (
     CacheForwardResult,
     PredictionBundle,
     PredictionLossWeights,
+    TrainingHyperparams,
 )
 from analysis.schema.v3 import LayerUnitSpec, PruneAction
 
@@ -39,13 +40,14 @@ class NewBackboneAdapter(BackboneAdapter):
     4. convert raw model outputs to PredictionBundle
     5. apply drop_unit and lora_unit by unit id
     6. provide cache-first replay and prediction loss for LoRA training
-    7. evaluate one scene through the shared eval contract
+    7. preprocess eval inputs for the dataset-adaptor-driven eval contract
+    8. optionally provide scene-local incremental skip prediction replay
     """
 
     name = "new_backbone"
 
-    # Fill this with the adapter-private mapping from public unit id to module.
-    # Example:
+    # Fill this with the adapter-private mapping in physical execution order.
+    # Frame-first example (a global-first model should reverse each pair):
     # UNIT_MODULE_PATHS = {
     #     "frame_0": "aggregator.frame_blocks.0",
     #     "global_0": "aggregator.global_blocks.0",
@@ -59,7 +61,8 @@ class NewBackboneAdapter(BackboneAdapter):
             supports_prune=True,
             supports_lora=True,
             supports_eval=True,
-            # TODO: fill real counts. They should match layer_unit_catalog().
+            # TODO: fill real static counts when known. Dynamic checkpoint
+            # depths may remain zero; layer_unit_catalog() is authoritative.
             num_frame_blocks=0,
             num_global_blocks=0,
         )
@@ -72,6 +75,23 @@ class NewBackboneAdapter(BackboneAdapter):
         # TODO: return vendor package paths if this backbone lives outside the
         # normal repo import path. Keep repo_root in the list unless unneeded.
         return [repo_root]
+
+    def training_config(self) -> TrainingHyperparams:
+        """Return backbone-specific optimizer/loss defaults."""
+        return TrainingHyperparams()
+
+    def build_training_optimizer(
+        self,
+        trainable: Sequence[nn.Parameter],
+        *,
+        config: Optional[TrainingHyperparams] = None,
+    ) -> torch.optim.Optimizer:
+        cfg = config or self.training_config()
+        return cfg.optimizer_cls(
+            trainable,
+            lr=float(cfg.lr),
+            weight_decay=float(cfg.weight_decay),
+        )
 
     def load_pretrained(
         self,
@@ -90,6 +110,11 @@ class NewBackboneAdapter(BackboneAdapter):
         del hf_model, device, dtype, eval_mode
         raise NotImplementedError("load the vendor model and move it to device")
 
+    def load_eval_images(self, image_paths: Sequence[Path | str]) -> torch.Tensor:
+        """Apply official eval resize/normalization and return [S,3,H,W] in [0,1]."""
+        del image_paths
+        raise NotImplementedError("load and preprocess evaluation images")
+
     def layer_unit_catalog(self, model: nn.Module) -> List[LayerUnitSpec]:
         """Return every public unit the shared pipeline may operate on."""
         del model
@@ -106,8 +131,9 @@ class NewBackboneAdapter(BackboneAdapter):
                     lora_target=True,
                 )
             )
-        kind_order = {"frame": 0, "global": 1}
-        return sorted(units, key=lambda unit: (unit.index, kind_order.get(unit.kind, 99)))
+        # Preserve declared physical order. Public unit indices are positions in
+        # this list, not a frame-first formula derived from kind/index.
+        return units
 
     def block_for_unit(self, model: nn.Module, unit_id: str) -> nn.Module:
         """Map public unit id to the concrete vendor module."""
@@ -221,6 +247,22 @@ class NewBackboneAdapter(BackboneAdapter):
         # TODO: call the official full forward, then:
         # return self.prediction_bundle_from_raw(raw_prediction, images)
         raise NotImplementedError("run full inference")
+
+    def supports_incremental_skip_eval(self) -> bool:
+        """Return True only after iter_skip_span_predictions is implemented."""
+        return False
+
+    def iter_skip_span_predictions(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        spans: Sequence[Tuple[int, int]],
+        *,
+        defer_cpu_geometry: bool = False,
+    ) -> Iterable[Tuple[int, int, PredictionBundle]]:
+        """Yield predictions for closed skip spans using reusable scene state."""
+        del model, images, spans, defer_cpu_geometry
+        raise NotImplementedError("implement incremental skip replay or keep support disabled")
 
     def prediction_bundle_from_raw(
         self,

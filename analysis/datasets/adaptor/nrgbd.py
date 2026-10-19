@@ -102,6 +102,15 @@ class NRGBDAdaptor(DatasetAdaptor):
             backbone_adaptor, batch, ctx.profile
         )
 
+    def prepare_inference_scene_cpu(
+        self,
+        backbone_adaptor: Any,
+        batch: EvalSampleBatch,
+    ) -> PreparedEvalScene:
+        from analysis.datasets import eval_impl
+
+        return eval_impl.prepare_7andn_inference_scene_cpu(backbone_adaptor, batch)
+
     def score_eval_prediction(
         self,
         backbone_adaptor: Any,

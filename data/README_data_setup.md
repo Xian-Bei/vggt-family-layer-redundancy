@@ -171,7 +171,7 @@ Run only the nuScenes extraction:
 
 ```bash
 python data/extract_nuscenes.py \
-  --data_root /media/fengyi/bb/nuscenes \
+  --data_root /media/bb/nuscenes \
   --target_dir data/nuscenes \
   --version v1.0-trainval \
   --seed 0 \
@@ -205,7 +205,7 @@ data/nuscenes/
 Wrapper environment variables:
 
 ```bash
-NUSCENES_DATA_ROOT=/media/fengyi/bb/nuscenes \
+NUSCENES_DATA_ROOT=/media/bb/nuscenes \
 NUSCENES_TARGET_DIR=data/nuscenes \
 NUSCENES_VERSION=v1.0-trainval \
 NUSCENES_SEED=0 \
@@ -225,6 +225,24 @@ Set `RUN_NUSCENES=0` to skip this step. If `NUSCENES_DATA_ROOT` does not exist,
 the wrapper prints a skip message and continues with the other datasets.
 
 ### Waymo Front-Camera Subset
+
+For an independent pool of **100 additional training scenes**, run from the
+`vggt` environment:
+
+```bash
+bash data/setup_waymo_train_extra100.sh
+```
+
+This saves raw TFRecords to `/media/bb/waymo_raw_extra100` and processed
+front-camera data to `data/waymo_train_extra100/training`. It excludes all scene
+IDs in the existing `data/waymo/training` and `data/waymo/validation` directories,
+plus `/media/cc/TALO/Data/waymo` when present. Selection uses seed `20260916`,
+deduplicates the scene IDs used by the extractor, and refuses a changed selection
+on resume. The selection is recorded under the raw root's `manifests` directory
+before downloading, and copied to `selected_scenes.json` in the output root only
+after extraction and sparse-depth validation succeed. Extraction uses the
+existing `waymo_new` environment. This pool is not automatically added to any
+calibration experiment.
 
 Waymo raw data is downloaded from the official Google Cloud bucket after
 accepting the Waymo Open Dataset terms and running `gcloud auth login`.
@@ -426,15 +444,61 @@ data/
 - `setup_waymo.sh` downloads/extracts a fixed Waymo `training`/`validation` subset when `RUN_WAYMO=1`.
 - `download_waymo_subset.py` samples Waymo `training`/`validation` tfrecords with a fixed seed and records manifests. With seed `20260616` and count `50`, the official bucket currently exposes 798 training and 202 validation scenes before sampling.
 
+## Additional calibration pools for the sample-count ablation
+
+The sample-count ablation keeps all main-experiment datasets unchanged and writes
+two independent, ordered pools:
+
+```text
+data/scans_dev_extra100/
+└── selected_scenes.json
+data/nuscenes_train_extra100/
+└── selected_scenes.json
+```
+
+Prepare them from the `vggt` environment:
+
+```bash
+conda activate vggt
+bash data/setup_scannet_dev_extra100.sh
+
+NUSCENES_RAW_ROOT=/media/bb/nuscenes \
+  bash data/setup_nuscenes_train_extra100.sh
+```
+
+The ScanNet wrapper excludes the exact scene IDs in both `scannet_dev50.txt` and
+`scannet_test50.txt`. The nuScenes wrapper excludes every train/val scene in the
+main `data/nuscenes/selected_scenes.json`. Both fail if the requested 100 unique
+extra scenes are unavailable, preserve a fixed seeded-random order, and skip
+already complete extraction output when rerun.
+
+Run the calibration ablation with:
+
+```bash
+# Inspect all cache and fit/eval commands without touching data or outputs.
+DRY_RUN=1 BACKBONES=vggt bash ablation_samples.sh
+
+# N is scenes per domain, not a cross-dataset total.
+SAMPLE_COUNTS=50,100,150 bash ablation_samples.sh
+```
+
+For `N=150`, fitting uses 50 main + 100 extra ScanNet scenes and 50 main + 100
+extra nuScenes scenes. The script caches the largest requested prefix once under
+`analysis_outputs_v3_samples_ablation/cache`, reuses it for every N, and writes
+each result under `samples_050`, `samples_100`, or `samples_150`. It reads plans
+and evaluation bounds from `analysis_outputs_v3` without modifying that tree.
+
 ## Script index
 
 - `setup_all_eval_data.sh`: top-level one-click entry
 - `setup_scannet.sh`: ScanNet test/dev setup + extraction + validation
+- `setup_scannet_dev_extra100.sh`: disjoint ordered ScanNet calibration pool
 - `setup_7scenes.sh`: 7Scenes download + extraction + depth projection + validation
 - `setup_nrgbd.sh`: NRGBD download + extraction + layout normalization + validation
 - `setup_waymo.sh`: Waymo raw subset download + extraction wrapper
 - `preprocess_7scenes_depth_proj.py`: 7Scenes `depth.png -> depth.proj.png`
 - `extract_nuscenes.py`: nuScenes front-camera subset extraction
+- `setup_nuscenes_train_extra100.sh`: disjoint ordered nuScenes train calibration pool
 - `download_waymo_subset.py`: Waymo raw subset download from GCS
 - `extract_waymo.py`: Waymo front-camera/lidar extraction
 - `sparse_depth.py`: shared compressed sparse camera-Z schema and rasterizer

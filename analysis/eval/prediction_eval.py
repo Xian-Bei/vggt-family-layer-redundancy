@@ -1,4 +1,4 @@
-"""FastVGGT-aligned ScanNet pose and geometry evaluation helpers.
+"""Backbone-adapted ScanNet pose, depth, and geometry evaluation helpers.
 
 This module lives under ``analysis.eval``; :class:`SceneData` and aggregation helpers come from
 ``analysis.eval.scannet_eval`` (dataset layout / scene discovery).

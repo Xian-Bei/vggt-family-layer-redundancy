@@ -25,8 +25,33 @@ _GENERIC_SET_SELECTOR_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*_k\d+$")
 BUDGET_PLAN_BUNDLE_FILENAME = "plan_budget_all.json"
 BUDGET_PLAN_BUNDLE_SCHEMA_VERSION = "budget_plan_bundle_v1"
 PRUNE_PLAN_BUNDLE_FILENAME = "prune_plan_all.json"
-PRUNE_PLAN_BUNDLE_SCHEMA_VERSION = "closed_interval_prune_plan_bundle_v4"
+PRUNE_PLAN_BUNDLE_SCHEMA_VERSION = "closed_interval_prune_plan_bundle_v5"
 PRUNE_PLAN_BUNDLE_SCHEMA_VERSIONS = {PRUNE_PLAN_BUNDLE_SCHEMA_VERSION}
+PRUNE_PLAN_STRATEGY_KEYS = frozenset(
+    {
+        "retention",
+        "retention_single",
+        "retention_double",
+        "CKA",
+        "CKA_single",
+        "CKA_double",
+        "cosine",
+        "cosine_single",
+        "cosine_double",
+        "inv_mse",
+        "inv_mse_single",
+        "inv_mse_double",
+        "cca",
+        "cca_single",
+        "cca_double",
+        "replaceme",
+        "replaceme_single",
+        "replaceme_double",
+        "shortgpt",
+        "gardener",
+        "simpler",
+    }
+)
 
 
 def _repo_root() -> Path:
@@ -73,6 +98,18 @@ def load_prune_plan_bundle(root: Path) -> Dict[str, Any]:
         raise ValueError(
             f"Invalid prune plan bundle schema at {path}: {schema!r} "
             f"(expected one of {sorted(PRUNE_PLAN_BUNDLE_SCHEMA_VERSIONS)!r})"
+        )
+    strategies = raw.get("strategies", {})
+    if not isinstance(strategies, dict):
+        raise ValueError(f"Invalid prune plan bundle: expected strategies object at {path}")
+    unsupported_strategy_keys = sorted(
+        str(key) for key in strategies if str(key) not in PRUNE_PLAN_STRATEGY_KEYS
+    )
+    if unsupported_strategy_keys:
+        raise ValueError(
+            f"Invalid prune plan bundle strategy keys at {path}: "
+            f"{unsupported_strategy_keys!r}; expected canonical keys from "
+            f"{sorted(PRUNE_PLAN_STRATEGY_KEYS)!r}"
         )
     for section in ("intervals", "sets", "spans"):
         records = raw.get(section, {})
@@ -323,15 +360,19 @@ def expand_pruning_strategy_keys(
     *,
     available: Optional[Sequence[str]] = None,
 ) -> List[str]:
-    """Expand legacy family names to explicit Single/Double strategy keys."""
+    """Expand canonical family names to explicit Single/Double strategy keys."""
     available_keys = (
         None
         if available is None
-        else {str(key).strip().lower() for key in available}
+        else {
+            str(key).strip().casefold(): str(key).strip()
+            for key in available
+            if str(key).strip()
+        }
     )
     family_aliases = {
-        "gt": ("gt_single", "gt_double"),
-        "ours": ("ours_single", "ours_double"),
+        "retention": ("retention_single", "retention_double"),
+        "CKA": ("CKA_single", "CKA_double"),
         "cosine": ("cosine_single", "cosine_double"),
         "inv_mse": ("inv_mse_single", "inv_mse_double"),
         "cca": ("cca_single", "cca_double"),
@@ -339,17 +380,27 @@ def expand_pruning_strategy_keys(
     }
     out: List[str] = []
     for raw in strategies:
-        key = str(raw).strip().lower()
+        key = canonical_pruning_strategy_key(raw)
         if not key:
             continue
-        if available_keys is not None and key in available_keys:
-            expanded = (key,)
+        if available_keys is not None and key.casefold() in available_keys:
+            expanded = (available_keys[key.casefold()],)
         else:
             expanded = family_aliases.get(key, (key,))
         for candidate in expanded:
             if candidate not in out:
                 out.append(candidate)
     return out
+
+
+def canonical_pruning_strategy_key(value: object) -> str:
+    """Return the case-stable public spelling for a pruning strategy key."""
+    key = str(value).strip().casefold()
+    return {
+        "cka": "CKA",
+        "cka_single": "CKA_single",
+        "cka_double": "CKA_double",
+    }.get(key, key)
 
 
 def strategy_interval_selectors(
@@ -372,7 +423,7 @@ def strategy_interval_selectors(
     selected: List[str] = []
     seen: set[str] = set()
     for strategy in requested:
-        strategy_key = str(strategy).strip().lower()
+        strategy_key = str(strategy).strip()
         record = strategy_records.get(strategy_key)
         if not isinstance(record, dict):
             raise FileNotFoundError(f"Strategy {strategy!r} is not present in prune plan bundle")
@@ -912,8 +963,8 @@ def _span_record_from_bundle(bundle: Dict[str, Any], selector: str) -> Dict[str,
         raise ValueError(f"invalid prune span selector: {selector!r}")
     span = int(m.group("span"))
     strategies = bundle_strategy_records(bundle)
-    ours = strategies.get("ours_double", strategies.get("ours", {}))
-    points = ours.get("points", {}) if isinstance(ours, dict) else {}
+    cka = strategies.get("CKA_double", strategies.get("CKA", {}))
+    points = cka.get("points", {}) if isinstance(cka, dict) else {}
     if isinstance(points, dict):
         plan_key = points.get(str(span))
         if isinstance(plan_key, str):

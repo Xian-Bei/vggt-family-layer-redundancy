@@ -29,38 +29,46 @@ frame_0, global_0, frame_1, global_1, ...
 当前实现支持以下 strategy key：
 
 ```text
-ours_single
-ours_double
-gt_single
-gt_double
+CKA_single
+CKA_double
+retention_single
+retention_double
 replaceme_single
 replaceme_double
 shortgpt
+gardener
 simpler
 cosine_single
 cosine_double
 inv_mse_single
 inv_mse_double
+cca_single
+cca_double
 ```
 
 其中：
 
-- `ours_single`、`gt_single`、`replaceme_single` 是单区间/单 block 版本；
-- `ours_double`、`cosine_double`、`inv_mse_double`、`gt_double`
+- `CKA_single`、`retention_single`、`replaceme_single` 是单区间/单 block 版本；
+- `CKA_double`、`cosine_double`、`inv_mse_double`、`cca_double`、`retention_double`
   是“在单区间和双区间之间自适应选择”的版本；
 - `replaceme_double` 对应官方 `num_A=2`，强制先选择两个等长 block；
 - `shortgpt` 使用官方无区间约束的全局 BI 排序，可能形成任意多个区间；
+- `gardener` 使用官方代码语义的 block 权重数值熵做一次性全局排序，可能形成任意多个区间；
 - `simpler` 是当前 pipeline 中的 suffix sweep 版本；
-- `cosine_single/double`、`inv_mse_single/double` 是 Ours 的内部相似度
-  ablation，不应描述成对应论文的严格官方方法。
+- `cosine_single/double`、`inv_mse_single/double`、`cca_single/double` 与 CKA
+  使用同一选择器，是不同 similarity evidence 的内部 ablation，不应描述成对应论文的
+  严格官方方法。
 
 `main.sh` 默认包含：
 
 ```text
-gt_single,gt_double,
-ours_single,ours_double,
+retention_single,retention_double,
+CKA_single,CKA_double,
+cosine_single,cosine_double,
+inv_mse_single,inv_mse_double,
+cca_single,cca_double,
 replaceme_single,replaceme_double,
-shortgpt,simpler
+shortgpt,gardener,simpler
 ```
 
 环境变量 `PRUNE_STRATEGY` 可以覆盖实际参与生成和评测的方法。TODO 脚本可能为当前实验临时注释步骤或缩小默认方法集合，因此论文实验应同时记录实际环境变量。
@@ -70,9 +78,9 @@ shortgpt,simpler
 典型设置为：
 
 ```text
-PRUNE_DATASET=scannet_dev50,nuscenes_train
-PRUNE_TOKEN_REGION=mean
-metric=cka
+TRAINING_DATASETS=scannet_dev50,nuscenes_train
+PRUNE_TOKEN_REGIONS=all,special_patch_mean
+PLAN_MAX_DROP=26
 ```
 
 步骤 6 读取：
@@ -80,6 +88,10 @@ metric=cka
 - plan-building datasets 的 redundancy graph；
 - `scannet_dev50`、`nuscenes_train` 的单区间 `eval/pruning/<selector>/summary.json`，用于 GT；
 - backbone 的 unit catalog 和参数统计。
+
+步骤 3 的默认 `METRICS=cka,cosine,angular,inv_mse,cca` 必须覆盖所选 strategy 的
+evidence；缺少某个明确请求的 metric 时，对应 strategy 无法构建，步骤 6 最终报错。
+`PLAN_MAX_DROP` 在生成 plan 前裁掉更大预算，并决定跨预算路径从哪个最大点开始。
 
 输出：
 
@@ -122,10 +134,10 @@ cosine_mean.shape   = [num_units, num_units]
 
 注意：`cosine_scenes[s,p,q]` 已经是在 scene 内对 token row 求均值的结果，不是逐 token cosine 明细。
 
-当 `token_region=mean` 时，加载顺序为：
+对于 `special_patch_mean` 候选，加载顺序为：
 
 ```text
-先对一个 dataset 的可用 token-region 矩阵求均值
+先对一个 dataset 的 special、patch token-region 矩阵求均值
 再对 scannet_dev50、nuscenes_train 的矩阵求均值
 ```
 
@@ -135,17 +147,31 @@ cosine_mean.shape   = [num_units, num_units]
 token region → dataset
 ```
 
+主流程用 `all` 生成全部 pruning strategies；`special_patch_mean` 只额外生成 CKA、
+Cosine、INV_MSE、CCA 的 Single/Double。先仅在 training datasets 上补齐两组物理
+selector，再按 strategy 和 drop budget 选择七指标归一化退化均值更小的候选。最终
+只在 held-out datasets 上评测 canonical winner，不评测落选候选。Retention 与 token
+region 无关；ReplaceMe、ShortGPT、SIMPLER 始终保留 `all`
+方案。逐点选择使用与 Stage 7 相同的 `PLAN_MIN_DROP`、`PLAN_MAX_DROP`、
+`PLAN_DROP_STEP`，四个双-region family 的 canonical points 只保留实际评测预算。最终
+选择写入 canonical `prune_plan_all.json`，供 recovery 和可视化统一读取。主流程只使用
+strategy 与 drop-budget 范围生成候选，不再提供显式物理 selector 参数，因为单个 selector
+无法表达两个 token-region 候选的逐预算比较。
+两条候选路径各自满足原有跨预算 overlap 约束，但逐预算切换 token region 后，最终混合
+路径不保证继续满足该约束；这一点会写入 bundle provenance。
+
 当前各方法读取的输入为：
 
 | 方法 | 输入 |
 |---|---|
-| Ours | CKA similarity |
+| CKA | CKA similarity |
 | Cosine | cosine similarity |
 | INV_MSE | inverse-MSE similarity |
+| CCA | CCA similarity |
 | ReplaceMe | angular distance |
 | ShortGPT | cosine similarity |
-| SIMPLER | 默认与 Ours 相同的 CKA similarity |
-| GT | 单区间真实下游指标，不以 redundancy graph 为目标 |
+| SIMPLER | 默认与 CKA 相同的 CKA similarity |
+| Retention | 单区间真实下游指标，不以 redundancy graph 为目标 |
 
 ### 3.1 ReplaceMe 的 angular distance
 
@@ -216,7 +242,7 @@ selector = i1_j1_i3_j3_i5_j6_i9_j9
 
 | 方法 | 区间约束 |
 |---|---|
-| Ours_CKA / Ours_Cosine / Ours_INV_MSE Double、GT Double | 最多两个；若为两个，中间至少保留 1 个 unit |
+| CKA / Cosine / INV_MSE / CCA Double、Retention Double | 最多两个；若为两个，中间至少保留 1 个 unit |
 | ReplaceMe Double | 两个等长 block；只禁止重叠；允许相邻 |
 | ShortGPT | 不限制区间数量或间隔 |
 | SIMPLER | 一个 suffix |
@@ -225,7 +251,7 @@ ReplaceMe 选出的两个 block 若相邻，纯删层后的物理并集是一个
 
 ## 5. 通用区间边界分数
 
-Ours、Cosine 和 INV_MSE 从 unit pairwise similarity 构造区间 corner score。
+CKA、Cosine、INV_MSE 和 CCA 从 unit pairwise similarity 构造区间 corner score。
 
 删除闭区间 `[a,b]` 时：
 
@@ -250,38 +276,29 @@ A[a,b] = angular_output_distance[a-1,b]
 
 ShortGPT 不使用区间 corner score，而使用每个 unit 自身的输入–输出 BI。
 
-## 6. Ours
+## 6. CKA 与公共 similarity 选择器
 
 ### 6.1 分数
 
-Ours 首先把 CKA corner similarity 转换成 proxy drop：
+CKA、Cosine、INV_MSE 和 CCA 都先把自己的 corner similarity 转换成 proxy drop：
 
 ```text
-D[a,b] = 1 - CKA[a-1,b]
+D_metric[a,b] = 1 - C_metric[a,b]
 ```
 
-因此 Ours 是 **越小越好**，而不是直接最大化 CKA：
+因此四个 family 都是 **越小越好**，不是直接最大化 raw similarity：
 
 ```text
 single score = D[a,b]
-double score = D[a,b] + D[c,d]       # sum 模式
-double score = max(D[a,b], D[c,d])   # max 模式
+double score = D[a,b] + D[c,d]
 ```
 
-双区间联合目标分别由两个参数硬编码控制：
+Retention Double 和 similarity family（CKA、Cosine、INV_MSE、CCA）的 Double
+版本固定将两个区间的分数相加，不提供聚合模式参数。Single 版本及 ReplaceMe、
+ShortGPT、SIMPLER 的选择规则保持不变。Double strategy 的 `source` 和预算点的
+`joint_score_aggregation` 继续记录 `sum`，用于说明分数语义。
 
-- `GT_TWO_INTERVAL_SCORE_AGGREGATION = "sum"`；
-- `OURS_TWO_INTERVAL_SCORE_AGGREGATION = "max"`。
-
-- `sum`：保持原有“两个区间下降量相加”的近似；
-- `max`：联合下降由两个分量中更大的下降量决定。
-
-这两个开关分别作用于 GT Double 和 Ours 系列的 Double 版本，即
-Ours_CKA、Ours_Cosine、Ours_INV_MSE；所有 Single 版本以及 ReplaceMe、
-ShortGPT、SIMPLER 均不受影响。每个 Double strategy 的 `source` 和每个
-预算点的 `joint_score_aggregation` 都会记录实际模式。
-
-两个分量均来自原始模型的一次性 CKA graph：
+两个分量均来自原始模型的一次性 redundancy graph：
 
 ```text
 scores_recomputed_after_first_drop = false
@@ -289,31 +306,47 @@ scores_recomputed_after_first_drop = false
 
 ### 6.2 Single 与 Double
 
-`ours_single`：
+`<metric>_single`：
 
 - 每个预算只允许一个连续区间；
 - 最小化该区间的 proxy drop。
 
-`ours_double`：
+`<metric>_double`：
 
 - 候选可以是一个区间或两个分离区间；
 - 两个区间之间至少保留一个 unit；
-- 双区间只有比最佳单区间至少改善超过 `0.01` 才会被采用；
-- 不足 `0.01` 视为同等，选择单区间。
+- 双区间只有比最佳单区间改善严格超过 `0.005` 才会被采用；
+- 改善不超过 `0.005` 时选择单区间。
 
 因为越小越好，双区间判定为：
 
 ```text
-score_double < score_single - 0.01
+score_double < score_single - 0.005
 ```
+Similarity-based Double candidates 使用 `double_gap_comparison_tolerance=5e-3`：
+优先更大的 component gap，较小 gap 的候选只有分数改善严格超过该 tolerance 才会替换。
+相同 gap 的候选按分数严格比较；完全同分时偏向更大 gap。该参数可通过
+`--double-gap-comparison-tolerance` 配置，设为 `0` 即恢复严格分数比较。
+
+`single_double_comparison_tolerance=5e-3` 仅用于 CKA、Cosine、INV_MSE、CCA 等
+similarity-based adaptive plan，决定是否从 single 切到 double。Retention 不使用任何
+tolerance，Double 只要严格优于 Single 就会被采用。
+
+两个 tolerance 仅写入 similarity Double 的 source、逐点记录及
+`similarity_selection_controls`，Retention 的选择和元数据均不使用它们。
 
 ### 6.3 跨预算路径约束
 
-当前 Ours 不是每个预算完全独立。候选按删层预算从大到小选择，并要求预算 `n` 的每个 component 至少与预算 `n+1` 已选方案中的一个 component 相交。
+CKA、Cosine、INV_MSE、CCA 和 Retention 都不是每个预算完全独立。候选按删层预算
+从大到小选择，并要求预算 `n` 的每个 component 至少与预算 `n+1` 已选方案中的一个
+component 相交。Double-to-Double 还要求两侧 component 能建立一对一 overlap 对应，
+不能让两个当前 interval 只依赖同一个上一级 interval。
 
-这会提高 drop curve 的路径连续性，但属于当前 Ours 的设计，不应错误描述为其他 baseline 的官方要求。
+整条路径不限制 Single→Double transition 的次数。
+上述连续性约束属于本项目 similarity/Retention 选择器，
+不应描述为 ReplaceMe、ShortGPT 或 SIMPLER 的官方要求。
 
-## 7. GT
+## 7. Retention（GT evidence）
 
 GT 从两个 training datasets 的单区间真实下游结果构造 degradation heatmap。
 
@@ -338,13 +371,13 @@ GT 指标求均值 → dataset GT heatmap
 
 `G[a,b]` 越小越好。
 
-`gt_single`：
+`retention_single`：
 
 ```text
 min G[a,b]
 ```
 
-`gt_double`：
+`retention_double`：
 
 ```text
 single = G[a,b]
@@ -352,13 +385,14 @@ double = G[a,b] + G[c,d]       # sum 模式
 double = max(G[a,b], G[c,d])   # max 模式
 ```
 
-并采用与 Ours 相同的：
+并采用与 CKA 相同的：
 
 - 最多两个区间；
 - 至少一个保留 unit 的间隔；
-- `0.01` 单/双区间改善阈值；
+- `0.005` 单/双区间改善阈值，以及相同数值的 single tie/double-gap tolerance；
 - 平分时选择单区间；
-- 从大预算到小预算的 component-overlap 路径约束。
+- 从大预算到小预算的 component-overlap 路径约束；Double-to-Double 要求一对一
+  overlap。
 
 GT 双区间始终假设删除第一个区间后，第二个区间基于原模型测得的下降近似
 不变；在 `sum` 模式下进一步采用可加性假设，在 `max` 模式下则采用
@@ -371,7 +405,7 @@ GT 双区间始终假设删除第一个区间后，第二个区间基于原模�
 
 步骤 6 不使用真实双区间结果参与选择。真实交互由步骤 7 的物理 pruning eval 检验。
 
-GT 是本项目内部的近似 oracle，不是外部论文 baseline。
+Retention 使用本项目内部的近似 GT oracle，不是外部论文 baseline。
 
 ## 8. ReplaceMe 官方复现
 
@@ -423,7 +457,7 @@ total_drop = 2 * layers_to_skip
 - 只禁止重叠；
 - 允许相邻；
 - `merge_consecutive=False`；
-- 不使用 0.01 阈值；
+- 不使用 similarity selector 的 `0.005` tolerance；
 - 不进行 joint-score 枚举；
 - 选完第一个 block 后不重算原模型 distance。
 
@@ -495,7 +529,7 @@ drop(n) = sorted(ranking[:n])
 - 不限制区间数量；
 - 不限制区间间隔；
 - 不比较单区间与双区间；
-- 不使用 0.01 阈值；
+- 不使用 similarity selector 的 `0.005` tolerance；
 - 不进行每个预算独立组合优化；
 - 不同预算严格嵌套：
 
@@ -520,7 +554,36 @@ drop(n) ⊂ drop(n+1)
 
 当前静态删层对应论文的 ShortGPT，而不是只对 prompt token 跳层、生成 token 走完整模型的 ShortGPT-gen。
 
-## 10. SIMPLER：公式对齐，但输出方式不是严格官方方法
+## 10. Gardener：按官方代码语义复现
+
+参考：
+
+- 论文：Entropy Reveals Block Importance in Masked Self-Supervised Vision Transformers
+- 官方仓库：https://github.com/Peihao-Xiang/Gardener
+
+Gardener 是 data-free、one-shot 的权重排序方法。对每个 block，把 attention 的
+qkv/projection kernel 与 MLP 的 fc1/fc2 kernel 拼接，计算权重值出现频率的 Shannon
+entropy：
+
+```text
+p(v) = count(weight == v) / number_of_weights
+H(block) = -sum_v p(v) log p(v)
+```
+
+然后按 `H(block)` 从小到大排序；预算 `k` 使用同一个全局 ranking 的前 `k` 个 block，
+因此跨预算严格嵌套，不限制区间数，也不会在删除后重算 entropy。
+
+官方 TensorFlow 实现使用 `get_weights()[2,3,9,11]`。本项目不照抄依赖框架内部顺序的
+下标，而是按等价参数语义选取 block 内递归的全部二维权重；这排除了 bias、LayerNorm
+以及其他一维参数。论文文字描述了将权重划入区间，但发布代码实际对原始浮点值调用
+`pandas.value_counts`，没有用于 entropy 的 histogram binning。本实现选择官方发布代码
+的 exact-value 语义，并在 plan JSON 中明确记录该差异。
+
+为遵守现有 LaRe pruning contract，物理 unit index 0 保持不删；这是相对 Gardener 官方
+VideoMAE 实验的适配。该策略不读取 redundancy graph、calibration dataset 或 token
+region，`special_patch_mean` plan 中沿用 `all` 版本。
+
+## 11. SIMPLER：公式对齐，但输出方式不是严格官方方法
 
 参考：
 
@@ -570,58 +633,53 @@ SIMPLER-style budget-matched suffix / Last-n sweep
 
 此外，论文使用任务图像的 layer representation；当前使用 3D scene/token graph，并对两个 plan datasets 聚合，这也是输入适配。
 
-## 11. Cosine 与 INV_MSE ablation
+## 12. Cosine、INV_MSE 与 CCA ablation
 
-这两个 strategy 使用公共一/二区间枚举器，并按每个预算独立选择。
-
-Cosine：
+这三个 family 与 CKA 完全复用 `_build_similarity_metric_strategy_pair()`：
 
 ```text
-single = C_cos[a,b]
-double = C_cos[a,b] + C_cos[c,d]
-maximize
+D_metric[a,b] = 1 - C_metric[a,b]
+single = D_metric[a,b]
+double = D_metric[a,b] + D_metric[c,d]   # 当前 aggregation=sum
+minimize
 ```
 
-INV_MSE：
+所以它们同样具有：
 
-```text
-single = C_inv_mse[a,b]
-double = C_inv_mse[a,b] + C_inv_mse[c,d]
-maximize
-```
+- Single 与 adaptive Double 两个版本；
+- 最多两个区间，component 之间至少保留一个 unit；
+- `0.005` single/double、single tie 与 double-gap tolerance；
+- 从最大预算向小预算扫描的 component-overlap path；
+- Double-to-Double 一对一 overlap；
+- 原始模型 graph 一次性评分，不在第一次删除后重算。
 
-共同规则：
+它们与 CKA 的区别只有输入 evidence，不是 ReplaceMe 或其他论文 baseline 的官方复现。
+由于当前 Double 使用两个 proxy drop 的 `sum`，Single/Double 比较仍是一种显式尺度与
+交互假设；plan JSON 会记录实际 aggregation 和 tolerance。
 
-- 最多两个区间；
-- 两区间之间至少保留一个 unit；
-- 双区间需比单区间高超过 `0.01`；
-- 平分时选择单区间；
-- 每个预算独立；
-- 所有分数来自原始模型 graph，不在第一次删除后重算。
-
-由于双区间是两个正 similarity score 直接相加，而单区间只有一个 score，这两个 ablation 在数值尺度上可能天然偏向双区间。它们不是当前 ReplaceMe 的实现；ReplaceMe 已改为官方 angular-distance 等长贪心算法。
-
-## 12. Strategy 对照表
+## 13. Strategy 对照表
 
 | Strategy | 目标 | 预算选择 | 区间数 | 跨预算关系 | 官方复现结论 |
 |---|---|---|---:|---|---|
-| Ours Single | 最小化 `1-CKA` | 单区间搜索 | 1 | component overlap path | 本项目方法 |
-| Ours Double | 最小化 proxy-drop 的 `sum`/`max` | 单/双自适应，阈值 0.01 | ≤2 | component overlap path | 本项目方法 |
-| GT Single | 最小化真实单区间退化 | 单区间搜索 | 1 | component overlap path | 内部 oracle |
-| GT Double | 最小化退化的 `sum`/`max` 近似 | 单/双自适应，阈值 0.01 | ≤2 | component overlap path | 内部 oracle |
+| CKA Single | 最小化 `1-CKA` | 单区间搜索 | 1 | component overlap path | 本项目方法 |
+| CKA Double | 最小化 proxy-drop 的 `sum`/`max` | 单/双自适应，阈值 0.005 | ≤2 | component overlap path + double 一对一 | 本项目方法 |
+| Retention Single | 最小化真实单区间退化 | 单区间搜索 | 1 | component overlap path | 内部 oracle |
+| Retention Double | 最小化退化的 `sum`/`max` 近似 | 单/双自适应，阈值 0.005 | ≤2 | component overlap path + double 一对一 | 内部 oracle |
 | ReplaceMe Single | 最小 angular distance | `num_A=1` 贪心 | 1 | 各 `layers_to_skip` 独立 | 选择逻辑对齐，输入为 3D 适配 |
 | ReplaceMe Double | 最小 individual angular distance | `num_A=2` 等长贪心 | 先选 2 blocks | 偶数预算 | 选择逻辑对齐，输入为 3D 适配 |
 | ShortGPT | 最小 BI | 全局 ranking 前缀 | 任意 | 严格嵌套 | 选择逻辑对齐，输入和 unit 0 有适配 |
+| Gardener | 最小 exact-value 权重数值熵 | 全局 ranking 前缀 | 任意 | 严格嵌套 | 官方代码语义对齐，参数定位和 unit 0 有适配 |
 | SIMPLER | 最大 TL-BR cutoff score | 当前输出 suffix sweep | 1 | suffix 天然嵌套 | 公式对齐，输出不是严格官方 |
-| Cosine | 最大 corner similarity 和 | 每预算独立 | ≤2 | 无 | 内部 ablation |
-| INV_MSE | 最大 corner similarity 和 | 每预算独立 | ≤2 | 无 | 内部 ablation |
+| Cosine | 最小化 `1-cosine` proxy | 同 CKA | ≤2 | component overlap path + double 一对一 | 内部 ablation |
+| INV_MSE | 最小化 `1-inv_mse` proxy | 同 CKA | ≤2 | component overlap path + double 一对一 | 内部 ablation |
+| CCA | 最小化 `1-CCA` proxy | 同 CKA | ≤2 | component overlap path + double 一对一 | 内部 ablation |
 
-## 13. 步骤 7：增量真实评测
+## 14. 步骤 7：增量真实评测
 
 步骤 7 将 strategy 内部别名：
 
 ```text
-ours_double_k10
+CKA_double_k10
 replaceme_double_k10
 shortgpt_k10
 ```
@@ -647,15 +705,21 @@ analysis_outputs_v3/<backbone>/<dataset>/eval/pruning/<eval_selector>/
 ```text
 scannet_dev50
 nuscenes_train
-→ training 两数据集严格平均图
+→ 补齐 all 与 special_patch_mean 候选
+→ 在 training 两数据集上逐预算选择 token-region winner
+→ 写入 canonical prune_plan_all.json
 scannet_test50
 7scenes_test
 nuscenes_val
 waymo_validation
+→ 只评测 canonical winner 与固定 all 策略
 → eval 四数据集严格平均图
 ```
 
-每个 dataset 完成后生成单数据集 pruning plot。分组平均只纳入组内所有 dataset 都完整存在的 strategy-budget 点，不做静默部分平均。
+步骤 7 只补齐每个 selector 的 `summary.json`，不保存 pruning PNG。
+`analysis/view.py` 的 Pruning Plan tab 重新读取这些 summary，并交互式渲染单数据集
+和严格分组平均视图。分组平均只纳入组内所有 dataset 都完整存在的
+strategy-budget 点，不做静默部分平均。
 
 training datasets 的单区间 brute-force 结果应已存在：
 
@@ -663,9 +727,9 @@ training datasets 的单区间 brute-force 结果应已存在：
 - 所需 selector 包含多个区间时，只补跑缺失结果；
 - ShortGPT 现在可能产生三个或更多区间，步骤 7 和磁盘 selector 已支持这种情况。
 
-## 14. Plot 语义
+## 15. Pruning Plan tab 语义
 
-Pruning metric plot 只绘制 GT metric mean degradation。
+Retention pruning metric plot 使用 GT metric mean degradation。
 
 - 颜色表示方法；
 - 虚线表示显式 Single 版本；
@@ -674,13 +738,15 @@ Pruning metric plot 只绘制 GT metric mean degradation。
 
 同一方法的 Single/Double 共用颜色，避免为每种“方法 × 线型”组合重复占用 legend。
 
-## 15. 解释结果时必须保留的边界
+## 16. 解释结果时必须保留的边界
 
-1. Ours 系列和 GT Double 的双区间分数是原始模型两个单区间 proxy
+1. CKA 系列和 Retention Double 的双区间分数是原始模型两个单区间 proxy
    的和或最大值（由硬编码开关控制），两种模式都没有重新测量删层交互。
-2. Ours/GT 当前存在跨预算 component-overlap 路径约束；Cosine、INV_MSE、ReplaceMe 没有该路径；ShortGPT 使用官方全局 ranking 前缀。
+2. CKA、Cosine、INV_MSE、CCA 和 Retention 当前都存在跨预算 component-overlap
+   路径约束，Double-to-Double 要求一对一 overlap；ReplaceMe 没有该路径，ShortGPT
+   使用官方全局 ranking 前缀。
 3. ReplaceMe 的 block 选择逻辑已对齐官方，但步骤 6/7 的纯删层结果不包含 ReplaceMe 的线性变换恢复，完整端到端方法需单独报告 recovery。
 4. ShortGPT 的选择逻辑已恢复官方，但 calibration 数据、聚合权重和 unit 0 保护仍是 3D pipeline 适配。
 5. SIMPLER 的 cutoff score 公式对齐论文，但完整预算 suffix curve 不等于官方只选择一个 `c*`。
-6. Cosine 和 INV_MSE 是内部 ablation，不应写成 ReplaceMe 或其他论文的严格复现。
-7. “使用原始模型一次性分数、不在第一次删除后重算”对当前所有相似度 baseline 都成立；这与 ReplaceMe、ShortGPT 官方的一次性选择一致，但对 Ours/GT 是显式建模假设。
+6. Cosine、INV_MSE 和 CCA 是内部 ablation，不应写成 ReplaceMe 或其他论文的严格复现。
+7. “使用原始模型一次性分数、不在第一次删除后重算”对当前所有相似度 baseline 都成立；这与 ReplaceMe、ShortGPT 官方的一次性选择一致，但对 CKA/Retention 是显式建模假设。

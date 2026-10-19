@@ -21,6 +21,7 @@ from analysis.prune_plan import (
     bundle_plan_records,
     bundle_physical_plan_records,
     bundle_strategy_records,
+    canonical_pruning_strategy_key,
     load_prune_plan_bundle,
     physical_pruning_selector_from_record,
 )
@@ -31,14 +32,11 @@ from analysis.prune_plan.eval_plots import (
 )
 from analysis.vis.recovery_backbone_comparison_tab import (
     _BACKBONE_COLORS,
-    _MIN_PRUNE_STRATEGY,
     _PRUNE_STRATEGY_FAMILIES,
     _PRUNE_STRUCTURES,
-    _collapse_min_prune_strategies,
-    _global_metric_ranges,
     _selected_dataset,
 )
-from analysis.vis.recovery_overview_tab import (
+from analysis.vis.recovery_tab import (
     _DATASET_AVERAGE_GROUPS,
     _pruning_only_recovery_like_payload,
     discover_recovery_overview_datasets,
@@ -164,12 +162,6 @@ def compute_parameter_series_for_backbone(
 
 
 def _selected_variants(strategy: str, structures: Sequence[str]) -> List[str]:
-    if strategy == _MIN_PRUNE_STRATEGY:
-        return [
-            f"{family}_{structure}"
-            for structure in structures
-            for family in _PRUNE_STRATEGY_FAMILIES
-        ]
     return [f"{strategy}_{structure}" for structure in structures]
 
 
@@ -179,7 +171,6 @@ def _load_backbone_efficiency_payload(
     method: str,
     dataset: str,
     variants: Sequence[str],
-    min_mode: bool,
 ) -> Tuple[Dict[str, Any], List[str]]:
     pruning = collect_pruning_eval_payload(experiment_root=root, prune_plan_root=root)
     merged: Dict[str, Any] = {"upper_average": {}, "strategies": {}}
@@ -226,9 +217,7 @@ def _load_backbone_efficiency_payload(
             if source_key == method:
                 target_key = f"{method}_{variant}"
             elif str(source_key).startswith("no_recovery"):
-                target_key = (
-                    f"no_recovery_{variant}" if min_mode else f"no_recovery_{structure}"
-                )
+                target_key = f"no_recovery_{structure}"
             else:
                 continue
             merged["strategies"][target_key] = strategy_payload
@@ -242,10 +231,7 @@ def _load_backbone_efficiency_payload(
             for drop, point in merged["strategies"].get(key, {}).get("points", {}).items()
             if isinstance(point, dict) and point.get("available", False)
         }
-        baseline_keys = (
-            [f"no_recovery_{variant}" for variant in variants if variant.endswith(f"_{structure}")]
-            if min_mode else [f"no_recovery_{structure}"]
-        )
+        baseline_keys = [f"no_recovery_{structure}"]
         baseline_drops = {
             str(drop)
             for key in baseline_keys
@@ -305,9 +291,7 @@ def _selectors_for_parameter_count(
     plan_records = bundle_plan_records(dict(bundle))
     for structure in structures:
         recovery_key = (
-            f"{method}_min_{structure}"
-            if strategy == _MIN_PRUNE_STRATEGY
-            else f"{method}_{strategy}_{structure}"
+            f"{method}_{strategy}_{structure}"
         )
         for key in (recovery_key, f"no_recovery_{structure}"):
             curve = payload.get("strategies", {}).get(key, {})
@@ -318,7 +302,7 @@ def _selectors_for_parameter_count(
                 drop_count = int(drop_key)
                 selector = str(point.get("selector", ""))
                 variant = str(point.get("min_prune_strategy", ""))
-                if not variant and strategy != _MIN_PRUNE_STRATEGY:
+                if not variant:
                     variant = f"{strategy}_{structure}"
                 if not selector and variant:
                     strategy_record = strategy_records.get(variant, {})
@@ -356,12 +340,12 @@ def render_backbone_efficiency(
     selected_backbones: Sequence[str] | None,
     selected_method: str | None,
     dataset: str = "training average",
-    prune_strategy: str = "ours",
+    prune_strategy: str = "CKA",
     prune_structures: Sequence[str] | None = None,
 ) -> Tuple[np.ndarray | None, str]:
     backbones = list(dict.fromkeys(str(value) for value in (selected_backbones or ())))
     method = str(selected_method or "").strip()
-    strategy = str(prune_strategy or "").strip().lower()
+    strategy = canonical_pruning_strategy_key(prune_strategy or "")
     structures = list(dict.fromkeys(
         str(value).strip().lower()
         for value in (prune_structures if prune_structures is not None else _PRUNE_STRUCTURES)
@@ -371,8 +355,8 @@ def render_backbone_efficiency(
         return None, "Select at least one backbone."
     if not method:
         return None, "Select one recovery method."
-    if strategy not in (*_PRUNE_STRATEGY_FAMILIES, _MIN_PRUNE_STRATEGY):
-        return None, "Prune strategy must be gt, ours, or min."
+    if strategy not in _PRUNE_STRATEGY_FAMILIES:
+        return None, "Prune strategy must be retention or CKA."
     if not structures:
         return None, "Select at least one pruning structure."
 
@@ -385,31 +369,11 @@ def render_backbone_efficiency(
             bundle = load_prune_plan_bundle(root)
             payload, notes = _load_backbone_efficiency_payload(
                 root, method=method, dataset=dataset, variants=variants,
-                min_mode=strategy == _MIN_PRUNE_STRATEGY,
             )
             loaded.append((backbone, payload, bundle))
             messages.extend(f"{backbone}: {note}" for note in notes)
         except Exception as exc:
             messages.append(f"{backbone}: {type(exc).__name__}: {exc}")
-
-    if strategy == _MIN_PRUNE_STRATEGY and loaded:
-        candidate_keys = [
-            str(key) for _, payload, _ in loaded
-            for key in payload.get("strategies", {})
-        ]
-        ranges = _global_metric_ranges(
-            [payload for _, payload, _ in loaded], candidate_keys
-        )
-        loaded = [
-            (
-                backbone,
-                _collapse_min_prune_strategies(
-                    payload, method=method, structures=structures, ranges=ranges
-                )[0],
-                bundle,
-            )
-            for backbone, payload, bundle in loaded
-        ]
 
     if not loaded:
         return None, "\n".join([*messages, "No matching backbone data to plot."])
@@ -444,9 +408,7 @@ def render_backbone_efficiency(
             for structure in structures:
                 marker = _STRUCTURE_MARKERS[structure]
                 recovery_key = (
-                    f"{method}_min_{structure}"
-                    if strategy == _MIN_PRUNE_STRATEGY
-                    else f"{method}_{strategy}_{structure}"
+                    f"{method}_{strategy}_{structure}"
                 )
                 for key, linestyle in ((recovery_key, "-"), (f"no_recovery_{structure}", "--")):
                     xs, ys, _ = _series_from_strategy(payload, key, metric)
@@ -538,8 +500,8 @@ def build_backbone_efficiency_tab(*, blocks: gr.Blocks, output_root: Path) -> Di
                 )
                 prune_strategy_dd = gr.Dropdown(
                     label="Prune strategy",
-                    choices=[*_PRUNE_STRATEGY_FAMILIES, _MIN_PRUNE_STRATEGY],
-                    value="ours", multiselect=False,
+                    choices=list(_PRUNE_STRATEGY_FAMILIES),
+                    value="CKA", multiselect=False,
                 )
                 prune_structure_cb = gr.CheckboxGroup(
                     label="Pruning structure", choices=list(_PRUNE_STRUCTURES),

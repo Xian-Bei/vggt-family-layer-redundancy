@@ -120,7 +120,7 @@ def prepare_cache_batch(
 
 
 def prepare_cache_images(images: Any, *, max_frames: int = 0) -> torch.Tensor:
-    """Return float tensor ``[1, S, 3, H, W]`` in [0, 1] for VGGT / Pi3 cache forward.
+    """Return float tensor ``[1,S,3,H,W]`` in [0,1] for a backbone cache forward.
 
     ScanNet plugins usually provide a tensor or list of tensors. 7scenes / NRGBD provide
     a list of per-view dicts (``img`` in [-1, 1]); we mirror ``eval_impl._collate_7andn_views``.

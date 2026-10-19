@@ -43,6 +43,30 @@ def _sample(paths: list[str], *, seed: int, split: str, count: int) -> list[str]
     return sorted(rng.sample(paths, count))
 
 
+def _scene_id(path: str) -> str:
+    """Match extract_waymo.py's scene-directory identity (not just filename)."""
+    name = Path(path).name
+    if not name.startswith("segment-") or "_" not in name:
+        raise ValueError(f"Unrecognized Waymo segment name: {name}")
+    return name.split("-", 1)[1].split("_", 1)[0]
+
+
+def _exclude_scenes(paths: list[str], roots: list[Path]) -> list[str]:
+    excluded = set()
+    for root in roots:
+        if not root.is_dir():
+            raise FileNotFoundError(f"Missing exclusion directory: {root}")
+        excluded.update(p.name for p in root.iterdir() if p.is_dir())
+    # Multiple segments can share the ID used by the extractor. Select at most
+    # one file per ID so two downloads cannot overwrite one output scene.
+    unique = {}
+    for path in sorted(paths):
+        scene = _scene_id(path)
+        if scene not in excluded:
+            unique.setdefault(scene, path)
+    return list(unique.values())
+
+
 def _write_lines(path: Path, lines: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
@@ -83,6 +107,8 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=50, help="Scenes per split.")
     parser.add_argument("--splits", nargs="+", default=["training", "validation"])
     parser.add_argument("--dry-run", action="store_true", help="Only list and sample; do not download.")
+    parser.add_argument("--exclude-scene-root", type=Path, action="append", default=[],
+                        help="Exclude scene IDs in this extracted split directory; repeatable.")
     args = parser.parse_args()
 
     target_root = Path(args.target_root)
@@ -98,7 +124,22 @@ def main() -> None:
     for split in args.splits:
         print(f"[waymo] listing {split} from {args.bucket}", flush=True)
         all_paths = _list_tfrecords(args.bucket, split)
-        selected = _sample(all_paths, seed=args.seed, split=split, count=args.count)
+        candidates = _exclude_scenes(all_paths, args.exclude_scene_root) if args.exclude_scene_root else all_paths
+        selected = _sample(candidates, seed=args.seed, split=split, count=args.count)
+        if args.exclude_scene_root:
+            selection_path = manifest_dir / f"{split}_extra_selection.json"
+            selection = {
+                "seed": args.seed, "split": split,
+                "scene_ids": [_scene_id(path) for path in selected],
+                "source_paths": selected,
+                "exclude_scene_roots": [str(root.resolve()) for root in args.exclude_scene_root],
+            }
+            if selection_path.is_file():
+                previous = json.loads(selection_path.read_text())
+                if previous != selection:
+                    raise RuntimeError(f"Selection changed; refusing to mix datasets in {target_root}")
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            selection_path.write_text(json.dumps(selection, indent=2) + "\n")
 
         _write_lines(manifest_dir / f"{split}_all.txt", all_paths)
         _write_lines(manifest_dir / f"{split}_selected.txt", selected)

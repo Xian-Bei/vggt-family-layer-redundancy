@@ -86,7 +86,9 @@ def apply_eval_model_structure(
         if has_ckpt:
             payload = load_train_checkpoint_payload(ckpt_path, map_location=map_location)
             if payload.get("variant") in {
-                "training_free_recovery_delta", "trainable_recovery_delta_v1"
+                "training_free_recovery_delta",
+                "local_fit_recovery_delta",
+                "trainable_recovery_delta_v1",
             } and "model_state_dict" not in payload:
                 raise ValueError("upper eval cannot load a compact recovery delta checkpoint")
             state = payload.get("model_state_dict", payload)

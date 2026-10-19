@@ -148,6 +148,11 @@ def materialize_eval_interval_result(
     }
     if recovery_plan_name:
         summary["recovery_plan_name"] = str(recovery_plan_name)
+        semantics_version = str(
+            record.extra.get("recovery_semantics_version", "")
+        ).strip()
+        if semantics_version:
+            summary["recovery_semantics_version"] = semantics_version
 
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     scene_text = "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in scene_rows)

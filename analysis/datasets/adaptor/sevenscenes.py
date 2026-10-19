@@ -43,7 +43,7 @@ class SevenScenesAdaptor(DatasetAdaptor):
     def eval_profile(self) -> DatasetEvalProfile:
         return DatasetEvalProfile(
             dataset=self.name,
-            geometry=GeometryEvalProfile(dist_clip=0.1, use_icp=True, max_points=999_999),
+            geometry=GeometryEvalProfile(dist_clip=0.5, use_icp=True, max_points=999_999),
             kf_every=10,
             size=518,
         )
@@ -111,6 +111,15 @@ class SevenScenesAdaptor(DatasetAdaptor):
         return eval_impl.prepare_7andn_eval_scene_cpu(
             backbone_adaptor, batch, ctx.profile
         )
+
+    def prepare_inference_scene_cpu(
+        self,
+        backbone_adaptor: Any,
+        batch: EvalSampleBatch,
+    ) -> PreparedEvalScene:
+        from analysis.datasets import eval_impl
+
+        return eval_impl.prepare_7andn_inference_scene_cpu(backbone_adaptor, batch)
 
     def score_eval_prediction(
         self,

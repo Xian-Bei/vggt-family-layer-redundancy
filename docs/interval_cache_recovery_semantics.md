@@ -1,146 +1,167 @@
 # LaRe 下标、区间、Cache 与 Recovery 语义规范
 
-本文是 LaRe 中 unit 下标、heatmap、剪枝区间、cache 和 recovery 的唯一语义规范。
-新增代码、脚本、JSON schema 和可视化必须遵循本文；不再支持旧的半开区间或
-`source=i` 语义。
+本文是 LaRe 当前 unit 下标、heatmap、剪枝 selector、activation cache 和 recovery
+boundary 的语义规范。实现依据是 `analysis/prune_plan/__init__.py`、
+`analysis/prune_plan/recovery_plan.py` 与 `analysis/recovery/`。
 
-## 1. Unit 编号
+各 recovery 算法的拟合目标、训练方式、多区间行为和 checkpoint 形态见
+[recovery_methods.md](recovery_methods.md)。
 
-所有可剪枝 unit 使用从 0 开始的全局线性下标。对于第 `L` 层：
+## 1. Unit 编号与执行顺序
+
+所有可剪枝 unit 使用从 0 开始的全局线性下标。下标的唯一权威来源是：
+
+```python
+unit_ids = [unit.unit_id for unit in adapter.layer_unit_catalog(model)]
+```
+
+当前 VGGT、VGGT-Omega 和 Pi3 的顺序是：
 
 ```text
 unit 2L     = frame_L
 unit 2L + 1 = global_L
 ```
 
-例如：
+MapAnything 和 MapAnything V1 是 global-first：
 
-| Unit index | Unit ID |
-| ---: | --- |
-| 9 | `global_4` |
-| 10 | `frame_5` |
-| 11 | `global_5` |
-| 15 | `global_7` |
+```text
+unit 2L     = global_L
+unit 2L + 1 = frame_L
+```
 
-若模型共有 `N` 个 unit，合法的单个 unit 下标范围是 `[0, N)`。这里的 `[0, N)`
-只描述单个下标的取值域，不是剪枝区间语义。
+因此公共代码必须使用 plan/cache 中保存的 `unit_ids` 映射 index 和 ID，不得仅根据
+奇偶下标推导 kind。若模型共有 `N` 个 unit，单个下标的取值域是 `[0, N)`。
 
-## 2. 剪枝区间统一为闭区间
+## 2. 闭区间与任意 drop set
 
-所有 `(i, j)`、`[i, j]`、`start/end` 和 `iX_jY` selector 都表示零基闭区间：
+所有 `(i, j)`、`[i, j]`、`start/end` 和 `iX_jY` 都表示零基闭区间：
 
 ```text
 drop = [i, i+1, ..., j]
 0 <= i <= j < N
-drop_count = span = j - i + 1
+drop_count = j - i + 1
 ```
 
-因此：
-
-- `[11, 15]` 删除 5 个 unit：`11, 12, 13, 14, 15`；
-- `[13, 13]` 删除 1 个 unit；
-- 横坐标“删除数量”必须使用 `j-i+1`；
-- 禁止把 `[i, j]` 解释为 Python slice `[i, j)`；
-- 禁止使用 `j-i` 作为删除数量。
-
-JSON 中推荐同时保存显式边界和 drop 列表：
-
-```json
-{
-  "i": 11,
-  "j": 15,
-  "start": 11,
-  "end": 15,
-  "span": 5,
-  "drop_count": 5,
-  "drop": [11, 12, 13, 14, 15]
-}
-```
-
-这些字段必须互相一致。`drop` 必须连续，不允许用同一条 interval record 表示多个
-离散区间。
-
-## 3. Heatmap 坐标语义
-
-区间 heatmap 中一个有效格点 `(i, j)` 表示“删除闭区间 `[i, j]`”。
-
-- 行坐标：区间起点 `i`；
-- 列坐标：区间终点 `j`；
-- 有效区域：`i <= j`；
-- 对角线 `(i, i)`：删除单个 unit；
-- `j < i` 的下三角区域无效，不得赋予剪枝语义。
-
-若 heatmap 存的是边界相似度，则格点 `(i, j)` 的两个边界 activation 是：
+当前 pruning/recovery 还支持多个不连续区间。任意 drop set 会被拆成全部最大连续
+component，并写成规范物理 selector：
 
 ```text
-source boundary = unit i-1 的输出
-target boundary = unit j 的输出
+drop = [1, 3, 5, 6, 9]
+selector = i1_j1_i3_j3_i5_j6_i9_j9
 ```
 
-当 `i=0` 时，source boundary 是 `layer_-1`，即 unit 0 的输入。它不是 unit 0 的
-输出。
+`intervals` section 中的一条 interval record 只描述一个连续区间；`sets` section
+描述 strategy 产生的任意 drop set。相邻或重叠 component 在物理 selector 中合并。
 
-可视化的 tooltip、tick label、导出的 selector 和点击后保存的计划必须保持同一组
-`(i, j)`，不得在 UI 层做 `+1` 或 `-1` 转换。
+当前所有合法 prune plan 都保护 unit 0：
 
-## 4. Cache activation 语义
+```text
+0 not in drop
+```
+
+所以当前可执行 pruning/recovery selector 的每个首 component 都满足 `start >= 1`。
+
+## 3. Heatmap 坐标
+
+区间 heatmap 的有效格点 `(i, j)` 表示删除闭区间 `[i, j]`：
+
+- 行坐标是起点 `i`；
+- 列坐标是终点 `j`；
+- `i <= j` 有效，`j < i` 无效；
+- 对角线 `(i, i)` 删除一个 unit；
+- 删除数量始终为 `j-i+1`。
+
+从 unit-output pairwise graph `S` 构造 boundary score 时：
+
+```text
+C[i,j] = S[i-1,j], i >= 1
+C[0,:] = NaN
+```
+
+当前 graph 没有把模型输入到 unit 0 输出作为一条普通 unit-output edge，因此 unit 0
+既不能通过该 heatmap 评分，也被 prune plan schema 明确禁止删除。tooltip、tick、
+selector 和保存的 plan 不得在 UI 层额外做 `+1/-1` 转换。
+
+## 4. Cache activation
 
 原模型 cache 中：
 
 ```text
-frame_L / global_L = 对应 block 执行完成后的输出
-layer_-1           = unit 0 执行前的初始 tokens
+unit_map[unit_id] = 对应物理 unit 执行完成后的输出
+layer_-1          = catalog 中 unit 0 执行前的真实初始 tokens
 ```
 
-所有 unit activation 的标准形状为 `[B, S, P, C]`。按层 replay 时可以临时把
-`frame_L` 与 `global_L` 拼成 `[B, S, P, 2C]`，但这不会改变它们各自表示 block
-输出的语义。
+标准 unit activation 形状是 `[B, S, P, C]`。某些 replay engine 可临时构造
+`[B, S, P, 2C]` 的 concat feature，但不改变单个 unit activation 的边界含义。
 
-`layer_-1` 必须满足以下不变量：
+`layer_-1` 用于从模型起点 replay。当前 VGGT、VGGT-Omega、Pi3 和 MapAnything adaptor
+都显式捕获或构造真实 unit-0 输入；不得用 unit 0 输出冒充 `layer_-1`。
 
-```text
-cached layer_-1 == 未剪枝模型 unit 0 的实际输入
-```
+minimal cache 保存 recovery record 的全部 `cache_unit_ids`，以及方法需要的
+`auxiliary_cache_ids`。ReplaceMe 方法会额外请求
+`replaceme_residual:<source_unit_id>`。
 
-不得为了节省一次 patch embedding forward，把 `frame_0` 输出保存为 `layer_-1`。
+## 5. Recovery boundary 的公共规则
 
-## 5. Training-free Recovery 边界
-
-对于删除闭区间 `[i, j]`：
+对一个最大连续删除 component `[i, j]`：
 
 ```text
 source_unit_index = i - 1
 target_unit_index = j
-source_unit_id    = layer_-1                      if i == 0
-                    unit_index_to_unit_id(i - 1)  if i > 0
-target_unit_id    = unit_index_to_unit_id(j)
+source_unit_id    = unit_ids[i - 1]
+target_unit_id    = unit_ids[j]
 ```
 
-拟合阶段使用原模型 cache：
+因为 unit 0 受保护，当前 recovery 的 `source_unit_index` 总是合法物理 unit，不存在
+`layer_-1` source 或 unit-0 pre-hook 分支。
+
+拟合使用未剪枝 cache 的同一对边界：
 
 ```text
-X = source boundary activation
-Y = target boundary activation
-拟合 recovery operator: X -> Y
+X = source unit 的原模型输出
+Y = target unit 的原模型输出
+fit X -> Y
 ```
 
-推理阶段先把 `[i, j]` 中的 block 替换为 identity，再安装 recovery：
+sequential 拟合路径是例外：第一个 component 仍等价于 Full-model source/target；从第二个
+component 起，source 和 target 都来自已经应用前序 recovery 和剪枝的当前模型。
+`recovery_ghost_interval_sequential`、其 token-grouped 变体、
+以及恢复为官方行为的 `recovery_replaceme_cos`，都以删去当前 component 前的当前模型
+为恢复目标。
 
-- `i > 0`：在保留的 unit `i-1` 输出上安装 forward hook；
-- `i == 0`：在 unit 0 上安装 forward pre-hook，输入为 `layer_-1`；
-- patch 后的 activation 通过 identity 区间传到 unit `j+1`。
+`recovery_streamline_ffn` 使用同一 boundary 定义，但优化的是带 bias 的
+`C -> 4C -> C` ReLU FFN，并以原模型 cache 中的 `MSE(FFN(X), Y)` 为目标。
 
-因此拟合和推理必须看到同一个 source boundary。禁止以下旧语义：
+部署时先把 drop units 替换为 skip/identity，再在 source unit 输出处安装或融合 recovery
+operator。训练和推理必须观察同一个 source boundary；禁止恢复旧的 `source=i` 语义。
 
-```text
-drop = [i, ..., j]
-source = i
-```
+## 6. 不同 recovery 方法如何拆 boundary
 
-因为 cache 中 unit `i` 是原 block 的输出，而剪枝推理中 unit `i` 已是 identity，
-它的输出等于原 unit `i-1` 的输出，两者不是同一个 activation。
+`analysis.prune_plan.recovery_plan._boundary_records()` 从任意 drop set 生成
+`boundaries`：
 
-## 6. 完整示例：删除 `[11, 15]`
+| 方法 | boundary 拆分 |
+|---|---|
+| `recovery_ghost` | 每个被删物理 unit 一个 `[k,k]` boundary；所有 token 共用一个矩阵 |
+| `recovery_ghost_interval` | 每个最大连续 component 一个 boundary；所有 token 共用一个矩阵 |
+| `recovery_ghost_interval_sequential` | 同上；后续 component 从逐步修改后的模型同时采集 source 和 target |
+| `recovery_ghost_interval_sequential_grouped` | 与 sequential Ghost 相同，但将 camera/register 合为 `special` 组，patch 单独成组 |
+| `recovery_replaceme_ls` | 每个最大连续 component 一个 boundary，并使用 Full-model source/target/residual |
+| `recovery_replaceme_cos` | 每个最大连续 component 一个 boundary，并使用 residual；多 component 时按官方顺序从逐步修改后的模型采集 source/residual/target |
+| `recovery_streamline_ffn` | 每个最大连续 component 一个 boundary；从 Full-model cache 以 boundary MSE 训练 4x-ReLU FFN |
+| `recovery_linearpatch` | 单 component 时一个 boundary；多 component 时退化为每个被删 unit 一个 boundary |
+| `recovery_lora` / `recovery_train` | 使用 recovery bundle 的 span training 配置，并保留派生的 boundary 列表 |
+
+顶层 record 为兼容公共调用保留第一个 boundary 的 source/target，同时
+`record["boundaries"]` 保存完整列表。cache unit 是所有 boundary source/target 的并集。
+
+Pi3 adaptor 只声明一个 `patch` token 组，因此 grouped Ghost 与其对应的非 grouped
+sequential 方法完全等价。Pi3 runner 会先保证基础方法完成，再把
+grouped recovery checkpoint 目录和 eval 目录创建为指向基础结果的相对符号链接。
+
+## 7. 示例
+
+以 frame-first catalog 中删除 `[11,15]` 为例：
 
 ```text
 drop indices = [11, 12, 13, 14, 15]
@@ -149,112 +170,87 @@ source index = 10 = frame_5
 target index = 15 = global_7
 ```
 
-正确的 recovery record：
+派生 boundary：
 
 ```json
 {
-  "drop": [11, 12, 13, 14, 15],
+  "drop_start_index": 11,
+  "drop_end_index": 15,
   "source_unit_index": 10,
   "source_unit_id": "frame_5",
   "target_unit_index": 15,
-  "target_unit_id": "global_7"
+  "target_unit_id": "global_7",
+  "cache_unit_ids": ["frame_5", "global_7"]
 }
 ```
 
-数据流为：
+对于 `drop=[1,2,5,6]`，interval Ghost 和 ReplaceMe 会产生 `[1,2]`、`[5,6]`
+两个 boundary；unit-wise Ghost 则产生 `[1,1]`、`[2,2]`、`[5,5]`、`[6,6]`。
+
+## 8. Trainable recovery
+
+对单个 `[i,j]`，LoRA anchor 从左边界 `i-1` 向前扩展 `lora_prefix` 个 unit，teacher
+target 是 `j`。cache replay seed 是最小训练 unit 的前驱；若 replay 从 catalog 起点
+开始，则使用合法的 `layer_-1` initial tokens。
+
+`recovery_lora` 和 `recovery_train` 的 span-specific `cache_unit_ids`、`lora_indices` 和
+`train_unit_indices` 保存在 recovery bundle 的 `methods.<name>.spans` 中。当前默认
+`RECOVERY_METHODS` 默认启用 training-free 与 Streamline local-fit 方法；显式启用 replay-trainable 方法时仍必须使用
+同一 v3 bundle。
+
+## 9. Schema
+
+Prune plan 当前唯一合法 schema：
 
 ```text
-拟合：原模型 frame_5 输出  -> 原模型 global_7 输出
-推理：保留的 frame_5 输出 -> recovery patch -> identity units 11..15
+closed_interval_prune_plan_bundle_v5
 ```
 
-## 7. LoRA / Trainable Recovery
-
-对于 `[i, j]`，LoRA recovery 的左边界 anchor 同样是 `i-1`：
+Recovery plan 文件固定为：
 
 ```text
-drop units       = i..j
-LoRA anchor      = i-1
-teacher target   = j
-cache replay seed = 最小 LoRA unit 的前驱
+<OUTPUT_ROOT>/<backbone>/recovery_plan_all.json
+schema_version = recovery_plan_bundle_v3
 ```
 
-例如 `[11, 15]` 且 LoRA prefix 为 1：
+v3 recovery bundle 顶层保存 backbone、dataset、`num_units`、`unit_ids` 和统一
+`methods` map。training-free method entry 只需保存 `method`；boundary 在与具体 prune
+selector 组合时派生。trainable entry 另外保存 LoRA 参数和 span records。
 
-```text
-LoRA anchor = unit 10
-replay seed = unit 9
-teacher     = unit 15
-```
+加载器不兼容旧 recovery schema。修改 schema、unit catalog、boundary 拆分或 operator
+后，必须重新生成 recovery plan 和 checkpoint，并重跑 recovery/testtime eval。
 
-`i=0` 没有物理左边界 unit，因此当前 LoRA recovery 必须拒绝该区间；不得静默改用
-unit 0 作为 anchor。
-
-## 8. Schema 与运行时校验
-
-Recovery plan 当前唯一合法 schema：
-
-```text
-closed_interval_recovery_plan_bundle_v2
-```
-
-加载 recovery plan 时必须验证：
-
-```text
-drop 连续
-source_unit_index == min(drop) - 1
-target_unit_index == max(drop)
-source/target unit ID 与 index 映射一致
-```
-
-旧的 `training_plan_bundle_v1` 和 `source=min(drop)` 记录必须报错，不允许自动迁移或
-兼容加载。
-
-## 9. 命名规范
+## 10. 命名与输出路径
 
 工程标识统一使用 `recovery`：
 
 ```text
 Python package : analysis.recovery
 shell entry    : scripts/run_recovery.sh
-checkpoint dir : <OUTPUT_ROOT>/<backbone>/recovery/...
-evaluation dir : <OUTPUT_ROOT>/<backbone>/<dataset>/eval/recovery/...
+checkpoint dir : <OUTPUT_ROOT>/<backbone>/recovery/<selector>/<method>/...
+evaluation dir : <OUTPUT_ROOT>/<backbone>/<dataset>/eval/recovery/<selector>/<method>/...
+test-time dir  : <OUTPUT_ROOT>/<backbone>/<dataset>/eval/testtime/<method>/<compression>/<selector>/...
 JSON kind      : recovery
 ```
 
 不得重新引入 `analysis.recover`、`run_recover.sh`、`/recover/`、`eval/recover/` 或
-`kind=recover`。自然语言中的英语动词 `recover`、形容词 `recovered` 不受此限制。
+`kind=recover`。
 
-## 10. 产物失效与重跑规则
+## 11. 产物复用
 
-以下变更会使既有 recovery 产物失效：
+- 全量 cache 只有在 unit catalog、activation 定义和模型输入预处理未变时才可复用；
+- minimal cache 必须覆盖当前 selector 与全部 recovery methods 派生出的 union；
+- boundary 拆分、source/target 规则或 auxiliary cache 变化后必须重建 minimal cache；
+- checkpoint topology、recovery operator 或 schema 变化后必须重跑 recovery eval；
+- testtime compression 结果不能覆盖普通 recovery baseline。
 
-- 区间从半开改为闭区间；
-- source 从 `i` 改为 `i-1`；
-- `layer_-1` 的定义或生成逻辑改变；
-- recovery schema 或 recovery operator 改变。
+## 12. 提交前检查
 
-失效后必须重新生成 recovery plan，并重新拟合或训练 checkpoint；已有 recovery eval
-和汇总也必须重跑。
-
-Cache 是否可复用：
-
-- 全量 cache：对 `i>0`，若包含 `i-1` 和 `j`，通常可以复用；
-- 根据旧 plan 保存的 minimal cache：必须重跑，因为可能缺少 `i-1`；
-- `i=0`：只有确认 `layer_-1` 是真实初始 tokens 时才能复用。
-
-## 11. 当前已知限制
-
-截至本文建立时，VGGT Omega fused cache 路径仍会把 `frame_0` 输出作为
-`layer_-1` 返回。该行为违反第 4 节的不变量。因此在修复并重新生成 cache 前，禁止
-使用 VGGT Omega 的 `i=0` training-free recovery。`i>0` 不受这个特例影响。
-
-## 12. 提交前检查清单
-
-- [ ] selector、JSON、heatmap 和绘图横坐标都使用 `j-i+1`；
-- [ ] `drop == list(range(i, j+1))`；
-- [ ] recovery source 是 `i-1`，target 是 `j`；
-- [ ] cache 保存 block 输出，`layer_-1` 保存 unit 0 输入；
-- [ ] 拟合 activation 与推理 hook activation 是同一边界；
-- [ ] 没有新增 `recover` 工程路径或兼容别名；
-- [ ] schema 和边界不变量测试通过。
+- [ ] index 来自保存的 `unit_ids`，没有假设固定 frame-first 奇偶映射；
+- [ ] interval 使用闭区间，单区间删除数量是 `j-i+1`；
+- [ ] 任意 drop set 的物理 selector 已按最大连续 component 规范化；
+- [ ] unit 0 未出现在 drop 中；
+- [ ] 每个 boundary 的 source 是 component start `-1`，target 是 component end；
+- [ ] cache union 包含全部 source/target 和 auxiliary IDs；
+- [ ] schema 分别是 prune v5 和 recovery v3；
+- [ ] 没有新增旧 `recover` 工程路径或兼容别名。

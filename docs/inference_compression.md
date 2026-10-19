@@ -1,8 +1,13 @@
 # Inference compression
 
-LaRe treats `vggt`, `pi3`, and `vggt_omega` as backbones. LoRA merge,
-FastVGGT, and QuantVGGT are deployment-only transformations registered under
-`analysis/inference_compression`; all currently support only the VGGT backbone.
+LoRA Merge、FastVGGT 和 QuantVGGT 是注册在 `analysis/inference_compression` 下的
+deployment-only transformation，不是独立 backbone。当前支持矩阵为：
+
+| Transformation | VGGT | Pi3 | VGGT-Omega | MapAnything / V1 |
+|---|---:|---:|---:|---:|
+| `lora_merge` | 支持 | 不支持 | 不支持 | 不支持 |
+| `fastvggt` | 支持 | 支持 | 支持 | 不支持 |
+| `quantvggt` | 支持 | 不支持 | 不支持 | 不支持 |
 
 The evaluation order is fixed:
 
@@ -62,19 +67,40 @@ INFERENCE_COMPRESSION=quantvggt QUANTVGGT_DTYPE=w4a4 \
   QUANTVGGT_PARAMS_DIR=/path/to/matching/w4a4_params bash scripts/run_eval.sh
 ```
 
-Only one inference compression adapter may be selected in a run. Enabling one
-for Pi3 or VGGT-Omega is an error. Output model names receive a configuration
-suffix automatically, preventing compressed and uncompressed evaluations from
-overwriting one another.
+Only one inference compression adapter may be selected in a run. The adapter
+validates the selected backbone before loading a large model. Output model names
+receive a configuration suffix automatically, preventing compressed and
+uncompressed evaluations from overwriting one another.
 
 ## Evaluate the best pruning + recovery model
 
-Step 10 in `main.sh` calls `scripts/run_testtime_eval.sh`. The standalone entry point
-reuses the completed Ours/CKA `prune_span12,14,...,24` checkpoints with
-`recovery_ghost_interval_sequential`, then evaluates FastVGGT and QuantVGGT as
-two alternative deployment transformations:
+Step 10 in `main.sh` calls `scripts/run_testtime_eval.sh`. For each drop count it
+selects the lower normalized seven-metric final recovery result across
+`CKA_single/CKA_double` and `retention_single/retention_double` on
+`TRAINING_DATASETS`. Identical physical selectors are deduplicated.
+
+The current default drop-count sets are:
+
+| Backbone | Drop counts | Accuracy transformations |
+|---|---|---|
+| VGGT | 16, 18, 20 | FastVGGT, QuantVGGT |
+| Pi3 | 20, 22, 24 | FastVGGT; QuantVGGT is skipped |
+| VGGT-Omega | 22, 24, 26 | FastVGGT; QuantVGGT is skipped |
+
+All use `recovery_ghost_interval_sequential`. `main.sh` supplies
+every required variable; the standalone script intentionally has no experiment
+defaults for backbone, datasets, prune budgets, selection datasets, or recovery
+plan.
+
+Equivalent explicit invocation:
 
 ```bash
+TESTTIME_BACKBONES=vggt \
+TESTTIME_RUN=scannet_dev50,nuscenes_train,scannet_test50,7scenes_test,nuscenes_val,waymo_validation \
+TESTTIME_PRUNE_PLAN_NAME=prune_span16,prune_span18,prune_span20 \
+TESTTIME_PRUNE_STRATEGY=CKA,retention \
+TESTTIME_RECOVERY_PLAN_NAME=recovery_ghost_interval_sequential \
+TESTTIME_SELECTION_DATASETS=scannet_dev50,nuscenes_train \
 bash scripts/run_testtime_eval.sh
 ```
 
@@ -82,11 +108,12 @@ Useful overrides include:
 
 ```bash
 TESTTIME_COMPRESSIONS=fastvggt \
+TESTTIME_BACKBONES=vggt \
 TESTTIME_PRUNE_PLAN_NAME=prune_span20 \
-TESTTIME_RUN=SCANNET_TEST50,NUSCENES_VAL \
-  bash scripts/run_testtime_eval.sh
-
-QUANTVGGT_PARAMS_DIR=/path/to/lare-aware/w4a4 \
+TESTTIME_PRUNE_STRATEGY=CKA,retention \
+TESTTIME_RECOVERY_PLAN_NAME=recovery_ghost_interval_sequential \
+TESTTIME_SELECTION_DATASETS=scannet_dev50,nuscenes_train \
+TESTTIME_RUN=scannet_test50,nuscenes_val \
   bash scripts/run_testtime_eval.sh
 ```
 
@@ -94,7 +121,52 @@ The official W4A4 transfer parameters under
 `submodules/quantvggt/w4a4_official` are the explicit default of this stage;
 `scripts/run_eval.sh` itself continues to require an explicit parameter directory.
 Results are isolated from the uncompressed recovery baseline under
-`<OUTPUT_ROOT>/vggt/<dataset>/eval/testtime/<recovery>/<compression>/<selector>`.
+`<OUTPUT_ROOT>/<backbone>/<dataset>/eval/testtime/<recovery>/<compression>/<selector>`.
+
+Standalone full-model FastVGGT/QuantVGGT accuracy evaluation also belongs to
+step 10 in `main.sh`, rather than `analysis.sh`. Existing records were migrated
+into `main_results`, so `TESTTIME_SKIP_FULL_MODEL_ACCURACY=1` is currently the
+default. Set it to `0` to regenerate `eval/upper_fastvggt_*` and
+`eval/upper_quantvggt_*` records.
+
+## Forward-only benchmark
+
+Step 10 subsequently calls `scripts/run_testtime_benchmark.sh` with the same
+selection inputs. The benchmark requires exactly one backbone per invocation,
+CUDA, and exclusive use of the selected GPU. It evaluates the full pretrained
+baseline with and without standalone inference compression, followed by four
+pruned variants per selected physical pruning plan where supported:
+
+```text
+full
+full_fastvggt
+full_quantvggt       # VGGT only
+pruning
+recovery
+recovery_fastvggt
+recovery_quantvggt   # VGGT only
+```
+
+`main.sh` currently sets `TESTTIME_BENCHMARK_SKIP_FULL_VARIANTS=1` by default
+because the existing `full*` records were migrated into `main_results`. This
+leaves only the selected pruning/recovery variants to run. Set it to `0` to
+benchmark the full-model variants again.
+
+The three `full*` results use the same ten-scene selection, warmup, forward
+timing, and peak-memory protocol as every pruned result. They retain the full
+pretrained model structure and do not load a pruning plan, recovery plan, or
+checkpoint. Their stable config IDs keep them independent of pruning selectors
+and recovery selection datasets.
+
+For every dataset it samples exactly ten evenly spaced scenes, runs one warmup
+on the first scene, and measures one `adapter.forward_predictions` call per
+scene. Timing excludes model load, CPU preprocessing, host-to-device copy,
+device-to-host copy and metric scoring. Results from all selectors/variants are
+merged by stable `config_id` into:
+
+```text
+<OUTPUT_ROOT>/<backbone>/<dataset>/eval/testtime/inference_benchmark_v3.json
+```
 
 ## What the QuantVGGT parameter files contain
 

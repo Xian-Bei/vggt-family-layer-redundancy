@@ -143,7 +143,7 @@ def _load_base_prune_plan(
             "closed_interval": True,
             "start": start,
             "end": end,
-            "source": "first_skip_eval_gt_single_interval_at_point",
+            "source": "first_skip_eval_retention_single_interval_at_point",
         },
     )
     plan.validate()
@@ -172,7 +172,7 @@ def _selection_provenance(
             f"{selection_path}: drop_count does not match {expected_drop_count}"
         )
     return {
-        "selection_path": str(selection_path.resolve()),
+        "selection_path": str(selection_path),
         "selection_sha256": hashlib.sha256(raw_bytes).hexdigest(),
         "selection_schema": str(payload.get("schema_version", "")),
         "selection_method": str(payload.get("method", "")),
@@ -418,6 +418,11 @@ def run_remaining_skip_gt_eval(
     n_units = len(remaining_unit_ids)
     if n_units < 1:
         raise RuntimeError("No units remain after applying the prune plan")
+    report_max_span = (
+        base.resolve_max_span(n_units, max_span=int(max_span))
+        if int(max_span) < 0
+        else int(max_span)
+    )
     base._latency_log(
         f"[remaining_skip_eval] pruned before dataset iteration: full={len(full_unit_ids)} "
         f"dropped={len(dropped_unit_ids)} remaining={n_units} "
@@ -436,7 +441,7 @@ def run_remaining_skip_gt_eval(
         raise RuntimeError(f"No skip-eval metrics overlap upper eval: {upper_metrics}")
 
     provenance: Dict[str, Any] = {
-        "prune_plan_root": str(Path(prune_plan_root).resolve()),
+        "prune_plan_root": str(Path(prune_plan_root)),
         "prune_plan_name": str(prune_plan_name),
         "expected_drop_count": int(expected_drop_count),
         "dropped_unit_ids": list(dropped_unit_ids),
@@ -452,7 +457,7 @@ def run_remaining_skip_gt_eval(
         "backbone": str(adapter.name),
         "dataset": str(tagged_dataset),
         "source_dataset": str(dataset),
-        "data_root": str(Path(data_root).resolve()),
+        "data_root": str(Path(data_root)),
         "split": split,
         "hf_model": hf,
         "max_scenes": int(max_scenes),
@@ -766,7 +771,7 @@ def run_remaining_skip_gt_eval(
         upper_scene_metrics=upper_scene_metrics,
         backbone=adapter.name,
         dataset=tagged_dataset,
-        max_span=int(max_span),
+        max_span=report_max_span,
         fusion_mode=str(mode),
         elapsed_seconds=time.perf_counter() - run_t0,
         ensure_scene_reports=True,

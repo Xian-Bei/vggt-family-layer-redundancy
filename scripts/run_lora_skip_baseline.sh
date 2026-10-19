@@ -23,7 +23,7 @@ SAVE_EVERY_EPOCH="${SAVE_EVERY_EPOCH:-1}"
 EVAL_AT_START="${EVAL_AT_START:-0}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-analysis_outputs_v3}"
 OUTPUT_KIND="${OUTPUT_KIND:-train}"
-EVAL_BOUNDS_ROOT="${EVAL_BOUNDS_ROOT:-${REPO_ROOT}/${OUTPUT_ROOT}}"
+EVAL_BOUNDS_ROOT="${EVAL_BOUNDS_ROOT:-${OUTPUT_ROOT}}"
 EVAL_MAX_SCENES="${EVAL_MAX_SCENES:-0}"
 
 #############################################
@@ -132,7 +132,7 @@ run_one_backbone() {
 
   local plan_root="${PRUNE_PLAN_ROOT}"
   if [[ -z "${plan_root}" ]]; then
-    plan_root="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}"
+    plan_root="${OUTPUT_ROOT}/${backbone}"
   fi
   local recovery_root="${RECOVERY_PLAN_ROOT:-${plan_root}}"
 
@@ -142,7 +142,7 @@ run_one_backbone() {
     --recovery-plan-root "${recovery_root}"
     --recovery-plan-name "${recovery_plan_name}"
     --eval-bounds-root "${EVAL_BOUNDS_ROOT}"
-    --output-dir "${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${OUTPUT_KIND}/${prune_plan_name}/${recovery_plan_name}"
+    --output-dir "${OUTPUT_ROOT}/${backbone}/${OUTPUT_KIND}/${prune_plan_name}/${recovery_plan_name}"
   )
   if eval_enabled "SCANNET_DEV50"; then
     extra+=(--eval-scannet-dev50)

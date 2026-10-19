@@ -51,6 +51,16 @@ class _OmegaSkipBlock(nn.Module):
 class VGGTOmegaAdapter(BackboneAdapter):
     name = "vggt_omega"
 
+    def ghost_token_group_layout(
+        self, *, patch_start_idx: int
+    ) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+        patch_start = int(patch_start_idx)
+        if patch_start <= 0:
+            return ("patch",), (0,)
+        if patch_start == 1:
+            return ("camera", "patch"), (0, 1)
+        return ("camera", "register", "patch"), (0, 1, patch_start)
+
     def capabilities(self) -> BackboneCapabilities:
         return BackboneCapabilities(
             name=self.name,
@@ -84,7 +94,7 @@ class VGGTOmegaAdapter(BackboneAdapter):
         return build_vggt_family_dummy_images(seq_len=seq_len, h=h, w=w, device=device)
 
     def default_hf_model(self) -> str:
-        local = _repo_root() / "backbones" / "vggt-omega" / "vggt_omega_1b_512.pt"
+        local = Path("backbones") / "vggt-omega" / "vggt_omega_1b_512.pt"
         return str(local) if local.is_file() else "vggt_omega_1b_512.pt"
 
     def pythonpath_entries(self, repo_root: Path) -> List[Path]:
@@ -534,6 +544,13 @@ class VGGTOmegaAdapter(BackboneAdapter):
         x = self._ensure_eval_batch(images)
         if x.device.type != "cuda":
             raise RuntimeError("vggt_omega incremental skip eval requires CUDA device")
+        from analysis.recovery.operators import set_recovery_token_layout
+
+        set_recovery_token_layout(
+            model,
+            batch_size=int(x.shape[0]),
+            num_frames=int(x.shape[1]),
+        )
 
         unit_ids = [u.unit_id for u in self.layer_unit_catalog(model)]
         total_units = len(unit_ids)

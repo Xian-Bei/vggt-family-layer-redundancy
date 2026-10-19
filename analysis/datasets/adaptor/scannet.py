@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, List
 
 import numpy as np
 import torch
@@ -19,6 +20,28 @@ from analysis.schema.v3 import DatasetEvalProfile, GeometryEvalProfile
 class ScanNetAdaptor(DatasetAdaptor):
     name = "scannet"
 
+    @staticmethod
+    def _ordered_scenes(data_root: Path) -> List[Any]:
+        scenes = discover_scannet_scenes(data_root)
+        manifest_path = Path(data_root) / "selected_scenes.json"
+        if not manifest_path.is_file():
+            return scenes
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        scene_ids = payload.get("scene_ids")
+        if not isinstance(scene_ids, list) or not all(
+            isinstance(scene_id, str) and scene_id for scene_id in scene_ids
+        ):
+            raise ValueError(f"Invalid ScanNet selection manifest: {manifest_path}")
+        if len(scene_ids) != len(set(scene_ids)):
+            raise ValueError(f"Duplicate ScanNet scene IDs in {manifest_path}")
+        by_id = {scene.scene_id: scene for scene in scenes}
+        missing = [scene_id for scene_id in scene_ids if scene_id not in by_id]
+        if missing:
+            raise FileNotFoundError(
+                f"ScanNet selection manifest references missing scenes: {missing[:5]}"
+            )
+        return [by_id[scene_id] for scene_id in scene_ids]
+
     def count_scenes(
         self,
         data_root: Path,
@@ -27,7 +50,7 @@ class ScanNetAdaptor(DatasetAdaptor):
         split: str | None = None,
     ) -> int:
         self.validate_split(split)
-        n = len(discover_scannet_scenes(data_root))
+        n = len(self._ordered_scenes(data_root))
         return n if max_scenes <= 0 else min(n, int(max_scenes))
 
     def eval_profile(self) -> DatasetEvalProfile:
@@ -47,7 +70,7 @@ class ScanNetAdaptor(DatasetAdaptor):
         split: str | None = None,
     ) -> Iterator[EvalSampleBatch]:
         self.validate_split(split)
-        scenes = discover_scannet_scenes(data_root)
+        scenes = self._ordered_scenes(data_root)
         if max_scenes > 0:
             scenes = scenes[:max_scenes]
         for scene in scenes:
@@ -62,7 +85,7 @@ class ScanNetAdaptor(DatasetAdaptor):
         split: str | None = None,
     ) -> EvalSampleBatch:
         self.validate_split(split)
-        scenes = {s.scene_id: s for s in discover_scannet_scenes(data_root)}
+        scenes = {s.scene_id: s for s in self._ordered_scenes(data_root)}
         if scene_id not in scenes:
             raise FileNotFoundError(scene_id)
         scene = select_scene_image_paths_fastvggt(scenes[scene_id], max_frames)
@@ -119,6 +142,20 @@ class ScanNetAdaptor(DatasetAdaptor):
 
         return eval_impl.prepare_scannet_eval_scene_cpu(
             backbone_adaptor, batch, ctx.profile
+        )
+
+    def prepare_inference_scene_cpu(
+        self,
+        backbone_adaptor: Any,
+        batch: EvalSampleBatch,
+    ) -> PreparedEvalScene:
+        image_paths = [Path(p) for p in batch.meta.get("image_paths", [])]
+        if not image_paths:
+            raise ValueError(f"ScanNet {batch.scene_id}: missing image_paths in batch meta")
+        images = backbone_adaptor.load_eval_images(image_paths)
+        return PreparedEvalScene(
+            scene_id=str(batch.scene_id),
+            images=images.unsqueeze(0).float().contiguous(),
         )
 
     def score_eval_prediction(

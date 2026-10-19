@@ -1,2 +1,1 @@
-"""Analysis utilities for VGGT research experiments."""
-
+"""LaRe multi-backbone analysis and evaluation utilities."""

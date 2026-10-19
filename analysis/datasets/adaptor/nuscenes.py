@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
@@ -55,7 +54,7 @@ class NuScenesAdaptor(DatasetAdaptor):
     def eval_profile(self) -> DatasetEvalProfile:
         return DatasetEvalProfile(
             dataset=self.name,
-            geometry=GeometryEvalProfile(dist_clip=1.0, use_icp=True, max_points=100_000),
+            geometry=GeometryEvalProfile(dist_clip=5.0, use_icp=True, max_points=100_000),
             kf_every=1,
             size=518,
         )
@@ -137,24 +136,11 @@ class NuScenesAdaptor(DatasetAdaptor):
         images = backbone_adaptor.load_eval_images(image_paths)
         images_b = images.unsqueeze(0).float().to(device)
 
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device.index)
-        t0 = time.perf_counter()
         ac_kw = autocast_device_dtype(device)
         with torch.no_grad(), torch.autocast(**ac_kw):
             bundle = backbone_adaptor.forward_predictions(model, images_b)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        infer_ms = (time.perf_counter() - t0) * 1000.0
-        peak_gb = 0.0
-        if device.type == "cuda":
-            peak_gb = float(torch.cuda.max_memory_allocated(device.index)) / (1024.0**3)
 
-        metrics: Dict[str, float] = {
-            "inference_time_ms": float(infer_ms),
-            "infer_peak_vram_gb": float(peak_gb),
-        }
+        metrics: Dict[str, float] = {}
 
         gt_c2w = _load_pose_stack(batch.meta.get("pose_paths", []))
         gt_w2c = np.linalg.inv(gt_c2w) if gt_c2w.shape[0] else np.zeros((0, 4, 4), dtype=np.float64)
@@ -255,6 +241,20 @@ class NuScenesAdaptor(DatasetAdaptor):
                 "gt_points": _load_lidar_points(batch.meta.get("lidar_paths", [])),
                 "frame_ids": [int(x) for x in batch.frame_ids],
             },
+        )
+
+    def prepare_inference_scene_cpu(
+        self,
+        backbone_adaptor: Any,
+        batch: EvalSampleBatch,
+    ) -> PreparedEvalScene:
+        image_paths = [Path(p) for p in batch.meta.get("image_paths", [])]
+        if not image_paths:
+            raise ValueError(f"{self.name} {batch.scene_id}: missing image_paths in batch meta")
+        images = backbone_adaptor.load_eval_images(image_paths)
+        return PreparedEvalScene(
+            scene_id=str(batch.scene_id),
+            images=images.unsqueeze(0).float().contiguous(),
         )
 
     def score_eval_prediction(

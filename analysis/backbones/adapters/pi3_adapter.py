@@ -86,6 +86,12 @@ def build_pi3_official_training_optimizer(
 class Pi3Adapter(BackboneAdapter):
     name = "pi3"
 
+    def ghost_token_group_layout(
+        self, *, patch_start_idx: int
+    ) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+        del patch_start_idx
+        return ("patch",), (0,)
+
     def capabilities(self) -> BackboneCapabilities:
         return BackboneCapabilities(
             name=self.name,
@@ -113,6 +119,7 @@ class Pi3Adapter(BackboneAdapter):
         return [
             repo_root / "analysis" / "backbones" / "vendor_extensions" / "pi3_curope",
             repo_root / "backbones" / "Pi3",
+            repo_root / "backbones" / "vggt",
             repo_root,
         ]
 

@@ -194,6 +194,30 @@ class BackboneAdapter(ABC):
     def default_hf_model(self) -> str:
         return "facebook/VGGT-1B"
 
+    def ghost_token_group_layout(
+        self, *, patch_start_idx: int
+    ) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+        """Describe per-frame Ghost token groups as names and inclusive starts.
+
+        The final group extends to the runtime token count.  Backbones with
+        richer special-token semantics should override this method instead of
+        making recovery code infer token types from model names.
+        """
+        split = int(patch_start_idx)
+        if split <= 0:
+            return ("patch",), (0,)
+        return ("special", "patch"), (0, split)
+
+    def ghost_runtime_token_group_order(
+        self, token_groups: Sequence[str]
+    ) -> Tuple[str, ...]:
+        """Return token-group order used by the backbone's internal block tensors."""
+        return tuple(str(name) for name in token_groups)
+
+    def ghost_runtime_trailing_token_count(self) -> int:
+        """Tokens after all per-frame groups that Ghost must leave unchanged."""
+        return 0
+
     def training_config(self) -> TrainingHyperparams:
         raise NotImplementedError(f"{self.name} does not define training hyperparameters")
 

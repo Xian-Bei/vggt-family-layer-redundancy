@@ -9,10 +9,24 @@ import numpy as np
 
 from analysis.prune_plan import UnitLoraSpec, UnitPrunePlan
 from analysis.redundancy.graph_io import (
+    SPECIAL_PATCH_MEAN,
     load_similarity as load_unit_similarity,
     parse_dataset_list,
 )
 from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT
+
+
+PRUNING_TOKEN_REGIONS = ("all", "special", "patch", SPECIAL_PATCH_MEAN)
+
+
+def normalize_pruning_token_region(token_region: str) -> str:
+    normalized_region = str(token_region).strip().lower()
+    if normalized_region not in PRUNING_TOKEN_REGIONS:
+        raise ValueError(
+            f"Unsupported pruning token region {token_region!r}; "
+            f"expected one of {PRUNING_TOKEN_REGIONS}"
+        )
+    return normalized_region
 
 
 def plan_name(t: int, l: int) -> str:
@@ -40,10 +54,11 @@ def load_similarity(
     metric: str,
 ) -> Tuple[List[str], np.ndarray, Dict[str, object]]:
     """Compatibility wrapper around the redundancy-layer raw similarity loader."""
+    normalized_region = normalize_pruning_token_region(token_region)
     return load_unit_similarity(
         experiment=experiment,
         dataset=dataset,
-        token_region=token_region,
+        token_region=normalized_region,
         metric=metric,
         output_root=OUTPUT_ROOT_DEFAULT,
     )

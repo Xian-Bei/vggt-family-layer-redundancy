@@ -85,6 +85,17 @@ class DatasetAdaptor(ABC):
             f"{self.name} does not implement CPU eval scene preparation"
         )
 
+    def prepare_inference_scene_cpu(
+        self,
+        backbone_adaptor: Any,
+        batch: EvalSampleBatch,
+    ) -> PreparedEvalScene:
+        """Load only model inputs for inference benchmarking, without GT state."""
+        del backbone_adaptor, batch
+        raise NotImplementedError(
+            f"{self.name} does not implement CPU inference scene preparation"
+        )
+
     def score_eval_prediction(
         self,
         backbone_adaptor: Any,

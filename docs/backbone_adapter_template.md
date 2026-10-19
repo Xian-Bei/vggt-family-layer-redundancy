@@ -8,7 +8,8 @@ cp analysis/backbones/adapters/backbone_adapter_template.py analysis/backbones/a
 
 然后把 `NewBackboneAdapter` 改名为 `<Name>Adapter`，把 `name = "new_backbone"` 改成公共 backbone 名，并在 `analysis/backbones/registry.py` 的 `_load_defaults()` 中导入和 `register()`。
 
-模板不会被默认导入，也不会影响现有 `vggt`、`vggt_omega`、`pi3`。
+模板不会被默认导入，也不会影响现有 `vggt`、`vggt_omega`、`pi3`、
+`mapanything`、`mapanything_v1`。
 
 ## 公共路径只认识的东西
 
@@ -24,7 +25,9 @@ cp analysis/backbones/adapters/backbone_adapter_template.py analysis/backbones/a
 
 `capabilities()`
 
-返回 backbone 名称、是否支持 cache/prune/lora/eval，以及 `num_frame_blocks`、`num_global_blocks`。这两个数量应该和 `layer_unit_catalog()` 对齐。
+返回 backbone 名称、是否支持 cache/prune/lora/eval，以及可选的静态
+`num_frame_blocks`、`num_global_blocks`。静态数量已知时应与 `layer_unit_catalog()`
+对齐；若数量由 checkpoint 决定，可保持 0，并以加载模型后的 catalog 为权威。
 
 `default_hf_model()` / `pythonpath_entries()` / `load_pretrained()`
 
@@ -32,7 +35,9 @@ cp analysis/backbones/adapters/backbone_adapter_template.py analysis/backbones/a
 
 `layer_unit_catalog()`
 
-返回所有可操作单元的 `LayerUnitSpec`。`module_path` 是 adaptor 内部可解释的路径，公共路径只会使用 `unit_id`。
+返回所有可操作单元的 `LayerUnitSpec`，列表顺序必须等于物理执行顺序。`module_path`
+是 adaptor 内部可解释的路径，公共路径只使用 `unit_id`。不要假设新模型一定
+frame-first；MapAnything 的现有实现就是 global-first。
 
 `block_for_unit()` / `apply_unit_operation()`
 
@@ -55,7 +60,8 @@ cp analysis/backbones/adapters/backbone_adapter_template.py analysis/backbones/a
 
 `forward_predictions()` / `prediction_bundle_from_raw()`
 
-`forward_predictions()` 跑完整推理，`prediction_bundle_from_raw()` 把 raw output 归一化为：
+`forward_predictions()` 跑完整推理，并接受 `defer_cpu_geometry=False` keyword；异步
+eval 可将它设为 `True`。`prediction_bundle_from_raw()` 把 raw output 归一化为：
 
 - `pose_enc`
 - `camera_poses`
@@ -72,17 +78,32 @@ cp analysis/backbones/adapters/backbone_adapter_template.py analysis/backbones/a
 
 返回 cache-first replay 的 `layer_-1` seed，形状 `[B, S, P, C]`。如果该 backbone 暂不支持从 cache seed replay，可以返回 `None`，但 LoRA cache training 需要它或等价 replay engine 能力。
 
+`training_config()` / `build_training_optimizer()`
+
+提供 backbone-specific 训练超参数和 optimizer。不要在公共 loop 中按 backbone 名称
+复制配置。
+
 `validate_cached_prediction()` / `build_target_batch_from_teacher()` / `prediction_loss()`
 
-align loss 属于公共训练路径，prediction loss 属于 adaptor。即使多个 backbone 共用同一套 loss，也要在各自 adaptor 里提供接口，然后委托公共 helper。
+align loss 属于公共训练路径，prediction loss 属于 adaptor。teacher target 接口包含
+可选 `dataset_name`。即使多个 backbone 共用同一套 loss，也要在各自 adaptor 里提供
+接口，然后委托公共 helper。
 
 `required_head_layers_for_cache()` / `replay_student_cache_first()` / `cache_replay_engine()`
 
 用于 LoRA cache-first training。公共训练只传 unit id、seed layer、target layers 和缓存读取函数；具体怎么从某个起点 replay 到 heads，由 adaptor 或 `analysis/backbones/cache_replay/<name>.py` 处理。
 
-`eval_scene()`
+`load_eval_images()` 与 GT 对齐 helper
 
-用于四个数据集的统一 eval。推荐内部调用 `forward_predictions()` 得到 `PredictionBundle`，再复用公共 eval helper。
+backbone adaptor 负责官方 resize/normalization，并按需实现
+`load_driving_depth_stack()`、`load_scannet_gt_depth()`、`align_7andn_gt_depth()`。
+`eval_scene()` 不属于当前 backbone contract；scene 读取与 scoring 由
+`analysis/datasets/contracts.py` 中的 `DatasetAdaptor` 负责。
+
+`supports_incremental_skip_eval()` / `iter_skip_span_predictions()`
+
+可选的 scene-local skip replay 快路径。输入 span 是闭区间，输出必须逐项 yield
+`(start, end, PredictionBundle)`，并与真正替换相同 units 后的完整 forward 等价。
 
 ## 精度和 autocast 约定
 
@@ -101,3 +122,5 @@ align loss 属于公共训练路径，prediction loss 属于 adaptor。即使多
 - `forward_predictions()` 返回合法 `PredictionBundle`。
 - `forward_cache_batch()` 返回 activation、prediction、meta，且 activation shape 为 `[B, S, P, C]`。
 - `prediction_loss()` 可对一批 teacher/student prediction 计算有限标量。
+- `load_eval_images()` 的范围、shape 和 patch grid 与官方模型一致。
+- 若声明支持 incremental skip eval，其 prediction 与物理 skip full forward 对齐。

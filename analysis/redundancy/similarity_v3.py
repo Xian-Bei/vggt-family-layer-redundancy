@@ -276,7 +276,7 @@ def validate_metric_names(metric_names: Sequence[str]) -> List[str]:
 
 
 class RedundancyAccumulator:
-    """Cross-scene redundancy graph builder for one token region (mean + per-scene stacks)."""
+    """Accumulate per-scene matrices for one token region and their average."""
 
     def __init__(self, metric_names: Sequence[str], token_region: str) -> None:
         self.metric_names = list(metric_names)
@@ -337,7 +337,6 @@ def write_redundancy_outputs(
     unit_ids: Sequence[str],
     accumulators: Dict[str, RedundancyAccumulator],
     token_regions: Sequence[str],
-    timing_total_s: float,
 ) -> List[Path]:
     red_dir = stage_dir(experiment, dataset, "redundancy")
     red_dir.mkdir(parents=True, exist_ok=True)
@@ -354,7 +353,7 @@ def write_redundancy_outputs(
         tmp_path.replace(out_npz_path)
         written.append(out_npz_path)
         if os.environ.get("COMPACT_LOG", "").lower() not in {"1", "true", "yes"}:
-            print(f"Wrote {out_npz_path} ({timing_total_s:.1f}s)", file=sys.stderr)
+            print(f"Wrote {out_npz_path}", file=sys.stderr)
 
     if not written:
         raise RuntimeError("No redundancy graphs were written (no scenes accumulated).")

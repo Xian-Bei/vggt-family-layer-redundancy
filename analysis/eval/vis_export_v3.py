@@ -43,14 +43,23 @@ def save_scene_plot_2d(
                 return False
             timestamps = frame_ids if frame_ids is not None else list(range(n))
             _, traj_plot, _ = eval_trajectory(
-                est[:n], gt_w2c[:n], timestamps[:n], align=True, plot_trajectory=True
+                est[:n],
+                gt_w2c[:n],
+                timestamps[:n],
+                align=True,
+                plot_trajectory=True,
+                trajectory_data_path=scene_dir / "trajectory_plot_data.npz",
             )
         elif ds in ("7scenes", "nrgbd", "nuscenes", "waymo"):
             from analysis.eval.metrics import evaluate_7andn_trajectory_metrics
 
             fids = frame_ids if frame_ids is not None else list(range(int(gt_poses.shape[0])))
             _, traj_plot = evaluate_7andn_trajectory_metrics(
-                est_w2c, gt_poses, fids, plot_trajectory=True
+                est_w2c,
+                gt_poses,
+                fids,
+                plot_trajectory=True,
+                trajectory_data_path=scene_dir / "trajectory_plot_data.npz",
             )
         else:
             print(f"[warn] 2D plot unsupported dataset: {dataset}", flush=True)

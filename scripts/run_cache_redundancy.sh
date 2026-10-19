@@ -10,7 +10,7 @@ RUN="${RUN:-}"
 CACHE="${CACHE:-}"
 SKIP_REDUNDANCY="${SKIP_REDUNDANCY:-0}"
 
-PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-${REPO_ROOT}/analysis/prune_plan}"
+PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-analysis/prune_plan}"
 PRUNE_PLAN_NAME="${PRUNE_PLAN_NAME:-}"
 RECOVERY_PLAN_ROOT="${RECOVERY_PLAN_ROOT:-}"
 RECOVERY_PLAN_NAME="${RECOVERY_PLAN_NAME:-}"
@@ -138,6 +138,9 @@ run_dataset_key() {
     SCANNET_TEST50)
       run_scannet_split "${ROOT_SCANNET_TEST50}" "${backbone}" "${save_cache}" "scannet_test50"
       ;;
+    SCANNET_DEV_EXTRA100)
+      run_scannet_split "${ROOT_SCANNET_DEV_EXTRA100}" "${backbone}" "${save_cache}" "scannet_dev_extra100"
+      ;;
     7SCENES_TRAIN)
       run_one_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "${save_cache}" "train"
       ;;
@@ -152,6 +155,9 @@ run_dataset_key() {
       ;;
     NUSCENES_TRAIN)
       run_one_dataset "nuscenes" "${ROOT_NUSCENES}" "${backbone}" "${save_cache}" "train"
+      ;;
+    NUSCENES_TRAIN_EXTRA100)
+      run_one_dataset "nuscenes" "${ROOT_NUSCENES_TRAIN_EXTRA100}" "${backbone}" "${save_cache}" "train" "nuscenes_train_extra100"
       ;;
     WAYMO_VALIDATION)
       run_one_dataset "waymo" "${ROOT_WAYMO}" "${backbone}" "${save_cache}" "validation"

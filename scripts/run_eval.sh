@@ -11,15 +11,14 @@ EXPORT_VIS_2D="${EXPORT_VIS_2D:-0}"
 EXPORT_VIS_3D="${EXPORT_VIS_3D:-0}"
 
 PRUNE="${PRUNE:-0,1}"
-PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-${REPO_ROOT}/analysis/prune_plan}"
+PRUNE_PLAN_ROOT="${PRUNE_PLAN_ROOT:-analysis/prune_plan}"
 # Pruned eval selectors use the split plan layout:
-#   PLAN_GROUP / PRUNE_PLAN_NAME: explicit physical interval selectors such as "i9_j19 i8_j20".
-#   PLAN_STRATEGY: strategy keys from prune_plan_all.json, such as "ours gt replaceme shortgpt simpler".
+#   PRUNE_PLAN_NAME: explicit physical interval selectors such as "i9_j19 i8_j20".
+#   PLAN_STRATEGY: strategy keys such as "CKA retention replaceme shortgpt gardener simpler".
 #   PLAN_MIN_DROP + PLAN_MAX_DROP + PLAN_DROP_STEP: select interval union from strategies by range.
 # For model-mode eval, RECOVERY_PLAN_NAME optionally composes
 # the prune selector with a recovery plan bundle such as "recovery_lora_l1_r32".
 PRUNE_PLAN_NAME="${PRUNE_PLAN_NAME:-}"
-PLAN_GROUP="${PLAN_GROUP:-}"
 PLAN_STRATEGY="${PLAN_STRATEGY:-}"
 PLAN_MIN_DROP="${PLAN_MIN_DROP:-}"
 PLAN_MAX_DROP="${PLAN_MAX_DROP:-}"
@@ -38,10 +37,8 @@ RECOVERY_OUTPUT_NAME="${RECOVERY_OUTPUT_NAME:-${RECOVERY_PLAN_NAME}}"
 #   eval/testtime/<recovery>/<compression>/<physical-selector>/...
 RECOVERY_RESULT_KIND="${RECOVERY_RESULT_KIND:-recovery}"
 MAX_SCENES="${MAX_SCENES:-0}"
-WRITE_SUMMARY="${WRITE_SUMMARY:-1}"
 RECOVERY_FORCE_RERUN="${RECOVERY_FORCE_RERUN:-1}"
 ASYNC_SCORE="${ASYNC_SCORE:-1}"
-EVAL_TIMING="${EVAL_TIMING:-0}"
 SCENE_PRELOAD="${SCENE_PRELOAD:-1}"
 
 #############################################
@@ -57,6 +54,7 @@ QUANTVGGT_PARAMS_DIR="${QUANTVGGT_PARAMS_DIR:-}"
 
 # shellcheck source=scripts/run_backbones_lib.sh
 source "${REPO_ROOT}/scripts/run_backbones_lib.sh"
+install_error_diagnostics "${BASH_SOURCE[0]}"
 parse_backbones_list
 parse_dataset_list "${RUN}" "RUN" "${DATASET_KEYS[@]}"
 RUN_LIST=("${PARSED_DATASETS[@]}")
@@ -83,14 +81,8 @@ parse_prune_list() {
 }
 parse_prune_list
 
-PLAN_GROUP_LIST=()
 PRUNE_PLAN_NAME_LIST=()
 PLAN_STRATEGY_LIST=()
-read -r -a _PLAN_GROUP_RAW <<< "${PLAN_GROUP//,/ }"
-for _value in "${_PLAN_GROUP_RAW[@]}"; do
-  _value="${_value//[[:space:]]/}"
-  [[ -n "${_value}" ]] && PLAN_GROUP_LIST+=("${_value}")
-done
 read -r -a _PLAN_STRATEGY_RAW <<< "${PLAN_STRATEGY//,/ }"
 for _value in "${_PLAN_STRATEGY_RAW[@]}"; do
   _value="${_value//[[:space:]]/}"
@@ -101,18 +93,14 @@ for _value in "${_PRUNE_PLAN_NAME_RAW[@]}"; do
   _value="${_value//[[:space:]]/}"
   [[ -n "${_value}" ]] && PRUNE_PLAN_NAME_LIST+=("${_value}")
 done
-if [[ "${#PLAN_GROUP_LIST[@]}" -gt 0 && "${#PRUNE_PLAN_NAME_LIST[@]}" -gt 0 ]]; then
-  echo "error: set only one of PLAN_GROUP or PRUNE_PLAN_NAME for prune-span eval." >&2
-  exit 1
-fi
-if [[ "${#PLAN_STRATEGY_LIST[@]}" -gt 0 && ( "${#PLAN_GROUP_LIST[@]}" -gt 0 || "${#PRUNE_PLAN_NAME_LIST[@]}" -gt 0 ) ]]; then
-  echo "error: set PLAN_STRATEGY with range selectors, or explicit PLAN_GROUP/PRUNE_PLAN_NAME, not both." >&2
+if [[ "${#PLAN_STRATEGY_LIST[@]}" -gt 0 && "${#PRUNE_PLAN_NAME_LIST[@]}" -gt 0 ]]; then
+  echo "error: set PLAN_STRATEGY with range selectors, or explicit PRUNE_PLAN_NAME, not both." >&2
   exit 1
 fi
 for _prune_value in "${PRUNE_LIST[@]}"; do
   _prune_value="${_prune_value//[[:space:]]/}"
-  if [[ "${_prune_value}" == "1" && "${#PLAN_GROUP_LIST[@]}" -eq 0 && "${#PRUNE_PLAN_NAME_LIST[@]}" -eq 0 && "${#PLAN_STRATEGY_LIST[@]}" -eq 0 && ( -z "${PLAN_MIN_DROP}" || -z "${PLAN_MAX_DROP}" || -z "${PLAN_DROP_STEP}" ) ]]; then
-    echo "error: PLAN_GROUP/PRUNE_PLAN_NAME, PLAN_STRATEGY, or PLAN_MIN_DROP+PLAN_MAX_DROP+PLAN_DROP_STEP is required when PRUNE includes 1." >&2
+  if [[ "${_prune_value}" == "1" && "${#PRUNE_PLAN_NAME_LIST[@]}" -eq 0 && "${#PLAN_STRATEGY_LIST[@]}" -eq 0 && ( -z "${PLAN_MIN_DROP}" || -z "${PLAN_MAX_DROP}" || -z "${PLAN_DROP_STEP}" ) ]]; then
+    echo "error: PRUNE_PLAN_NAME, PLAN_STRATEGY, or PLAN_MIN_DROP+PLAN_MAX_DROP+PLAN_DROP_STEP is required when PRUNE includes 1." >&2
     exit 1
   fi
 done
@@ -180,12 +168,12 @@ print(plan_group_from_name(os.environ['PRUNE_PLAN_NAME_FOR_PY']))
 python_resolve_canonical_plan() {
   local root="$1"
   local group="$2"
-  PRUNE_PLAN_ROOT_FOR_PY="${root}" PLAN_GROUP_FOR_PY="${group}" python -c "
+  PRUNE_PLAN_ROOT_FOR_PY="${root}" PRUNE_SELECTOR_FOR_PY="${group}" python -c "
 import os
 from pathlib import Path
 from analysis.prune_plan import canonical_plan_name_for_group
 try:
-    print(canonical_plan_name_for_group(Path(os.environ['PRUNE_PLAN_ROOT_FOR_PY']), os.environ['PLAN_GROUP_FOR_PY']))
+    print(canonical_plan_name_for_group(Path(os.environ['PRUNE_PLAN_ROOT_FOR_PY']), os.environ['PRUNE_SELECTOR_FOR_PY']))
 except FileNotFoundError:
     pass
 "
@@ -263,9 +251,9 @@ checkpoint_for_model_mode() {
     return
   fi
   if [[ -n "${prune_plan_name}" && -n "${RECOVERY_PLAN_NAME}" ]]; then
-    local recovery_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/recovery/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
-    local new_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/train/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
-    local legacy_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${scannet_tag}/train/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
+    local recovery_ckpt="${OUTPUT_ROOT}/${backbone}/recovery/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
+    local new_ckpt="${OUTPUT_ROOT}/${backbone}/train/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
+    local legacy_ckpt="${OUTPUT_ROOT}/${backbone}/${scannet_tag}/train/${prune_plan_name}/${RECOVERY_PLAN_NAME}/checkpoints/latest.pt"
     if [[ -f "${recovery_ckpt}" ]]; then
       echo "${recovery_ckpt}"
     elif [[ -f "${new_ckpt}" || ! -f "${legacy_ckpt}" ]]; then
@@ -275,8 +263,8 @@ checkpoint_for_model_mode() {
     fi
     return
   fi
-  local new_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/train/checkpoints/latest.pt"
-  local legacy_ckpt="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${scannet_tag}/train/checkpoints/latest.pt"
+  local new_ckpt="${OUTPUT_ROOT}/${backbone}/train/checkpoints/latest.pt"
+  local legacy_ckpt="${OUTPUT_ROOT}/${backbone}/${scannet_tag}/train/checkpoints/latest.pt"
   if [[ -f "${new_ckpt}" || ! -f "${legacy_ckpt}" ]]; then
     echo "${new_ckpt}"
   else
@@ -303,15 +291,15 @@ run_eval_dataset() {
     effective_model_name="${model_name}_${compression_tag}"
   fi
   local output_plan_name="${plan_group:-${prune_plan_name}}"
-  local out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/${effective_model_name}"
+  local out_dir="${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/${effective_model_name}"
   if [[ "${mode}" == "lower" && -n "${output_plan_name}" ]]; then
-    out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/pruning/${output_plan_name}"
+    out_dir="${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/pruning/${output_plan_name}"
   elif [[ "${mode}" == "model" && -n "${prune_plan_name}" ]]; then
     if [[ -n "${RECOVERY_PLAN_NAME}" ]]; then
       if [[ "${RECOVERY_RESULT_KIND}" == "testtime" ]]; then
-        out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/testtime/${RECOVERY_OUTPUT_NAME}/${compression_tag}/${output_plan_name}"
+        out_dir="${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/testtime/${RECOVERY_OUTPUT_NAME}/${compression_tag}/${output_plan_name}"
       else
-        out_dir="${REPO_ROOT}/${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/recovery/${output_plan_name}/${RECOVERY_OUTPUT_NAME}"
+        out_dir="${OUTPUT_ROOT}/${backbone}/${output_dataset}/eval/recovery/${output_plan_name}/${RECOVERY_OUTPUT_NAME}"
       fi
     else
       out_dir="${out_dir}/${output_plan_name}"
@@ -372,9 +360,6 @@ run_eval_dataset() {
   if ! truthy "${ASYNC_SCORE}"; then
     extra+=(--no-async-score)
   fi
-  if truthy "${EVAL_TIMING}"; then
-    extra+=(--timing)
-  fi
   if ! truthy "${SCENE_PRELOAD}"; then
     extra+=(--no-scene-preload)
   fi
@@ -420,7 +405,7 @@ run_eval_dataset() {
     JOB_DEVICE="${DEVICE}" JOB_MAX_SCENES="${MAX_SCENES}" \
     JOB_MAX_FRAMES="${MAX_FRAMES}" JOB_VIS_2D="${EXPORT_VIS_2D}" \
     JOB_VIS_3D="${EXPORT_VIS_3D}" JOB_VIS_POINTS="${VIS_MAX_POINTS:-0}" \
-    JOB_ASYNC_SCORE="${ASYNC_SCORE}" JOB_TIMING="${EVAL_TIMING}" \
+    JOB_ASYNC_SCORE="${ASYNC_SCORE}" \
     JOB_SCORE_WORKERS="${ASYNC_SCORE_WORKERS}" \
     JOB_SCORE_MAX_PENDING="${ASYNC_SCORE_MAX_PENDING}" \
     JOB_SCENE_PRELOAD="${SCENE_PRELOAD}" \
@@ -447,7 +432,6 @@ jobs.append({
     "no_async_score": not truthy(os.environ["JOB_ASYNC_SCORE"]),
     "score_workers": int(os.environ["JOB_SCORE_WORKERS"]),
     "score_max_pending": int(os.environ["JOB_SCORE_MAX_PENDING"]),
-    "timing": truthy(os.environ["JOB_TIMING"]),
     "no_scene_preload": not truthy(os.environ["JOB_SCENE_PRELOAD"]),
     "inference_compression": os.environ["JOB_COMPRESSION"],
     "fastvggt_merge_start": int(os.environ["JOB_FAST_START"]),
@@ -499,6 +483,9 @@ run_eval_dataset_key() {
     SCANNET_TEST50)
       run_eval_dataset "scannet" "${ROOT_SCANNET_TEST50}" "${backbone}" "${mode}" "${model_name}" "scannet_test50" "${prune_plan_name}" "${plan_group}"
       ;;
+    SCANNET_DEV_EXTRA100)
+      run_eval_dataset "scannet" "${ROOT_SCANNET_DEV_EXTRA100}" "${backbone}" "${mode}" "${model_name}" "scannet_dev_extra100" "${prune_plan_name}" "${plan_group}"
+      ;;
     7SCENES_TEST)
       run_eval_dataset "7scenes" "${ROOT_7SCENES}" "${backbone}" "${mode}" "${model_name}" "7scenes_test" "${prune_plan_name}" "${plan_group}" "test"
       ;;
@@ -513,6 +500,9 @@ run_eval_dataset_key() {
       ;;
     NUSCENES_TRAIN)
       run_eval_dataset "nuscenes" "${ROOT_NUSCENES}" "${backbone}" "${mode}" "${model_name}" "nuscenes_train" "${prune_plan_name}" "${plan_group}" "train"
+      ;;
+    NUSCENES_TRAIN_EXTRA100)
+      run_eval_dataset "nuscenes" "${ROOT_NUSCENES_TRAIN_EXTRA100}" "${backbone}" "${mode}" "${model_name}" "nuscenes_train_extra100" "${prune_plan_name}" "${plan_group}" "train"
       ;;
     WAYMO_VALIDATION)
       run_eval_dataset "waymo" "${ROOT_WAYMO}" "${backbone}" "${mode}" "${model_name}" "waymo_validation" "${prune_plan_name}" "${plan_group}" "validation"
@@ -579,13 +569,6 @@ run_eval_group_variant() {
 
 run_eval_for_prune_variants() {
   local bb="$1"
-  if [[ "${#PLAN_GROUP_LIST[@]}" -gt 0 ]]; then
-    local requested_group
-    for requested_group in "${PLAN_GROUP_LIST[@]}"; do
-      run_eval_group_variant "${bb}" "${requested_group}"
-    done
-    return
-  fi
   if [[ "${#PLAN_STRATEGY_LIST[@]}" -gt 0 && -z "${PLAN_MIN_DROP}${PLAN_MAX_DROP}${PLAN_DROP_STEP}" ]]; then
     local strategy_selectors=()
     local strategy_csv="${PLAN_STRATEGY_LIST[*]}"
@@ -677,14 +660,6 @@ for bb in "${BB_LIST[@]}"; do
       run_datasets_for_backbone "${bb}" "${prune_flag}" ""
     fi
   done
-  if truthy "${WRITE_SUMMARY}"; then
-    if ! truthy "${COMPACT_LOG:-0}"; then
-      echo "   [summary] ${OUTPUT_ROOT}/${bb}/summary_comparison.md"
-    fi
-    run_command python -m analysis.eval.summary_v3 \
-      --experiment "${bb}" \
-      --prune-plan-root "${PRUNE_PLAN_ROOT}"
-  fi
 done
 
 if ! truthy "${COMPACT_LOG:-0}"; then

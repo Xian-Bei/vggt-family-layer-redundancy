@@ -96,7 +96,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-span",
         type=int,
         default=0,
-        help="Max closed-interval drop count; 0 means full upper triangle.",
+        help=(
+            "Max closed-interval drop count; 0 means the full upper triangle, "
+            "and a negative value is relative to the unit count (-1 keeps at "
+            "least one unit)."
+        ),
     )
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--no-progress", action="store_true")
@@ -134,12 +138,31 @@ def unit_ids_from_catalog(adapter, model: torch.nn.Module) -> List[str]:
     return [u.unit_id for u in adapter.layer_unit_catalog(model)]
 
 
+def resolve_max_span(n: int, *, max_span: int) -> int:
+    """Resolve a user-facing span limit to an absolute drop-count cap."""
+    if n <= 0:
+        return 0
+    requested = int(max_span)
+    if requested == 0:
+        return n
+    if requested > 0:
+        return min(n, requested)
+
+    cap = n + requested
+    if cap < 1:
+        raise ValueError(
+            f"max_span={requested} resolves to {cap} for {n} units; "
+            f"negative max_span must be greater than {-n}"
+        )
+    return cap
+
+
 def iter_unit_spans(n: int, *, max_span: int) -> Iterable[Tuple[int, int]]:
     if n <= 0:
         return
-    cap = int(max_span)
+    cap = resolve_max_span(n, max_span=max_span)
     for i in range(n):
-        j_max = n - 1 if cap <= 0 else min(n - 1, i + cap - 1)
+        j_max = min(n - 1, i + cap - 1)
         for j in range(i, j_max + 1):
             yield i, j
 
@@ -266,7 +289,7 @@ def build_packed_matrices(
     for metric in metrics:
         if metric not in upper_metrics:
             continue
-        mat = np.zeros((n_units, n_units), dtype=np.float64)
+        mat = np.full((n_units, n_units), np.nan, dtype=np.float64)
         u = float(upper_metrics[metric])
         for i, j in spans:
             cur = span_metrics.get((i, j), {}).get(metric)
@@ -276,7 +299,7 @@ def build_packed_matrices(
                 mat[i, j] = degrade_pct_vs_upper(u, float(cur), metric)
         pct_packed[metric] = upper_triangle_pack(torch.from_numpy(mat))
 
-        mat_d = np.zeros((n_units, n_units), dtype=np.float64)
+        mat_d = np.full((n_units, n_units), np.nan, dtype=np.float64)
         for i, j in spans:
             cur = span_metrics.get((i, j), {}).get(metric)
             if cur is None:
@@ -829,8 +852,16 @@ def run_skip_gt_eval(
 
     t_phase = time.perf_counter()
     spans = list(iter_unit_spans(n_units, max_span=int(max_span)))
+    resolved_max_span = resolve_max_span(n_units, max_span=int(max_span))
+    report_max_span = (
+        resolved_max_span if int(max_span) < 0 else int(max_span)
+    )
     metrics_available = list(SKIP_EVAL_METRICS)
-    _latency_log(f"[skip_gt_eval] span enumeration n_spans={len(spans)} {time.perf_counter() - t_phase:.3f}s")
+    _latency_log(
+        f"[skip_gt_eval] span enumeration n_spans={len(spans)} "
+        f"resolved_max_span={resolved_max_span} "
+        f"{time.perf_counter() - t_phase:.3f}s"
+    )
 
     t_phase = time.perf_counter()
     upper_metrics, upper_scene_metrics = load_upper_eval_or_fail(
@@ -850,7 +881,7 @@ def run_skip_gt_eval(
         "backbone": str(adapter.name),
         "dataset": str(tagged_dataset),
         "source_dataset": str(dataset),
-        "data_root": str(Path(data_root).resolve()),
+        "data_root": str(Path(data_root)),
         "split": split,
         "hf_model": hf,
         "max_scenes": int(max_scenes),
@@ -1082,7 +1113,7 @@ def run_skip_gt_eval(
         upper_scene_metrics=upper_scene_metrics,
         backbone=adapter.name,
         dataset=tagged_dataset,
-        max_span=int(max_span),
+        max_span=report_max_span,
         fusion_mode=str(mode),
         elapsed_seconds=time.perf_counter() - run_t0,
         ensure_scene_reports=True,

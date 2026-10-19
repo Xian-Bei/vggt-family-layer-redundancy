@@ -10,6 +10,7 @@ from typing import List, Optional
 
 from analysis.backbones.registry import get_backbone
 from analysis.prune_plan import (
+    bundle_plan_records,
     load_prune_plan_bundle,
     prune_plan_bundle_path,
 )
@@ -19,9 +20,10 @@ from analysis.prune_plan.build_prune_plan_common import (
 )
 from analysis.prune_plan.training_cache_units import required_cache_unit_ids
 from analysis.prune_plan.recovery_plan import (
-    TRAINING_FREE_RECOVERY_METHODS,
+    CACHE_FIT_RECOVERY_METHODS,
     RECOVERY_PLAN_BUNDLE_SCHEMA_VERSION,
     RECOVERY_PLAN_METHODS,
+    TOKEN_GROUPED_RECOVERY_BASE_METHODS,
     execution_method,
     recovery_plan_name,
     recovery_plan_path,
@@ -98,8 +100,22 @@ def run_build_recovery_plan(
 
     prune_bundle = load_prune_plan_bundle(prune_plan_root)
     spans_raw = prune_bundle.get("spans", {})
-    if not isinstance(spans_raw, dict) or not spans_raw:
-        raise ValueError(f"No spans in prune bundle: {prune_plan_bundle_path(prune_plan_root)}")
+    if not isinstance(spans_raw, dict):
+        raise ValueError(
+            f"Invalid spans object in prune bundle: "
+            f"{prune_plan_bundle_path(prune_plan_root)}"
+        )
+    if method_key in CACHE_FIT_RECOVERY_METHODS:
+        if not bundle_plan_records(prune_bundle):
+            raise ValueError(
+                f"No pruning plans in bundle: "
+                f"{prune_plan_bundle_path(prune_plan_root)}"
+            )
+    elif not spans_raw:
+        raise ValueError(
+            f"No legacy span records for trainable recovery in prune bundle: "
+            f"{prune_plan_bundle_path(prune_plan_root)}"
+        )
     num_units = int(prune_bundle.get("num_units", 0))
     unit_ids = [str(x) for x in prune_bundle.get("unit_ids", [])]
     dataset = str(prune_bundle.get("dataset", ""))
@@ -110,12 +126,12 @@ def run_build_recovery_plan(
     out_path = output_path or recovery_plan_path(out_root)
     adapter = get_backbone(backbone)
     model = None
-    if method_key not in TRAINING_FREE_RECOVERY_METHODS:
+    if method_key not in CACHE_FIT_RECOVERY_METHODS:
         hf = str(hf_model or adapter.default_hf_model())
         model = adapter.load_pretrained(hf_model=hf, device=str(cache_device), dtype=None, eval_mode=True)
 
     span_records: dict[str, dict] = {}
-    if method_key not in TRAINING_FREE_RECOVERY_METHODS:
+    if method_key not in CACHE_FIT_RECOVERY_METHODS:
         for span_key, span_record_raw in sorted(
             spans_raw.items(),
             key=lambda item: int(item[0]) if str(item[0]).isdigit() else 10**9,
@@ -150,7 +166,7 @@ def run_build_recovery_plan(
             }
 
     method_entry: dict = {"method": method_key}
-    if method_key not in TRAINING_FREE_RECOVERY_METHODS:
+    if method_key not in CACHE_FIT_RECOVERY_METHODS:
         method_entry.update(
             {
                 "lora_prefix": prefix,
@@ -178,10 +194,27 @@ def run_build_recovery_plan(
     if not isinstance(methods, dict):
         raise ValueError(f"Invalid methods object in {out_path}")
     methods[name] = method_entry
+    dependency_name = ""
+    if (
+        str(backbone).strip().lower() == "pi3"
+        and method_key in TOKEN_GROUPED_RECOVERY_BASE_METHODS
+    ):
+        dependency_method = TOKEN_GROUPED_RECOVERY_BASE_METHODS[method_key]
+        dependency_name = recovery_plan_name(
+            method=dependency_method,
+            lora_prefix=prefix,
+            lora_rank=rank,
+        )
+        methods.setdefault(dependency_name, {"method": dependency_method})
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
 
     print(f"Updated {name} in unified recovery plan {out_path}", flush=True)
+    if dependency_name:
+        print(
+            f"Ensured Pi3 token-group dependency {dependency_name} in {out_path}",
+            flush=True,
+        )
     return out_path
 
 

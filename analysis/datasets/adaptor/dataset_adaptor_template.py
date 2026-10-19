@@ -164,9 +164,8 @@ class NewDatasetAdaptor(DatasetAdaptor):
         - load and align GT poses, depth, or point clouds;
         - compute unified metric keys used by ``EvalRecordV3``.
 
-        Return only JSON-serializable metric values. Common keys include:
-        ``ape``, ``are``, ``rpe_trans``, ``rpe_rot``, ``acc``, ``comp``, ``cd``,
-        ``inference_time_ms``, and ``infer_peak_vram_gb``.
+        Return only JSON-serializable accuracy metric values. Common keys include
+        ``ape``, ``are``, ``rpe_trans``, ``rpe_rot``, ``acc``, ``comp``, and ``cd``.
         """
         del backbone_adaptor, model, batch, ctx
         # TODO: implement directly or call helpers in ``analysis.datasets``.

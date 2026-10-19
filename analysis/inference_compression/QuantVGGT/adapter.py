@@ -1,4 +1,4 @@
-"""QuantVGGT fake-quant adapter for restored VGGT, Pi3, and VGGT-Omega models."""
+"""QuantVGGT fake-quant adapter for restored original-VGGT models."""
 
 from __future__ import annotations
 
@@ -72,8 +72,8 @@ class QuantVGGTInferenceAdapter(InferenceCompressionAdapter):
     name = "quantvggt"
     # The released QuantVGGT calibration/training pipeline and the transferred
     # W4A4 parameters target the original VGGT architecture only.  Pi3 and
-    # VGGT-Omega need backbone-aware recalibration before they can be treated as
-    # supported QuantVGGT accuracy baselines.
+    # VGGT-Omega need both a backbone-specific adapter and matching calibration
+    # before they can be treated as supported QuantVGGT accuracy baselines.
     supported_backbones = frozenset({"vggt"})
 
     @staticmethod

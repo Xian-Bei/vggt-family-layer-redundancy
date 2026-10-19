@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import os
 import re
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -14,12 +17,14 @@ from analysis.metric_labels import SEVEN_METRIC_LABELS
 from analysis.prune_plan import (
     bundle_plan_records,
     bundle_strategy_records,
+    canonical_pruning_strategy_key,
     canonical_physical_pruning_selector,
     load_prune_plan_bundle,
     physical_pruning_selector_from_record,
 )
 from analysis.redundancy.skip_metric_scaling import (
     GT_METRIC_KEYS,
+    normalize_raw_metric_against_upper_worst,
 )
 
 PRUNING_METRIC_GRID = (
@@ -37,12 +42,109 @@ PUBLICATION_TICK_LABEL_FONTSIZE = 13.0
 PUBLICATION_AXIS_LABEL_FONTSIZE = 15.0
 PUBLICATION_LEGEND_FONTSIZE = 15.0
 PUBLICATION_FLAT_AXES_BOX_ASPECT = 0.704
+# Shared flatter geometry for publication figures 5--9 (axes height / width).
+PUBLICATION_COMPARISON_AXES_BOX_ASPECT = 0.55
+PUBLICATION_COMPARISON_SUBPLOT_HEIGHT = 4.8
+PUBLICATION_DETAIL_SUBPLOT_HEIGHT = 6.0
+PUBLICATION_DETAIL_AXES_BOX_ASPECT = (
+    PUBLICATION_COMPARISON_AXES_BOX_ASPECT
+    * PUBLICATION_DETAIL_SUBPLOT_HEIGHT
+    / PUBLICATION_COMPARISON_SUBPLOT_HEIGHT
+)
 GT_MEAN_METRICS = ("ape", "are", "rpe_trans", "rpe_rot", "acc", "comp", "chamfer_distance")
-NORMALIZATION_MAX_DROP_COUNT = 24
+POSE_SELECTION_METRICS = ("ape", "are", "rpe_trans", "rpe_rot")
+PRUNING_NORMALIZATION_PROFILE_FILENAME = "normalization_profile.json"
+PRUNING_NORMALIZATION_PROFILE_SCHEMA_VERSION = "stage2_upper_zero_worst_all_intervals_v3"
+DEFAULT_NORMALIZATION_MAX_DROP = 48
+CALIBRATION_DATASET_BY_DATASET = {
+    "scannet_dev50": "scannet_dev50",
+    "scannet_test50": "scannet_dev50",
+    "7scenes_train": "7scenes_train",
+    "7scenes_test": "7scenes_train",
+    "nuscenes_train": "nuscenes_train",
+    "nuscenes_val": "nuscenes_train",
+    "waymo_training": "waymo_training",
+    "waymo_validation": "waymo_training",
+}
 METRIC_HEADERS = {
     **SEVEN_METRIC_LABELS,
     "gt_mean": "7-metric mean ↓",
 }
+
+
+def pose_selection_score(metrics: dict[str, Any]) -> Optional[float]:
+    """Return the direct four-pose-metric sum used for Single/Double selection."""
+    values = [metric_value(metrics, metric) for metric in POSE_SELECTION_METRICS]
+    if not all(value is not None and math.isfinite(float(value)) for value in values):
+        return None
+    return float(sum(float(value) for value in values if value is not None))
+
+
+def set_y_axis_max_decimals(axis: Any, decimals: int = 2) -> None:
+    """Format every y tick with one shared precision up to ``decimals``."""
+    from matplotlib.ticker import FuncFormatter  # type: ignore
+
+    max_places = max(0, int(decimals))
+    finite_ticks = [
+        float(value)
+        for value in axis.get_yticks()
+        if math.isfinite(float(value))
+    ]
+    places = max_places
+    for candidate in range(max_places + 1):
+        if all(
+            math.isclose(
+                value,
+                round(value, candidate),
+                rel_tol=1e-9,
+                abs_tol=10.0 ** (-(candidate + 7)),
+            )
+            for value in finite_ticks
+        ):
+            places = candidate
+            break
+
+    def _format_tick(value: float, _position: int) -> str:
+        rounded = round(float(value), places)
+        if rounded == 0:
+            rounded = 0.0
+        return f"{rounded:.{places}f}"
+
+    axis.yaxis.set_major_formatter(FuncFormatter(_format_tick))
+
+
+def move_y_axis_label_to_top(
+    axis: Any,
+    label: str,
+    *,
+    fontsize: float,
+) -> None:
+    """Draw a metric label inside the top center without changing layout."""
+    axis.set_ylabel(
+        str(label),
+        fontsize=float(fontsize),
+        fontweight="bold",
+    )
+    # Retain the original ylabel as an invisible layout placeholder so moving
+    # the visible text does not change subplot widths or inter-panel spacing.
+    axis.yaxis.label.set_alpha(0.0)
+    for artist in list(axis.texts):
+        if artist.get_gid() == "metric-label-top":
+            artist.remove()
+    axis.text(
+        0.5,
+        0.98,
+        str(label),
+        ha="center",
+        va="top",
+        transform=axis.transAxes,
+        fontsize=float(fontsize),
+        fontweight="bold",
+        zorder=20,
+        gid="metric-label-top",
+    )
+
+
 STRATEGY_PLOT_ORDER = (
     "no_recovery_single",
     "no_recovery_double",
@@ -52,14 +154,17 @@ STRATEGY_PLOT_ORDER = (
     "recovery_ghost",
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
-    "recovery_replaceme_ls",
+    "recovery_ghost_interval_sequential_grouped",
+    "recovery_ghost_interval_sequential_autogroup",
     "recovery_replaceme_cos",
+    "recovery_replaceme_ls",
+    "recovery_streamline_ffn",
     "recovery_lora",
     "recovery_train",
-    "gt_single",
-    "gt_double",
-    "ours_single",
-    "ours_double",
+    "retention_single",
+    "retention_double",
+    "CKA_single",
+    "CKA_double",
     "cosine_single",
     "cosine_double",
     "inv_mse_single",
@@ -69,21 +174,22 @@ STRATEGY_PLOT_ORDER = (
     "replaceme_single",
     "replaceme_double",
     "shortgpt",
+    "gardener",
     "simpler",
 )
 RECOVERY_METHOD_ORDER = tuple(
     method for method in STRATEGY_PLOT_ORDER if method.startswith("recovery_")
 )
 STRATEGY_PLOT_COLORS = {
-    "ours": "#d62728",
-    "ours_single": "#d62728",
-    "ours_double": "#d62728",
+    "CKA": "#d62728",
+    "CKA_single": "#d62728",
+    "CKA_double": "#d62728",
     "cosine": "#ff7f0e",
     "cosine_single": "#ff7f0e",
     "cosine_double": "#ff7f0e",
-    "gt": "#1f77b4",
-    "gt_single": "#1f77b4",
-    "gt_double": "#1f77b4",
+    "retention": "#1f77b4",
+    "retention_single": "#1f77b4",
+    "retention_double": "#1f77b4",
     "replaceme": "#2ca02c",
     "replaceme_single": "#2ca02c",
     "replaceme_double": "#2ca02c",
@@ -94,6 +200,7 @@ STRATEGY_PLOT_COLORS = {
     "cca_single": "#17becf",
     "cca_double": "#17becf",
     "shortgpt": "#8c564b",
+    "gardener": "#bcbd22",
     "simpler": "#e377c2",
     "no_recovery_single": "#1f77b4",
     "no_recovery_double": "#1f77b4",
@@ -102,28 +209,32 @@ STRATEGY_PLOT_COLORS = {
     "recovery_linearpatch": "#ff7f0e",
     "recovery_ghost": "#9467bd",
     "recovery_ghost_interval": "#2ca02c",
-    "recovery_ghost_interval_sequential": "#17becf",
+    "recovery_ghost_interval_sequential": "#aec7e8",
+    "recovery_ghost_interval_sequential_grouped": "#c49c94",
+    "recovery_ghost_interval_sequential_autogroup": "#d62728",
     "recovery_replaceme_ls": "#8c564b",
-    "recovery_replaceme_cos": "#d62728",
+    "recovery_replaceme_cos": "#17becf",
+    "recovery_streamline_ffn": "#e377c2",
     "recovery_lora": "#7f7f7f",
     "recovery_train": "#bcbd22",
 }
 
 PRUNING_METHOD_LABELS = {
-    "gt": "GT",
-    "ours": "Ours_CKA",
+    "retention": "Retention",
+    "CKA": "CKA",
     "replaceme": "ReplaceMe",
     "shortgpt": "ShortGPT",
+    "gardener": "Gardener",
     "simpler": "SIMPLER",
-    "cosine": "Ours_Cosine",
-    "inv_mse": "Ours_INV_MSE",
-    "cca": "Ours_CCA",
+    "cosine": "Cosine",
+    "inv_mse": "INV_MSE",
+    "cca": "CCA",
 }
-OURS_PRUNING_FAMILIES = frozenset({"ours", "cosine", "inv_mse", "cca"})
+CKA_PRUNING_FAMILIES = frozenset({"CKA", "cosine", "inv_mse", "cca"})
 
 
 def pruning_strategy_family(strategy_key: str) -> str:
-    key = str(strategy_key).strip().lower()
+    key = canonical_pruning_strategy_key(strategy_key)
     for suffix in ("_single", "_double"):
         if key.endswith(suffix):
             return key[: -len(suffix)]
@@ -135,32 +246,32 @@ def pruning_average_strategy_keys(
     group: str,
 ) -> tuple[str, ...]:
     """Select a method-family or interval-structure average-plot group."""
-    normalized_group = str(group).strip().lower().replace("-", "_")
+    normalized_group = str(group).strip().casefold().replace("-", "_")
     if normalized_group not in {
         "all",
-        "ours",
-        "ours_single",
-        "ours_multi",
+        "cka",
+        "cka_single",
+        "cka_multi",
         "others",
         "single",
         "non_single",
     }:
         raise ValueError(
             f"unsupported pruning average strategy group {group!r}; "
-            "expected all, ours, ours_single, ours_multi, others, single, "
+            "expected all, CKA, CKA_single, CKA_multi, others, single, "
             "or non_single"
         )
     if normalized_group in {"single", "non_single"}:
         return pruning_structure_strategy_keys(strategy_keys, normalized_group)
-    if normalized_group in {"ours_single", "ours_multi"}:
-        want_single = normalized_group == "ours_single"
+    if normalized_group in {"cka_single", "cka_multi"}:
+        want_single = normalized_group == "cka_single"
         return tuple(
             str(strategy_key)
             for strategy_key in strategy_keys
             if (
-                pruning_strategy_family(str(strategy_key)) == "gt"
+                pruning_strategy_family(str(strategy_key)) == "retention"
                 or pruning_strategy_family(str(strategy_key))
-                in OURS_PRUNING_FAMILIES
+                in CKA_PRUNING_FAMILIES
             )
             and strategy_is_single_interval(str(strategy_key)) == want_single
         )
@@ -170,17 +281,14 @@ def pruning_average_strategy_keys(
         family = pruning_strategy_family(key)
         if (
             normalized_group == "all"
-            or family == "gt"
+            or family == "retention"
             or (
-                normalized_group == "ours"
-                and family in OURS_PRUNING_FAMILIES
+                normalized_group == "cka"
+                and family in CKA_PRUNING_FAMILIES
             )
             or (
                 normalized_group == "others"
-                and (
-                    family == "ours"
-                    or family not in OURS_PRUNING_FAMILIES
-                )
+                and family not in CKA_PRUNING_FAMILIES
             )
         ):
             selected.append(key)
@@ -238,11 +346,23 @@ def strategy_plot_marker(strategy_key: str) -> str:
 
 def strategy_plot_marker_offset(strategy_key: str) -> float:
     """Horizontally dodge markers without moving their underlying data line."""
-    return -0.12 if strategy_is_single_interval(strategy_key) else 0.12
+    return -0.24 if strategy_is_single_interval(strategy_key) else 0.24
+
+
+OURS_CURVE_ZORDER = 20.0
+OURS_MARKER_ZORDER = 22.0
+
+
+def display_name_is_ours(display_name: str) -> bool:
+    """Identify publication curves that belong to the Ours family."""
+    label = str(display_name).strip()
+    return label == "Ours" or label.startswith(("Ours(", "Ours ", "Ours·"))
 
 
 def strategy_plot_zorder(strategy_key: str) -> float:
     """Keep dashed/dotted curves visible above potentially coincident solids."""
+    if "ghost_interval_sequential_autogroup" in str(strategy_key).lower():
+        return OURS_CURVE_ZORDER
     return 3.0 if strategy_plot_linestyle(strategy_key) != "-" else 2.0
 
 
@@ -369,43 +489,214 @@ def _fit_pruning_normalization_profile(
     summaries: dict[str, dict[str, Any]],
     upper_average: dict[str, Any],
     result_root: Path,
+    max_drop_count: Optional[int],
 ) -> dict[str, Any]:
+    """Fit visualization bounds from all Stage-2 contiguous intervals in scope."""
     maxima: dict[str, float] = {}
     counts: dict[str, int] = {}
+    worst_sources: dict[str, dict[str, Any]] = {}
+    candidates: list[dict[str, Any]] = []
+    for selector, summary in summaries.items():
+        match = re.fullmatch(r"i([1-9]\d*)_j([1-9]\d*)", str(selector))
+        if match is None or not isinstance(summary, dict):
+            continue
+        start, end = int(match.group(1)), int(match.group(2))
+        if end < start:
+            continue
+        drop_count = end - start + 1
+        if max_drop_count is not None and drop_count > int(max_drop_count):
+            continue
+        candidates.append(
+            {
+                "selector": str(selector),
+                "drop_count": drop_count,
+                "metrics_mean": summary.get("metrics_mean", {}),
+                "summary_path": summary.get("summary_path", ""),
+            }
+        )
     for metric_key in GT_METRIC_KEYS:
-        values: list[float] = []
-        for selector, summary in summaries.items():
-            match = re.fullmatch(r"i([1-9]\d*)_j(\d+)", str(selector))
-            if match is None or int(match.group(2)) < int(match.group(1)):
+        values: list[tuple[float, dict[str, Any]]] = []
+        for candidate in candidates:
+            drop_count = candidate.get("drop_count")
+            if not isinstance(drop_count, (int, float)):
                 continue
-            drop_count = int(match.group(2)) - int(match.group(1)) + 1
-            if drop_count > NORMALIZATION_MAX_DROP_COUNT:
-                continue
-            if not isinstance(summary, dict):
-                continue
-            metrics = summary.get("metrics_mean", {})
+            metrics = candidate.get("metrics_mean", {})
             current = metric_value(metrics, metric_key) if isinstance(metrics, dict) else None
             if current is None:
                 continue
             if math.isfinite(float(current)):
-                values.append(float(current))
+                values.append((float(current), candidate))
         if values:
-            maxima[metric_key] = float(max(values))
+            maximum, source = max(
+                values,
+                key=lambda item: (
+                    item[0],
+                    int(item[1].get("drop_count", 0)),
+                    str(item[1].get("selector", "")),
+                ),
+            )
+            maxima[metric_key] = float(maximum)
             counts[metric_key] = len(values)
+            worst_sources[metric_key] = {
+                "value": float(maximum),
+                "drop_count": int(source.get("drop_count", 0)),
+                "selector": str(source.get("selector", "")),
+                "summary_path": str(source.get("summary_path", "")),
+            }
+    signature_payload = {
+        "upper_average": {
+            key: metric_value(upper_average, key) for key in GT_METRIC_KEYS
+        },
+        "max_drop_budget": max_drop_count,
+        "candidates": [
+            {
+                "drop_count": int(candidate.get("drop_count", 0)),
+                "selector": str(candidate.get("selector", "")),
+                "metrics_mean": candidate.get("metrics_mean", {}),
+            }
+            for candidate in candidates
+        ],
+    }
+    input_signature = hashlib.sha256(
+        json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
     return {
-        "method": "pruning_single_interval_raw_metric_max",
+        "schema_version": PRUNING_NORMALIZATION_PROFILE_SCHEMA_VERSION,
+        "method": "stage2_brute_force_all_interval_raw_metric_max",
         "source": str(result_root),
-        "max_drop_budget": NORMALIZATION_MAX_DROP_COUNT,
-        "candidate_scope": "single_intervals_with_drop_count_at_most_24",
+        "source_dataset": Path(result_root).parent.parent.name,
+        "input_signature": input_signature,
+        "max_drop_budget": max_drop_count,
+        "candidate_scope": "stage2_contiguous_intervals_with_drop_count_at_most_max_drop_budget",
         "upper_average": {
             key: value
             for key in GT_METRIC_KEYS
             for value in [metric_value(upper_average, key)]
             if value is not None
         },
+        "maximum_brute_force_metric": maxima,
+        # Compatibility aliases for older consumers.
+        "maximum_selected_pruning_metric": maxima,
         "maximum_single_interval_metric": maxima,
+        "worst_source_by_metric": worst_sources,
+        "candidate_points": [
+            {
+                "drop_count": int(candidate.get("drop_count", 0)),
+                "selector": str(candidate.get("selector", "")),
+                "summary_path": str(candidate.get("summary_path", "")),
+            }
+            for candidate in candidates
+        ],
         "candidate_counts": counts,
     }
+
+
+def _write_normalization_profile(result_root: Path, profile: dict[str, Any]) -> Path:
+    output = Path(result_root) / PRUNING_NORMALIZATION_PROFILE_FILENAME
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(profile, handle, indent=2)
+            handle.write("\n")
+        os.replace(temp_name, output)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+    return output
+
+
+def _load_normalization_profile(result_root: Path) -> Optional[dict[str, Any]]:
+    path = Path(result_root) / PRUNING_NORMALIZATION_PROFILE_FILENAME
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(saved, dict):
+        return None
+    if saved.get("schema_version") != PRUNING_NORMALIZATION_PROFILE_SCHEMA_VERSION:
+        return None
+    # Stage 2 is the sole authority for normalization bounds.  Profiles from
+    # older plan-dependent schemes are deliberately ignored.
+    saved["profile_path"] = str(path)
+    return saved
+
+
+def _normalization_profile_maxima(profile: dict[str, Any]) -> dict[str, Any]:
+    maxima = profile.get(
+        "maximum_brute_force_metric",
+        profile.get(
+            "maximum_selected_pruning_metric",
+            profile.get("maximum_single_interval_metric", {}),
+        ),
+    )
+    return maxima if isinstance(maxima, dict) else {}
+
+
+def _adapt_normalization_profile_to_dataset(
+    profile: dict[str, Any],
+    *,
+    dataset: str,
+    upper_average: dict[str, Any],
+) -> dict[str, Any]:
+    """Reuse a calibration Stage-2 span, anchored at this split's upper model."""
+    source_upper = profile.get("upper_average", {})
+    source_maxima = _normalization_profile_maxima(profile)
+    if not isinstance(source_upper, dict):
+        source_upper = {}
+    maxima: dict[str, float] = {}
+    adapted_upper: dict[str, float] = {}
+    for metric in GT_METRIC_KEYS:
+        source_min = metric_value(source_upper, metric)
+        source_max = metric_value(source_maxima, metric)
+        target_min = metric_value(upper_average, metric)
+        if source_min is None or source_max is None or target_min is None:
+            continue
+        span = max(0.0, float(source_max) - float(source_min))
+        adapted_upper[metric] = float(target_min)
+        maxima[metric] = float(target_min) + span
+    result = deepcopy(profile)
+    result["normalization_source_dataset"] = str(
+        profile.get("source_dataset", dataset)
+    )
+    result["applied_dataset"] = str(dataset)
+    result["source_upper_average"] = deepcopy(source_upper)
+    result["source_maximum_brute_force_metric"] = deepcopy(source_maxima)
+    result["upper_average"] = adapted_upper
+    result["maximum_brute_force_metric"] = maxima
+    result["maximum_selected_pruning_metric"] = maxima
+    result["maximum_single_interval_metric"] = maxima
+    return result
+
+
+def _normalization_profile_for_dataset(
+    *,
+    experiment_root: Path,
+    dataset: str,
+    result_root: Path,
+    upper_average: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    source_dataset = CALIBRATION_DATASET_BY_DATASET.get(str(dataset), str(dataset))
+    source_root = (
+        Path(result_root)
+        if source_dataset == str(dataset)
+        else Path(experiment_root) / source_dataset / "eval" / "pruning"
+    )
+    profile = _load_normalization_profile(source_root)
+    if profile is None:
+        return None
+    return _adapt_normalization_profile_to_dataset(
+        profile,
+        dataset=str(dataset),
+        upper_average=upper_average,
+    )
 
 
 def _apply_metric_profile_to_point(
@@ -417,7 +708,7 @@ def _apply_metric_profile_to_point(
     metrics = point.get("metrics_mean", {})
     if not isinstance(metrics, dict):
         return
-    maxima = profile.get("maximum_single_interval_metric", {})
+    maxima = _normalization_profile_maxima(profile)
     if not isinstance(maxima, dict):
         maxima = {}
     raw: dict[str, float] = {}
@@ -432,11 +723,13 @@ def _apply_metric_profile_to_point(
             raw[metric_key] = raw_value
         maximum = maxima.get(metric_key)
         if maximum is not None and math.isfinite(raw_value):
-            denominator = float(maximum) - float(upper)
-            normalized[metric_key] = (
-                (raw_value - float(upper)) / denominator
-                if math.isfinite(denominator) and denominator > 0.0
-                else 0.0
+            normalized[metric_key] = float(
+                normalize_raw_metric_against_upper_worst(
+                    np.asarray([raw_value], dtype=np.float64),
+                    upper_baseline=float(upper),
+                    worst_value=float(maximum),
+                    clamp_better_than_upper=False,
+                )[0]
             )
     point["raw_metric"] = raw
     point["normalized_metric"] = normalized
@@ -447,7 +740,7 @@ def _normalize_metric_map(
     values: dict[str, Any],
     profile: dict[str, Any],
 ) -> dict[str, float]:
-    maxima = profile.get("maximum_single_interval_metric", {})
+    maxima = _normalization_profile_maxima(profile)
     upper_average = profile.get("upper_average", {})
     if not isinstance(maxima, dict):
         return {}
@@ -460,11 +753,14 @@ def _normalize_metric_map(
         maximum = maxima.get(metric_key)
         if value is None or upper is None or maximum is None:
             continue
-        denominator = float(maximum) - float(upper)
-        if math.isfinite(denominator) and denominator > 0.0:
-            normalized[metric_key] = (
-                float(value) - float(upper)
-            ) / denominator
+        normalized[metric_key] = float(
+            normalize_raw_metric_against_upper_worst(
+                np.asarray([float(value)], dtype=np.float64),
+                upper_baseline=float(upper),
+                worst_value=float(maximum),
+                clamp_better_than_upper=False,
+            )[0]
+        )
     return normalized
 
 
@@ -528,11 +824,6 @@ def collect_pruning_eval_payload(
         if requested_datasets is not None and dataset not in requested_datasets:
             continue
         upper_average = load_upper_average_for_result_root(result_root)
-        normalization_profile = _fit_pruning_normalization_profile(
-            summaries=summaries,
-            upper_average=upper_average,
-            result_root=result_root,
-        )
         strategy_payload: dict[str, Any] = {}
         for strategy_key, strategy_record in strategies.items():
             display_name = str(strategy_record.get("display_name", strategy_key))
@@ -584,16 +875,42 @@ def collect_pruning_eval_payload(
                     "metrics_mean": metrics_mean,
                     "relative_to_upper": relative,
                 }
-                _apply_metric_profile_to_point(
-                    point_payload,
-                    upper_average=upper_average,
-                    profile=normalization_profile,
-                )
                 points_payload[str(drop_count)] = point_payload
             strategy_payload[strategy_key] = {
                 "display_name": display_name,
                 "points": points_payload,
             }
+        normalization_profile = _normalization_profile_for_dataset(
+            experiment_root=Path(experiment_root),
+            dataset=dataset,
+            result_root=result_root,
+            upper_average=upper_average,
+        )
+        if normalization_profile is None and (
+            CALIBRATION_DATASET_BY_DATASET.get(dataset, dataset) == dataset
+        ):
+            fallback = _fit_pruning_normalization_profile(
+                summaries=summaries,
+                upper_average=upper_average,
+                result_root=result_root,
+                max_drop_count=DEFAULT_NORMALIZATION_MAX_DROP,
+            )
+            normalization_profile = _adapt_normalization_profile_to_dataset(
+                fallback,
+                dataset=dataset,
+                upper_average=upper_average,
+            )
+        normalization_profile = normalization_profile or {}
+        for strategy in strategy_payload.values():
+            points = strategy.get("points", {}) if isinstance(strategy, dict) else {}
+            for point in points.values() if isinstance(points, dict) else ():
+                if not isinstance(point, dict) or not point.get("available", False):
+                    continue
+                _apply_metric_profile_to_point(
+                    point,
+                    upper_average=upper_average,
+                    profile=normalization_profile,
+                )
         dataset_payloads[dataset] = {
             "result_root": str(result_root),
             "upper_average": upper_average,
@@ -602,9 +919,12 @@ def collect_pruning_eval_payload(
             ),
             "normalization_profile": normalization_profile,
             "normalization_bounds": {
-                metric: {"min": 0.0, "max": float(maximum)}
-                for metric, maximum in normalization_profile.get(
-                    "maximum_single_interval_metric", {}
+                metric: {
+                    "min": float(metric_value(upper_average, metric) or 0.0),
+                    "max": float(maximum),
+                }
+                for metric, maximum in _normalization_profile_maxima(
+                    normalization_profile
                 ).items()
             },
             "strategies": strategy_payload,
@@ -623,11 +943,12 @@ def collect_recovery_eval_payload(
     *,
     experiment_root: Path,
     prune_strategy: Optional[str] = None,
+    prune_plan_root: Optional[Path] = None,
 ) -> dict[str, Any]:
-    selected_prune_strategy = str(prune_strategy or "").strip().lower()
+    selected_prune_strategy = canonical_pruning_strategy_key(prune_strategy or "")
     expected_selector_by_drop: dict[int, str] = {}
     try:
-        current_bundle = load_prune_plan_bundle(Path(experiment_root))
+        current_bundle = load_prune_plan_bundle(Path(prune_plan_root or experiment_root))
     except (FileNotFoundError, ValueError, KeyError, json.JSONDecodeError):
         current_bundle = {}
     expected_records: dict[str, Any] = {}
@@ -780,10 +1101,14 @@ def add_recovery_comparison_strategies(
                 for drop_key, point in points.items()
                 if isinstance(point, dict) and bool(point.get("available", False))
             )
-        gt_source_key = (
-            "gt_double" if "gt_double" in pruning_strategies else "gt"
+        retention_source_key = (
+            "retention_double"
+            if "retention_double" in pruning_strategies
+            else "retention"
         )
-        selected_prune_strategy = str(prune_strategy or "").strip().lower()
+        selected_prune_strategy = canonical_pruning_strategy_key(
+            prune_strategy or ""
+        )
         comparison_specs: list[tuple[str, str, str]] = []
         if selected_prune_strategy and selected_prune_strategy in pruning_strategies:
             source_payload = pruning_strategies.get(selected_prune_strategy, {})
@@ -795,28 +1120,28 @@ def add_recovery_comparison_strategies(
             comparison_specs.append(
                 (selected_prune_strategy, "no_recovery", f"No recovery · {display_name}")
             )
-        elif "ours_single" in pruning_strategies:
+        elif "CKA_single" in pruning_strategies:
             comparison_specs.append(
                 (
-                    "ours_single",
+                    "CKA_single",
                     "no_recovery_single",
                     "No recovery · CKA single",
                 )
             )
-        if not selected_prune_strategy and "ours_double" in pruning_strategies:
+        if not selected_prune_strategy and "CKA_double" in pruning_strategies:
             comparison_specs.append(
                 (
-                    "ours_double",
+                    "CKA_double",
                     "no_recovery_double",
                     "No recovery · CKA double",
                 )
             )
-        # Backward compatibility for plan bundles written before explicit
-        # single/double CKA strategy variants were introduced.
-        if not comparison_specs and "ours" in pruning_strategies:
-            comparison_specs.append(("ours", "no_recovery", "No recovery"))
+        if not comparison_specs and "CKA" in pruning_strategies:
+            comparison_specs.append(("CKA", "no_recovery", "No recovery · CKA"))
         if dataset in gt_route_datasets:
-            comparison_specs.insert(0, (gt_source_key, "gt_drop", "GT route"))
+            comparison_specs.insert(
+                0, (retention_source_key, "gt_drop", "GT route")
+            )
         for source_key, comparison_key, display_name in comparison_specs:
             source = pruning_strategies.get(source_key)
             if not isinstance(source, dict):
@@ -853,7 +1178,17 @@ def add_recovery_comparison_strategies(
             if isinstance(pruning_dataset, dict)
             else {}
         )
-        maxima = profile.get("maximum_single_interval_metric", {}) if isinstance(profile, dict) else {}
+        maxima = (
+            profile.get(
+                "maximum_brute_force_metric",
+                profile.get(
+                    "maximum_selected_pruning_metric",
+                    profile.get("maximum_single_interval_metric", {}),
+                ),
+            )
+            if isinstance(profile, dict)
+            else {}
+        )
         if not isinstance(maxima, dict) or not maxima:
             dataset_payload["normalization_skip_reason"] = (
                 "missing_complete_pruning_normalization_profile"
@@ -865,7 +1200,10 @@ def add_recovery_comparison_strategies(
             dataset_payload["normalization_incomplete_metrics"] = missing_metrics
         dataset_payload["normalization_profile"] = deepcopy(profile)
         dataset_payload["normalization_bounds"] = {
-            metric: {"min": 0.0, "max": float(maxima[metric])}
+            metric: {
+                "min": float(metric_value(profile.get("upper_average", {}), metric) or 0.0),
+                "max": float(maxima[metric]),
+            }
             for metric in GT_METRIC_KEYS
             if metric in maxima
         }
@@ -946,6 +1284,7 @@ def _with_dataset_average(payload: dict[str, Any]) -> dict[str, Any]:
     upper_values: dict[str, list[float]] = {}
     normalized_upper_values: dict[str, list[float]] = {}
     normalization_bound_values: dict[str, list[float]] = {}
+    normalization_bound_min_values: dict[str, list[float]] = {}
     for dataset_payload in payload.get("datasets", {}).values():
         upper_average = dataset_payload.get("upper_average", {})
         if isinstance(upper_average, dict):
@@ -965,7 +1304,12 @@ def _with_dataset_average(payload: dict[str, Any]) -> dict[str, Any]:
         normalization_bounds = dataset_payload.get("normalization_bounds", {})
         if isinstance(normalization_bounds, dict):
             for metric_key, bounds in normalization_bounds.items():
+                minimum = bounds.get("min") if isinstance(bounds, dict) else None
                 maximum = bounds.get("max") if isinstance(bounds, dict) else None
+                if isinstance(minimum, (int, float)) and math.isfinite(float(minimum)):
+                    normalization_bound_min_values.setdefault(str(metric_key), []).append(
+                        float(minimum)
+                    )
                 if isinstance(maximum, (int, float)) and math.isfinite(float(maximum)):
                     normalization_bound_values.setdefault(str(metric_key), []).append(
                         float(maximum)
@@ -1070,7 +1414,10 @@ def _with_dataset_average(payload: dict[str, Any]) -> dict[str, Any]:
             if values
         },
         "normalization_bounds": {
-            metric_key: {"min": 0.0, "max": float(np.mean(values))}
+            metric_key: {
+                "min": float(np.mean(normalization_bound_min_values.get(metric_key, [0.0]))),
+                "max": float(np.mean(values)),
+            }
             for metric_key, values in sorted(normalization_bound_values.items())
             if values
         },
@@ -1090,70 +1437,6 @@ def _display_names(payload: dict[str, Any]) -> dict[str, str]:
             if isinstance(strategy_payload, dict):
                 out[str(key)] = str(strategy_payload.get("display_name", key))
     return out
-
-
-def write_recovery_eval_plots(
-    *,
-    experiment_root: Path,
-    backbone: str,
-    payload: dict[str, Any],
-) -> list[Path]:
-    written: list[Path] = []
-    prune_strategy = str(payload.get("prune_strategy", "")).strip()
-    datasets = payload.get("datasets", {})
-    if isinstance(datasets, dict):
-        for dataset, dataset_payload in sorted(datasets.items()):
-            if not isinstance(dataset_payload, dict):
-                continue
-            result_root_raw = str(dataset_payload.get("result_root", "")).strip()
-            if not result_root_raw:
-                continue
-            result_root = Path(result_root_raw)
-            safe_ds = str(dataset).replace("/", "_").replace(" ", "_")
-            plot_root = (
-                result_root / "_plots" / prune_strategy
-                if prune_strategy
-                else result_root.parent
-            )
-            out_path = plot_root / f"recovery_plan_{safe_ds}_recovery_drop.png"
-            path = _write_strategy_metric_plot(
-                payload=dataset_payload,
-                out_path=out_path,
-                title=f"{backbone} / {dataset}: recovery strategies vs upper",
-                metric_grid=RECOVERY_METRIC_GRID,
-            )
-            if path is not None:
-                written.append(path)
-                if not prune_strategy:
-                    for legacy_path in (
-                        result_root / f"recovery_plan_{safe_ds}_recovery_drop.png",
-                        result_root / f"{safe_ds}_recovery_drop.png",
-                    ):
-                        if legacy_path.is_file():
-                            legacy_path.unlink()
-    average = payload.get("dataset_average", {})
-    if isinstance(average, dict):
-        safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
-        out_path = (
-            Path(experiment_root)
-            / (Path("recovery") / "_plots" / prune_strategy if prune_strategy else Path())
-            / f"recovery_plan_{safe_backbone}_recovery_drop.png"
-        )
-        path = _write_strategy_metric_plot(
-            payload=average,
-            out_path=out_path,
-            title=f"{backbone}: recovery strategies averaged over datasets",
-            metric_grid=RECOVERY_METRIC_GRID,
-        )
-        if path is not None:
-            written.append(path)
-            legacy_path = (
-                Path(experiment_root)
-                / f"prune_plan_{safe_backbone}_recovery_drop.png"
-            )
-            if legacy_path.is_file():
-                legacy_path.unlink()
-    return written
 
 
 def write_source_pruning_eval_plots(
@@ -1343,23 +1626,23 @@ def _write_split_pruning_group_plots(
     written: list[Path] = []
     plot_groups = (
         (
-            "ours_single",
-            "Ours methods + GT (Single)",
-            pruning_average_strategy_keys(strategy_keys, "ours_single"),
+            "CKA_single",
+            "Similarity methods + Retention (Single)",
+            pruning_average_strategy_keys(strategy_keys, "CKA_single"),
         ),
         (
-            "ours_multi",
-            "Ours methods + GT (Multi)",
-            pruning_average_strategy_keys(strategy_keys, "ours_multi"),
+            "CKA_multi",
+            "Similarity methods + Retention (Multi)",
+            pruning_average_strategy_keys(strategy_keys, "CKA_multi"),
         ),
         (
-            "ours",
-            "Ours methods + GT (Single and Multi)",
-            pruning_average_strategy_keys(strategy_keys, "ours"),
+            "CKA",
+            "Similarity methods + Retention (Single and Multi)",
+            pruning_average_strategy_keys(strategy_keys, "CKA"),
         ),
         (
             "others",
-            "Ours_CKA + GT + other baselines (Single and Multi)",
+            "Retention + other baselines (Single and Multi)",
             pruning_average_strategy_keys(strategy_keys, "others"),
         ),
     )
@@ -1401,9 +1684,9 @@ def write_gt_degradation_plot(
     safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
     strategies = average.get("strategies", {})
     strategy_key = (
-        "gt_double"
-        if isinstance(strategies, dict) and "gt_double" in strategies
-        else "gt"
+        "retention_double"
+        if isinstance(strategies, dict) and "retention_double" in strategies
+        else "retention"
     )
     return _write_strategy_metric_plot(
         payload=average,
@@ -1420,7 +1703,7 @@ def write_gt_degradation_plot(
 def gt_mean_degradation_series(
     payload: dict[str, Any],
     *,
-    strategy_key: str = "gt",
+    strategy_key: str = "retention",
 ) -> list[tuple[int, float]]:
     """Extract the same averaged GT curve used by the gt_mean plot panel."""
     average = payload.get("dataset_average", {})
@@ -1474,11 +1757,23 @@ def render_strategy_metric_figure(
     subplot_width: Optional[float] = None,
     subplot_box_aspect: Optional[float] = None,
     strategy_style_overrides: Optional[dict[str, dict[str, Any]]] = None,
-    shared_xlabel: Optional[str] = "Dropped units",
+    default_linewidth: Optional[float] = None,
+    upper_linewidth: float = 1.2,
+    draw_solid_before_dashed: bool = False,
+    dodge_structure_markers: bool = True,
+    shared_xlabel: Optional[str] = "Dropped Layers",
     bottom_row_xlabel: Optional[str] = None,
+    all_axes_xlabel: bool = False,
     show_figure_title: bool = True,
     show_metric_titles: bool = True,
     metric_labels_as_ylabels: bool = False,
+    metric_ylabel: Optional[str] = None,
+    y_tick_percentage: bool = False,
+    y_tick_max_decimals: Optional[int] = None,
+    cap_y_at_normalization_max: bool = True,
+    minimum_y_axis_upper: Optional[float] = None,
+    fixed_y_axis_upper: Optional[float] = None,
+    upper_anchor_bottom_margin_fraction: Optional[float] = None,
     x_tick_step: Optional[float] = None,
     tick_label_fontsize: float = 10.0,
     axis_label_fontsize: float = 11.0,
@@ -1498,6 +1793,8 @@ def render_strategy_metric_figure(
     combine_compact_legend: bool = False,
     shared_ylabel: Optional[str] = None,
     figure_height_per_row: float = PUBLICATION_METRIC_SUBPLOT_HEIGHT,
+    fixed_layout_margins: Optional[tuple[float, float, float, float]] = None,
+    fixed_layout_wspace: Optional[float] = None,
 ) -> Optional[Any]:
     """Render a strategy metric figure without reading or writing a cached PNG."""
     strategies = payload.get("strategies", {})
@@ -1522,6 +1819,11 @@ def render_strategy_metric_figure(
             ),
         )
     )
+    if draw_solid_before_dashed:
+        strategies = dict(sorted(
+            strategies.items(),
+            key=lambda item: strategy_plot_linestyle(str(item[0])) != "-",
+        ))
     upper_average = payload.get("upper_average", {})
     if not isinstance(upper_average, dict):
         upper_average = {}
@@ -1536,7 +1838,11 @@ def render_strategy_metric_figure(
     try:
         import matplotlib.pyplot as plt  # type: ignore
         from matplotlib.lines import Line2D  # type: ignore
-        from matplotlib.ticker import MaxNLocator, MultipleLocator  # type: ignore
+        from matplotlib.ticker import (  # type: ignore
+            MaxNLocator,
+            MultipleLocator,
+            PercentFormatter,
+        )
     except Exception as exc:
         print(f"[warn] Could not import matplotlib for strategy eval plot: {exc}", flush=True)
         return None
@@ -1605,7 +1911,7 @@ def render_strategy_metric_figure(
                     float(upper_value),
                     linestyle="--",
                     color="#333333",
-                    linewidth=1.2,
+                    linewidth=float(upper_linewidth),
                     alpha=0.7,
                     label=str(upper_label),
                 )
@@ -1677,7 +1983,10 @@ def render_strategy_metric_figure(
                 )
                 linewidth = float(
                     style_override.get(
-                        "linewidth", 2.6 if linestyle != "-" else 2.0
+                        "linewidth",
+                        default_linewidth
+                        if default_linewidth is not None
+                        else (2.6 if linestyle != "-" else 2.0),
                     )
                 )
                 alpha = float(style_override.get("alpha", 0.9))
@@ -1686,6 +1995,8 @@ def render_strategy_metric_figure(
                         "zorder", strategy_plot_zorder(str(strategy_key))
                     )
                 )
+                if display_name_is_ours(display_name):
+                    line_zorder = max(line_zorder, OURS_CURVE_ZORDER)
                 (line,) = ax.plot(
                     xs,
                     ys,
@@ -1702,12 +2013,24 @@ def render_strategy_metric_figure(
                 if dashes is not None:
                     line.set_dashes(dashes)
 
-                marker_offset = strategy_plot_marker_offset(str(strategy_key))
+                structure_marker_offset = (
+                    strategy_plot_marker_offset(str(strategy_key))
+                    if dodge_structure_markers
+                    else 0.0
+                )
+                marker_offset = structure_marker_offset + float(
+                    style_override.get("marker_offset", 0.0)
+                )
                 marker_xs = [
                     float(x) if int(x) == 0 else float(x) + marker_offset
                     for x in xs
                 ]
                 is_single = strategy_is_single_interval(str(strategy_key))
+                marker_zorder = float(
+                    style_override.get("marker_zorder", line_zorder + 2.0)
+                )
+                if display_name_is_ours(display_name):
+                    marker_zorder = max(marker_zorder, OURS_MARKER_ZORDER)
                 ax.scatter(
                     marker_xs,
                     ys,
@@ -1721,9 +2044,7 @@ def render_strategy_metric_figure(
                         )
                     ),
                     alpha=float(style_override.get("marker_alpha", 1.0)),
-                    zorder=float(
-                        style_override.get("marker_zorder", line_zorder + 2.0)
-                    ),
+                    zorder=marker_zorder,
                 )
             if not has_data:
                 ax.axis("off")
@@ -1733,11 +2054,13 @@ def render_strategy_metric_figure(
                 ax.set_title(metric_title, fontsize=11, fontweight="bold")
             if metric_labels_as_ylabels:
                 ax.set_ylabel(
-                    metric_title,
+                    str(metric_ylabel or metric_title),
                     fontsize=float(axis_label_fontsize),
                     fontweight="bold",
                 )
-            if bottom_row_xlabel and row_idx == rows - 1:
+            if bottom_row_xlabel and (
+                all_axes_xlabel or row_idx == rows - 1
+            ):
                 ax.set_xlabel(
                     str(bottom_row_xlabel),
                     fontsize=float(axis_label_fontsize),
@@ -1773,8 +2096,41 @@ def render_strategy_metric_figure(
                     else None
                 )
             axis_upper = 1.0 if metric_normalized_view and raw_axis_upper is not None else raw_axis_upper
-            if axis_upper is not None:
+            if cap_y_at_normalization_max and axis_upper is not None:
                 ax.set_ylim(top=axis_upper)
+            if minimum_y_axis_upper is not None:
+                ax.set_ylim(
+                    top=max(
+                        float(minimum_y_axis_upper),
+                        float(ax.get_ylim()[1]),
+                    )
+                )
+            if fixed_y_axis_upper is not None:
+                ax.set_ylim(top=float(fixed_y_axis_upper))
+            if (
+                upper_anchor_bottom_margin_fraction is not None
+                and upper_value is not None
+            ):
+                margin_fraction = max(
+                    0.0,
+                    float(upper_anchor_bottom_margin_fraction),
+                )
+                current_top = float(ax.get_ylim()[1])
+                upper_scalar = float(upper_value)
+                span_above_upper = current_top - upper_scalar
+                if span_above_upper > 0.0:
+                    ax.set_ylim(
+                        bottom=(
+                            upper_scalar
+                            - margin_fraction * span_above_upper
+                        )
+                    )
+            if y_tick_percentage:
+                ax.yaxis.set_major_formatter(
+                    PercentFormatter(xmax=1.0, decimals=0)
+                )
+            elif y_tick_max_decimals is not None:
+                set_y_axis_max_decimals(ax, y_tick_max_decimals)
             if all_xs:
                 if x_tick_step is not None and float(x_tick_step) > 0:
                     ax.xaxis.set_major_locator(
@@ -1806,8 +2162,13 @@ def render_strategy_metric_figure(
                         Line2D(
                             [],
                             [],
-                            color=STRATEGY_PLOT_COLORS.get(
-                                str(strategy_key), "#333333"
+                            color=style_overrides.get(
+                                str(strategy_key), {}
+                            ).get(
+                                "color",
+                                STRATEGY_PLOT_COLORS.get(
+                                    str(strategy_key), "#333333"
+                                ),
                             ),
                             marker="o",
                             linestyle="None",
@@ -1824,6 +2185,12 @@ def render_strategy_metric_figure(
                     None
                     if compact_structure_labels is None
                     else {str(label) for label in compact_structure_labels}
+                )
+                multi_structure_label = (
+                    "Double"
+                    if shown_structure_labels is not None
+                    and "Double" in shown_structure_labels
+                    else "Multi"
                 )
                 if (
                     shown_structure_labels is None
@@ -1848,7 +2215,11 @@ def render_strategy_metric_figure(
                         linestyle=single_linestyle,
                         marker="o", markerfacecolor="none",
                         markeredgecolor=single_override.get("color", "#222222"),
-                        linewidth=float(single_override.get("linewidth", 2.6)),
+                        linewidth=(
+                            float(default_linewidth)
+                            if default_linewidth is not None
+                            else float(single_override.get("linewidth", 2.6))
+                        ),
                         alpha=float(single_override.get("alpha", 1.0)),
                         label="Single",
                     )
@@ -1860,7 +2231,7 @@ def render_strategy_metric_figure(
                     style_handles.append(single_handle)
                 if (
                     shown_structure_labels is None
-                    or "Multi" in shown_structure_labels
+                    or multi_structure_label in shown_structure_labels
                 ) and any(
                     not strategy_is_single_interval(key)
                     for key in strategy_names
@@ -1869,7 +2240,12 @@ def render_strategy_metric_figure(
                         Line2D(
                             [], [], color="#222222", linestyle="-",
                             marker="s", markerfacecolor="#222222",
-                            linewidth=2.0, label="Multi",
+                            linewidth=(
+                                float(default_linewidth)
+                                if default_linewidth is not None
+                                else 2.0
+                            ),
+                            label=multi_structure_label,
                         )
                     )
                 if combine_compact_legend and (method_handles or style_handles):
@@ -1954,6 +2330,9 @@ def render_strategy_metric_figure(
                     **legend_kwargs,
                 )
                 _style_legend_text(legend)
+    for row_idx, row in enumerate(metric_grid):
+        for col_idx in range(len(row), cols):
+            axes[row_idx][col_idx].axis("off")
     if not any_data:
         plt.close(fig)
         return None
@@ -1983,8 +2362,55 @@ def render_strategy_metric_figure(
             fontweight="bold",
         )
     top = 0.97 if show_figure_title else 0.99
-    fig.tight_layout(rect=(0.01, bottom, 0.99, top), pad=0.7, h_pad=1.0, w_pad=0.8)
+    if fixed_layout_margins is None:
+        fig.tight_layout(
+            rect=(0.01, bottom, 0.99, top),
+            pad=0.7,
+            h_pad=1.0,
+            w_pad=0.8,
+        )
+    else:
+        left, fixed_bottom, right, fixed_top = (
+            float(value) for value in fixed_layout_margins
+        )
+        fig.subplots_adjust(
+            left=left,
+            bottom=fixed_bottom,
+            right=right,
+            top=fixed_top,
+            wspace=(
+                None
+                if fixed_layout_wspace is None
+                else float(fixed_layout_wspace)
+            ),
+        )
     return fig
+
+
+def emphasize_figure(fig: Any, *, linewidth_scale: float = 1.25) -> None:
+    """Bold every label and slightly strengthen every visible figure stroke."""
+    from matplotlib.collections import Collection
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    from matplotlib.spines import Spine
+    from matplotlib.text import Text
+
+    scale = max(1.0, float(linewidth_scale))
+    for text in fig.findobj(match=Text):
+        text.set_fontweight("bold")
+    for line in fig.findobj(match=Line2D):
+        line.set_linewidth(line.get_linewidth() * scale)
+        line.set_markeredgewidth(line.get_markeredgewidth() * scale)
+    for collection in fig.findobj(match=Collection):
+        widths = collection.get_linewidths()
+        if len(widths):
+            collection.set_linewidths(np.asarray(widths) * scale)
+    for patch in fig.findobj(match=Patch):
+        if not isinstance(patch, Spine) and patch.get_linewidth() > 0:
+            patch.set_linewidth(patch.get_linewidth() * scale)
+    for axis in getattr(fig, "axes", ()):
+        for spine in axis.spines.values():
+            spine.set_linewidth(spine.get_linewidth() * scale)
 
 
 def _write_strategy_metric_plot(

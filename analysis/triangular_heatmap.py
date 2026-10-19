@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 
 import numpy as np
-from matplotlib.ticker import MultipleLocator
 
 
 TRIANGLE_EMPTY_LEGEND_LOC = "lower right"
@@ -60,13 +59,17 @@ def configure_triangle_axes(
     ax.set_ylabel(str(ylabel) if ylabel is not None else f"{index_name} index j", **label_kwargs)
     ax.set_xlim(-0.5, float(n) - 0.5)
     ax.set_ylim(-0.5, float(n) - 0.5)
-    if use_major_locator:
-        ax.xaxis.set_major_locator(MultipleLocator(step))
-        ax.yaxis.set_major_locator(MultipleLocator(step))
-    else:
-        ticks = list(range(0, int(n), step))
-        ax.set_xticks(ticks)
-        ax.set_yticks(ticks)
+    # Data coordinates remain zero-based, but every public heatmap displays
+    # one-based layer/unit indices.  Anchor the regular ticks at multiples of
+    # ``step`` and always include both endpoints, especially the maximum index.
+    # Explicit fixed ticks are also required for ``use_major_locator`` callers:
+    # a MultipleLocator anchored at zero would omit the one-based endpoint.
+    del use_major_locator
+    display_ticks = sorted({1, int(n), *range(step, int(n) + 1, step)})
+    tick_positions = [value - 1 for value in display_ticks]
+    tick_labels = [str(value) for value in display_ticks]
+    ax.set_xticks(tick_positions, labels=tick_labels)
+    ax.set_yticks(tick_positions, labels=tick_labels)
 
     tick_kwargs: dict[str, Any] = {}
     if tick_fontsize is not None:

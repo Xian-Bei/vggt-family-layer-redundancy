@@ -10,6 +10,8 @@ from typing import Any, Sequence
 from analysis.prune_plan import (
     bundle_plan_records,
     bundle_strategy_records,
+    canonical_pruning_strategy_key,
+    drop_from_physical_pruning_selector,
     load_named_prune_plan,
     load_prune_plan_bundle,
     physical_pruning_selector_from_drop,
@@ -18,19 +20,91 @@ from analysis.prune_plan import (
 )
 from analysis.prune_plan.eval_plots import (
     GT_MEAN_METRICS,
-    collect_pruning_eval_payload,
     metric_value,
 )
-from analysis.prune_plan.recovery_plan import list_recovery_plan_names
+from analysis.prune_plan.recovery_plan import (
+    TOKEN_GROUPED_RECOVERY_BASE_METHODS,
+    list_recovery_plan_names,
+    recovery_method_semantics_version,
+)
 
 _DERIVED_GHOST_METHODS = {
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
 }
-PRUNE_FAMILY_STRATEGIES = {
-    "ours": ("ours_single", "ours_double"),
-    "gt": ("gt_single", "gt_double"),
+_LEGACY_SINGLE_COMPONENT_SEMANTICS_COMPAT = {
+    "recovery_replaceme_cos",
 }
+_SINGLE_COMPONENT_VERSION_COMPAT = {
+    # Before the official current-target behavior was restored, multi-interval
+    # ReplaceMe Cosine used Full-model targets. The two objectives are identical
+    # for a single interval, so those artifacts remain reusable.
+    "recovery_replaceme_cos": {"current_source_full_target_v2"},
+}
+PRUNE_FAMILY_STRATEGIES = {
+    "CKA": ("CKA_single", "CKA_double"),
+    "retention": ("retention_single", "retention_double"),
+}
+SINGLE_DOUBLE_MEAN_MARGIN = 0.1
+SINGLE_DOUBLE_SELECTION_DATASETS = (
+    "scannet_dev50",
+    "7scenes_train",
+    "nuscenes_train",
+    "waymo_training",
+)
+
+
+def seven_metric_mean_score(metrics: dict[str, Any]) -> float | None:
+    """Return the direct arithmetic mean of the seven raw error metrics."""
+    values = [metric_value(metrics, metric) for metric in GT_MEAN_METRICS]
+    if not all(value is not None for value in values):
+        return None
+    numeric = [float(value) for value in values if value is not None]
+    if not all(math.isfinite(value) for value in numeric):
+        return None
+    return float(sum(numeric) / len(numeric))
+
+
+def single_double_mean_decision(
+    single_score: float,
+    double_score: float,
+    *,
+    margin: float = SINGLE_DOUBLE_MEAN_MARGIN,
+) -> dict[str, Any]:
+    """Prefer Single unless Double lowers the seven-metric mean beyond margin."""
+    single = float(single_score)
+    double = float(double_score)
+    threshold = float(margin)
+    if not all(math.isfinite(value) for value in (single, double, threshold)):
+        raise ValueError("single, double, and margin must be finite")
+    if threshold < 0.0:
+        raise ValueError("margin must be non-negative")
+    double_improvement = single - double
+    winner = "double" if double_improvement > threshold else "single"
+    return {
+        "winner": winner,
+        "single": single,
+        "double": double,
+        "gap": double - single,
+        "double_improvement": double_improvement,
+        "margin": threshold,
+        "margin_override": 0.0 < double_improvement <= threshold,
+    }
+
+
+def _validate_single_prune_family(strategies: Sequence[str]) -> tuple[str, ...]:
+    requested = tuple(dict.fromkeys(str(strategy).strip() for strategy in strategies))
+    matching_families = [
+        family
+        for family, family_strategies in PRUNE_FAMILY_STRATEGIES.items()
+        if requested and set(requested).issubset(family_strategies)
+    ]
+    if len(matching_families) != 1:
+        raise ValueError(
+            "recovery selection candidates must be single/double variants from "
+            "exactly one pruning family"
+        )
+    return requested
 
 
 def best_recovery_result(
@@ -41,7 +115,8 @@ def best_recovery_result(
     recovery_plan_name: str,
     strategies: Sequence[str],
 ) -> dict[str, Any]:
-    """Select the lowest normalized final-recovery score on training datasets."""
+    """Select Single/Double by raw seven-metric mean with a Single margin."""
+    strategies = _validate_single_prune_family(strategies)
     requested_datasets = tuple(dict.fromkeys(str(name).strip() for name in datasets if str(name).strip()))
     if not requested_datasets:
         raise ValueError("at least one selection dataset is required")
@@ -52,10 +127,6 @@ def best_recovery_result(
         raise ValueError("recovery_plan_name is required")
 
     root = Path(plan_root)
-    payload = collect_pruning_eval_payload(experiment_root=root, prune_plan_root=root)
-    dataset_payloads = payload.get("datasets", {})
-    if not isinstance(dataset_payloads, dict):
-        raise ValueError(f"pruning evaluation payload has no datasets under {root}")
     bundle = load_prune_plan_bundle(root)
     strategy_records = bundle_strategy_records(bundle)
     plan_records = bundle_plan_records(bundle)
@@ -83,18 +154,6 @@ def best_recovery_result(
         scores: list[float] = []
         missing: list[str] = []
         for dataset in requested_datasets:
-            dataset_payload = dataset_payloads.get(dataset, {})
-            profile = (
-                dataset_payload.get("normalization_profile", {})
-                if isinstance(dataset_payload, dict)
-                else {}
-            )
-            upper = profile.get("upper_average", {}) if isinstance(profile, dict) else {}
-            maxima = (
-                profile.get("maximum_single_interval_metric", {})
-                if isinstance(profile, dict)
-                else {}
-            )
             method_root = (
                 root / dataset / "eval" / "recovery" / selector / recovery_plan_name
             )
@@ -106,8 +165,12 @@ def best_recovery_result(
                 recorded_drop = -1
             recovery_matches = recorded_recovery == recovery_plan_name or (
                 method_root.is_symlink()
-                and recovery_plan_name in _DERIVED_GHOST_METHODS
-                and recorded_recovery == "recovery_ghost"
+                and _symlink_recovery_alias_matches(
+                    expected=recovery_plan_name,
+                    recorded=recorded_recovery,
+                    selector=selector,
+                    backbone=str(bundle.get("backbone", "")),
+                )
             )
             if (
                 not summary
@@ -118,26 +181,11 @@ def best_recovery_result(
                 missing.append(dataset)
                 continue
             metrics = summary.get("metrics_mean", {})
-            normalized: dict[str, float] = {}
-            for metric in GT_MEAN_METRICS:
-                current = metric_value(metrics, metric) if isinstance(metrics, dict) else None
-                baseline = metric_value(upper, metric) if isinstance(upper, dict) else None
-                maximum = metric_value(maxima, metric) if isinstance(maxima, dict) else None
-                if current is None or baseline is None or maximum is None:
-                    continue
-                denominator = float(maximum) - float(baseline)
-                if math.isfinite(denominator) and denominator > 0.0:
-                    normalized[metric] = (float(current) - float(baseline)) / denominator
-            metric_scores = [
-                value
-                for metric in GT_MEAN_METRICS
-                for value in [metric_value(normalized, metric) if isinstance(normalized, dict) else None]
-                if value is not None and math.isfinite(float(value))
-            ]
-            if len(metric_scores) != len(GT_MEAN_METRICS):
+            score = seven_metric_mean_score(metrics) if isinstance(metrics, dict) else None
+            if score is None:
                 missing.append(dataset)
                 continue
-            scores.append(float(sum(metric_scores) / len(metric_scores)))
+            scores.append(float(score))
         if missing or len(scores) != len(requested_datasets):
             failures.append(f"{strategy}: missing complete metrics for {','.join(missing)}")
             continue
@@ -155,7 +203,33 @@ def best_recovery_result(
     if not candidates:
         detail = "; ".join(failures) if failures else "no candidate strategies"
         raise ValueError(f"no complete recovered candidate at drop {drop_count}: {detail}")
-    best = min(candidates, key=lambda item: (float(item["score"]), int(item["order"])))
+    by_structure = {
+        structure: candidate
+        for candidate in candidates
+        for structure in (
+            "single" if str(candidate["strategy"]).endswith("_single") else
+            "double" if str(candidate["strategy"]).endswith("_double") else "",
+        )
+        if structure
+    }
+    if set(by_structure) == {"single", "double"}:
+        decision = single_double_mean_decision(
+            float(by_structure["single"]["score"]),
+            float(by_structure["double"]["score"]),
+        )
+        best = by_structure[str(decision["winner"])]
+        best = {
+            **best,
+            "single_score": decision["single"],
+            "double_score": decision["double"],
+            "selection_margin": decision["margin"],
+            "margin_override": decision["margin_override"],
+        }
+    else:
+        best = min(
+            candidates,
+            key=lambda item: (float(item["score"]), int(item["order"])),
+        )
     best.pop("order", None)
     return best
 
@@ -211,6 +285,48 @@ def _load_object(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _is_single_contiguous_selector(selector: str) -> bool:
+    """Return whether a canonical physical selector has exactly one component."""
+    try:
+        drop = sorted(
+            {int(index) for index in drop_from_physical_pruning_selector(selector)}
+        )
+    except (TypeError, ValueError):
+        return False
+    return bool(drop) and drop == list(range(drop[0], drop[-1] + 1))
+
+
+def _symlink_recovery_alias_matches(
+    *, expected: str, recorded: str, selector: str, backbone: str = ""
+) -> bool:
+    """Validate only exact recovery aliases that the runners create."""
+    aliases: set[str] = set()
+    if (
+        str(backbone).strip().lower() == "pi3"
+        and expected in TOKEN_GROUPED_RECOVERY_BASE_METHODS
+    ):
+        aliases.add(TOKEN_GROUPED_RECOVERY_BASE_METHODS[expected])
+    if _is_single_contiguous_selector(selector):
+        candidates = {expected, *aliases}
+        if any(candidate in _DERIVED_GHOST_METHODS for candidate in candidates):
+            aliases.add("recovery_ghost")
+    return recorded in aliases
+
+
+def _semantics_compatible(
+    *, method: str, recorded_version: str, selector: str
+) -> bool:
+    expected = recovery_method_semantics_version(method)
+    recorded = str(recorded_version).strip()
+    if not expected or recorded == expected:
+        return True
+    if not _is_single_contiguous_selector(selector):
+        return False
+    if not recorded and method in _LEGACY_SINGLE_COMPONENT_SEMANTICS_COMPAT:
+        return True
+    return recorded in _SINGLE_COMPONENT_VERSION_COMPAT.get(method, set())
+
+
 def recovery_result_complete(
     output_dir: Path,
     *,
@@ -218,6 +334,7 @@ def recovery_result_complete(
     backbone: str,
     selector: str,
     recovery_plan_name: str,
+    expected_fit_signature: str = "",
 ) -> bool:
     output_dir = Path(output_dir)
     checkpoint = output_dir / "checkpoints" / "latest.pt"
@@ -228,15 +345,30 @@ def recovery_result_complete(
         config = _load_object(output_dir / "recovery_summary.json")
     if not config or str(config.get("backbone", "")).strip() != str(backbone).strip():
         return False
+    if expected_fit_signature and str(config.get("fit_signature", "")) != str(
+        expected_fit_signature
+    ):
+        return False
     recorded_recovery = str(
         config.get("recovery_plan_name") or config.get("method") or ""
     ).strip()
     expected_recovery = str(recovery_plan_name).strip()
-    if recorded_recovery != expected_recovery and not (
-        output_dir.is_symlink()
-        and expected_recovery in _DERIVED_GHOST_METHODS
-        and recorded_recovery == "recovery_ghost"
+    if (
+        str(backbone).strip().lower() == "pi3"
+        and expected_recovery in TOKEN_GROUPED_RECOVERY_BASE_METHODS
+        and not output_dir.is_symlink()
     ):
+        return False
+    symlink_alias = (
+        output_dir.is_symlink()
+        and _symlink_recovery_alias_matches(
+            expected=expected_recovery,
+            recorded=recorded_recovery,
+            selector=selector,
+            backbone=backbone,
+        )
+    )
+    if recorded_recovery != expected_recovery and not symlink_alias:
         return False
     recorded_selector = str(config.get("prune_plan_name", "")).strip()
     if not recorded_selector:
@@ -246,7 +378,13 @@ def recovery_result_complete(
         recorded = canonical_selector(plan_root, recorded_selector)
     except (FileNotFoundError, KeyError, TypeError, ValueError):
         return False
-    return recorded == expected
+    if recorded != expected:
+        return False
+    return _semantics_compatible(
+        method=(recorded_recovery if symlink_alias else expected_recovery),
+        recorded_version=str(config.get("recovery_semantics_version", "")),
+        selector=expected,
+    )
 
 
 def eval_result_complete(
@@ -264,10 +402,28 @@ def eval_result_complete(
         return False
     recorded_recovery = str(summary.get("recovery_plan_name", "")).strip()
     expected_recovery = str(recovery_plan_name).strip()
-    return recorded_recovery == expected_recovery or (
+    if (
+        str(record.get("backbone", "")).strip().lower() == "pi3"
+        and expected_recovery in TOKEN_GROUPED_RECOVERY_BASE_METHODS
+        and not output_dir.is_symlink()
+    ):
+        return False
+    symlink_alias = (
         output_dir.is_symlink()
-        and expected_recovery in _DERIVED_GHOST_METHODS
-        and recorded_recovery == "recovery_ghost"
+        and _symlink_recovery_alias_matches(
+            expected=expected_recovery,
+            recorded=recorded_recovery,
+            selector=selector,
+            backbone=str(record.get("backbone", "")),
+        )
+    )
+    recovery_matches = recorded_recovery == expected_recovery or symlink_alias
+    if not recovery_matches:
+        return False
+    return _semantics_compatible(
+        method=(recorded_recovery if symlink_alias else expected_recovery),
+        recorded_version=str(summary.get("recovery_semantics_version", "")),
+        selector=str(selector),
     )
 
 
@@ -280,6 +436,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     recovery.add_argument("--backbone", required=True)
     recovery.add_argument("--selector", required=True)
     recovery.add_argument("--recovery-plan-name", required=True)
+    recovery.add_argument("--fit-signature", default="")
     evaluation = subparsers.add_parser("eval-complete")
     evaluation.add_argument("--output-dir", type=Path, required=True)
     evaluation.add_argument("--selector", required=True)
@@ -299,7 +456,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     best_recovery.add_argument("--datasets", required=True)
     best_recovery.add_argument("--recovery-plan-name", required=True)
     best_recovery.add_argument(
-        "--prune-family", choices=tuple(PRUNE_FAMILY_STRATEGIES), required=True
+        "--prune-family",
+        type=canonical_pruning_strategy_key,
+        choices=tuple(PRUNE_FAMILY_STRATEGIES),
+        required=True,
     )
     args = parser.parse_args(argv)
     if args.command == "recovery-complete":
@@ -309,6 +469,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             backbone=args.backbone,
             selector=args.selector,
             recovery_plan_name=args.recovery_plan_name,
+            expected_fit_signature=args.fit_signature,
         )
     elif args.command == "eval-complete":
         complete = eval_result_complete(

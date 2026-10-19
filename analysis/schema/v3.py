@@ -125,8 +125,6 @@ UNIFIED_METRIC_KEYS = (
     "acc",
     "comp",
     "cd",
-    "inference_time_ms",
-    "infer_peak_vram_gb",
 )
 
 

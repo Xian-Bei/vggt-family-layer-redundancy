@@ -1,4 +1,4 @@
-"""Training-free boundary recovery for pruned LaRe models."""
+"""Cached-boundary recovery fitting for pruned LaRe models."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ import sys
 import tempfile
 import copy
 import hashlib
-from dataclasses import asdict
+import math
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -29,10 +30,12 @@ from analysis.prune_plan import (
     unit_index_to_unit_id,
 )
 from analysis.recovery.operators import (
+    StreamlineFFN,
     apply_recovery_weights,
     compact_recovery_operators,
     fuse_replaceme_transform,
     install_recovery_modules,
+    pack_streamline_ffn_parameters,
     recovery_module_name,
 )
 from analysis.recovery.activation_store import (
@@ -56,21 +59,31 @@ from analysis.redundancy.cache_redundancy_v3 import (
 )
 from analysis.schema.v3 import OUTPUT_ROOT_DEFAULT, stage_dir
 from analysis.prune_plan.recovery_plan import (
-    TRAINING_FREE_RECOVERY_METHODS,
+    CACHE_FIT_RECOVERY_METHODS,
+    TOKEN_GROUPED_RECOVERY_BASE_METHODS,
     compose_recovery_unit_prune_plan,
     load_recovery_plan_bundle,
+    recovery_method_semantics_version,
 )
 
 
 DEFAULT_RECOVERY_CHUNK_ROWS = 16_384
+DEFAULT_GHOST_AUTOGROUP_THRESHOLD = 20.0
 _DERIVED_GHOST_METHODS = {
     "recovery_ghost_interval",
     "recovery_ghost_interval_sequential",
 }
+_SPECIAL_PATCH_GROUPED_GHOST_METHODS = frozenset(
+    {
+        "recovery_ghost_interval_sequential_grouped",
+        "recovery_ghost_interval_sequential_autogroup",
+    }
+)
+_TOKEN_GROUPED_GHOST_METHODS = _SPECIAL_PATCH_GROUPED_GHOST_METHODS
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser("Fit training-free recovery operators for a pruned model.")
+    p = argparse.ArgumentParser("Fit cached-boundary recovery operators for a pruned model.")
     p.add_argument("--experiment", type=str, default="default")
     p.add_argument("--dataset", type=str, required=True)
     p.add_argument("--datasets", type=str, default="")
@@ -83,8 +96,74 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recovery-plan-root", type=Path, default=None)
     p.add_argument("--recovery-plan-name", type=str, required=True)
     p.add_argument("--output-dir", type=Path, default=None)
-    p.add_argument("--max-scenes", type=int, default=0)
+    p.add_argument(
+        "--cache-root",
+        type=Path,
+        default=None,
+        help="Optional shared output root containing <backbone>/<dataset>/cache.",
+    )
+    p.add_argument(
+        "--max-scenes",
+        type=int,
+        default=0,
+        help="Maximum calibration scenes per cache dataset; 0 means all scenes.",
+    )
+    p.add_argument(
+        "--scene-limits",
+        default="",
+        help=(
+            "Optional exact per-dataset quotas as tag=count pairs separated by commas. "
+            "When set, every selected dataset must appear exactly once."
+        ),
+    )
     p.add_argument("--ridge", type=float, default=1e-6)
+    p.add_argument(
+        "--ghost-stability-profile",
+        choices=("legacy", "hybrid", "trace_identity", "trace_all", "native_all"),
+        default="legacy",
+    )
+    p.add_argument("--ghost-special-ridge", type=float, default=0.0)
+    p.add_argument("--ghost-camera-ridge", type=float, default=0.0)
+    p.add_argument("--ghost-register-ridge", type=float, default=0.0)
+    p.add_argument(
+        "--ghost-coupling-profile",
+        choices=("none", "shared_residual", "patch_mean", "shared_residual_patch_mean"),
+        default="none",
+    )
+    p.add_argument("--ghost-residual-ridge", type=float, default=0.0)
+    p.add_argument("--ghost-context-ridge", type=float, default=0.0)
+    p.add_argument(
+        "--ghost-autogroup-threshold",
+        type=float,
+        default=DEFAULT_GHOST_AUTOGROUP_THRESHOLD,
+        help=(
+            "Use grouped special/patch matrices only when "
+            "||Ws-Wall||F/||Wall-I||F is below this value. Used only by "
+            "recovery_ghost_interval_sequential_autogroup."
+        ),
+    )
+    p.add_argument(
+        "--ghost-boundary-fit-mode",
+        choices=(
+            "sequential_current_target",
+            "sequential_full_target",
+            "independent_full_target",
+        ),
+        default="sequential_current_target",
+        help=(
+            "How later interval Ghost boundaries are fit. The default preserves "
+            "the current sequential source/current target behavior."
+        ),
+    )
+    p.add_argument(
+        "--reuse-boundary-prefix-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional compatible recovery checkpoint whose leading boundary "
+            "weights are reused instead of refit."
+        ),
+    )
     p.add_argument(
         "--recovery-chunk-rows",
         type=int,
@@ -96,6 +175,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--replaceme-cos-batch-size", type=int, default=1024)
     p.add_argument("--replaceme-cos-lr", type=float, default=1e-4)
     p.add_argument("--replaceme-seed", type=int, default=0)
+    p.add_argument("--streamline-ffn-epochs", type=int, default=1)
+    p.add_argument("--streamline-ffn-batch-size", type=int, default=16384)
+    p.add_argument("--streamline-ffn-lr", type=float, default=2e-4)
+    p.add_argument("--streamline-ffn-min-lr", type=float, default=5e-6)
+    p.add_argument("--streamline-ffn-weight-decay", type=float, default=1e-3)
+    p.add_argument("--streamline-ffn-expansion", type=int, default=4)
+    p.add_argument("--streamline-ffn-seed", type=int, default=0)
     p.add_argument(
         "--jobs-manifest",
         type=Path,
@@ -109,18 +195,126 @@ def _parse_name_list(raw: str) -> List[str]:
     return [x.strip() for x in str(raw or "").replace(",", " ").split() if x.strip()]
 
 
-_SESSION_SCENES: Dict[Tuple[Tuple[str, ...], int], List[Dict[str, Any]]] = {}
+@dataclass(frozen=True)
+class GhostStabilityConfig:
+    profile: str = "legacy"
+    special_ridge: float = 0.0
+    camera_ridge: float = 0.0
+    register_ridge: float = 0.0
+    coupling_profile: str = "none"
+    residual_ridge: float = 0.0
+    context_ridge: float = 0.0
+
+    def validate(self) -> "GhostStabilityConfig":
+        if self.profile not in {
+            "legacy", "hybrid", "trace_identity", "trace_all", "native_all"
+        }:
+            raise ValueError(f"Unsupported Ghost stability profile: {self.profile!r}")
+        if self.coupling_profile not in {
+            "none", "shared_residual", "patch_mean", "shared_residual_patch_mean"
+        }:
+            raise ValueError(f"Unsupported Ghost coupling profile: {self.coupling_profile!r}")
+        for name, value in (
+            ("special_ridge", self.special_ridge),
+            ("camera_ridge", self.camera_ridge),
+            ("register_ridge", self.register_ridge),
+            ("residual_ridge", self.residual_ridge),
+            ("context_ridge", self.context_ridge),
+        ):
+            if not math.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
+        return self
+
+    def signature_payload(self) -> Dict[str, Any]:
+        return asdict(self.validate())
 
 
-def _load_training_scenes(cache_dirs: Sequence[Path], max_scenes: int) -> List[Dict[str, Any]]:
-    session_key = (tuple(str(Path(path).resolve()) for path in cache_dirs), int(max_scenes))
+def _ghost_stability_config(args: argparse.Namespace) -> GhostStabilityConfig:
+    return GhostStabilityConfig(
+        profile=str(args.ghost_stability_profile),
+        special_ridge=float(args.ghost_special_ridge),
+        camera_ridge=float(args.ghost_camera_ridge),
+        register_ridge=float(args.ghost_register_ridge),
+        coupling_profile=str(args.ghost_coupling_profile),
+        residual_ridge=float(args.ghost_residual_ridge),
+        context_ridge=float(args.ghost_context_ridge),
+    ).validate()
+
+
+_SESSION_SCENES: Dict[
+    Tuple[Tuple[str, ...], int, Tuple[int, ...]], List[Dict[str, Any]]
+] = {}
+
+
+def _parse_scene_limits(raw: str, dataset_names: Sequence[str]) -> Dict[str, int]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    limits: Dict[str, int] = {}
+    for entry in text.replace(" ", ",").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry.count("=") != 1:
+            raise ValueError(
+                f"Invalid scene-limit entry {entry!r}; expected dataset=count"
+            )
+        dataset, value = (part.strip() for part in entry.split("=", 1))
+        if not dataset or dataset in limits:
+            raise ValueError(f"Duplicate or empty scene-limit dataset: {dataset!r}")
+        try:
+            count = int(value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid scene limit for {dataset!r}: {value!r}") from exc
+        if count <= 0:
+            raise ValueError(
+                f"Scene limit for {dataset!r} must be a positive integer, got {count}"
+            )
+        limits[dataset] = count
+    expected = list(dict.fromkeys(str(name) for name in dataset_names))
+    missing = [name for name in expected if name not in limits]
+    extra = [name for name in limits if name not in expected]
+    if missing or extra:
+        raise ValueError(
+            "Scene-limit datasets do not match selected datasets: "
+            f"missing={missing}, extra={extra}"
+        )
+    return limits
+
+
+def _load_training_scenes(
+    cache_dirs: Sequence[Path],
+    max_scenes: int,
+    exact_limits: Optional[Sequence[int]] = None,
+) -> List[Dict[str, Any]]:
+    if exact_limits is not None and len(exact_limits) != len(cache_dirs):
+        raise ValueError(
+            f"exact_limits length {len(exact_limits)} != cache_dirs length {len(cache_dirs)}"
+        )
+    limit_key = tuple(int(value) for value in (exact_limits or ()))
+    session_key = (
+        tuple(str(Path(path).resolve()) for path in cache_dirs),
+        int(max_scenes),
+        limit_key,
+    )
     cached = _SESSION_SCENES.get(session_key)
     if cached is not None:
         return cached
     scenes: List[Dict[str, Any]] = []
-    for cache_dir in cache_dirs:
+    for cache_index, cache_dir in enumerate(cache_dirs):
         manifest = load_v3_manifest(cache_dir)
-        for item in manifest_scenes_for_training(manifest):
+        dataset_scenes = manifest_scenes_for_training(manifest)
+        exact_limit = int(exact_limits[cache_index]) if exact_limits is not None else 0
+        if exact_limit > 0:
+            if len(dataset_scenes) < exact_limit:
+                raise ValueError(
+                    f"Cache {cache_dir} contains {len(dataset_scenes)} scenes, "
+                    f"fewer than its requested exact quota {exact_limit}"
+                )
+            dataset_scenes = dataset_scenes[:exact_limit]
+        elif int(max_scenes) > 0:
+            dataset_scenes = dataset_scenes[: int(max_scenes)]
+        for item in dataset_scenes:
             item = dict(item)
             # The legacy training view intentionally contains only tensor-file
             # references. Progressive recovery additionally needs the exact
@@ -128,9 +322,6 @@ def _load_training_scenes(cache_dirs: Sequence[Path], max_scenes: int) -> List[D
             item.update(load_scene_metadata_v3(cache_dir, item))
             item["_cache_dir"] = str(cache_dir)
             scenes.append(item)
-            if int(max_scenes) > 0 and len(scenes) >= int(max_scenes):
-                _SESSION_SCENES[session_key] = scenes
-                return scenes
     _SESSION_SCENES[session_key] = scenes
     return scenes
 
@@ -171,6 +362,98 @@ def _flatten(t: torch.Tensor) -> torch.Tensor:
     if t.dim() != 4:
         raise ValueError(f"expected 4D unit tensor [B,S,P,C], got {tuple(t.shape)}")
     return t.reshape(-1, int(t.shape[-1])).to(torch.float32)
+
+
+def _validate_ghost_token_layout(
+    token_group_names: Sequence[str], token_group_starts: Sequence[int]
+) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+    names = tuple(str(name).strip() for name in token_group_names)
+    starts = tuple(int(start) for start in token_group_starts)
+    if not names or any(not name for name in names):
+        raise ValueError(f"Ghost token-group names must be non-empty: {names}")
+    if len(set(names)) != len(names):
+        raise ValueError(f"Ghost token-group names must be unique: {names}")
+    if len(names) != len(starts):
+        raise ValueError(
+            f"Ghost token groups and starts disagree: {len(names)} != {len(starts)}"
+        )
+    if starts[0] != 0 or any(right <= left for left, right in zip(starts, starts[1:])):
+        raise ValueError(f"Ghost token-group starts must begin at 0 and increase: {starts}")
+    return names, starts
+
+
+def _merge_special_ghost_token_groups(
+    token_group_names: Sequence[str], token_group_starts: Sequence[int]
+) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+    """Merge camera/register groups into one leading special-token group."""
+    names, starts = _validate_ghost_token_layout(
+        token_group_names, token_group_starts
+    )
+    merged_names: List[str] = []
+    merged_starts: List[int] = []
+    for name, start in zip(names, starts):
+        merged_name = "special" if name in {"camera", "register", "special"} else name
+        if merged_names and merged_names[-1] == merged_name:
+            continue
+        if merged_name in merged_names:
+            raise ValueError(
+                "Ghost special groups must be contiguous: "
+                f"groups={names}, starts={starts}"
+            )
+        merged_names.append(merged_name)
+        merged_starts.append(start)
+    return _validate_ghost_token_layout(merged_names, merged_starts)
+
+
+def _ghost_token_layout_for_method(
+    *, adapter: Any, method: str, patch_start_idx: int
+) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+    names, starts = _validate_ghost_token_layout(
+        *adapter.ghost_token_group_layout(patch_start_idx=int(patch_start_idx))
+    )
+    if str(method) in _SPECIAL_PATCH_GROUPED_GHOST_METHODS:
+        return _merge_special_ghost_token_groups(names, starts)
+    return names, starts
+
+
+def _ghost_token_group_ids(
+    tensor: torch.Tensor,
+    *,
+    token_group_names: Sequence[str],
+    token_group_starts: Sequence[int],
+) -> Optional[torch.Tensor]:
+    """Return flattened token-group ids aligned with a public ``[B,S,P,C]`` tensor."""
+    names, starts = _validate_ghost_token_layout(token_group_names, token_group_starts)
+    if len(names) == 1:
+        return None
+    if tensor.dim() != 4:
+        raise ValueError(f"Token grouping expects [B,S,P,C], got {tuple(tensor.shape)}")
+    bsz, frames, tokens, _channels = (int(value) for value in tensor.shape)
+    if starts[-1] >= tokens:
+        raise ValueError(
+            f"Ghost token-group start {starts[-1]} is outside a {tokens}-token frame"
+        )
+    per_frame = torch.empty(tokens, dtype=torch.int16)
+    for group_index, start in enumerate(starts):
+        end = starts[group_index + 1] if group_index + 1 < len(starts) else tokens
+        per_frame[start:end] = group_index
+    return per_frame.repeat(bsz * frames).to(dtype=torch.long)
+
+
+def _scene_patch_start(item: Dict[str, Any]) -> int:
+    if "patch_start_idx" not in item:
+        raise KeyError(
+            f"Scene {item.get('scene_id', '<unknown>')} lacks patch_start_idx; "
+            "rebuild its recovery cache before token-grouped fitting"
+        )
+    return int(item["patch_start_idx"])
+
+
+def _common_patch_start(scenes: Sequence[Dict[str, Any]]) -> int:
+    values = {_scene_patch_start(item) for item in scenes}
+    if len(values) != 1:
+        raise ValueError(f"Recovery scenes disagree on patch_start_idx: {sorted(values)}")
+    return next(iter(values))
 
 
 def _stage_row_chunk(
@@ -287,8 +570,8 @@ def _pair_records(
     bundle: Dict[str, Any], prune_plan: UnitPrunePlan, recovery_plan_name: str
 ) -> Tuple[str, List[Dict[str, Any]]]:
     method = str(bundle.get("method", "")).strip().lower()
-    if method not in TRAINING_FREE_RECOVERY_METHODS:
-        raise ValueError(f"{recovery_plan_name} is not training-free recovery: method={method!r}")
+    if method not in CACHE_FIT_RECOVERY_METHODS:
+        raise ValueError(f"{recovery_plan_name} is not cache-fit recovery: method={method!r}")
     extra = prune_plan.extra
     boundaries = extra.get("recovery_boundaries")
     if isinstance(boundaries, list) and boundaries:
@@ -323,10 +606,23 @@ def _fit_boundary_weight(
     chunk_rows: int = DEFAULT_RECOVERY_CHUNK_ROWS,
     boundary_index: int = 0,
     boundary_total: int = 1,
-) -> torch.Tensor:
+    ghost_token_group_names: Sequence[str] = ("all",),
+    ghost_token_group_starts: Sequence[int] = (0,),
+    ghost_stability: Optional[GhostStabilityConfig] = None,
+    ghost_autogroup_threshold: Optional[float] = None,
+    return_diagnostics: bool = False,
+) -> Any:
+    stability = (ghost_stability or GhostStabilityConfig()).validate()
+    token_group_names, token_group_starts = _validate_ghost_token_layout(
+        ghost_token_group_names, ghost_token_group_starts
+    )
+    if method != "recovery_ghost" and len(token_group_names) != 1:
+        raise ValueError(f"Token-group matrices are only supported by Ghost, not {method}")
     cache_key: Tuple[Any, ...] = (
         str(method), str(source_unit_id), str(target_unit_id), int(num_layers),
-        str(device), float(ridge), int(chunk_rows),
+        str(device), float(ridge), int(chunk_rows), token_group_names, token_group_starts,
+        tuple(sorted(stability.signature_payload().items())),
+        ghost_autogroup_threshold,
         tuple(
             (str(item.get("_cache_dir", "")), str(item.get("scene_id", "")))
             for item in scenes
@@ -334,9 +630,39 @@ def _fit_boundary_weight(
     )
     cached_weight = _CLOSED_FORM_SESSION_CACHE.get(cache_key)
     if cached_weight is not None:
-        return cached_weight.clone()
-    xtx: Optional[torch.Tensor] = None
-    xtd: Optional[torch.Tensor] = None
+        cached_result = cached_weight.clone()
+        if return_diagnostics:
+            return cached_result, {"cache_hit": True, "stability": stability.signature_payload()}
+        return cached_result
+    if method == "recovery_ghost" and stability.coupling_profile != "none":
+        coupled_stats: Optional[Dict[str, torch.Tensor]] = None
+        patch_start_idx = _common_patch_start(scenes)
+        for scene_index, item in enumerate(scenes, start=1):
+            cache_dir = Path(str(item["_cache_dir"]))
+            source = _load_unit_tensor(cache_dir, item, source_unit_id, num_layers=num_layers, map_location="cpu")
+            target = _load_unit_tensor(cache_dir, item, target_unit_id, num_layers=num_layers, map_location="cpu")
+            coupled_stats = _accumulate_coupled_statistics(
+                coupled_stats, source, target,
+                patch_start_idx=patch_start_idx, device=device,
+            )
+            del source, target
+            if scene_index == len(scenes) or scene_index % 10 == 0:
+                print(
+                    f"[recovery-fit][boundary={boundary_index + 1}/{boundary_total}]"
+                    f"[scenes={scene_index}/{len(scenes)}] method=ghost_coupled",
+                    file=sys.stderr, flush=True,
+                )
+        assert coupled_stats is not None
+        result, diagnostics = _solve_coupled_ghost_statistics(
+            coupled_stats, legacy_ridge=float(ridge), stability=stability
+        )
+        diagnostics.update({"token_groups": ["special", "patch"], "token_group_starts": [0, patch_start_idx]})
+        _CLOSED_FORM_SESSION_CACHE[cache_key] = result.clone()
+        return (result, diagnostics) if return_diagnostics else result
+    xtx_by_group: List[Optional[torch.Tensor]] = [None] * len(token_group_names)
+    xtd_by_group: List[Optional[torch.Tensor]] = [None] * len(token_group_names)
+    delta_ss_by_group = [0.0] * len(token_group_names)
+    rows_by_group = [0] * len(token_group_names)
     sum_x_abs: Optional[torch.Tensor] = None
     sum_y_abs: Optional[torch.Tensor] = None
     count = 0
@@ -344,33 +670,55 @@ def _fit_boundary_weight(
     total_scenes = len(scenes)
     for scene_index, item in enumerate(scenes, start=1):
         cache_dir = Path(str(item["_cache_dir"]))
-        x_cpu = rows_view(
-            _load_unit_tensor(
-                cache_dir, item, source_unit_id, num_layers=num_layers, map_location="cpu"
-            )
+        x_tensor = _load_unit_tensor(
+            cache_dir, item, source_unit_id, num_layers=num_layers, map_location="cpu"
         )
-        y_cpu = rows_view(
-            _load_unit_tensor(
-                cache_dir, item, target_unit_id, num_layers=num_layers, map_location="cpu"
-            )
+        y_tensor = _load_unit_tensor(
+            cache_dir, item, target_unit_id, num_layers=num_layers, map_location="cpu"
         )
+        x_cpu = rows_view(x_tensor)
+        y_cpu = rows_view(y_tensor)
         if x_cpu.shape != y_cpu.shape:
             raise RuntimeError(
                 f"source/target activation shape mismatch for {item.get('scene_id')}: "
                 f"{source_unit_id}={tuple(x_cpu.shape)} {target_unit_id}={tuple(y_cpu.shape)}"
             )
+        group_ids = _ghost_token_group_ids(
+            x_tensor,
+            token_group_names=token_group_names,
+            token_group_starts=token_group_starts,
+        )
         for start in range(0, int(x_cpu.shape[0]), int(chunk_rows)):
             end = min(start + int(chunk_rows), int(x_cpu.shape[0]))
             x = _stage_row_chunk(x_cpu, start, end, device=device)
             y = _stage_row_chunk(y_cpu, start, end, device=device)
             if method == "recovery_ghost":
-                x64 = x.to(torch.float64)
-                delta64 = (y - x).to(torch.float64)
-                xx = x64.T @ x64
-                xd = x64.T @ delta64
-                xtx = xx if xtx is None else xtx + xx
-                xtd = xd if xtd is None else xtd + xd
-                del x64, delta64, xx, xd
+                chunk_groups = (
+                    group_ids[start:end].to(device=device)
+                    if group_ids is not None
+                    else None
+                )
+                for group_index in range(len(token_group_names)):
+                    if chunk_groups is None:
+                        x_group, y_group = x, y
+                    else:
+                        mask = chunk_groups == group_index
+                        if not bool(mask.any()):
+                            continue
+                        x_group, y_group = x[mask], y[mask]
+                    x64 = x_group.to(torch.float64)
+                    delta64 = (y_group - x_group).to(torch.float64)
+                    xx = x64.T @ x64
+                    xd = x64.T @ delta64
+                    delta_ss = float(torch.sum(delta64.square()).item())
+                    old_xx = xtx_by_group[group_index]
+                    old_xd = xtd_by_group[group_index]
+                    xtx_by_group[group_index] = xx if old_xx is None else old_xx + xx
+                    xtd_by_group[group_index] = xd if old_xd is None else old_xd + xd
+                    delta_ss_by_group[group_index] += delta_ss
+                    rows_by_group[group_index] += int(x_group.shape[0])
+                    del x_group, y_group, x64, delta64, xx, xd
+                del chunk_groups
             else:
                 if hmat is None:
                     hmat = _hadamard(int(x.shape[-1]), device=device)
@@ -383,7 +731,7 @@ def _fit_boundary_weight(
                 count += int(xx.shape[0])
                 del xx, yy, sx, sy
             del x, y
-        del x_cpu, y_cpu
+        del x_tensor, y_tensor, x_cpu, y_cpu, group_ids
         if scene_index == total_scenes or scene_index % 10 == 0:
             print(
                 "[recovery-fit]"
@@ -397,13 +745,18 @@ def _fit_boundary_weight(
     if _ACTIVE_RECOVERY_SESSION is not None:
         _ACTIVE_RECOVERY_SESSION.clear_units()
     if method == "recovery_ghost":
-        if xtx is None or xtd is None:
-            raise RuntimeError("No activation rows were available for ghost recovery")
-        result = _solve_ghost_from_statistics(
-            xtx, xtd, ridge=float(ridge)
-        ).cpu()
+        result, diagnostics = _solve_grouped_ghost_statistics(
+            xtx_by_group=xtx_by_group,
+            xtd_by_group=xtd_by_group,
+            delta_ss_by_group=delta_ss_by_group,
+            rows_by_group=rows_by_group,
+            token_group_names=token_group_names,
+            legacy_ridge=float(ridge),
+            stability=stability,
+            autogroup_threshold=ghost_autogroup_threshold,
+        )
         _CLOSED_FORM_SESSION_CACHE[cache_key] = result.clone()
-        return result
+        return (result, diagnostics) if return_diagnostics else result
 
     if sum_x_abs is None or sum_y_abs is None or count <= 0:
         raise RuntimeError(f"No activation rows were available for {method}")
@@ -411,7 +764,7 @@ def _fit_boundary_weight(
     assert hmat is not None
     result = (hmat @ torch.diag(scale.to(torch.float32)) @ hmat.T).to(torch.float32).cpu()
     _CLOSED_FORM_SESSION_CACHE[cache_key] = result.clone()
-    return result
+    return (result, {}) if return_diagnostics else result
 
 
 def _solve_ghost_from_statistics(
@@ -426,6 +779,403 @@ def _solve_ghost_from_statistics(
     return (
         torch.eye(channels, device=xtx.device, dtype=torch.float64) + delta
     ).to(torch.float32)
+
+
+def _solve_ghost_with_prior(
+    xtx: torch.Tensor,
+    xtd: torch.Tensor,
+    *,
+    strength: float,
+    prior_weight: torch.Tensor,
+) -> Tuple[torch.Tensor, float]:
+    """Solve a trace-scaled ridge objective centered on ``prior_weight``."""
+    channels = int(xtx.shape[0])
+    scale = float((torch.trace(xtx) / max(channels, 1)).item())
+    regularization = float(strength) * scale
+    eye = torch.eye(channels, device=xtx.device, dtype=torch.float64)
+    prior_delta = prior_weight.to(device=xtx.device, dtype=torch.float64) - eye
+    delta = torch.linalg.solve(
+        xtx + regularization * eye,
+        xtd + regularization * prior_delta,
+    )
+    return (eye + delta).to(torch.float32), regularization
+
+
+def _matrix_diagnostics(weight: torch.Tensor) -> Dict[str, Any]:
+    matrix = weight.to(dtype=torch.float64)
+    channels = int(matrix.shape[0])
+    singular = torch.linalg.svdvals(matrix)
+    identity = torch.eye(channels, device=matrix.device, dtype=matrix.dtype)
+    finite = bool(torch.isfinite(matrix).all().item())
+    minimum = float(singular.min().item())
+    maximum = float(singular.max().item())
+    return {
+        "finite": finite,
+        "delta_rms": float(torch.linalg.vector_norm(matrix - identity).item() / math.sqrt(channels)),
+        "singular_min": minimum,
+        "singular_max": maximum,
+        "matrix_condition": (maximum / minimum if minimum > 0.0 else None),
+    }
+
+
+def _zero_prior_matrix_diagnostics(weight: torch.Tensor) -> Dict[str, Any]:
+    matrix = weight.to(dtype=torch.float64)
+    channels = int(matrix.shape[0])
+    singular = torch.linalg.svdvals(matrix)
+    minimum = float(singular.min().item())
+    maximum = float(singular.max().item())
+    return {
+        "finite": bool(torch.isfinite(matrix).all().item()),
+        "delta_rms": float(torch.linalg.vector_norm(matrix).item() / math.sqrt(channels)),
+        "singular_min": minimum,
+        "singular_max": maximum,
+        "matrix_condition": (maximum / minimum if minimum > 0.0 else None),
+    }
+
+
+def _gram_diagnostics(xtx: torch.Tensor, rows: int) -> Dict[str, Any]:
+    eigenvalues = torch.linalg.eigvalsh(xtx)
+    maximum = max(float(eigenvalues.max().item()), 0.0)
+    positive = eigenvalues[eigenvalues > maximum * 1e-10]
+    minimum = float(positive.min().item()) if int(positive.numel()) else 0.0
+    return {
+        "rows": int(rows),
+        "trace": float(torch.trace(xtx).item()),
+        "effective_rank": int(positive.numel()),
+        "gram_condition": (maximum / minimum if minimum > 0.0 else None),
+    }
+
+
+def _solve_grouped_ghost_statistics(
+    *,
+    xtx_by_group: Sequence[Optional[torch.Tensor]],
+    xtd_by_group: Sequence[Optional[torch.Tensor]],
+    rows_by_group: Sequence[int],
+    token_group_names: Sequence[str],
+    legacy_ridge: float,
+    stability: GhostStabilityConfig,
+    autogroup_threshold: Optional[float] = None,
+    delta_ss_by_group: Optional[Sequence[float]] = None,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    names = tuple(str(name) for name in token_group_names)
+    populated = [value for value in xtx_by_group if value is not None]
+    if not populated:
+        raise RuntimeError("Ghost recovery requires at least one activation row")
+    channels = int(populated[0].shape[0])
+    all_xtx = sum(
+        (value for value in xtx_by_group if value is not None),
+        torch.zeros_like(populated[0]),
+    )
+    populated_d = [value for value in xtd_by_group if value is not None]
+    all_xtd = sum(populated_d, torch.zeros_like(populated_d[0]))
+    all_weight = _solve_ghost_from_statistics(
+        all_xtx, all_xtd, ridge=float(legacy_ridge)
+    )
+    identity = torch.eye(channels, device=all_xtx.device, dtype=torch.float32)
+    weights: List[torch.Tensor] = []
+    group_diagnostics: Dict[str, Any] = {}
+    for index, name in enumerate(names):
+        xtx, xtd = xtx_by_group[index], xtd_by_group[index]
+        regularization = float(legacy_ridge)
+        prior_name = "identity"
+        if xtx is None or xtd is None:
+            weight = identity
+        elif stability.profile == "hybrid" and name == "special":
+            weight = all_weight
+            regularization = 0.0
+            prior_name = "all_exact"
+        elif stability.profile == "trace_identity" and name == "special":
+            weight, regularization = _solve_ghost_with_prior(
+                xtx, xtd,
+                strength=float(stability.special_ridge),
+                prior_weight=identity,
+            )
+        elif stability.profile == "trace_all" and name == "special":
+            weight, regularization = _solve_ghost_with_prior(
+                xtx, xtd,
+                strength=float(stability.special_ridge),
+                prior_weight=all_weight,
+            )
+            prior_name = "all"
+        elif stability.profile == "native_all" and name in {"camera", "register"}:
+            strength = (
+                stability.camera_ridge if name == "camera" else stability.register_ridge
+            )
+            weight, regularization = _solve_ghost_with_prior(
+                xtx, xtd, strength=float(strength), prior_weight=all_weight
+            )
+            prior_name = "all"
+        else:
+            weight = _solve_ghost_from_statistics(
+                xtx, xtd, ridge=float(legacy_ridge)
+            )
+        weights.append(weight.cpu())
+        gram = (
+            _gram_diagnostics(xtx, int(rows_by_group[index]))
+            if xtx is not None
+            else {"rows": 0}
+        )
+        group_diagnostics[name] = {
+            **gram,
+            **_matrix_diagnostics(weight),
+            "prior": prior_name,
+            "regularization": float(regularization),
+        }
+    result = weights[0] if len(weights) == 1 else torch.stack(weights)
+    autogroup: Optional[Dict[str, Any]] = None
+    if autogroup_threshold is not None:
+        threshold = float(autogroup_threshold)
+        if not math.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError(
+                f"Ghost autogroup threshold must be finite and positive, got {threshold}"
+            )
+        if names == ("patch",) and result.dim() == 2:
+            autogroup = {
+                "metric": "special_to_all_over_all_delta",
+                "value": None,
+                "threshold": threshold,
+                "comparison": "not_applicable",
+                "decision": "un-grouped",
+                "reason": "no_special_tokens",
+                "candidate_grouped_weight_shape": None,
+                "selected_weight_shape": [int(x) for x in all_weight.shape],
+            }
+            # A patch-only backbone has no second token group to choose from.
+            # Select the shared solve explicitly so this path is numerically
+            # identical to ordinary sequential Ghost recovery.
+            result = all_weight.detach().cpu().to(torch.float32)
+        elif names != ("special", "patch") or result.dim() != 3:
+            raise ValueError(
+                "Ghost autogroup requires special/patch or patch-only token layout, "
+                f"got {names}"
+            )
+        else:
+            special_weight = result[names.index("special")].to(torch.float64)
+            all_weight_cpu = all_weight.detach().cpu().to(torch.float64)
+            identity_cpu = torch.eye(channels, dtype=torch.float64)
+            numerator = float(
+                torch.linalg.vector_norm(special_weight - all_weight_cpu).item()
+            )
+            denominator = float(
+                torch.linalg.vector_norm(all_weight_cpu - identity_cpu).item()
+            )
+            relative = (
+                numerator / denominator
+                if denominator > 0.0
+                else (0.0 if numerator == 0.0 else math.inf)
+            )
+            use_grouped = bool(math.isfinite(relative) and relative < threshold)
+            autogroup = {
+                "metric": "special_to_all_over_all_delta",
+                "value": relative,
+                "threshold": threshold,
+                "comparison": "lt",
+                "decision": "grouped" if use_grouped else "un-grouped",
+                "candidate_grouped_weight_shape": [int(x) for x in result.shape],
+                "selected_weight_shape": [
+                    int(x) for x in (
+                        result.shape if use_grouped else all_weight_cpu.shape
+                    )
+                ],
+            }
+            if not use_grouped:
+                result = all_weight_cpu.to(torch.float32)
+    for index, name in enumerate(names):
+        xtx = xtx_by_group[index]
+        xtd = xtd_by_group[index]
+        rows = int(rows_by_group[index])
+        if xtx is None or xtd is None or rows <= 0:
+            continue
+        if delta_ss_by_group is None:
+            continue
+        selected_weight = result if result.dim() == 2 else result[index]
+        delta_matrix = (
+            selected_weight.to(device=xtx.device, dtype=torch.float64)
+            - torch.eye(channels, device=xtx.device, dtype=torch.float64)
+        )
+        delta_ss = float(delta_ss_by_group[index])
+        residual_ss = (
+            delta_ss
+            - 2.0 * float(torch.sum(delta_matrix * xtd).item())
+            + float(torch.trace(delta_matrix.T @ xtx @ delta_matrix).item())
+        )
+        denominator = max(rows * channels, 1)
+        residual_rms = math.sqrt(max(residual_ss, 0.0) / denominator)
+        target_delta_rms = math.sqrt(max(delta_ss, 0.0) / denominator)
+        group_diagnostics[name].update(
+            {
+                "activation_residual_rms": residual_rms,
+                "activation_target_delta_rms": target_delta_rms,
+                "activation_residual_ratio": (
+                    residual_rms / target_delta_rms if target_delta_rms > 0.0 else None
+                ),
+            }
+        )
+    diagnostics = {
+        "stability": stability.signature_payload(),
+        "groups": group_diagnostics,
+        "all_token_matrix": _matrix_diagnostics(all_weight),
+    }
+    if autogroup is not None:
+        diagnostics["autogroup"] = autogroup
+    return result, diagnostics
+
+
+def _accumulate_coupled_statistics(
+    stats: Optional[Dict[str, torch.Tensor]],
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    patch_start_idx: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Accumulate scene/frame-aware normal equations without retaining activations."""
+    if source.dim() != 4 or source.shape != target.shape:
+        raise ValueError(f"coupled Ghost expects matching [B,S,P,C], got {source.shape}/{target.shape}")
+    x = source.to(device=device, dtype=torch.float64)
+    y = target.to(device=device, dtype=torch.float64)
+    special_x, patch_x = x[:, :, :patch_start_idx], x[:, :, patch_start_idx:]
+    special_y, patch_y = y[:, :, :patch_start_idx], y[:, :, patch_start_idx:]
+    channels = int(x.shape[-1])
+    xs = special_x.reshape(-1, channels)
+    xp = patch_x.reshape(-1, channels)
+    ys = special_y.reshape(-1, channels)
+    yp = patch_y.reshape(-1, channels)
+    mean_patch = patch_x.mean(dim=2, keepdim=True).expand(
+        -1, -1, int(special_x.shape[2]), -1
+    ).reshape(-1, channels)
+    values = {
+        "all_xx": x.reshape(-1, channels).T @ x.reshape(-1, channels),
+        "all_xy": x.reshape(-1, channels).T @ y.reshape(-1, channels),
+        "s_xx": xs.T @ xs, "s_xy": xs.T @ ys,
+        "p_xx": xp.T @ xp, "p_xy": xp.T @ yp,
+        "s_xm": xs.T @ mean_patch,
+        "m_xx": mean_patch.T @ mean_patch,
+        "m_xy": mean_patch.T @ ys,
+    }
+    if stats is None:
+        stats = {key: value for key, value in values.items()}
+        stats["rows_s"] = torch.tensor(int(xs.shape[0]), device=device, dtype=torch.int64)
+        stats["rows_p"] = torch.tensor(int(xp.shape[0]), device=device, dtype=torch.int64)
+    else:
+        for key, value in values.items():
+            stats[key] += value
+        stats["rows_s"] += int(xs.shape[0])
+        stats["rows_p"] += int(xp.shape[0])
+    return stats
+
+
+def _solve_coupled_ghost_statistics(
+    stats: Dict[str, torch.Tensor], *, legacy_ridge: float, stability: GhostStabilityConfig
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    channels = int(stats["all_xx"].shape[0])
+    eye = torch.eye(channels, device=stats["all_xx"].device, dtype=torch.float64)
+    w0 = _solve_ghost_from_statistics(
+        stats["all_xx"], stats["all_xy"] - stats["all_xx"], ridge=legacy_ridge
+    ).to(device=eye.device, dtype=torch.float64)
+    zszs = w0.T @ stats["s_xx"] @ w0
+    zsys = w0.T @ stats["s_xy"]
+    zpzp = w0.T @ stats["p_xx"] @ w0
+    zpyp = w0.T @ stats["p_xy"]
+    mz_mz = w0.T @ stats["m_xx"] @ w0
+    zs_mz = w0.T @ stats["s_xm"] @ w0
+    mz_ys = w0.T @ stats["m_xy"]
+
+    def solve_identity(xx: torch.Tensor, xy: torch.Tensor, strength: float) -> Tuple[torch.Tensor, float]:
+        scale = float((torch.trace(xx) / channels).item())
+        reg = float(strength) * scale
+        return torch.linalg.solve(xx + (reg + legacy_ridge) * eye, xy + reg * eye), reg
+
+    profile = stability.coupling_profile
+    rs = eye.clone()
+    rp = eye.clone()
+    bps = torch.zeros_like(eye)
+    residual_reg_s = 0.0
+    residual_reg_p = 0.0
+    context_reg = 0.0
+    if profile in {"shared_residual", "shared_residual_patch_mean"}:
+        rp, residual_reg_p = solve_identity(zpzp, zpyp, stability.residual_ridge)
+    if profile == "shared_residual":
+        rs, residual_reg_s = solve_identity(zszs, zsys, stability.residual_ridge)
+    elif profile == "patch_mean":
+        scale = float((torch.trace(mz_mz) / channels).item())
+        context_reg = float(stability.context_ridge) * scale
+        bps = torch.linalg.solve(
+            mz_mz + (context_reg + legacy_ridge) * eye,
+            mz_ys - zs_mz.T,
+        )
+    elif profile == "shared_residual_patch_mean":
+        scale_r = float((torch.trace(zszs) / channels).item())
+        scale_c = float((torch.trace(mz_mz) / channels).item())
+        residual_reg_s = float(stability.residual_ridge) * scale_r
+        context_reg = float(stability.context_ridge) * scale_c
+        normal = torch.cat(
+            [torch.cat([zszs, zs_mz], dim=1), torch.cat([zs_mz.T, mz_mz], dim=1)], dim=0
+        )
+        prior = torch.cat([eye, torch.zeros_like(eye)], dim=0)
+        regularizer = torch.diag(torch.cat([
+            torch.full((channels,), residual_reg_s, device=eye.device, dtype=eye.dtype),
+            torch.full((channels,), context_reg, device=eye.device, dtype=eye.dtype),
+        ]))
+        rhs = torch.cat([zsys, mz_ys], dim=0) + regularizer @ prior
+        jitter = float(legacy_ridge) * torch.eye(
+            2 * channels, device=eye.device, dtype=eye.dtype
+        )
+        solution = torch.linalg.solve(normal + regularizer + jitter, rhs)
+        rs, bps = solution[:channels], solution[channels:]
+    elif profile != "patch_mean":
+        raise ValueError(f"Unsupported coupled profile {profile!r}")
+
+    effective_s = w0 @ rs
+    effective_p = w0 @ rp
+    effective_context = w0 @ bps
+    packed = torch.stack([effective_s, effective_p, effective_context, w0, rs, rp, bps]).to(torch.float32).cpu()
+    if not bool(torch.isfinite(packed).all().item()):
+        raise FloatingPointError(f"Coupled Ghost profile {profile!r} produced non-finite matrices")
+    diagnostics = {
+        "coupling": stability.signature_payload(),
+        "rows_by_token_group": {"special": int(stats["rows_s"].item()), "patch": int(stats["rows_p"].item())},
+        "all_token_matrix": {
+            **_gram_diagnostics(
+                stats["all_xx"], int(stats["rows_s"].item() + stats["rows_p"].item())
+            ),
+            **_matrix_diagnostics(w0),
+        },
+        "groups": {
+            "special": {
+                **_gram_diagnostics(zszs, int(stats["rows_s"].item())),
+                **_matrix_diagnostics(effective_s),
+                "prior": "all_then_identity",
+                "regularization": residual_reg_s,
+            },
+            "patch": {
+                **_gram_diagnostics(zpzp, int(stats["rows_p"].item())),
+                **_matrix_diagnostics(effective_p),
+                "prior": "all_then_identity",
+                "regularization": residual_reg_p,
+            },
+        },
+        "context": {
+            **_gram_diagnostics(mz_mz, int(stats["rows_s"].item())),
+            **_zero_prior_matrix_diagnostics(bps),
+            "regularization": context_reg,
+            "prior": "zero",
+            "matrix": "Bps",
+        },
+        "effective_context": {
+            **_zero_prior_matrix_diagnostics(effective_context),
+            "matrix": "W0@Bps",
+        },
+        "components": {
+            "packing": ["effective_special", "effective_patch", "effective_context", "W0", "Rs", "Rp", "Bps"],
+            "W0": _matrix_diagnostics(w0),
+            "Rs": _matrix_diagnostics(rs),
+            "Rp": _matrix_diagnostics(rp),
+            "Bps": _zero_prior_matrix_diagnostics(bps),
+            "effective_context": _zero_prior_matrix_diagnostics(effective_context),
+        },
+    }
+    return packed, diagnostics
 
 
 def _fit_replaceme_ls(
@@ -741,6 +1491,223 @@ def _optimize_cosine_transform(
     return result, diagnostics
 
 
+def _streamline_lr_factor(
+    step: int,
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float,
+) -> float:
+    """Linear warmup followed by cosine decay, matching Streamline's schedule."""
+    current = int(step)
+    if current < int(warmup_steps):
+        return float(current) / float(max(1, int(warmup_steps)))
+    progress = float(current - int(warmup_steps)) / float(
+        max(1, int(total_steps) - int(warmup_steps))
+    )
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+    return float(min_lr_ratio) + (1.0 - float(min_lr_ratio)) * cosine
+
+
+def _optimize_streamline_ffn(
+    *,
+    row_store: ShardedRowStore,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    min_lr: float,
+    weight_decay: float,
+    expansion_factor: int,
+    seed: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Fit the official two-layer Streamline FFN with boundary-alignment MSE."""
+    if epochs <= 0 or batch_size <= 0 or lr <= 0:
+        raise ValueError("Streamline FFN epochs, batch size, and learning rate must be positive")
+    if min_lr < 0 or min_lr > lr:
+        raise ValueError(f"Streamline FFN min_lr must be in [0, lr], got {min_lr}")
+    if weight_decay < 0 or expansion_factor <= 0:
+        raise ValueError("Streamline FFN weight decay must be non-negative and expansion positive")
+
+    channels = int(row_store.channels)
+    num_rows = int(row_store.num_rows)
+    steps_per_epoch = math.ceil(num_rows / int(batch_size))
+    total_steps = int(epochs) * steps_per_epoch
+    warmup_steps = max(1, int(total_steps * 0.03))
+    cuda_devices: List[int] = []
+    if device.type == "cuda":
+        cuda_devices.append(
+            int(device.index) if device.index is not None else torch.cuda.current_device()
+        )
+
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(int(seed))
+        module = StreamlineFFN(
+            channels, expansion_factor=int(expansion_factor)
+        ).to(device=device, dtype=torch.float32)
+        optimizer = torch.optim.AdamW(
+            module.parameters(),
+            lr=float(lr),
+            weight_decay=float(weight_decay),
+            betas=(0.9, 0.95),
+        )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: _streamline_lr_factor(
+                step,
+                total_steps=total_steps,
+                warmup_steps=warmup_steps,
+                min_lr_ratio=float(min_lr) / float(lr),
+            ),
+        )
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        rows_seen = 0
+        optimizer_steps = 0
+        best_loss = float("inf")
+        best_epoch = 0
+        best_parameters: Optional[torch.Tensor] = None
+        history: List[Dict[str, Any]] = []
+
+        for epoch in range(1, int(epochs) + 1):
+            order = torch.randperm(num_rows, generator=generator)
+            epoch_squared_error = 0.0
+            epoch_elements = 0
+            for start in range(0, num_rows, int(batch_size)):
+                indices = order[start : start + int(batch_size)]
+                xb_cpu, yb_cpu = row_store.gather(
+                    indices, pin_memory=device.type == "cuda"
+                )
+                xb = xb_cpu.to(
+                    device=device, dtype=torch.float32, non_blocking=device.type == "cuda"
+                )
+                yb = yb_cpu.to(
+                    device=device, dtype=torch.float32, non_blocking=device.type == "cuda"
+                )
+                row_store.record_transfer()
+                optimizer.zero_grad(set_to_none=True)
+                prediction = module(xb)
+                loss = torch.nn.functional.mse_loss(prediction, yb)
+                if not bool(torch.isfinite(loss)):
+                    raise FloatingPointError("Streamline FFN produced a non-finite loss")
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                elements = int(yb.numel())
+                epoch_squared_error += float(loss.detach().item()) * elements
+                epoch_elements += elements
+                rows_seen += int(xb.shape[0])
+                optimizer_steps += 1
+
+            mean_loss = epoch_squared_error / float(max(1, epoch_elements))
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            history.append({"epoch": epoch, "mean_loss": mean_loss, "lr": current_lr})
+            if mean_loss < best_loss:
+                best_loss = mean_loss
+                best_epoch = epoch
+                best_parameters = pack_streamline_ffn_parameters(module)
+            print(
+                "[recovery-fit] method=streamline_ffn "
+                f"epochs={epoch}/{epochs} mean_loss={mean_loss:.6g} lr={current_lr:.6g}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        if best_parameters is None or not bool(torch.isfinite(best_parameters).all()):
+            raise FloatingPointError("Streamline FFN produced non-finite parameters")
+        diagnostics = {
+            "num_rows": num_rows,
+            "rows_seen": rows_seen,
+            "hidden_size": channels,
+            "expansion_factor": int(expansion_factor),
+            "epochs": int(epochs),
+            "batch_size": int(batch_size),
+            "lr": float(lr),
+            "min_lr": float(min_lr),
+            "weight_decay": float(weight_decay),
+            "seed": int(seed),
+            "warmup_steps": warmup_steps,
+            "optimizer_steps": optimizer_steps,
+            "selected_epoch": best_epoch,
+            "best_loss": best_loss,
+            "loss_components": ["mse"],
+            "history": history,
+            "row_storage": "scene_sharded_cpu_float32",
+        }
+        return best_parameters, diagnostics
+
+
+def _fit_streamline_ffn(
+    *,
+    source_unit_id: str,
+    target_unit_id: str,
+    scenes: Sequence[Dict[str, Any]],
+    num_layers: int,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    min_lr: float,
+    weight_decay: float,
+    expansion_factor: int,
+    seed: int,
+    boundary_index: int = 0,
+    boundary_total: int = 1,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Collect cached component boundaries and train one Streamline FFN."""
+    shards: List[RowShard] = []
+    total_scenes = len(scenes)
+    for scene_index, item in enumerate(scenes, start=1):
+        cache_dir = Path(str(item["_cache_dir"]))
+        source = _load_unit_tensor(
+            cache_dir, item, source_unit_id, num_layers=num_layers, map_location="cpu"
+        )
+        target = _load_unit_tensor(
+            cache_dir, item, target_unit_id, num_layers=num_layers, map_location="cpu"
+        )
+        source_rows = rows_view(source)
+        target_rows = rows_view(target)
+        if source_rows.shape != target_rows.shape:
+            raise RuntimeError(
+                f"Streamline FFN boundary mismatch for {item.get('scene_id')}: "
+                f"{source_unit_id}={tuple(source_rows.shape)} "
+                f"{target_unit_id}={tuple(target_rows.shape)}"
+            )
+        shards.append(
+            RowShard(
+                scene_id=str(item.get("scene_id", "")),
+                inputs=source_rows,
+                desired=target_rows,
+            )
+        )
+        if scene_index == total_scenes or scene_index % 10 == 0:
+            print(
+                "[recovery-fit]"
+                f"[boundary={boundary_index + 1}/{boundary_total}]"
+                f"[scenes={scene_index}/{total_scenes}] "
+                "method=streamline_ffn phase=collection",
+                file=sys.stderr,
+                flush=True,
+            )
+    store = RecoveryActivationStore(shards)
+    try:
+        return _optimize_streamline_ffn(
+            row_store=store,
+            device=device,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            min_lr=min_lr,
+            weight_decay=weight_decay,
+            expansion_factor=expansion_factor,
+            seed=seed,
+        )
+    finally:
+        store.close()
+        if _ACTIVE_RECOVERY_SESSION is not None:
+            _ACTIVE_RECOVERY_SESSION.clear_units()
+
+
 def _fit_replaceme_cos(
     *,
     source_unit_id: str,
@@ -825,7 +1792,7 @@ def _forward_current_ghost_boundary(
     item: Dict[str, Any],
     device: torch.device,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-    """Forward one scene while retaining only the requested Ghost boundary."""
+    """Forward one scene while retaining the requested evolving boundaries."""
     image_paths = [str(path) for path in item.get("image_paths", []) if str(path)]
     if not image_paths:
         raise FileNotFoundError(
@@ -852,7 +1819,7 @@ def _forward_current_ghost_boundary(
     missing = sorted(requested - set(unit_map))
     if missing:
         raise KeyError(
-            f"Sequential Ghost forward missed {source_unit_id}/{target_unit_id}: {missing}"
+            f"Sequential Ghost forward missed source {source_unit_id}: {missing}"
         )
     return unit_map, images
 
@@ -869,11 +1836,66 @@ def _fit_current_ghost_boundary(
     chunk_rows: int = DEFAULT_RECOVERY_CHUNK_ROWS,
     boundary_index: int = 0,
     boundary_total: int = 1,
+    ghost_token_group_names: Sequence[str] = ("all",),
+    ghost_token_group_starts: Sequence[int] = (0,),
+    ghost_stability: Optional[GhostStabilityConfig] = None,
+    ghost_autogroup_threshold: Optional[float] = None,
+    num_layers: int = 0,
+    target_mode: str = "sequential_current_model",
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Fit one progressive Ghost boundary with O(C^2) persistent memory."""
-    xtx: Optional[torch.Tensor] = None
-    xtd: Optional[torch.Tensor] = None
-    num_rows = 0
+    """Fit an evolving Ghost source to a current- or full-model target."""
+    if target_mode not in {"sequential_current_model", "full_model_disk_cache"}:
+        raise ValueError(f"Unsupported current Ghost target mode: {target_mode!r}")
+    token_group_names, token_group_starts = _validate_ghost_token_layout(
+        ghost_token_group_names, ghost_token_group_starts
+    )
+    stability = (ghost_stability or GhostStabilityConfig()).validate()
+    if stability.coupling_profile != "none":
+        coupled_stats: Optional[Dict[str, torch.Tensor]] = None
+        patch_start_idx = int(token_group_starts[1])
+        for scene_index, item in enumerate(scenes, start=1):
+            unit_map, images = _forward_current_ghost_boundary(
+                model=model, adapter=adapter, source_unit_id=source_unit_id,
+                target_unit_id=target_unit_id, item=item, device=device,
+            )
+            target = (
+                unit_map[target_unit_id]
+                if target_mode == "sequential_current_model"
+                else _load_unit_tensor(
+                    Path(str(item["_cache_dir"])), item, target_unit_id,
+                    num_layers=num_layers, map_location="cpu",
+                )
+            )
+            coupled_stats = _accumulate_coupled_statistics(
+                coupled_stats, unit_map[source_unit_id], target,
+                patch_start_idx=patch_start_idx, device=device,
+            )
+            del unit_map, images, target
+            if scene_index == len(scenes) or scene_index % 10 == 0:
+                print(
+                    f"[recovery-fit][boundary={boundary_index + 1}/{boundary_total}]"
+                    f"[scenes={scene_index}/{len(scenes)}] method=ghost_coupled_current",
+                    file=sys.stderr, flush=True,
+                )
+        assert coupled_stats is not None
+        weight, details = _solve_coupled_ghost_statistics(
+            coupled_stats, legacy_ridge=float(ridge), stability=stability
+        )
+        return weight, {
+            "fit_mode": "sequential_current_model",
+            "source_mode": "sequential_current_model",
+            "target_mode": target_mode,
+            "num_scenes": len(scenes),
+            "ridge": float(ridge),
+            "chunk_rows": int(chunk_rows),
+            "token_groups": ["special", "patch"],
+            "token_group_starts": [0, patch_start_idx],
+            **details,
+        }
+    xtx_by_group: List[Optional[torch.Tensor]] = [None] * len(token_group_names)
+    xtd_by_group: List[Optional[torch.Tensor]] = [None] * len(token_group_names)
+    delta_ss_by_group = [0.0] * len(token_group_names)
+    rows_by_group = [0] * len(token_group_names)
     num_scenes = 0
     total_scenes = len(scenes)
     for scene_index, item in enumerate(scenes, start=1):
@@ -886,7 +1908,14 @@ def _fit_current_ghost_boundary(
             device=device,
         )
         source = unit_map[source_unit_id]
-        target = unit_map[target_unit_id]
+        target = (
+            unit_map[target_unit_id]
+            if target_mode == "sequential_current_model"
+            else _load_unit_tensor(
+                Path(str(item["_cache_dir"])), item, target_unit_id,
+                num_layers=num_layers, map_location="cpu",
+            )
+        )
         if source.shape != target.shape:
             raise RuntimeError(
                 f"source/target activation shape mismatch for {item.get('scene_id')}: "
@@ -896,26 +1925,45 @@ def _fit_current_ghost_boundary(
         channels = int(source.shape[-1])
         source_flat = source.reshape(-1, channels)
         target_flat = target.reshape(-1, channels)
+        group_ids = _ghost_token_group_ids(
+            source,
+            token_group_names=token_group_names,
+            token_group_starts=token_group_starts,
+        )
         # Bound FP64 workspace while retaining the existing FP64 normal equations.
         for row_start in range(0, int(source_flat.shape[0]), int(chunk_rows)):
             row_end = min(row_start + int(chunk_rows), int(source_flat.shape[0]))
-            x = source_flat[row_start:row_end].to(device=device, dtype=torch.float64)
-            delta = target_flat[row_start:row_end].to(
+            x_chunk = source_flat[row_start:row_end].to(device=device, dtype=torch.float64)
+            target_chunk = target_flat[row_start:row_end].to(
                 device=device, dtype=torch.float64
             )
-            delta.sub_(x)
-            xx = x.T @ x
-            xd = x.T @ delta
-            if xtx is None:
-                xtx, xtd = xx, xd
-            else:
-                xtx.add_(xx)
-                assert xtd is not None
-                xtd.add_(xd)
-            del x, delta, xx, xd
-        num_rows += int(source_flat.shape[0])
+            chunk_groups = (
+                group_ids[row_start:row_end].to(device=device)
+                if group_ids is not None
+                else None
+            )
+            for group_index in range(len(token_group_names)):
+                if chunk_groups is None:
+                    x, target_group = x_chunk, target_chunk
+                else:
+                    mask = chunk_groups == group_index
+                    if not bool(mask.any()):
+                        continue
+                    x, target_group = x_chunk[mask], target_chunk[mask]
+                delta = target_group - x
+                xx = x.T @ x
+                xd = x.T @ delta
+                delta_ss = float(torch.sum(delta.square()).item())
+                old_xx = xtx_by_group[group_index]
+                old_xd = xtd_by_group[group_index]
+                xtx_by_group[group_index] = xx if old_xx is None else old_xx + xx
+                xtd_by_group[group_index] = xd if old_xd is None else old_xd + xd
+                delta_ss_by_group[group_index] += delta_ss
+                rows_by_group[group_index] += int(x.shape[0])
+                del x, target_group, delta, xx, xd
+            del x_chunk, target_chunk, chunk_groups
         num_scenes += 1
-        del unit_map, images, source, target, source_flat, target_flat
+        del unit_map, images, source, target, source_flat, target_flat, group_ids
         if scene_index == total_scenes or scene_index % 10 == 0:
             print(
                 "[recovery-fit]"
@@ -926,16 +1974,35 @@ def _fit_current_ghost_boundary(
                 file=sys.stderr,
                 flush=True,
             )
-    if xtx is None or xtd is None:
-        raise RuntimeError("Ghost recovery requires at least one activation row")
-    weight = _solve_ghost_from_statistics(xtx, xtd, ridge=float(ridge))
-    return weight.detach().cpu(), {
+    weight, stability_diagnostics = _solve_grouped_ghost_statistics(
+        xtx_by_group=xtx_by_group,
+        xtd_by_group=xtd_by_group,
+        delta_ss_by_group=delta_ss_by_group,
+        rows_by_group=rows_by_group,
+        token_group_names=token_group_names,
+        legacy_ridge=float(ridge),
+        stability=stability,
+        autogroup_threshold=ghost_autogroup_threshold,
+    )
+    diagnostics = {
         "fit_mode": "sequential_current_model",
+        "source_mode": "sequential_current_model",
+        "target_mode": target_mode,
         "num_scenes": num_scenes,
-        "num_rows": num_rows,
+        "num_rows": sum(rows_by_group),
         "ridge": float(ridge),
         "chunk_rows": int(chunk_rows),
+        **stability_diagnostics,
     }
+    if len(token_group_names) > 1:
+        diagnostics.update(
+            {
+                "rows_by_token_group": dict(zip(token_group_names, rows_by_group)),
+                "token_groups": list(token_group_names),
+                "token_group_starts": list(token_group_starts),
+            }
+        )
+    return weight.detach().cpu(), diagnostics
 
 
 _SEQUENTIAL_GHOST_PREFIX_CACHE: Dict[
@@ -1019,23 +2086,38 @@ def _try_link_derived_ghost_recovery(
     selector: str,
 ) -> bool:
     """Reuse ordinary Ghost artifacts when a derived method is identical."""
-    if method not in _DERIVED_GHOST_METHODS or not _has_single_drop_interval(prune_plan):
+    pi3_token_group_alias = (
+        str(backbone).strip().lower() == "pi3"
+        and method in TOKEN_GROUPED_RECOVERY_BASE_METHODS
+    )
+    if pi3_token_group_alias:
+        source_method = TOKEN_GROUPED_RECOVERY_BASE_METHODS[method]
+        reason = "Pi3 exposes one patch-token group"
+    elif method in _DERIVED_GHOST_METHODS and _has_single_drop_interval(prune_plan):
+        source_method = "recovery_ghost"
+        reason = "single contiguous drop interval"
+    else:
         return False
-    source_dir = Path(out_dir).parent / "recovery_ghost"
+    source_dir = Path(out_dir).parent / source_method
     if not recovery_result_complete(
         source_dir,
         plan_root=Path(plan_root),
         backbone=backbone,
         selector=selector,
-        recovery_plan_name="recovery_ghost",
+        recovery_plan_name=source_method,
     ):
+        if pi3_token_group_alias:
+            raise FileNotFoundError(
+                f"Pi3 token-grouped recovery {method!r} must reuse the complete "
+                f"non-grouped result {source_method!r}, but {source_dir} is incomplete"
+            )
         return False
     _replace_with_relative_symlink(Path(out_dir), source_dir)
     print(
         "\n  recovery reuse\n"
         f"    method: {recovery_plan_name.removeprefix('recovery_')}\n"
-        "    source: ghost\n"
-        "    reason: single contiguous drop interval\n"
+        f"    source: {source_method.removeprefix('recovery_')}\n"
+        f"    reason: {reason}\n"
         f"    link: {out_dir} -> {source_dir}\n",
         file=sys.stderr,
         flush=True,
@@ -1062,6 +2144,24 @@ def _scenes_have_cached_units(
     return True
 
 
+def _scenes_have_cached_replaceme_boundary(
+    scenes: Sequence[Dict[str, Any]], source_unit_id: str, target_unit_id: str
+) -> bool:
+    """Return whether disk cache can fit one complete ReplaceMe boundary."""
+    if not _scenes_have_cached_units(scenes, (source_unit_id, target_unit_id)):
+        return False
+    auxiliary_id = f"replaceme_residual:{source_unit_id}"
+    for item in scenes:
+        auxiliary_files = item.get("auxiliary_files")
+        if not isinstance(auxiliary_files, dict):
+            return False
+        relative = str(auxiliary_files.get(auxiliary_id, "")).strip()
+        cache_dir = Path(str(item.get("_cache_dir", "")))
+        if not relative or not (cache_dir / relative).is_file():
+            return False
+    return True
+
+
 def _collect_current_replaceme_rows(
     *,
     model: Any,
@@ -1071,22 +2171,26 @@ def _collect_current_replaceme_rows(
     scenes: Sequence[Dict[str, Any]],
     device: torch.device,
 ) -> ShardedRowStore:
-    """Capture one boundary into a temporary file-backed row store."""
+    """Capture current source/residual/target rows on the evolving model."""
     auxiliary_id = f"replaceme_residual:{source_unit_id}"
     scratch_root = Path(tempfile.mkdtemp(prefix="lare_replaceme_"))
     # Existing cache file sizes provide a conservative, model-independent
-    # estimate for three dynamic activation streams plus serialization headers.
+    # estimate for the three dynamic streams plus serialization headers.
     estimated = 0
     for item in scenes:
         cache_dir = Path(str(item["_cache_dir"]))
         layer_files = item.get("layer_files") or {}
         auxiliary_files = item.get("auxiliary_files") or {}
-        for key in (source_unit_id, target_unit_id):
+        for key in (source_unit_id,):
             rel = str(layer_files.get(key, ""))
             path = cache_dir / rel if rel else Path()
             if rel and path.is_file():
                 estimated += path.stat().st_size
         rel = str(auxiliary_files.get(auxiliary_id, ""))
+        path = cache_dir / rel if rel else Path()
+        if rel and path.is_file():
+            estimated += path.stat().st_size
+        rel = str(layer_files.get(target_unit_id, ""))
         path = cache_dir / rel if rel else Path()
         if rel and path.is_file():
             estimated += path.stat().st_size
@@ -1116,31 +2220,36 @@ def _collect_current_replaceme_rows(
                 backbone_adapter=adapter,
             )
             images = prepared.images.to(device=device, non_blocking=False)
+            requested_units = {source_unit_id, target_unit_id}
             unit_map, _selected_meta, auxiliary_map = forward_selected_units_with_auxiliaries(
                 adapter=adapter,
                 model=model,
                 images=images,
                 device=device,
-                unit_ids={source_unit_id, target_unit_id},
+                unit_ids=requested_units,
                 auxiliary_ids={auxiliary_id},
             )
+            target = unit_map[target_unit_id]
             h_raw, y_raw, r_raw = _align_replaceme_activations(
                 unit_map[source_unit_id],
-                unit_map[target_unit_id],
+                target,
                 auxiliary_map[auxiliary_id],
                 scene_id=str(item.get("scene_id", "<unknown>")),
                 source_unit_id=source_unit_id,
             )
+            tensors_to_stage = [("h", h_raw), ("y", y_raw), ("r", r_raw)]
             paths = []
-            for name, tensor in (("h", h_raw), ("y", y_raw), ("r", r_raw)):
+            for name, tensor in tensors_to_stage:
                 path = scratch_root / f"{scene_index:06d}_{name}.pt"
                 torch.save(tensor.detach().cpu().contiguous(), path)
                 paths.append(path)
-            h_disk, y_disk, r_disk = (
+            staged = [
                 torch.load(path, map_location="cpu", mmap=True, weights_only=False)
                 for path in paths
-            )
-            h, y, r = rows_view(h_disk), rows_view(y_disk), rows_view(r_disk)
+            ]
+            h_disk, y_disk, r_disk = staged
+            y = rows_view(y_disk)
+            h, r = rows_view(h_disk), rows_view(r_disk)
 
             def desired_builder(
                 indices: torch.Tensor,
@@ -1158,7 +2267,7 @@ def _collect_current_replaceme_rows(
                     desired_builder=desired_builder,
                 )
             )
-            del images, unit_map, auxiliary_map, h_raw, y_raw, r_raw
+            del images, unit_map, auxiliary_map, target, h_raw, y_raw, r_raw
         store = RecoveryActivationStore(shards)
         setattr(store, "_scratch_root", scratch_root)
         return store
@@ -1175,6 +2284,123 @@ def _close_dynamic_row_store(store: ShardedRowStore) -> None:
         shutil.rmtree(Path(scratch_root), ignore_errors=True)
 
 
+def _fit_replaceme_ls_from_row_store(
+    *,
+    row_store: ShardedRowStore,
+    device: torch.device,
+    alpha: float,
+    chunk_rows: int = DEFAULT_RECOVERY_CHUNK_ROWS,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Solve ReplaceMe LS from activations captured on the evolving model."""
+    if int(chunk_rows) <= 0:
+        raise ValueError("Sequential ReplaceMe LS chunk_rows must be positive")
+    rtr: Optional[torch.Tensor] = None
+    rtd: Optional[torch.Tensor] = None
+    rows = 0
+    for start in range(0, int(row_store.num_rows), int(chunk_rows)):
+        end = min(start + int(chunk_rows), int(row_store.num_rows))
+        indices = torch.arange(start, end, dtype=torch.long)
+        input_rows, desired_rows = row_store.gather(
+            indices, pin_memory=device.type == "cuda"
+        )
+        if input_rows.shape != desired_rows.shape:
+            raise RuntimeError(
+                "Sequential ReplaceMe LS received mismatched rows: "
+                f"{tuple(input_rows.shape)} vs {tuple(desired_rows.shape)}"
+            )
+        residual = input_rows.to(
+            device=device, dtype=torch.float32, non_blocking=device.type == "cuda"
+        )
+        desired = desired_rows.to(
+            device=device, dtype=torch.float32, non_blocking=device.type == "cuda"
+        )
+        row_store.record_transfer()
+        residual64 = residual.to(torch.float64)
+        desired64 = desired.to(torch.float64)
+        rr = residual64.T @ residual64
+        rd = residual64.T @ desired64
+        rtr = rr if rtr is None else rtr + rr
+        rtd = rd if rtd is None else rtd + rd
+        rows += int(residual.shape[0])
+        del residual, desired, residual64, desired64, rr, rd
+    if rtr is None or rtd is None or rows <= 0:
+        raise RuntimeError("No activation rows were available for sequential ReplaceMe LS")
+    channels = int(rtr.shape[0])
+    reg = float(alpha) * torch.eye(channels, device=device, dtype=torch.float64)
+    transform = torch.linalg.solve(rtr + reg, rtd).to(torch.float32).cpu()
+    return transform, {
+        "num_scenes": len(row_store.shards),
+        "num_rows": rows,
+        "ls_alpha": float(alpha),
+        "chunk_rows": int(chunk_rows),
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_boundary_prefix_checkpoint(
+    path: Path,
+    records: Sequence[Dict[str, Any]],
+    method: str,
+    prune_plan_name: str,
+) -> Tuple[List[Tuple[torch.Tensor, Dict[str, Any]]], str]:
+    checkpoint_path = Path(path)
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid prefix checkpoint payload: {checkpoint_path}")
+    recorded_method = str(payload.get("recovery_method", ""))
+    if recorded_method != str(method):
+        raise ValueError(
+            f"Prefix checkpoint method mismatch: {recorded_method!r} != {method!r}"
+        )
+    configuration = payload.get("fit_configuration", {})
+    if not isinstance(configuration, dict):
+        raise ValueError(f"Prefix checkpoint has no fit configuration: {checkpoint_path}")
+    recorded_selector = str(configuration.get("prune_plan_name", ""))
+    if recorded_selector != str(prune_plan_name):
+        raise ValueError(
+            f"Prefix checkpoint selector mismatch: {recorded_selector!r} != {prune_plan_name!r}"
+        )
+    specs = payload.get("recovery_specs")
+    weights = payload.get("recovery_weights")
+    diagnostics = payload.get("fit_diagnostics", [])
+    if (
+        not isinstance(specs, list)
+        or not isinstance(weights, list)
+        or len(specs) != len(records)
+        or len(weights) != len(records)
+    ):
+        raise ValueError(
+            f"Prefix checkpoint boundary count mismatch: {checkpoint_path}"
+        )
+    for boundary_index, (raw_record, raw_spec) in enumerate(zip(records, specs)):
+        record = dict(raw_record)
+        spec = dict(raw_spec)
+        for field in ("source_unit_id", "target_unit_id"):
+            if str(spec.get(field, "")) != str(record.get(field, "")):
+                raise ValueError(
+                    f"Prefix checkpoint boundary {boundary_index} mismatch for {field}: "
+                    f"{spec.get(field)!r} != {record.get(field)!r}"
+                )
+    spec = dict(specs[0])
+    weight_entry = dict(weights[0])
+    weight = weight_entry.get("weight")
+    if not isinstance(weight, torch.Tensor):
+        raise ValueError(f"Prefix checkpoint boundary weight is not a tensor: {checkpoint_path}")
+    detail = dict(diagnostics[0]) if isinstance(diagnostics, list) and diagnostics else {}
+    detail.update({
+        "reused_prefix_checkpoint": str(checkpoint_path),
+        "reused_prefix_checkpoint_sha256": _sha256_file(checkpoint_path),
+    })
+    return [(weight.detach().cpu().to(torch.float32), detail)], _sha256_file(checkpoint_path)
+
+
 def _fit_ghost_interval_sequential(
     *,
     adapter: Any,
@@ -1186,14 +2412,30 @@ def _fit_ghost_interval_sequential(
     chunk_rows: int = DEFAULT_RECOVERY_CHUNK_ROWS,
     method: str = "recovery_ghost_interval_sequential",
     num_layers: int = 0,
+    ghost_token_group_names: Sequence[str] = ("all",),
+    ghost_token_group_starts: Sequence[int] = (0,),
+    ghost_stability: Optional[GhostStabilityConfig] = None,
+    ghost_autogroup_threshold: Optional[float] = None,
+    boundary_fit_mode: str = "sequential_current_target",
+    prefix_results: Sequence[Tuple[torch.Tensor, Dict[str, Any]]] = (),
 ) -> List[Tuple[torch.Tensor, Dict[str, Any]]]:
-    """Fit Ghost operators front-to-back on the evolving model."""
+    """Fit evolving Ghost interval boundaries front-to-back."""
+    if boundary_fit_mode not in {
+        "sequential_current_target",
+        "sequential_full_target",
+        "independent_full_target",
+    }:
+        raise ValueError(f"Unsupported Ghost boundary fit mode: {boundary_fit_mode!r}")
     model = adapter.load_pretrained(
         hf_model=str(hf_model or adapter.default_hf_model()),
         device=str(device),
         dtype=None,
         eval_mode=True,
     )
+    token_group_names, token_group_starts = _validate_ghost_token_layout(
+        ghost_token_group_names, ghost_token_group_starts
+    )
+    stability = (ghost_stability or GhostStabilityConfig()).validate()
     results: List[Tuple[torch.Tensor, Dict[str, Any]]] = []
     handles: List[Any] = []
     ordered_signatures = tuple(_boundary_signature(dict(raw)) for raw in records)
@@ -1201,10 +2443,18 @@ def _fit_ghost_interval_sequential(
         str(getattr(adapter, "name", type(adapter).__name__)),
         _base_checkpoint_hash(str(hf_model or adapter.default_hf_model())),
         _calibration_manifest_hash(scenes), "default", str(method), float(ridge),
+        recovery_method_semantics_version(str(method)),
         int(chunk_rows),
+        token_group_names,
+        token_group_starts,
+        tuple(sorted(stability.signature_payload().items())),
+        ghost_autogroup_threshold,
+        boundary_fit_mode,
     )
     prefix_entries = _SEQUENTIAL_GHOST_PREFIX_CACHE.setdefault(prefix_base_key, {})
-    reusable: List[Tuple[torch.Tensor, Dict[str, Any]]] = []
+    reusable: List[Tuple[torch.Tensor, Dict[str, Any]]] = [
+        (weight.clone(), dict(diagnostics)) for weight, diagnostics in prefix_results
+    ]
     for signature, candidate in prefix_entries.items():
         if (
             len(signature) > len(reusable)
@@ -1236,7 +2486,7 @@ def _fit_ghost_interval_sequential(
                 file=sys.stderr,
                 flush=True,
             )
-            weight = _fit_boundary_weight(
+            weight, fit_details = _fit_boundary_weight(
                 method="recovery_ghost",
                 source_unit_id=source_unit_id,
                 target_unit_id=target_unit_id,
@@ -1247,13 +2497,51 @@ def _fit_ghost_interval_sequential(
                 chunk_rows=chunk_rows,
                 boundary_index=boundary_index,
                 boundary_total=len(records),
+                ghost_token_group_names=token_group_names,
+                ghost_token_group_starts=token_group_starts,
+                ghost_stability=stability,
+                ghost_autogroup_threshold=ghost_autogroup_threshold,
+                return_diagnostics=True,
             )
             diagnostics = {
                 "fit_mode": "disk_cache",
+                "source_mode": "full_model_disk_cache",
+                "target_mode": "current_model_equivalent_full_model_disk_cache",
                 "num_scenes": len(scenes),
                 "ridge": float(ridge),
                 "chunk_rows": int(chunk_rows),
+                **fit_details,
             }
+            if len(token_group_names) > 1:
+                diagnostics.update(
+                    {
+                        "token_groups": list(token_group_names),
+                        "token_group_starts": list(token_group_starts),
+                    }
+                )
+        elif boundary_fit_mode == "independent_full_target":
+            weight, diagnostics = _fit_boundary_weight(
+                method="recovery_ghost",
+                source_unit_id=source_unit_id,
+                target_unit_id=target_unit_id,
+                scenes=scenes,
+                num_layers=int(num_layers),
+                device=device,
+                ridge=ridge,
+                chunk_rows=chunk_rows,
+                boundary_index=boundary_index,
+                boundary_total=len(records),
+                ghost_token_group_names=token_group_names,
+                ghost_token_group_starts=token_group_starts,
+                ghost_stability=stability,
+                ghost_autogroup_threshold=ghost_autogroup_threshold,
+                return_diagnostics=True,
+            )
+            diagnostics.update({
+                "fit_mode": "independent_full_target",
+                "source_mode": "full_model_disk_cache",
+                "target_mode": "full_model_disk_cache",
+            })
         else:
             weight, diagnostics = _fit_current_ghost_boundary(
                 model=model,
@@ -1266,7 +2554,18 @@ def _fit_ghost_interval_sequential(
                 chunk_rows=chunk_rows,
                 boundary_index=boundary_index,
                 boundary_total=len(records),
+                ghost_token_group_names=token_group_names,
+                ghost_token_group_starts=token_group_starts,
+                ghost_stability=stability,
+                ghost_autogroup_threshold=ghost_autogroup_threshold,
+                num_layers=int(num_layers),
+                target_mode=(
+                    "full_model_disk_cache"
+                    if boundary_fit_mode == "sequential_full_target"
+                    else "sequential_current_model"
+                ),
             )
+        diagnostics["boundary_fit_mode"] = boundary_fit_mode
         diagnostics["boundary_index"] = boundary_index
         module_name = recovery_module_name(source_unit_id)
         spec = {
@@ -1276,6 +2575,11 @@ def _fit_ghost_interval_sequential(
             "module_name": module_name,
             "weight_shape": [int(x) for x in weight.shape],
         }
+        if weight.dim() == 3:
+            spec["token_groups"] = list(token_group_names)
+            spec["token_group_starts"] = list(token_group_starts)
+        if stability.coupling_profile != "none":
+            spec["ghost_coupling_profile"] = stability.coupling_profile
         actions = [
             PruneAction(action="drop_unit", unit_id=unit_index_to_unit_id(index))
             for index in range(
@@ -1326,8 +2630,9 @@ def _fit_replaceme_cos_sequential(
     batch_size: int,
     lr: float,
     seed: int,
+    num_layers: int = 0,
 ) -> List[Tuple[torch.Tensor, Dict[str, Any]]]:
-    """Fit Multi-LT cosine transforms front-to-back on the evolving model."""
+    """Match official ReplaceMe Cosine: fit each interval on the current model."""
     if _ACTIVE_RECOVERY_SESSION is not None:
         _ACTIVE_RECOVERY_SESSION.clear_units()
     model = adapter.load_pretrained(
@@ -1344,6 +2649,7 @@ def _fit_replaceme_cos_sequential(
         _calibration_manifest_hash(scenes),
         "default",
         "recovery_replaceme_cos_sequential",
+        recovery_method_semantics_version("recovery_replaceme_cos"),
         int(epochs), int(batch_size), float(lr), int(seed),
     )
     prefix_entries = _SEQUENTIAL_REPLACEME_PREFIX_CACHE.setdefault(prefix_base_key, {})
@@ -1403,6 +2709,8 @@ def _fit_replaceme_cos_sequential(
         diagnostics.update(
             {
                 "fit_mode": "sequential_current_model",
+                "source_mode": "sequential_current_model",
+                "target_mode": "sequential_current_model",
                 "boundary_index": boundary_index,
             }
         )
@@ -1475,6 +2783,7 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
     recovery_root = Path(args.recovery_plan_root or args.prune_plan_root)
     recovery_plan_name = str(args.recovery_plan_name).strip()
     prune_plan_name = str(args.prune_plan_name).strip()
+    ghost_stability = _ghost_stability_config(args)
     prune_plan = compose_recovery_unit_prune_plan(
         prune_plan_root=plan_root,
         recovery_plan_root=recovery_root,
@@ -1483,6 +2792,38 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
     )
     bundle = load_recovery_plan_bundle(recovery_root, recovery_plan_name)
     method, pair_records = _pair_records(bundle, prune_plan, recovery_plan_name)
+    ghost_boundary_fit_mode = str(args.ghost_boundary_fit_mode)
+    ghost_methods = {
+        "recovery_ghost_interval_sequential",
+        *_TOKEN_GROUPED_GHOST_METHODS,
+    }
+    if ghost_boundary_fit_mode != "sequential_current_target" and (
+        method not in ghost_methods or len(pair_records) <= 1
+    ):
+        raise SystemExit(
+            "Non-default --ghost-boundary-fit-mode requires a multi-interval "
+            "sequential Ghost recovery plan"
+        )
+    if args.reuse_boundary_prefix_checkpoint is not None and (
+        method not in ghost_methods or len(pair_records) <= 1
+    ):
+        raise SystemExit(
+            "--reuse-boundary-prefix-checkpoint requires a multi-interval "
+            "sequential Ghost recovery plan"
+        )
+    is_autogroup = method == "recovery_ghost_interval_sequential_autogroup"
+    ghost_autogroup_threshold: Optional[float] = None
+    if is_autogroup:
+        ghost_autogroup_threshold = float(args.ghost_autogroup_threshold)
+        if (
+            not math.isfinite(ghost_autogroup_threshold)
+            or ghost_autogroup_threshold <= 0.0
+        ):
+            raise SystemExit("--ghost-autogroup-threshold must be finite and positive")
+        if ghost_stability != GhostStabilityConfig():
+            raise SystemExit(
+                "autogroup currently requires legacy Ghost fitting without coupling"
+            )
     default_output_root = Path(os.environ.get("OUTPUT_ROOT", str(OUTPUT_ROOT_DEFAULT)))
     out_dir = (
         args.output_dir
@@ -1492,7 +2833,7 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
         / prune_plan_name
         / recovery_plan_name
     )
-    if _try_link_derived_ghost_recovery(
+    if ghost_stability.coupling_profile == "none" and _try_link_derived_ghost_recovery(
         method=method,
         prune_plan=prune_plan,
         recovery_plan_name=recovery_plan_name,
@@ -1503,14 +2844,56 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
     ):
         return
     dataset_names = _parse_name_list(args.datasets or args.dataset)
-    cache_dirs = [stage_dir(args.experiment, name, "cache") for name in dataset_names]
-    scenes = _load_training_scenes(cache_dirs, int(args.max_scenes))
+    scene_limits = _parse_scene_limits(args.scene_limits, dataset_names)
+    cache_dirs = (
+        [Path(args.cache_root) / adapter.name / name / "cache" for name in dataset_names]
+        if args.cache_root is not None
+        else [stage_dir(args.experiment, name, "cache") for name in dataset_names]
+    )
+    scenes = _load_training_scenes(
+        cache_dirs,
+        int(args.max_scenes),
+        exact_limits=(
+            [scene_limits[name] for name in dataset_names] if scene_limits else None
+        ),
+    )
     if not scenes:
         raise SystemExit("No scenes selected from cache")
     first_manifest = load_v3_manifest(cache_dirs[0])
     num_layers = max((int(u.index) for u in first_manifest.layer_units if u.kind in ("frame", "global")), default=-1) + 1
     if int(prune_plan.num_units) != int(num_layers * 2):
         raise SystemExit(f"prune plan num_units={prune_plan.num_units} != cache num_units={num_layers * 2}")
+
+    ghost_token_group_names: Tuple[str, ...] = ("all",)
+    ghost_token_group_starts: Tuple[int, ...] = (0,)
+    if method in _TOKEN_GROUPED_GHOST_METHODS:
+        patch_start_idx = _common_patch_start(scenes)
+        if ghost_stability.profile == "native_all":
+            ghost_token_group_names, ghost_token_group_starts = (
+                _validate_ghost_token_layout(
+                    *adapter.ghost_token_group_layout(
+                        patch_start_idx=int(patch_start_idx)
+                    )
+                )
+            )
+        else:
+            ghost_token_group_names, ghost_token_group_starts = (
+                _ghost_token_layout_for_method(
+                    adapter=adapter,
+                    method=method,
+                    patch_start_idx=patch_start_idx,
+                )
+            )
+
+    prefix_results: List[Tuple[torch.Tensor, Dict[str, Any]]] = []
+    prefix_checkpoint_sha256 = ""
+    if args.reuse_boundary_prefix_checkpoint is not None:
+        prefix_results, prefix_checkpoint_sha256 = _load_boundary_prefix_checkpoint(
+            Path(args.reuse_boundary_prefix_checkpoint),
+            pair_records,
+            method,
+            prune_plan_name,
+        )
 
     job_index = int(getattr(args, "_job_index", 1))
     job_total = int(getattr(args, "_job_total", 1))
@@ -1522,7 +2905,12 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
         f"    method: {method.removeprefix('recovery_')}\n"
         f"    datasets: {','.join(dataset_names)}\n"
         f"    scenes: {len(scenes)}\n"
-        f"    boundaries: {len(pair_records)}\n",
+        f"    boundaries: {len(pair_records)}\n"
+        + (
+            f"    ghost token groups: {','.join(ghost_token_group_names)}\n"
+            if method in _TOKEN_GROUPED_GHOST_METHODS
+            else ""
+        ),
         file=sys.stderr,
         flush=True,
     )
@@ -1532,7 +2920,10 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
     fit_diagnostics: List[Dict[str, Any]] = []
     sequential_replaceme_results: Optional[List[Tuple[torch.Tensor, Dict[str, Any]]]] = None
     sequential_ghost_results: Optional[List[Tuple[torch.Tensor, Dict[str, Any]]]] = None
-    if method == "recovery_ghost_interval_sequential" and len(pair_records) > 1:
+    if method in (
+        "recovery_ghost_interval_sequential",
+        *_TOKEN_GROUPED_GHOST_METHODS,
+    ) and len(pair_records) > 1:
         sequential_ghost_results = _fit_ghost_interval_sequential(
             adapter=adapter,
             hf_model=str(args.hf_model),
@@ -1543,6 +2934,12 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
             chunk_rows=chunk_rows,
             method=method,
             num_layers=num_layers,
+            ghost_token_group_names=ghost_token_group_names,
+            ghost_token_group_starts=ghost_token_group_starts,
+            ghost_stability=ghost_stability,
+            ghost_autogroup_threshold=ghost_autogroup_threshold,
+            boundary_fit_mode=ghost_boundary_fit_mode,
+            prefix_results=prefix_results,
         )
     if method == "recovery_replaceme_cos" and len(pair_records) > 1:
         sequential_replaceme_results = _fit_replaceme_cos_sequential(
@@ -1555,6 +2952,7 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
             batch_size=int(args.replaceme_cos_batch_size),
             lr=float(args.replaceme_cos_lr),
             seed=int(args.replaceme_seed),
+            num_layers=num_layers,
         )
     for record_index, record in enumerate(pair_records):
         _compact_resource_log(
@@ -1584,8 +2982,9 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
             "recovery_ghost_interval",
             "recovery_ghost_interval_sequential",
             "recovery_linearpatch",
+            *_TOKEN_GROUPED_GHOST_METHODS,
         ):
-            weight = _fit_boundary_weight(
+            weight, diagnostics = _fit_boundary_weight(
                 method=(
                     "recovery_linearpatch"
                     if method == "recovery_linearpatch"
@@ -1600,6 +2999,23 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
                 chunk_rows=chunk_rows,
                 boundary_index=record_index,
                 boundary_total=len(pair_records),
+                ghost_token_group_names=(
+                    ghost_token_group_names
+                    if method in _TOKEN_GROUPED_GHOST_METHODS
+                    else ("all",)
+                ),
+                ghost_token_group_starts=(
+                    ghost_token_group_starts
+                    if method in _TOKEN_GROUPED_GHOST_METHODS
+                    else (0,)
+                ),
+                ghost_stability=(
+                    ghost_stability
+                    if method in _TOKEN_GROUPED_GHOST_METHODS
+                    else GhostStabilityConfig()
+                ),
+                ghost_autogroup_threshold=ghost_autogroup_threshold,
+                return_diagnostics=True,
             )
         elif method == "recovery_replaceme_ls":
             weight, diagnostics = _fit_replaceme_ls(
@@ -1627,21 +3043,54 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
                 boundary_index=record_index,
                 boundary_total=len(pair_records),
             )
+        elif method == "recovery_streamline_ffn":
+            weight, diagnostics = _fit_streamline_ffn(
+                source_unit_id=source_unit_id,
+                target_unit_id=target_unit_id,
+                scenes=scenes,
+                num_layers=num_layers,
+                device=device,
+                epochs=int(args.streamline_ffn_epochs),
+                batch_size=int(args.streamline_ffn_batch_size),
+                lr=float(args.streamline_ffn_lr),
+                min_lr=float(args.streamline_ffn_min_lr),
+                weight_decay=float(args.streamline_ffn_weight_decay),
+                expansion_factor=int(args.streamline_ffn_expansion),
+                seed=int(args.streamline_ffn_seed),
+                boundary_index=record_index,
+                boundary_total=len(pair_records),
+            )
         else:
-            raise ValueError(f"Unsupported training-free recovery method {method!r}")
+            raise ValueError(f"Unsupported cache-fit recovery method {method!r}")
+        if method in _TOKEN_GROUPED_GHOST_METHODS:
+            diagnostics.setdefault("token_groups", list(ghost_token_group_names))
+            diagnostics.setdefault("token_group_starts", list(ghost_token_group_starts))
         weights.append(weight)
         fit_diagnostics.append(diagnostics)
-        recovery_specs.append(
-            {
-                "type": method,
-                "source_unit_id": source_unit_id,
-                "target_unit_id": target_unit_id,
-                "source_unit_index": int(record.get("source_unit_index")),
-                "target_unit_index": int(record.get("target_unit_index")),
-                "module_name": recovery_module_name(source_unit_id),
-                "weight_shape": [int(x) for x in weight.shape],
-            }
-        )
+        spec = {
+            "type": method,
+            "source_unit_id": source_unit_id,
+            "target_unit_id": target_unit_id,
+            "source_unit_index": int(record.get("source_unit_index")),
+            "target_unit_index": int(record.get("target_unit_index")),
+            "module_name": recovery_module_name(source_unit_id),
+            "weight_shape": [int(x) for x in weight.shape],
+        }
+        if method in _TOKEN_GROUPED_GHOST_METHODS and weight.dim() == 3:
+            spec["token_groups"] = list(ghost_token_group_names)
+            spec["token_group_starts"] = list(ghost_token_group_starts)
+            if ghost_stability.coupling_profile != "none":
+                spec["ghost_coupling_profile"] = ghost_stability.coupling_profile
+        if method == "recovery_streamline_ffn":
+            spec.update(
+                {
+                    "hidden_size": int(diagnostics["hidden_size"]),
+                    "expansion_factor": int(diagnostics["expansion_factor"]),
+                    "activation": "relu",
+                    "objective": "boundary_mse",
+                }
+            )
+        recovery_specs.append(spec)
 
     recovery_specs, compact_entries = compact_recovery_operators(
         recovery_specs,
@@ -1658,19 +3107,70 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    num_scenes_by_cache = {
+        str(cache_dir): sum(
+            1 for scene in scenes if str(scene.get("_cache_dir", "")) == str(cache_dir)
+        )
+        for cache_dir in cache_dirs
+    }
+    cache_manifest_sha256_by_dataset = {
+        str(dataset_name): _sha256_file(Path(cache_dir) / "cache_manifest_v3.json")
+        for dataset_name, cache_dir in zip(dataset_names, cache_dirs)
+    }
+    hf_model = str(args.hf_model or adapter.default_hf_model())
+    fit_configuration = {
+        "backbone": adapter.name,
+        "base_hf_model": hf_model,
+        "base_checkpoint_hash": _base_checkpoint_hash(hf_model),
+        "method": method,
+        "recovery_semantics_version": recovery_method_semantics_version(method),
+        "prune_plan_name": prune_plan_name,
+        "recovery_plan_name": recovery_plan_name,
+        "prune_drop_indices": sorted(set(int(index) for index in prune_plan.drop)),
+        "boundaries": [dict(record) for record in pair_records],
+        "recovery_specs": recovery_specs,
+        "ghost_stability": ghost_stability.signature_payload(),
+        "ghost_token_layout": {
+            "groups": list(ghost_token_group_names),
+            "starts": list(ghost_token_group_starts),
+        },
+        "ghost_autogroup_threshold": ghost_autogroup_threshold,
+        "ghost_boundary_fit_mode": ghost_boundary_fit_mode,
+        "reused_boundary_prefix_checkpoint": (
+            str(Path(args.reuse_boundary_prefix_checkpoint))
+            if args.reuse_boundary_prefix_checkpoint is not None else ""
+        ),
+        "reused_boundary_prefix_checkpoint_sha256": prefix_checkpoint_sha256,
+        "legacy_ridge": float(args.ridge),
+        "chunk_rows": chunk_rows,
+        "cache_root": str(Path(args.cache_root)) if args.cache_root else "",
+        "calibration_manifest_hash": _calibration_manifest_hash(scenes),
+        "cache_manifest_sha256_by_dataset": cache_manifest_sha256_by_dataset,
+        "datasets": list(dataset_names),
+        "max_scenes_per_dataset": int(args.max_scenes),
+        "scene_limits_by_dataset": dict(scene_limits),
+    }
+    fit_signature = hashlib.sha256(
+        json.dumps(fit_configuration, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     summary = {
         "backbone": adapter.name,
         "method": method,
         "prune_plan_name": prune_plan_name,
         "recovery_plan_name": recovery_plan_name,
         "num_scenes": len(scenes),
+        "max_scenes_per_dataset": int(args.max_scenes),
+        "scene_limits_by_dataset": dict(scene_limits),
+        "num_scenes_by_cache": num_scenes_by_cache,
         "cache_dirs": [str(p) for p in cache_dirs],
         "recovery_specs": recovery_specs,
         "fit_diagnostics": fit_diagnostics,
+        "fit_configuration": fit_configuration,
+        "fit_signature": fit_signature,
+        "recovery_semantics_version": recovery_method_semantics_version(method),
     }
     (out_dir / "config.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (out_dir / "recovery_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    hf_model = str(args.hf_model or adapter.default_hf_model())
     def checkpoint_payload(
         checkpoint_weights: Sequence[torch.Tensor],
         *,
@@ -1686,6 +3186,10 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
             "train_unit_indices": [],
             "training_method": method,
             "recovery_method": method,
+            "recovery_semantics_version": recovery_method_semantics_version(method),
+            "fit_configuration": fit_configuration,
+            "fit_signature": fit_signature,
+            "fit_diagnostics": fit_diagnostics,
             "recovery_specs": recovery_specs,
             "recovery_weights": [
                 {
@@ -1710,7 +3214,11 @@ def _run_recovery_request(args: argparse.Namespace) -> None:
                 if fit_diagnostics
                 else 0
             ),
-            variant="training_free_recovery_delta",
+            variant=(
+                "local_fit_recovery_delta"
+                if method == "recovery_streamline_ffn"
+                else "training_free_recovery_delta"
+            ),
         ),
         out_dir / "checkpoints" / "latest.pt",
     )

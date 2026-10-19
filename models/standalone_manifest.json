@@ -1,0 +1,43 @@
+{
+  "schema_version": "lare_calibrated_v1",
+  "format": "standalone_model",
+  "calibration_datasets": [
+    "scannet_dev50",
+    "7scenes_train",
+    "nuscenes_train",
+    "waymo_training"
+  ],
+  "selection_policy": "calibration_raw_seven_metric_mean; double_improvement > 0.1",
+  "models": {
+    "vggt": {
+      "checkpoint": "vggt/model.pt",
+      "bytes": 4408918987,
+      "sha256": "dedc618fc89f92abc8417bea4cd10bcba4182e8e748279f79694fba009056344",
+      "drop_count": 10,
+      "selector": "i8_j17",
+      "strategy": "retention_single",
+      "calibration_score": 2.8196375760036183,
+      "recovery_method": "recovery_ghost_interval_sequential_autogroup"
+    },
+    "pi3": {
+      "checkpoint": "pi3/model.pt",
+      "bytes": 3037188346,
+      "sha256": "c6d32262f55afaae8029d1288549df260ad9efd219fde665342300bcb39e3c91",
+      "drop_count": 16,
+      "selector": "i3_j18",
+      "strategy": "retention_single",
+      "calibration_score": 2.979049234369896,
+      "recovery_method": "recovery_ghost_interval_sequential_autogroup"
+    },
+    "vggt_omega": {
+      "checkpoint": "vggt_omega/model.pt",
+      "bytes": 3677697293,
+      "sha256": "d787a967d5411ff94a87ca6e0726ae144807d50f5b2fde58afef78414d9f0a74",
+      "drop_count": 18,
+      "selector": "i1_j18",
+      "strategy": "retention_single",
+      "calibration_score": 2.7187466441008574,
+      "recovery_method": "recovery_ghost_interval_sequential_autogroup"
+    }
+  }
+}

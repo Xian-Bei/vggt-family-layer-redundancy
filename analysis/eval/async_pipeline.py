@@ -46,8 +46,6 @@ def scene_preload_enabled(
 class PreloadedScene:
     batch: Any = None
     prepared: Any = None
-    iterator_s: float = 0.0
-    cpu_prepare_s: float = 0.0
     error: Optional[Exception] = None
     exhausted: bool = False
 
@@ -57,16 +55,10 @@ def _preload_next_scene(
     scene_iterator: Iterator[Any],
     prepare_fn: Callable[[Any], Any],
 ) -> PreloadedScene:
-    iterator_t0 = time.perf_counter()
     try:
         batch = next(scene_iterator)
     except StopIteration:
-        return PreloadedScene(
-            iterator_s=time.perf_counter() - iterator_t0,
-            exhausted=True,
-        )
-    iterator_s = time.perf_counter() - iterator_t0
-    prepare_t0 = time.perf_counter()
+        return PreloadedScene(exhausted=True)
     try:
         prepared = prepare_fn(batch)
         images = getattr(prepared, "images", None)
@@ -79,14 +71,10 @@ def _preload_next_scene(
         return PreloadedScene(
             batch=batch,
             prepared=prepared,
-            iterator_s=iterator_s,
-            cpu_prepare_s=time.perf_counter() - prepare_t0,
         )
     except Exception as exc:
         return PreloadedScene(
             batch=batch,
-            iterator_s=iterator_s,
-            cpu_prepare_s=time.perf_counter() - prepare_t0,
             error=exc,
         )
 
@@ -106,9 +94,6 @@ class AsyncScenePreloader:
             max_workers=1, thread_name_prefix="eval-preload"
         )
         self.future: Optional[Future[PreloadedScene]] = self._submit()
-        self.iterator_s = 0.0
-        self.cpu_prepare_s = 0.0
-        self.preload_wait_s = 0.0
         self.max_lookahead_seen = 1
         self.closed = False
 
@@ -122,11 +107,7 @@ class AsyncScenePreloader:
     def next(self) -> Optional[PreloadedScene]:
         if self.closed or self.future is None:
             return None
-        wait_t0 = time.perf_counter()
         item = self.future.result()
-        self.preload_wait_s += time.perf_counter() - wait_t0
-        self.iterator_s += item.iterator_s
-        self.cpu_prepare_s += item.cpu_prepare_s
         if item.exhausted:
             self.future = None
             return None
@@ -311,12 +292,14 @@ def _score_staged_prediction(
     score_fn: Callable[[Any, PredictionBundle], Dict[str, float]],
     key: Any,
     prediction: PredictionBundle,
+    timing: bool,
 ) -> _ScoreResult:
     ready_event.synchronize()
-    score_t0 = time.perf_counter()
+    score_t0 = time.perf_counter() if timing else 0.0
     materialize_deferred_cpu_geometry(prediction)
     metrics = score_fn(key, prediction)
-    return _ScoreResult(metrics=metrics, score_s=time.perf_counter() - score_t0)
+    score_s = time.perf_counter() - score_t0 if timing else 0.0
+    return _ScoreResult(metrics=metrics, score_s=score_s)
 
 
 class AsyncPredictionScorePipeline:
@@ -362,6 +345,9 @@ class AsyncPredictionScorePipeline:
     def submit(self, key: Any, prediction: PredictionBundle) -> None:
         if self.closed:
             raise RuntimeError("Cannot submit to a closed async score pipeline")
+        # Publish completed results even when the bounded queue is not full.
+        # Keep callbacks on the producer thread and preserve submission order.
+        self.drain_ready()
         if len(self.pending) >= self.max_pending:
             self._drain_one(count_producer_wait=True)
         slot = self.free_slots.popleft()
@@ -382,6 +368,7 @@ class AsyncPredictionScorePipeline:
             score_fn=self.score_fn,
             key=key,
             prediction=staged,
+            timing=self.timing,
         )
         self.pending.append(
             _PendingScore(
@@ -396,10 +383,11 @@ class AsyncPredictionScorePipeline:
 
     def _drain_one(self, *, count_producer_wait: bool) -> None:
         item = self.pending.popleft()
-        wait_t0 = time.perf_counter()
+        measure_wait = self.timing and count_producer_wait
+        wait_t0 = time.perf_counter() if measure_wait else 0.0
         try:
             result = item.future.result()
-            if count_producer_wait:
+            if measure_wait:
                 self.producer_wait_s += time.perf_counter() - wait_t0
             self.score_s += result.score_s
             if self.timing and item.copy_start_event is not None:
@@ -408,11 +396,16 @@ class AsyncPredictionScorePipeline:
                 )
             self.result_fn(item.key, result.metrics)
         except Exception as exc:
-            if count_producer_wait:
+            if measure_wait:
                 self.producer_wait_s += time.perf_counter() - wait_t0
             self.error_fn(item.key, exc)
         finally:
             self.free_slots.append(item.slot)
+
+    def drain_ready(self) -> None:
+        """Collect the completed prefix without waiting for unfinished scores."""
+        while self.pending and self.pending[0].future.done():
+            self._drain_one(count_producer_wait=False)
 
     def drain(self) -> None:
         while self.pending:

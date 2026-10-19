@@ -22,15 +22,26 @@ class Cell:
 class Section:
     columns: int
     cells: list[Cell]
+    column_width_weights: list[float] | None = None
+    column_gaps: list[int] | None = None
     fixed_rows: list[list[Cell]] | None = None
     row_labels: list[str] | None = None
     row_labels_bold: bool = False
+    row_label_centers: list[float] | None = None
     column_labels: list[str] | None = None
+    column_label_columns: int | None = None
     column_labels_below: bool = False
     column_labels_bold: bool = False
+    column_label_centers: list[float] | None = None
     heading: str = ""
+    heading_y_offset: int = 0
     caption_bold: bool = False
     group_headings: list[tuple[str, int]] | None = None
+    group_heading_anchor_columns: list[float] | None = None
+    group_heading_anchor_boundaries: list[int] | None = None
+    group_headings_below: bool = False
+    row_banners: dict[int, Any] | None = None
+    row_banners_align_content: bool = False
 
 
 def update_value(value: Any) -> tuple[Any, dict[str, Any]]:
@@ -77,6 +88,37 @@ def gallery_cells(value: Any) -> list[Cell]:
         if image is not None:
             cells.append(Cell(image=image, caption=str(caption or "")))
     return cells
+
+
+def crop_horizontal_white_margins(
+    image: Image.Image,
+    *,
+    padding: int = 10,
+    threshold: int = 250,
+) -> Image.Image:
+    """Trim blank side margins while preserving normalized x-axis metadata."""
+    source = image.convert("RGB")
+    pixels = np.asarray(source)
+    ink_columns = np.flatnonzero(np.any(pixels < threshold, axis=(0, 2)))
+    if not ink_columns.size:
+        return source
+    left = max(0, int(ink_columns[0]) - max(0, int(padding)))
+    right = min(source.width, int(ink_columns[-1]) + max(0, int(padding)) + 1)
+    if left == 0 and right == source.width:
+        return source
+
+    cropped = source.crop((left, 0, right, source.height))
+    cropped.info.update(source.info)
+    for key in ("axes_center_x", "axes_left_x", "axes_right_x"):
+        if key not in source.info:
+            continue
+        old_x = float(source.info[key]) * source.width
+        cropped.info[key] = float(np.clip(
+            (old_x - left) / cropped.width,
+            0.0,
+            1.0,
+        ))
+    return cropped
 
 
 def _font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
@@ -143,11 +185,41 @@ def compose_sections(
             ) + 12
         x_offset = label_width + (left_label_to_image_gap if label_width else 0)
         content_width = width - x_offset
+        column_gaps = [int(heatmap_column_gap)] * max(0, section.columns - 1)
+        if (
+            section.column_gaps is not None
+            and len(section.column_gaps) == max(0, section.columns - 1)
+        ):
+            column_gaps = [int(gap) for gap in section.column_gaps]
+        total_column_gap = sum(column_gaps)
         cell_width = max(
             1,
-            (content_width - heatmap_column_gap * (section.columns - 1))
+            (content_width - total_column_gap)
             // section.columns,
         )
+        column_widths = [cell_width] * section.columns
+        if (
+            section.column_width_weights is not None
+            and len(section.column_width_weights) == section.columns
+            and all(
+                np.isfinite(weight) and float(weight) > 0.0
+                for weight in section.column_width_weights
+            )
+        ):
+            available_width = max(
+                section.columns,
+                content_width - total_column_gap,
+            )
+            weights = np.asarray(section.column_width_weights, dtype=np.float64)
+            exact_widths = available_width * weights / float(weights.sum())
+            column_widths = np.maximum(1, np.floor(exact_widths)).astype(int).tolist()
+        column_starts: list[int] = []
+        cursor = x_offset
+        for column, column_width in enumerate(column_widths):
+            column_starts.append(cursor)
+            cursor += column_width
+            if column < len(column_gaps):
+                cursor += column_gaps[column]
         if section.heading:
             font_size = int(outer_font_size)
             font = _font(font_size, bold=True)
@@ -156,54 +228,158 @@ def compose_sections(
             draw = ImageDraw.Draw(image)
             bounds = draw.textbbox((0, 0), section.heading, font=font)
             draw.text(
-                (max(0, (width - (bounds[2] - bounds[0])) // 2), 0),
+                (
+                    max(0, (width - (bounds[2] - bounds[0])) // 2),
+                    int(section.heading_y_offset),
+                ),
                 section.heading,
                 fill="#111111",
                 font=font,
             )
             rendered_rows.append(image)
             spacing_after.append(top_label_to_image_gap)
+        group_row: Image.Image | None = None
         if section.group_headings:
             font_size = int(outer_font_size)
             font = _font(font_size, bold=True)
             height = font_size + 6
-            image = Image.new("RGB", (width, height), "white")
-            draw = ImageDraw.Draw(image)
+            group_row = Image.new("RGB", (width, height), "white")
+            draw = ImageDraw.Draw(group_row)
             start = 0
-            for label, span in section.group_headings:
-                span_width = cell_width * span + heatmap_column_gap * (span - 1)
-                x = x_offset + start * (cell_width + heatmap_column_gap)
+            for group_index, (label, span) in enumerate(section.group_headings):
+                end = min(section.columns, start + span)
+                if start >= end:
+                    break
+                span_width = sum(column_widths[start:end]) + sum(
+                    column_gaps[start : max(start, end - 1)]
+                )
+                x = column_starts[start]
                 bounds = draw.textbbox((0, 0), label, font=font)
+                heading_center = x + span_width / 2.0
+                if (
+                    section.group_heading_anchor_boundaries is not None
+                    and group_index
+                    < len(section.group_heading_anchor_boundaries)
+                ):
+                    boundary = int(
+                        section.group_heading_anchor_boundaries[group_index]
+                    )
+                    if 0 < boundary < section.columns:
+                        heading_center = (
+                            column_starts[boundary]
+                            - column_gaps[boundary - 1] / 2.0
+                        )
+                elif (
+                    section.group_heading_anchor_columns is not None
+                    and group_index < len(section.group_heading_anchor_columns)
+                ):
+                    anchor = float(section.group_heading_anchor_columns[group_index])
+                    lower = int(np.floor(anchor))
+                    upper = int(np.ceil(anchor))
+                    if 0 <= lower < section.columns and 0 <= upper < section.columns:
+                        fraction = anchor - lower
+
+                        def _axis_center(column: int) -> float:
+                            center = (
+                                section.column_label_centers[column]
+                                if section.column_label_centers is not None
+                                and column < len(section.column_label_centers)
+                                else 0.5
+                            )
+                            return column_starts[column] + column_widths[column] * center
+
+                        heading_center = (
+                            (1.0 - fraction) * _axis_center(lower)
+                            + fraction * _axis_center(upper)
+                        )
                 draw.text(
-                    (x + max(0, (span_width - (bounds[2] - bounds[0])) // 2), 0),
+                    (
+                        max(0, round(heading_center - (bounds[2] - bounds[0]) / 2)),
+                        0,
+                    ),
                     label,
                     fill="#111111",
                     font=font,
                 )
-                start += span
-            rendered_rows.append(image)
-            spacing_after.append(top_label_to_image_gap)
+                start = end
+            if not section.group_headings_below:
+                rendered_rows.append(group_row)
+                spacing_after.append(top_label_to_image_gap)
         column_row: Image.Image | None = None
         if section.column_labels:
+            label_columns = max(
+                1,
+                int(section.column_label_columns or section.columns),
+            )
+            if label_columns == section.columns:
+                label_widths = column_widths
+                label_starts = column_starts
+            else:
+                label_cell_width = max(
+                    1,
+                    (
+                        content_width
+                        - heatmap_column_gap * (label_columns - 1)
+                    )
+                    // label_columns,
+                )
+                label_widths = [label_cell_width] * label_columns
+                label_starts = [
+                    x_offset + column * (label_cell_width + heatmap_column_gap)
+                    for column in range(label_columns)
+                ]
             font_size = int(outer_font_size)
             font = _font(font_size, bold=section.column_labels_bold)
             wrapped = [
-                _caption_lines(label, cell_width, font_size)
-                for label in section.column_labels[: section.columns]
+                _caption_lines(label, label_widths[column], font_size)
+                for column, label in enumerate(
+                    section.column_labels[:label_columns]
+                )
             ]
             line_height = font_size + 2
+            measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+            max_line_bottom = max(
+                (
+                    measure.textbbox((0, 0), line, font=font)[3]
+                    for lines in wrapped
+                    for line in lines
+                ),
+                default=line_height,
+            )
+            max_line_count = max((len(lines) for lines in wrapped), default=1)
             column_row = Image.new(
                 "RGB",
-                (width, max((len(lines) for lines in wrapped), default=1) * line_height + 2),
+                (
+                    width,
+                    (max_line_count - 1) * line_height
+                    + max_line_bottom
+                    + 2,
+                ),
                 "white",
             )
             draw = ImageDraw.Draw(column_row)
             for column, lines in enumerate(wrapped):
-                x = x_offset + column * (cell_width + heatmap_column_gap)
+                x = label_starts[column]
+                label_cell_width = label_widths[column]
+                center = (
+                    section.column_label_centers[column]
+                    if section.column_label_centers is not None
+                    else 0.5
+                )
                 for line_index, line in enumerate(lines):
                     bounds = draw.textbbox((0, 0), line, font=font)
                     draw.text(
-                        (x + max(0, (cell_width - (bounds[2] - bounds[0])) // 2), line_index * line_height),
+                        (
+                            x
+                            + max(
+                                0,
+                                (
+                                    label_cell_width * center
+                                    - (bounds[2] - bounds[0]) / 2
+                                ),
+                            ),
+                            line_index * line_height,
+                        ),
                         line,
                         fill="#222222",
                         font=font,
@@ -212,29 +388,92 @@ def compose_sections(
                 rendered_rows.append(column_row)
                 spacing_after.append(top_label_to_image_gap)
         for row_index, cells in enumerate(rows):
+            if section.row_banners and row_index in section.row_banners:
+                banner = to_image(section.row_banners[row_index])
+                if banner is not None:
+                    if banner.width != width:
+                        banner_height = max(
+                            1, round(banner.height * width / banner.width)
+                        )
+                        banner = banner.resize(
+                            (width, banner_height), Image.Resampling.LANCZOS
+                        )
+                    if section.row_banners_align_content:
+                        # Remove only horizontal white padding, keeping the
+                        # legend's original font size when it fits the plots.
+                        ink_columns = np.flatnonzero(
+                            np.any(np.asarray(banner) < 250, axis=(0, 2))
+                        )
+                        if ink_columns.size:
+                            banner = banner.crop((
+                                max(0, int(ink_columns[0]) - 2), 0,
+                                min(banner.width, int(ink_columns[-1]) + 3),
+                                banner.height,
+                            ))
+                        if banner.width > content_width:
+                            banner = banner.resize(
+                                (content_width, max(1, round(
+                                    banner.height * content_width / banner.width
+                                ))),
+                                Image.Resampling.LANCZOS,
+                            )
+                        aligned = Image.new("RGB", (width, banner.height), "white")
+                        aligned.paste(
+                            banner,
+                            (x_offset + (content_width - banner.width) // 2, 0),
+                        )
+                        banner = aligned
+                    rendered_rows.append(banner)
+                    spacing_after.append(top_label_to_image_gap)
             scaled: list[tuple[Image.Image | None, list[str]]] = []
             image_height = caption_height = 0
-            for cell in cells:
+            for column, cell in enumerate(cells):
+                resolved_cell_width = column_widths[column]
                 image = cell.image
                 if image is not None:
-                    height = max(1, round(image.height * cell_width / image.width))
-                    image = image.resize((cell_width, height), Image.Resampling.LANCZOS)
+                    height = max(
+                        1,
+                        round(image.height * resolved_cell_width / image.width),
+                    )
+                    image = image.resize(
+                        (resolved_cell_width, height),
+                        Image.Resampling.LANCZOS,
+                    )
                     image_height = max(image_height, height)
-                lines = _caption_lines(cell.caption, cell_width, cell_font_size)
-                if lines:
+                lines = _caption_lines(
+                    cell.caption,
+                    resolved_cell_width,
+                    cell_font_size,
+                )
+                if lines and image is not None:
                     caption_height = max(caption_height, len(lines) * (cell_font_size + 5) + 12)
                 scaled.append((image, lines))
             row_height = max(1, image_height + caption_height)
             canvas = Image.new("RGB", (width, row_height), "white")
             draw = ImageDraw.Draw(canvas)
             for column, (image, lines) in enumerate(scaled):
-                x = x_offset + column * (cell_width + heatmap_column_gap)
+                x = column_starts[column]
+                resolved_cell_width = column_widths[column]
                 if image is not None:
                     canvas.paste(image, (x, max(0, (image_height - image.height) // 2)))
                 for line_index, line in enumerate(lines):
                     bounds = draw.textbbox((0, 0), line, font=cell_font)
+                    text_y = (
+                        max(
+                            0,
+                            (image_height - len(lines) * (cell_font_size + 5)) // 2,
+                        )
+                        if image is None
+                        else image_height + 6
+                    )
                     draw.text(
-                        (x + max(0, (cell_width - (bounds[2] - bounds[0])) // 2), image_height + 6 + line_index * (cell_font_size + 5)),
+                        (
+                            x + max(
+                                0,
+                                (resolved_cell_width - (bounds[2] - bounds[0])) // 2,
+                            ),
+                            text_y + line_index * (cell_font_size + 5),
+                        ),
                         line,
                         fill="#222222",
                         font=cell_font,
@@ -242,14 +481,29 @@ def compose_sections(
             if section.row_labels and row_index < len(section.row_labels):
                 label = section.row_labels[row_index]
                 bounds = draw.textbbox((0, 0), label, font=row_font)
+                center = (
+                    section.row_label_centers[row_index]
+                    if section.row_label_centers is not None
+                    and row_index < len(section.row_label_centers)
+                    else 0.5
+                )
+                target_y = row_height * float(np.clip(center, 0.0, 1.0))
                 draw.text(
                     (
                         max(0, (label_width - (bounds[2] - bounds[0])) // 2),
-                        max(0, (row_height - (bounds[3] - bounds[1])) // 2),
+                        max(
+                            0,
+                            round(
+                                target_y
+                                - (bounds[3] - bounds[1]) / 2
+                                - bounds[1]
+                            ),
+                        ),
                     ),
                     label,
                     fill="#222222",
                     font=row_font,
+                    align="center",
                 )
             rendered_rows.append(canvas)
             last = row_index == len(rows) - 1
@@ -261,6 +515,13 @@ def compose_sections(
             )
         if column_row is not None and section.column_labels_below:
             rendered_rows.append(column_row)
+            spacing_after.append(
+                top_label_to_image_gap
+                if group_row is not None and section.group_headings_below
+                else section_gap
+            )
+        if group_row is not None and section.group_headings_below:
+            rendered_rows.append(group_row)
             spacing_after.append(section_gap)
     if not rendered_rows:
         raise ValueError("No default plot images were returned.")

@@ -40,6 +40,7 @@ def evaluate_7andn_trajectory_metrics(
     frame_ids: List[int],
     *,
     plot_trajectory: bool = False,
+    trajectory_data_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, float], Optional[Image.Image]]:
     """ATE / ARE / RPE vs GT for 7-Scenes / NRGBD, aligned with ScanNet trajectory eval.
 
@@ -116,6 +117,7 @@ def evaluate_7andn_trajectory_metrics(
             timestamps,
             align=True,
             plot_trajectory=plot_trajectory,
+            trajectory_data_path=trajectory_data_path,
         )
         out = {
             "ate": float(stats_aligned["ate"]),

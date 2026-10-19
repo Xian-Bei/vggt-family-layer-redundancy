@@ -10,7 +10,9 @@ BACKBONES="${BACKBONES:-vggt}"
 EVAL_DATASET="${EVAL_DATASET:-}"
 
 MAX_SCENES="${MAX_SCENES:-0}"
-SKIP_GT_EVAL_MAX_SPAN="${SKIP_GT_EVAL_MAX_SPAN:-0}"
+# 0 evaluates all spans; negative values are relative to the backbone unit count
+# (for example, -1 evaluates spans up to num_units - 1).
+SKIP_GT_EVAL_MAX_SPAN="${SKIP_GT_EVAL_MAX_SPAN:--2}"
 SKIP_GT_EVAL_TIMING="${SKIP_GT_EVAL_TIMING:-0}"
 SKIP_GT_EVAL_RESUME="${SKIP_GT_EVAL_RESUME:-1}"
 
@@ -63,6 +65,8 @@ run_skip_eval_dataset() {
     local span_scope="1-${SKIP_GT_EVAL_MAX_SPAN}"
     if [[ "${SKIP_GT_EVAL_MAX_SPAN}" == "0" ]]; then
       span_scope="all"
+    elif [[ "${SKIP_GT_EVAL_MAX_SPAN}" == -* ]]; then
+      span_scope="1 through num_units${SKIP_GT_EVAL_MAX_SPAN}"
     fi
     printf '\n  skip evaluation\n    model: %s\n    spans: %s\n    score workers: %s\n    max pending: %s\n    dataset: %s\n\n' \
       "${backbone}" "${span_scope}" "${ASYNC_SCORE_WORKERS}" \

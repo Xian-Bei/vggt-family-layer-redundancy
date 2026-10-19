@@ -42,18 +42,18 @@ def main() -> None:
         "--average-strategy-group",
         choices=(
             "all",
-            "ours",
-            "ours_single",
-            "ours_multi",
+            "CKA_single",
+            "CKA_multi",
+            "CKA",
             "others",
             "single",
             "non_single",
         ),
         default="all",
         help=(
-            "Filter only the dataset-average plot. ours_single/ours_multi contain "
-            "GT plus the four Ours families at one structure; others contains "
-            "GT, Ours_CKA, and other baselines at all available structures."
+            "Filter only the dataset-average plot. CKA_single/CKA_multi contain "
+            "Retention plus the four similarity families at one structure; others "
+            "contains Retention, CKA, and other baselines at all structures."
         ),
     )
     args = parser.parse_args()
@@ -65,13 +65,14 @@ def main() -> None:
         available=all_strategies.keys(),
     )
     strategies = {}
+    available_by_casefold = {key.casefold(): key for key in all_strategies}
     for key in requested:
-        normalized = key.lower()
-        if normalized not in all_strategies:
+        canonical = available_by_casefold.get(key.casefold())
+        if canonical is None:
             raise FileNotFoundError(
                 f"strategy {key!r} is not present in prune plan bundle"
             )
-        strategies[normalized] = all_strategies[normalized]
+        strategies[canonical] = all_strategies[canonical]
     payload = collect_pruning_eval_payload(
         experiment_root=args.experiment_root,
         prune_plan_root=args.prune_plan_root,

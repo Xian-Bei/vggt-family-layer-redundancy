@@ -182,7 +182,7 @@ def render_gt_trajectory_score_plot(
         ys = [val for _span, val in points]
         max_y = max(max_y, max(ys))
         max_x = max(max_x, max(xs))
-        if name.lower().startswith("gt"):
+        if name.casefold().startswith("retention"):
             color = "red"
             linestyle = "--"
             marker = "o"
@@ -212,7 +212,7 @@ def render_gt_trajectory_score_plot(
         fontsize=15,
         fontweight="bold",
     )
-    ax.set_xlabel("Dropped units / span", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Dropped Layers / span", fontsize=12, fontweight="bold")
     ax.set_ylabel("Relative degradation multiple (lower is better)", fontsize=12, fontweight="bold")
     ax.set_xlim(left=0, right=min(max_x, int(TRAJECTORY_SCORE_MAX_SPAN)) + 0.5)
     ax.set_ylim(bottom=1.0, top=max(cap, max_y) * 1.03)
@@ -283,9 +283,11 @@ def render_method_corner_overlay_heatmap(
             gt_score if gt_score is not None else heatmap_arr,
             list(gt_picks),
         )
-    method_is_gt = str(method_name).strip().lower().startswith("gt")
+    method_is_retention = str(method_name).strip().casefold().startswith(
+        "retention"
+    )
     drew_method = False
-    if method_picks and not method_is_gt:
+    if method_picks and not method_is_retention:
         drew_method = _draw_selected_path(
             ax,
             heatmap_arr,
@@ -386,7 +388,9 @@ def render_method_corner_overlay_grid(
             _draw_finite_score_candidate_segments(ax, heatmap_arr)
 
         method_picks = list(spec.get("picks", []) or [])
-        method_is_gt = method_name.strip().lower().startswith("gt")
+        method_is_retention = method_name.strip().casefold().startswith(
+            "retention"
+        )
         drew_gt = False
         if gt_picks:
             drew_gt = _draw_gt_path(
@@ -395,7 +399,7 @@ def render_method_corner_overlay_grid(
                 list(gt_picks),
             )
         drew_method = False
-        if method_picks and not method_is_gt:
+        if method_picks and not method_is_retention:
             drew_method = _draw_selected_path(
                 ax,
                 heatmap_arr,
@@ -602,7 +606,7 @@ def render_budget_similarity_curve(
             f"(score >= {float(threshold):g})"
         )
     ax.set_title(title, fontsize=16, fontweight="bold")
-    ax.set_xlabel("Dropped units (end - start + 1)", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Dropped Layers (end - start + 1)", fontsize=14, fontweight="bold")
     ax.set_ylabel("Selected corner similarity", fontsize=14, fontweight="bold")
     ax.tick_params(axis="both", labelsize=12)
     for tick_label in (*ax.get_xticklabels(), *ax.get_yticklabels()):
@@ -666,8 +670,8 @@ def render_max_similarity_by_drop_count(
     out_dir.mkdir(parents=True, exist_ok=True)
     display_names = {
         "cka": "CKA",
-        "cosine": "Ours_Cosine",
-        "inv_mse": "Ours_INV_MSE",
+        "cosine": "Cosine",
+        "inv_mse": "INV_MSE",
         "cca": "CCA",
     }
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -791,8 +795,8 @@ def render_similarity_gap_heatmaps(
     out_dir.mkdir(parents=True, exist_ok=True)
     display_names = {
         "cka": "CKA",
-        "cosine": "Ours_Cosine",
-        "inv_mse": "Ours_INV_MSE",
+        "cosine": "Cosine",
+        "inv_mse": "INV_MSE",
         "cca": "CCA",
     }
     items = list(similarity_matrices.items())
@@ -1151,7 +1155,7 @@ def _draw_selected_path(
     score: Optional[np.ndarray],
     picks: Sequence[TrianglePick],
     *,
-    label: str = "Ours_CKA",
+    label: str = "CKA",
     color: str = "#c000ff",
     marker: str = "s",
     marker_label: Optional[str] = None,
@@ -1246,7 +1250,7 @@ def render_token_region_corner_grid(
             ax,
             gt_score,
             picks,
-            label="Ours_CKA",
+            label="CKA",
             color="#c000ff",
         )
 
@@ -1264,7 +1268,7 @@ def render_token_region_corner_grid(
         legend_ax.axis("off")
         handles = [
             Line2D([0], [0], color="white", linewidth=1.9, label="Span candidates"),
-            Line2D([0], [0], color="#c000ff", marker="s", linewidth=1.7, label="Ours_CKA"),
+            Line2D([0], [0], color="#c000ff", marker="s", linewidth=1.7, label="CKA"),
         ]
         if gt_picks:
             handles.insert(
@@ -1380,7 +1384,7 @@ def render_gt_aggregate_corner_heatmap(
     if cka_trajectories is not None:
         cka_items.extend((str(name), picks) for name, picks in cka_trajectories)
     elif cka_picks:
-        cka_items.append(("Ours_CKA", cka_picks))
+        cka_items.append(("CKA", cka_picks))
     drew_cka = _draw_cka_trajectories(ax, score_arr, cka_items)
 
     if metric_names:
@@ -1429,7 +1433,7 @@ def render_gt_component_heatmaps(
     tag: Optional[str] = None,
     title: Optional[str] = None,
 ) -> Optional[Path]:
-    """Render per-metric min-max normalized heatmaps used for GT selection."""
+    """Render upper-zero, all-interval-worst normalized GT heatmaps."""
     out_dir.mkdir(parents=True, exist_ok=True)
     metric_grid: list[list[Optional[str]]] = [
         ["ape", "are", "rpe_trans", "rpe_rot"],
@@ -1464,7 +1468,7 @@ def render_gt_component_heatmaps(
             cbar.ax.tick_params(labelsize=6)
     fig.suptitle(
         title
-        or f"{backbone}: per-metric min-max normalized degradation (lower is better)",
+        or f"{backbone}: upper-zero normalized degradation (lower is better)",
         fontsize=15,
         fontweight="bold",
     )
@@ -1563,7 +1567,7 @@ def render_gt_ranked_candidate_heatmap(
     if cka_trajectories is not None:
         cka_items.extend((str(name), picks) for name, picks in cka_trajectories)
     elif cka_picks:
-        cka_items.append(("Ours_CKA", cka_picks))
+        cka_items.append(("CKA", cka_picks))
     drew_cka = _draw_cka_trajectories(ax, values, cka_items)
     if gt_xs or drew_cka:
         ax.legend(loc=TRIANGLE_EMPTY_LEGEND_LOC, fontsize=9)
@@ -1808,13 +1812,13 @@ def render_corner_overview_heatmap(
                 ax,
                 score_arr,
                 picks,
-                label="Ours_CKA",
+                label="CKA",
                 color="#c000ff",
             )
             extra_token_trajectories = [
                 (name, trajectory_picks)
                 for name, trajectory_picks in cka_items
-                if str(name) != "Ours_CKA"
+                if str(name) != "CKA"
             ]
             drew_extra = _draw_cka_trajectories(
                 ax,
@@ -2207,6 +2211,11 @@ def _draw_drop_grid_panel(
     title: str,
 ) -> None:
     n = int(num_units)
+    actual_budget = max(
+        (int(span) for span in span_to_drop_indices if int(span) > 0),
+        default=1,
+    )
+    actual_budget = min(actual_budget, n - 1)
     drop_cells: set[tuple[int, int]] = set()
     for span, indices in span_to_drop_indices.items():
         row = int(span)
@@ -2220,7 +2229,7 @@ def _draw_drop_grid_panel(
     ax.set_facecolor("white")
     drop_color = "#ffb3b3"
     grid_edge = "#d0d0d0"
-    for row in range(n):
+    for row in range(1, actual_budget + 1):
         for col in range(n):
             ax.add_patch(
                 Rectangle(
@@ -2232,16 +2241,36 @@ def _draw_drop_grid_panel(
                     linewidth=0.35,
                 )
             )
-    ax.set_title(title, fontsize=12, fontweight="bold")
-    ax.set_xlabel("unit index")
-    ax.set_ylabel("dropped units")
-    ticks = list(range(n))
-    ax.set_xticks(ticks)
-    ax.set_yticks(ticks)
-    ax.tick_params(axis="both", labelsize=6)
+    ax.set_title(title, fontsize=24, fontweight="bold", pad=14)
+    ax.set_xlabel("Droped Layers", fontsize=22, fontweight="bold", labelpad=10)
+    ax.set_ylabel("Budget", fontsize=22, fontweight="bold", labelpad=10)
+    ax.set_xticks(list(range(0, n, 4)))
+    ax.set_yticks(list(range(4, actual_budget + 1, 4)))
+    ax.tick_params(axis="both", labelsize=16, width=1.5, length=6)
     ax.set_xlim(-0.5, n - 0.5)
-    ax.set_ylim(-0.5, n - 0.5)
+    ax.set_ylim(0.5, actual_budget + 0.5)
     ax.set_aspect("equal", adjustable="box")
+
+
+def _drop_grid_display_title(name: str) -> str:
+    """Return the publication-facing method/structure panel title."""
+    display_name = str(name).strip()
+    lower_name = display_name.casefold()
+    variant: Optional[str] = None
+    method_name = display_name
+    for suffix, candidate_variant in (
+        (" single", "Single"),
+        (" double", "Double"),
+        ("_single", "Single"),
+        ("_double", "Double"),
+    ):
+        if lower_name.endswith(suffix):
+            method_name = display_name[: -len(suffix)].rstrip()
+            variant = candidate_variant
+            break
+    if method_name.casefold() == "retention":
+        method_name = "Degradation"
+    return f"{method_name} ({variant})" if variant else method_name
 
 
 def _group_drop_grid_items_by_method(
@@ -2364,25 +2393,47 @@ def render_prune_strategy_drop_grids(
     tag: Optional[str] = None,
     title: Optional[str] = None,
     strategy_evidence: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    display_methods: Optional[Sequence[str]] = ("retention", "cka"),
 ) -> Path:
-    """Render Single/Double drop grids and optional raw evidence per method."""
+    """Render Single/Double drop grids and optional raw evidence per method.
+
+    By default the figure contains only Retention and CKA. Pass
+    ``display_methods=None`` to render every supplied method.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     items = [(str(name), drops) for name, drops in strategy_drop_indices if drops]
+    if display_methods is not None:
+        selected_methods = {str(method).strip().casefold() for method in display_methods}
+        items = [
+            item
+            for item in items
+            if _drop_grid_method_name((item, None)).casefold() in selected_methods
+        ]
     if not items:
-        raise ValueError("strategy_drop_indices must contain at least one non-empty grid")
+        raise ValueError(
+            "strategy_drop_indices must contain at least one non-empty grid "
+            "selected for display"
+        )
     method_rows = _group_drop_grid_items_by_method(items)
     evidence_by_method = {
         str(method).strip().casefold(): evidence
         for method, evidence in (strategy_evidence or {}).items()
     }
     n = int(num_units)
-    panel_size = max(4.2, n * 0.16)
+    max_budget = max(
+        int(span)
+        for _name, drops in items
+        for span in drops
+        if int(span) > 0
+    )
+    panel_width = max(7.0, n * 0.22)
+    panel_height = max(3.5, panel_width * min(max_budget, n - 1) / n + 1.5)
     ncols = 3 if strategy_evidence is not None else 2
     nrows = len(method_rows)
     fig, axes = plt.subplots(
         nrows,
         ncols,
-        figsize=(panel_size * ncols, (panel_size + 0.8) * nrows),
+        figsize=(panel_width * ncols, panel_height * nrows),
         squeeze=False,
         gridspec_kw=(
             {"width_ratios": [1.0, 1.0, 1.15]}
@@ -2401,7 +2452,7 @@ def render_prune_strategy_drop_grids(
                 ax,
                 num_units=n,
                 span_to_drop_indices=drops,
-                title=name,
+                title=_drop_grid_display_title(name),
             )
         if ncols == 3:
             evidence_ax = axes[row_index, 2]
@@ -2416,10 +2467,10 @@ def render_prune_strategy_drop_grids(
                     num_units=n,
                 )
     if title:
-        fig.suptitle(title, fontsize=14, fontweight="bold")
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        fig.suptitle(title, fontsize=28, fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, 0.94), h_pad=3.0, w_pad=2.0)
     else:
-        fig.tight_layout()
+        fig.tight_layout(h_pad=3.0, w_pad=2.0)
     safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
     safe_tag = (
         str(tag).replace("/", "_").replace(" ", "_")

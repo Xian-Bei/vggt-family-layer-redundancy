@@ -12,24 +12,27 @@ from typing import Any, List, Optional
 
 import numpy as np
 
+from analysis.metric_labels import SEVEN_METRIC_LABELS
 from analysis.prune_plan import (
     PRUNE_PLAN_BUNDLE_FILENAME,
     PRUNE_PLAN_BUNDLE_SCHEMA_VERSION,
+    canonical_pruning_strategy_key,
+    expand_pruning_strategy_keys,
     interval_bounds_from_selector,
     interval_selector,
     physical_pruning_selector_from_drop,
 )
 from analysis.prune_plan.build_prune_plan_common import (
+    PRUNING_TOKEN_REGIONS,
     default_plan_root as _default_plan_root,
     load_similarity,
+    normalize_pruning_token_region,
     parse_dataset_list,
 )
-from analysis.redundancy.similarity_v3 import (
-    REDUNDANCY_GRAPH_REGIONS,
-    unit_similarity_to_interval_score,
-)
+from analysis.redundancy.similarity_v3 import unit_similarity_to_interval_score
 from analysis.redundancy.skip_metric_scaling import (
     normalize_metric_components,
+    raw_metric_to_degradation,
 )
 from analysis.prune_plan.triangle_prune import TrianglePick
 from analysis.prune_plan.visualize_triangle_prune import (
@@ -37,35 +40,28 @@ from analysis.prune_plan.visualize_triangle_prune import (
 )
 
 # ---------------------------------------------------------------------------
-# GT / Ours controls
-# Edit this block to tune GT and all Ours variants (CKA, cosine, inverse-MSE, CCA).
+# Retention / similarity controls
+# Edit this block to tune Retention and similarity variants.
 # ---------------------------------------------------------------------------
 
 # GT score construction and metric fusion.
-GT_COMPONENT_AGGREGATION = "mean"  # "mean", "min", or "max"; lower is selected.
+GT_COMPONENT_AGGREGATION = "mean"
 GT_POSE_METRICS = ("ape", "are", "rpe_trans", "rpe_rot")
 GT_POINT_METRICS = ("acc", "comp", "chamfer_distance")
 GT_AGGREGATE_METRICS = (*GT_POSE_METRICS, *GT_POINT_METRICS)
 
-GT_OURS_COMPARISON_TOLERANCE = GT_OURS_DOUBLE_GAP_COMPARISON_TOLERANCE = GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE = 5e-3
+DOUBLE_GAP_COMPARISON_TOLERANCE = 5e-3
+SINGLE_DOUBLE_COMPARISON_TOLERANCE = 5e-3
 MIN_RETAINED_UNITS_BETWEEN_INTERVALS = 1
-# For Double-to-Double transitions, continuity is one-to-one: each current
-# interval overlaps a previous interval and each previous interval survives.
-GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP = True
-# Independently limit the number of Single-to-Double transitions.
-GT_OURS_DOUBLE_ONE_SPLIT_ONLY = False
+REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP = True
 
-# Joint scores for adaptive Double variants. GT keeps the additive degradation
-# proxy, while Ours is governed by its worse original-model component.
-GT_TWO_INTERVAL_SCORE_AGGREGATION = "sum"  # "sum" or "max"
-OURS_TWO_INTERVAL_SCORE_AGGREGATION = "sum"  # "sum" or "max"
 SUPPORTED_PRUNING_STRATEGIES = (
-    "ours_single",
-    "ours_double",
+    "CKA_single",
+    "CKA_double",
     "cosine_single",
     "cosine_double",
-    "gt_single",
-    "gt_double",
+    "retention_single",
+    "retention_double",
     "replaceme_single",
     "replaceme_double",
     "inv_mse_single",
@@ -73,16 +69,9 @@ SUPPORTED_PRUNING_STRATEGIES = (
     "cca_single",
     "cca_double",
     "shortgpt",
+    "gardener",
     "simpler",
 )
-PRUNING_STRATEGY_FAMILY_ALIASES = {
-    "ours": ("ours_single", "ours_double"),
-    "cosine": ("cosine_single", "cosine_double"),
-    "inv_mse": ("inv_mse_single", "inv_mse_double"),
-    "cca": ("cca_single", "cca_double"),
-    "gt": ("gt_single", "gt_double"),
-    "replaceme": ("replaceme_single", "replaceme_double"),
-}
 
 
 def _normalize_max_drop_budget(value: Optional[int]) -> Optional[int]:
@@ -99,21 +88,22 @@ def _normalize_max_drop_budget(value: Optional[int]) -> Optional[int]:
     return int(budget)
 
 
+def _normalize_comparison_tolerance(value: float, *, name: str) -> float:
+    tolerance = float(value)
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return tolerance
+
+
 def _parse_pruning_strategies(raw: Optional[str]) -> list[str]:
     values = [
-        value.strip().lower()
+        canonical_pruning_strategy_key(value)
         for value in str(raw or "").replace(",", " ").split()
         if value.strip()
     ]
     if not values:
         values = list(SUPPORTED_PRUNING_STRATEGIES)
-    selected = list(
-        dict.fromkeys(
-            expanded
-            for value in values
-            for expanded in PRUNING_STRATEGY_FAMILY_ALIASES.get(value, (value,))
-        )
-    )
+    selected = expand_pruning_strategy_keys(values)
     unknown = sorted(set(selected) - set(SUPPORTED_PRUNING_STRATEGIES))
     if unknown:
         raise ValueError(
@@ -157,10 +147,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--token-region",
         type=str,
-        choices=(*REDUNDANCY_GRAPH_REGIONS, "mean", "min"),
-        default="mean",
+        choices=PRUNING_TOKEN_REGIONS,
+        default="special_patch_mean",
+        help=(
+            "Token-region graph selector. special_patch_mean averages exactly the "
+            "special and patch graphs."
+        ),
     )
     p.add_argument("--prune-plan-root", type=Path, default=None)
+    p.add_argument(
+        "--double-gap-comparison-tolerance",
+        type=float,
+        default=DOUBLE_GAP_COMPARISON_TOLERANCE,
+        help="Similarity Double candidate gap preference tolerance (Retention unaffected).",
+    )
+    p.add_argument(
+        "--single-double-comparison-tolerance",
+        type=float,
+        default=SINGLE_DOUBLE_COMPARISON_TOLERANCE,
+        help=(
+            "Similarity improvement required before Double replaces Single "
+            f"(default: {SINGLE_DOUBLE_COMPARISON_TOLERANCE:g})."
+        ),
+    )
     p.add_argument(
         "--output",
         type=Path,
@@ -244,22 +253,17 @@ def _normalize_and_aggregate_gt_components(
     }
 
 
-def _raw_metric_to_upper_clamped_score(
+def _raw_metric_to_upper_degradation_score(
     values: np.ndarray,
     *,
     upper_baseline: Optional[float],
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Clamp better-than-upper values without ratio scaling.
-
-    For a positive upper baseline, min-max normalization of
-    ``max(current, upper)`` is exactly equivalent to normalizing
-    ``max(current / upper, 1)``.
-    """
+    """Convert a raw lower-is-better metric to upper-relative degradation."""
     arr = np.asarray(values, dtype=np.float64)
     out = np.full(arr.shape, np.nan, dtype=np.float64)
     finite = np.isfinite(arr)
     meta: dict[str, Any] = {
-        "scale_mode": "raw_metric_upper_clamped",
+        "scale_mode": "raw_metric_upper_relative_degradation",
         "upper_baseline": upper_baseline,
         "enabled": False,
     }
@@ -270,7 +274,11 @@ def _raw_metric_to_upper_clamped_score(
     if not math.isfinite(upper) or upper <= 0.0:
         meta["skip_reason"] = "invalid_upper_baseline"
         return out, meta
-    out[finite] = np.maximum(arr[finite], upper)
+    out = raw_metric_to_degradation(
+        arr,
+        metric="lower_is_better",
+        upper_baseline=upper,
+    )
     meta["enabled"] = True
     return out, meta
 
@@ -338,11 +346,128 @@ def _compute_aggregator_total_params(backbone: str) -> int:
     return int(counted)
 
 
+def _gardener_exact_value_entropy(block: Any) -> tuple[float, dict[str, Any]]:
+    """Compute Gardener's exact-value weight-number entropy for one block.
+
+    The official TensorFlow implementation concatenates four Dense kernels
+    (attention qkv/proj and MLP fc1/fc2) and applies ``value_counts``.  Their
+    stable PyTorch equivalent is every recursively named rank-2 parameter.
+    """
+    import torch
+
+    selected = [
+        (str(name), parameter.detach())
+        for name, parameter in block.named_parameters(recurse=True)
+        if int(parameter.ndim) == 2
+    ]
+    if not selected:
+        raise ValueError("Gardener found no rank-2 weight parameters in block")
+    devices = {str(parameter.device) for _name, parameter in selected}
+    dtypes = {str(parameter.dtype) for _name, parameter in selected}
+    if len(devices) != 1 or len(dtypes) != 1:
+        raise ValueError(
+            "Gardener rank-2 parameters must share one device and dtype; "
+            f"got devices={sorted(devices)}, dtypes={sorted(dtypes)}"
+        )
+    values = torch.cat([parameter.reshape(-1) for _name, parameter in selected])
+    if not bool(torch.isfinite(values).all().item()):
+        raise ValueError("Gardener cannot score non-finite block weights")
+    _unique, counts = torch.unique(values, sorted=False, return_counts=True)
+    probabilities = counts.to(dtype=torch.float64) / float(values.numel())
+    entropy = float((-(probabilities * probabilities.log()).sum()).item())
+    return entropy, {
+        "selected_parameter_names": [name for name, _parameter in selected],
+        "selected_parameter_count": int(values.numel()),
+        "unique_value_count": int(counts.numel()),
+        "dtype": str(selected[0][1].dtype),
+    }
+
+
+def _load_gardener_weight_entropy(
+    backbone: str,
+) -> tuple[list[str], np.ndarray, dict[str, Any], int]:
+    """Load the pretrained backbone once and score every droppable block."""
+    import torch
+
+    from analysis.backbones.bootstrap import apply_pythonpath
+    from analysis.backbones.cache_replay import get_cache_replay_engine
+    from analysis.backbones.registry import get_backbone
+
+    apply_pythonpath(backbone)
+    adapter = get_backbone(backbone)
+    engine = get_cache_replay_engine(backbone)
+    model, _trainable, pre_prune_total_params, _removed = engine.build_train_model(
+        hf_model=adapter.default_hf_model(),
+        device=torch.device("cpu"),
+        drop_actions=[],
+        lora_actions=[],
+        frame_skip_intervals=[],
+        global_skip_intervals=[],
+        skipped_frame_idxs=[],
+        skipped_global_idxs=[],
+        prune=False,
+        inject_lora=False,
+    )
+    catalog = [unit for unit in adapter.layer_unit_catalog(model) if unit.droppable]
+    unit_ids = [str(unit.unit_id) for unit in catalog]
+    if not unit_ids or len(unit_ids) != len(set(unit_ids)):
+        raise ValueError(
+            "Gardener requires a non-empty droppable catalog with unique unit_ids"
+        )
+
+    scores: list[float] = []
+    details: dict[str, dict[str, Any]] = {}
+    with torch.no_grad():
+        for unit_id in unit_ids:
+            entropy, unit_details = _gardener_exact_value_entropy(
+                adapter.block_for_unit(model, unit_id)
+            )
+            scores.append(float(entropy))
+            details[unit_id] = unit_details
+            print(f"[gardener] {unit_id}: entropy={entropy:.8f}", flush=True)
+
+    counted = sum(p.numel() for p in engine.parameter_accounting_parameters(model))
+    if int(pre_prune_total_params) != int(counted):
+        print(
+            "[warn] Gardener aggregator param count mismatch: "
+            f"engine returned {_format_param_count(int(pre_prune_total_params))}, "
+            f"accounting scope counted {_format_param_count(int(counted))}; using counted value.",
+            flush=True,
+        )
+    source = {
+        "kind": "gardener_official_code_semantics",
+        "checkpoint": str(adapter.default_hf_model()),
+        "data_free": True,
+        "one_shot": True,
+        "entropy_base": "e",
+        "frequency_definition": "exact_equal_floating_point_values",
+        "parameter_selection": "all_recursive_rank_2_parameters_per_block",
+        "official_keras_weight_slots": [2, 3, 9, 11],
+        "parameter_semantics": [
+            "attention_qkv_kernel",
+            "attention_projection_kernel",
+            "mlp_fc1_kernel",
+            "mlp_fc2_kernel",
+        ],
+        "paper_implementation_note": (
+            "The paper describes histogram intervals, while the official code "
+            "uses pandas.value_counts on the raw concatenated weights; this "
+            "implementation follows the released code for reproducibility."
+        ),
+        "unit_entropy": {
+            unit_id: float(entropy) for unit_id, entropy in zip(unit_ids, scores)
+        },
+        "unit_score_details": details,
+    }
+    return unit_ids, np.asarray(scores, dtype=np.float64), source, int(counted)
+
+
 def _build_param_accounting(
     *,
     backbone: str,
     num_units: int,
     skip: bool,
+    total_params_override: Optional[int] = None,
 ) -> dict[str, Any]:
     if skip:
         return {
@@ -351,16 +476,19 @@ def _build_param_accounting(
             "scope": "prunable_aggregator_blocks",
             "skip_reason": "skipped_by_cli",
         }
-    try:
-        total_params = _compute_aggregator_total_params(backbone)
-    except Exception as exc:
-        print(f"[warn] Could not compute aggregator param accounting for {backbone}: {exc}", flush=True)
-        return {
-            "available": False,
-            "method": "linear_by_remaining_units",
-            "scope": "prunable_aggregator_blocks",
-            "skip_reason": str(exc),
-        }
+    if total_params_override is None:
+        try:
+            total_params = _compute_aggregator_total_params(backbone)
+        except Exception as exc:
+            print(f"[warn] Could not compute aggregator param accounting for {backbone}: {exc}", flush=True)
+            return {
+                "available": False,
+                "method": "linear_by_remaining_units",
+                "scope": "prunable_aggregator_blocks",
+                "skip_reason": str(exc),
+            }
+    else:
+        total_params = int(total_params_override)
     per_unit = float(total_params) / float(num_units) if int(num_units) > 0 else float("nan")
     print(
         f"[params] {backbone}: aggregator_total={_format_param_count(total_params)} "
@@ -434,16 +562,7 @@ _PRUNING_METRIC_GRID = (
     ("ape", "are", "rpe_trans", "rpe_rot"),
     ("acc", "comp", "chamfer_distance", None),
 )
-_PRUNING_METRIC_HEADERS = {
-    "ape": "APE ↓",
-    "are": "ARE (deg) ↓",
-    "rpe_trans": "RPE trans ↓",
-    "rpe_rot": "RPE rot (deg) ↓",
-    "acc": "Acc ↓",
-    "comp": "Comp ↓",
-    "chamfer_distance": "CD ↓",
-    "cd": "CD ↓",
-}
+_PRUNING_METRIC_HEADERS = {**SEVEN_METRIC_LABELS}
 
 
 def _metric_aliases(metric: str) -> tuple[str, ...]:
@@ -543,7 +662,7 @@ def _load_gt_aggregate_from_pruning_dir(
             start, end = interval_bounds_from_selector(selector)
             raw_values[start, end] = value
         upper_value = _dict_metric_value(upper_average, metric_key)
-        clamped_score, scaling_meta = _raw_metric_to_upper_clamped_score(
+        clamped_score, scaling_meta = _raw_metric_to_upper_degradation_score(
             raw_values,
             upper_baseline=upper_value,
         )
@@ -594,10 +713,7 @@ def _load_gt_aggregate_from_pruning_dir(
                 continue
             drop_count = int(end - start + 1)
             current = best_by_drop_count.get(drop_count)
-            if (
-                current is None
-                or val < current[0] - GT_OURS_COMPARISON_TOLERANCE
-            ):
+            if current is None or val < current[0]:
                 best_by_drop_count[drop_count] = (val, start, end)
 
     picks: list[TrianglePick] = []
@@ -632,11 +748,10 @@ def _load_gt_aggregate_from_pruning_dir(
         "component_aggregation": str(GT_COMPONENT_AGGREGATION),
         "component_normalization": normalization_meta,
         "metric_normalization": (
-            "Raw eval/pruning interval metrics are clamped at the upper baseline: "
-            "lower-is-better values that outperform upper are replaced by upper. "
-            "This removes ratio scaling while preserving the exact subsequent "
-            "min-max result. Each metric heatmap is then independently "
-            "min-max normalized to [0,1] before the seven metrics are averaged."
+            "Raw eval/pruning interval metrics are converted to upper-relative "
+            "degradation and clamped at zero. Each metric uses upper as the fixed "
+            "zero anchor and the worst value over all available single intervals "
+            "as one before the seven metrics are averaged."
         ),
         "metric_records": metric_records,
         "upper_average": upper_average,
@@ -939,7 +1054,7 @@ def _write_strategy_pruning_metric_plot(
                 ax.axis("off")
                 continue
             ax.set_title(_PRUNING_METRIC_HEADERS.get(metric_key, metric_key), fontsize=11, fontweight="bold")
-            ax.set_xlabel("Dropped units")
+            ax.set_xlabel("Dropped Layers")
             ax.grid(True, alpha=0.25)
             ax.set_xlim(left=0)
             if all_xs:
@@ -1103,10 +1218,7 @@ def _load_gt_aggregate_from_skip_eval_report(
                 continue
             drop_count = int(end - start + 1)
             current = best_by_drop_count.get(drop_count)
-            if (
-                current is None
-                or val < current[0] - GT_OURS_COMPARISON_TOLERANCE
-            ):
+            if current is None or val < current[0]:
                 best_by_drop_count[drop_count] = (val, start, end)
 
     picks: list[TrianglePick] = []
@@ -1144,9 +1256,8 @@ def _load_gt_aggregate_from_skip_eval_report(
             "Only pose metrics (ape, are, rpe_trans, rpe_rot) and point-cloud "
             "metrics (acc, comp, chamfer_distance) are used. NC is excluded. "
             "Saved signed degradation percentages are clamped at zero, which is "
-            "min-max equivalent to the previous upper-relative multiple without "
-            "performing ratio scaling. Each metric heatmap is "
-            "independently min-max normalized to [0,1] "
+            "the fixed upper-model anchor. Each metric heatmap is independently "
+            "scaled by its worst degradation over all available single intervals "
             + f"before components are aggregated with {GT_COMPONENT_AGGREGATION!r}."
         ),
         "metric_records": metric_records,
@@ -1159,12 +1270,82 @@ def _load_gt_aggregate_from_skip_eval_report(
 
 def _default_gt_corner_report_path(plan_root: Path, dataset: str) -> Path:
     pruning_dir = Path(plan_root) / str(dataset) / "eval" / "pruning"
-    if any(pruning_dir.glob("i*_j*/summary.json")):
-        return pruning_dir
     new_path = pruning_dir / "skip_eval_report_v3.json"
     if new_path.is_file():
         return new_path
+    if any(pruning_dir.glob("i*_j*/summary.json")):
+        return pruning_dir
     return Path(plan_root) / str(dataset) / "skip_eval" / "skip_eval_report_v3.json"
+
+
+def _skip_eval_report_file(path: Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_dir():
+        candidate = candidate / "skip_eval_report_v3.json"
+    return candidate
+
+
+def _load_unit_ids_from_skip_eval_reports(
+    *,
+    plan_root: Path,
+    datasets: Sequence[str],
+    explicit_report: Optional[Path] = None,
+) -> tuple[list[str], dict[str, Any]]:
+    """Load and validate the shared unit catalog without redundancy graphs."""
+    dataset_names = [str(name) for name in datasets]
+    if explicit_report is not None and len(dataset_names) != 1:
+        raise ValueError(
+            "--gt-corner-skip-eval-report can only override a single PRUNE_DATASET; "
+            "multiple datasets resolve their reports from each dataset directory"
+        )
+
+    unit_ids: Optional[list[str]] = None
+    sources: list[str] = []
+    for dataset_name in dataset_names:
+        report_path = _skip_eval_report_file(
+            Path(explicit_report)
+            if explicit_report is not None
+            else _default_gt_corner_report_path(plan_root, dataset_name)
+        )
+        if not report_path.is_file():
+            raise FileNotFoundError(
+                f"Missing skip-eval report with unit_ids for "
+                f"PRUNE_DATASET={dataset_name!r}: {report_path}"
+            )
+        raw = json.loads(report_path.read_text(encoding="utf-8"))
+        current_ids_raw = raw.get("unit_ids", []) if isinstance(raw, dict) else []
+        if not isinstance(current_ids_raw, list) or not current_ids_raw:
+            raise ValueError(f"skip-eval report has no unit_ids: {report_path}")
+        current_ids = [str(value).strip() for value in current_ids_raw]
+        if any(not value for value in current_ids) or len(set(current_ids)) != len(current_ids):
+            raise ValueError(f"skip-eval report has invalid unit_ids: {report_path}")
+        try:
+            declared_count = int(raw.get("num_layers", len(current_ids)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"skip-eval report has invalid num_layers: {report_path}"
+            ) from exc
+        if declared_count != len(current_ids):
+            raise ValueError(
+                f"skip-eval num_layers={declared_count} does not match "
+                f"unit_ids={len(current_ids)} in {report_path}"
+            )
+        if unit_ids is None:
+            unit_ids = current_ids
+        elif current_ids != unit_ids:
+            raise ValueError(
+                f"unit_ids in {report_path} do not match the other selected "
+                "skip-eval reports"
+            )
+        sources.append(str(report_path))
+
+    if unit_ids is None:
+        raise ValueError("at least one pruning dataset is required")
+    return unit_ids, {
+        "kind": "skip_eval_report_unit_catalog",
+        "datasets": dataset_names,
+        "sources": sources,
+    }
 
 
 def _gt_picks_from_score(score: np.ndarray, unit_ids: Sequence[str]) -> list[TrianglePick]:
@@ -1178,10 +1359,7 @@ def _gt_picks_from_score(score: np.ndarray, unit_ids: Sequence[str]) -> list[Tri
             value = float(score[start, end])
             if not math.isfinite(value):
                 continue
-            if (
-                best is None
-                or value < best[0] - GT_OURS_COMPARISON_TOLERANCE
-            ):
+            if best is None or value < best[0]:
                 best = (value, start, end)
         if best is None:
             continue
@@ -1343,7 +1521,7 @@ def _merge_interval_record(
 
 
 def _set_selector(strategy: str, drop_count: int) -> str:
-    key = str(strategy or "").strip().lower()
+    key = canonical_pruning_strategy_key(strategy)
     if not key:
         raise ValueError("set strategy key must be non-empty")
     count = int(drop_count)
@@ -1475,21 +1653,14 @@ def _one_or_two_interval_drop_sets_from_score(
     score: np.ndarray,
     *,
     maximize: bool,
-    two_interval_score_aggregation: str = GT_TWO_INTERVAL_SCORE_AGGREGATION,
-    comparison_tolerance: float = GT_OURS_COMPARISON_TOLERANCE,
-    double_gap_comparison_tolerance: float = (
-        GT_OURS_DOUBLE_GAP_COMPARISON_TOLERANCE
-    ),
-    single_double_comparison_tolerance: float = (
-        GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE
-    ),
+    double_gap_comparison_tolerance: Optional[float] = None,
+    single_double_comparison_tolerance: Optional[float] = None,
     selection_mode: str = "best",
     min_retained_units_between_intervals: int = MIN_RETAINED_UNITS_BETWEEN_INTERVALS,
     max_drop_budget: Optional[int] = None,
     require_cross_budget_interval_overlap: bool = (
-        GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+        REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
     ),
-    limit_double_to_one_split: bool = False,
 ) -> tuple[
     dict[int, list[int]],
     dict[int, float],
@@ -1500,17 +1671,16 @@ def _one_or_two_interval_drop_sets_from_score(
     Both component scores come from the unchanged original-model score matrix.
     Components must leave at least ``min_retained_units_between_intervals``
     retained units between them.
-    A two-interval candidate combines its original-model component scores using
-    ``two_interval_score_aggregation`` (``sum`` or ``max``). In ``best`` mode,
+    A two-interval candidate adds its original-model component scores.
+    In ``best`` mode,
     it is selected only when that joint score is strictly better than the best
-    single interval by more than ``single_double_comparison_tolerance``.
-    ``comparison_tolerance`` compares Single candidates: differences at or
-    below it keep the earlier candidate. Double candidates instead prefer the
-    larger component gap when their scores differ by no more than
-    ``double_gap_comparison_tolerance``. A smaller-gap Double replaces a
-    larger-gap Double only when its score is strictly better by more than that
-    tolerance. Equal-gap Doubles use their score directly. Single/Double ties
-    prefer the simpler Single interval.
+    single interval by more than ``single_double_comparison_tolerance`` when
+    that tolerance is supplied. Otherwise, strict improvement is sufficient.
+    Single candidates are compared strictly. When a Double gap tolerance is
+    supplied, a smaller-gap candidate must improve the score beyond it;
+    equal-gap candidates compare strictly. With no gap tolerance, all Double
+    candidates compare strictly. Exact ties prefer the larger component gap;
+    Single/Double ties prefer the simpler Single interval.
     ``single`` and ``two`` modes restrict the candidate set without comparing
     across interval counts.
     Budgets are scanned from large to small. Every component interval selected
@@ -1519,28 +1689,28 @@ def _one_or_two_interval_drop_sets_from_score(
     ``require_cross_budget_interval_overlap`` is enabled. When both plans have
     two intervals, the overlap must admit a one-to-one correspondence: every
     interval on both sides must have an overlapping counterpart.
-    In adaptive ``best`` mode, ``limit_double_to_one_split`` permits at most one
-    Single-to-Double transition. Once a split path returns to Single, all lower
-    budgets remain Single.
     When ``max_drop_budget`` is set, larger-budget plans are excluded before
     path selection begins.
     """
     values = np.asarray(score, dtype=np.float64)
     if values.ndim != 2 or values.shape[0] != values.shape[1]:
         raise ValueError(f"expected square interval score matrix, got {values.shape}")
-    tolerance = float(comparison_tolerance)
-    if not math.isfinite(tolerance) or tolerance < 0.0:
-        raise ValueError("comparison_tolerance must be finite and non-negative")
-    double_gap_tolerance = float(double_gap_comparison_tolerance)
-    if not math.isfinite(double_gap_tolerance) or double_gap_tolerance < 0.0:
-        raise ValueError(
-            "double_gap_comparison_tolerance must be finite and non-negative"
+    double_gap_tolerance = (
+        0.0
+        if double_gap_comparison_tolerance is None
+        else _normalize_comparison_tolerance(
+            double_gap_comparison_tolerance,
+            name="double_gap_comparison_tolerance",
         )
-    single_double_tolerance = float(single_double_comparison_tolerance)
-    if not math.isfinite(single_double_tolerance) or single_double_tolerance < 0.0:
-        raise ValueError(
-            "single_double_comparison_tolerance must be finite and non-negative"
+    )
+    single_double_tolerance = (
+        0.0
+        if single_double_comparison_tolerance is None
+        else _normalize_comparison_tolerance(
+            single_double_comparison_tolerance,
+            name="single_double_comparison_tolerance",
         )
+    )
     min_gap = int(min_retained_units_between_intervals)
     if min_gap < 0:
         raise ValueError(
@@ -1551,12 +1721,6 @@ def _one_or_two_interval_drop_sets_from_score(
     if mode not in {"best", "single", "two"}:
         raise ValueError(
             f"selection_mode must be 'best', 'single', or 'two', got {selection_mode!r}"
-        )
-    two_interval_aggregation = str(two_interval_score_aggregation).strip().lower()
-    if two_interval_aggregation not in {"sum", "max"}:
-        raise ValueError(
-            "two_interval_score_aggregation must be 'sum' or 'max', got "
-            f"{two_interval_score_aggregation!r}"
         )
     n = int(values.shape[0])
     two_candidates_by_count: dict[
@@ -1582,11 +1746,7 @@ def _one_or_two_interval_drop_sets_from_score(
             if second_start <= first_end + min_gap:
                 continue
             total = int(first_len + second_len)
-            combined_score = (
-                float(first_score + second_score)
-                if two_interval_aggregation == "sum"
-                else float(max(first_score, second_score))
-            )
+            combined_score = float(first_score + second_score)
             two_candidates_by_count.setdefault(total, []).append(
                 (
                     combined_score,
@@ -1610,18 +1770,14 @@ def _one_or_two_interval_drop_sets_from_score(
             count for count in available_counts if int(count) <= max_budget
         }
     cross_budget_constraints_enabled = bool(require_cross_budget_interval_overlap)
-    path_constraints_enabled = bool(
-        cross_budget_constraints_enabled or limit_double_to_one_split
-    )
     totals = sorted(available_counts, reverse=True)
     previous_total: Optional[int] = None
     previous_components: Optional[list[tuple[int, int]]] = None
     previous_num_intervals: Optional[int] = None
-    split_has_occurred = False
     for total in totals:
         single_candidates = single_candidates_by_count.get(total, [])
         two_candidates = two_candidates_by_count.get(total, [])
-        if path_constraints_enabled and previous_components is not None:
+        if cross_budget_constraints_enabled and previous_components is not None:
             if previous_total != int(total) + 1:
                 break
 
@@ -1658,14 +1814,6 @@ def _one_or_two_interval_drop_sets_from_score(
                     )
                 ]
 
-            if (
-                limit_double_to_one_split
-                and mode == "best"
-                and split_has_occurred
-                and previous_num_intervals == 1
-            ):
-                two_candidates = []
-
             has_eligible_candidate = (
                 bool(single_candidates)
                 if mode == "single"
@@ -1680,14 +1828,12 @@ def _one_or_two_interval_drop_sets_from_score(
         for candidate in single_candidates[1:]:
             assert best_single is not None
             delta = float(candidate[0] - best_single[0])
-            if (maximize and delta > tolerance) or (
-                not maximize and delta < -tolerance
-            ):
+            if (maximize and delta > 0.0) or (not maximize and delta < 0.0):
                 best_single = candidate
 
         # Start from the widest gap so the result does not inherit interval
-        # enumeration order. Narrower gaps must earn their way in by exceeding
-        # the dedicated score tolerance; equal gaps compare scores directly.
+        # enumeration order. A narrower gap must exceed the optional tolerance;
+        # equal gaps compare strictly and exact ties keep the wider gap.
         ordered_two_candidates = sorted(
             two_candidates,
             key=lambda candidate: candidate[2][0] - candidate[1][1] - 1,
@@ -1697,19 +1843,14 @@ def _one_or_two_interval_drop_sets_from_score(
         for candidate in ordered_two_candidates[1:]:
             assert best_two is not None
             delta = float(candidate[0] - best_two[0])
-            candidate_gap = int(candidate[2][0] - candidate[1][1] - 1)
-            best_gap = int(best_two[2][0] - best_two[1][1] - 1)
             candidate_strictly_better = (maximize and delta > 0.0) or (
                 not maximize and delta < 0.0
             )
-            candidate_better_beyond_gap_tolerance = (
-                maximize and delta > double_gap_tolerance
-            ) or (not maximize and delta < -double_gap_tolerance)
-            if (
-                candidate_gap < best_gap
-                and candidate_better_beyond_gap_tolerance
-            ) or (
-                candidate_gap == best_gap and candidate_strictly_better
+            candidate_gap = candidate[2][0] - candidate[1][1] - 1
+            best_gap = best_two[2][0] - best_two[1][1] - 1
+            improvement = delta if maximize else -delta
+            if candidate_strictly_better and (
+                candidate_gap >= best_gap or improvement > double_gap_tolerance
             ):
                 best_two = candidate
 
@@ -1727,7 +1868,7 @@ def _one_or_two_interval_drop_sets_from_score(
             assert best_two is not None
             combined_score, first, second = best_two
             components = [first, second]
-            aggregation = two_interval_aggregation
+            aggregation = "sum"
         else:
             assert best_single is not None
             combined_score, first = best_single
@@ -1735,18 +1876,6 @@ def _one_or_two_interval_drop_sets_from_score(
             aggregation = "single_interval_score"
 
         num_intervals = int(len(components))
-        interval_count_transition: Optional[str] = None
-        if limit_double_to_one_split:
-            if previous_num_intervals is None:
-                # A path whose highest available budget is already Double is
-                # treated as having split before the observed budget range.
-                split_has_occurred = num_intervals == 2
-            elif previous_num_intervals == 1 and num_intervals == 2:
-                interval_count_transition = "single_to_double"
-                split_has_occurred = True
-            elif previous_num_intervals == 2 and num_intervals == 1:
-                interval_count_transition = "double_to_single"
-
         drop = [
             idx
             for component_start, component_end in components
@@ -1782,18 +1911,8 @@ def _one_or_two_interval_drop_sets_from_score(
                     "score": float(best_single[0]),
                 }
             ),
-            **(
-                {
-                    "best_two_interval_score_sum": (
-                        None if best_two is None else float(best_two[0])
-                    )
-                }
-                if two_interval_aggregation == "sum"
-                else {
-                    "best_two_interval_score_max": (
-                        None if best_two is None else float(best_two[0])
-                    )
-                }
+            "best_two_interval_score_sum": (
+                None if best_two is None else float(best_two[0])
             ),
             "selection_mode": mode,
             "min_retained_units_between_intervals": min_gap,
@@ -1803,22 +1922,29 @@ def _one_or_two_interval_drop_sets_from_score(
                 if mode == "best"
                 else f"force_{mode}_interval"
             ),
-            "comparison_tolerance": tolerance,
-            "double_gap_comparison_tolerance": double_gap_tolerance,
-            "double_candidate_tie_policy": "prefer_larger_interval_gap",
-            "single_double_comparison_tolerance": (
-                single_double_tolerance if mode == "best" else None
+            "double_candidate_tie_policy": (
+                "prefer_larger_interval_gap_within_tolerance"
+                if double_gap_comparison_tolerance is not None
+                else "strict_score_then_prefer_larger_interval_gap_on_exact_tie"
+            ),
+            **(
+                {"double_gap_comparison_tolerance": double_gap_tolerance}
+                if mode != "single" and double_gap_comparison_tolerance is not None
+                else {}
+            ),
+            **(
+                {"single_double_comparison_tolerance": single_double_tolerance}
+                if mode == "best"
+                and single_double_comparison_tolerance is not None
+                else {}
             ),
             "cross_budget_interval_overlap_required": bool(
                 require_cross_budget_interval_overlap
             ),
             "cross_budget_scan_direction": "large_to_small",
-            "double_one_split_only": bool(limit_double_to_one_split),
             "cross_budget_double_interval_one_to_one_required": bool(
                 require_cross_budget_interval_overlap and mode != "single"
             ),
-            "single_to_double_split_has_occurred": bool(split_has_occurred),
-            "interval_count_transition": interval_count_transition,
             "linked_to_drop_count": (
                 None if previous_components is None else int(previous_total)
             ),
@@ -1938,7 +2064,7 @@ def _each_interval_overlaps_previous_plan(
     )
 
 
-def select_gt_single_interval_path(
+def select_retention_single_interval_path(
     score: np.ndarray,
     *,
     max_drop_budget: Optional[int] = None,
@@ -1947,21 +2073,20 @@ def select_gt_single_interval_path(
     dict[int, float],
     dict[int, dict[str, Any]],
 ]:
-    """Select the canonical continuous GT single-interval path."""
+    """Select the canonical continuous Retention single-interval path."""
     return _one_or_two_interval_drop_sets_from_score(
         score,
         maximize=False,
-        comparison_tolerance=GT_OURS_COMPARISON_TOLERANCE,
         selection_mode="single",
         max_drop_budget=max_drop_budget,
         require_cross_budget_interval_overlap=(
-            GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+            REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
         ),
     )
 
 
 def _similarity_to_proxy_drop_score(score: np.ndarray) -> np.ndarray:
-    """Convert Ours similarity to a lower-is-better proxy drop."""
+    """Convert similarity to a lower-is-better proxy drop."""
     values = np.asarray(score, dtype=np.float64)
     return np.where(np.isfinite(values), 1.0 - values, np.nan)
 
@@ -2040,8 +2165,76 @@ def _shortgpt_drop_sets_from_unit_similarity(
             "budget_path_nested": True,
             "interval_count_constraint": None,
             "interval_gap_constraint": None,
-            "comparison_tolerance": None,
             "joint_score_aggregation": "sum_selected_unit_redundancy_for_diagnostics",
+            "scores_recomputed_after_first_drop": False,
+        }
+    return drops_by_count, scores_by_count, ranking, extra_by_count
+
+
+def _gardener_drop_sets_from_scores(
+    unit_entropy: np.ndarray,
+    *,
+    protected_indices: Sequence[int] = (0,),
+) -> tuple[
+    dict[int, list[int]],
+    dict[int, float],
+    list[int],
+    dict[int, dict[str, Any]],
+]:
+    """Build nested prefixes of Gardener's low-entropy global ranking."""
+    scores = np.asarray(unit_entropy, dtype=np.float64)
+    if scores.ndim != 1:
+        raise ValueError(f"expected 1D Gardener unit entropy, got {scores.shape}")
+    n = int(scores.shape[0])
+    protected = sorted({int(idx) for idx in protected_indices})
+    if any(idx < 0 or idx >= n for idx in protected):
+        raise ValueError(
+            f"Gardener protected indices {protected} are outside [0, {n})"
+        )
+    eligible = [idx for idx in range(n) if idx not in protected]
+    if any(not math.isfinite(float(scores[idx])) for idx in eligible):
+        raise ValueError("Gardener unit entropy must be finite for every droppable unit")
+    ranking = sorted(eligible, key=lambda idx: (float(scores[idx]), int(idx)))
+
+    drops_by_count: dict[int, list[int]] = {}
+    scores_by_count: dict[int, float] = {}
+    extra_by_count: dict[int, dict[str, Any]] = {}
+    for drop_count in range(1, len(ranking) + 1):
+        selected = sorted(int(idx) for idx in ranking[:drop_count])
+        components: list[tuple[int, int]] = []
+        component_start = component_end = selected[0]
+        for idx in selected[1:]:
+            if idx == component_end + 1:
+                component_end = idx
+            else:
+                components.append((component_start, component_end))
+                component_start = component_end = idx
+        components.append((component_start, component_end))
+
+        drops_by_count[drop_count] = selected
+        scores_by_count[drop_count] = float(
+            sum(float(scores[idx]) for idx in selected)
+        )
+        extra_by_count[drop_count] = {
+            "component_intervals": [
+                {
+                    "start": int(start),
+                    "end": int(end),
+                    "drop_count": int(end - start + 1),
+                }
+                for start, end in components
+            ],
+            "num_intervals": len(components),
+            "weight_number_entropy": {
+                str(int(idx)): float(scores[idx]) for idx in selected
+            },
+            "global_pruning_order": [int(idx) for idx in ranking],
+            "protected_unit_indices": protected,
+            "selection": "prefix_of_single_global_low_entropy_ranking",
+            "budget_path_nested": True,
+            "interval_count_constraint": None,
+            "interval_gap_constraint": None,
+            "joint_score_aggregation": "sum_selected_unit_entropy_for_diagnostics",
             "scores_recomputed_after_first_drop": False,
         }
     return drops_by_count, scores_by_count, ranking, extra_by_count
@@ -2204,7 +2397,7 @@ def _strategy_summary_score_series(
     return series
 
 
-def _build_ours_metric_strategy_pair(
+def _build_similarity_metric_strategy_pair(
     *,
     family_key: str,
     display_name: str,
@@ -2217,19 +2410,20 @@ def _build_ours_metric_strategy_pair(
     num_units: int,
     param_accounting: dict[str, Any],
     sets: dict[str, dict[str, Any]],
+    double_gap_comparison_tolerance: float = DOUBLE_GAP_COMPARISON_TOLERANCE,
+    single_double_comparison_tolerance: float = SINGLE_DOUBLE_COMPARISON_TOLERANCE,
     max_drop_budget: Optional[int] = None,
 ) -> dict[str, dict[str, Any]]:
-    """Build Ours Single/Double identically for any similarity metric."""
+    """Build Single/Double variants identically for any similarity metric."""
     proxy_drop_score = _similarity_to_proxy_drop_score(interval_score)
     single_drops, single_scores, single_extra = (
         _one_or_two_interval_drop_sets_from_score(
             proxy_drop_score,
             maximize=False,
-            comparison_tolerance=GT_OURS_COMPARISON_TOLERANCE,
             selection_mode="single",
             max_drop_budget=max_drop_budget,
             require_cross_budget_interval_overlap=(
-                GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+                REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
             ),
         )
     )
@@ -2237,16 +2431,14 @@ def _build_ours_metric_strategy_pair(
         _one_or_two_interval_drop_sets_from_score(
             proxy_drop_score,
             maximize=False,
-            two_interval_score_aggregation=OURS_TWO_INTERVAL_SCORE_AGGREGATION,
-            comparison_tolerance=GT_OURS_COMPARISON_TOLERANCE,
+            double_gap_comparison_tolerance=double_gap_comparison_tolerance,
             single_double_comparison_tolerance=(
-                GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE
+                single_double_comparison_tolerance
             ),
             max_drop_budget=max_drop_budget,
             require_cross_budget_interval_overlap=(
-                GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+                REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
             ),
-            limit_double_to_one_split=GT_OURS_DOUBLE_ONE_SPLIT_ONLY,
         )
     )
     source = {
@@ -2265,7 +2457,7 @@ def _build_ours_metric_strategy_pair(
                 "component_interval_at_drop_count_n_plus_1;"
                 "double_to_double_requires_one_to_one_overlap"
             )
-            if GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+            if REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
             else False
         ),
         "cross_budget_scan_direction": "large_to_small",
@@ -2309,33 +2501,25 @@ def _build_ours_metric_strategy_pair(
             score_name="one_or_two_interval_similarity_proxy_drop",
             source={
                 **source,
-                "two_interval_score_aggregation": (
-                    OURS_TWO_INTERVAL_SCORE_AGGREGATION
-                ),
+                "two_interval_score_aggregation": "sum",
                 "selection": (
                     "descending-drop-count minimum of one-interval proxy drop or "
-                    f"{OURS_TWO_INTERVAL_SCORE_AGGREGATION}-aggregated "
+                    "sum-aggregated "
                     "two-separated-interval proxy drops, with every "
                     "component overlapping the selected plan at the next larger "
                     "drop count"
                 ),
-                "comparison_tolerance": float(
-                    GT_OURS_COMPARISON_TOLERANCE
-                ),
-                "double_gap_comparison_tolerance": float(
-                    GT_OURS_DOUBLE_GAP_COMPARISON_TOLERANCE
-                ),
-                "single_double_comparison_tolerance": float(
-                    GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE
-                ),
                 "max_num_intervals": 2,
                 "interval_mode": "best_of_one_or_two",
-                "tie_policy": "prefer_single_interval",
-                "double_one_split_only": bool(
-                    GT_OURS_DOUBLE_ONE_SPLIT_ONLY
+                "double_gap_comparison_tolerance": float(
+                    double_gap_comparison_tolerance
                 ),
+                "single_double_comparison_tolerance": float(
+                    single_double_comparison_tolerance
+                ),
+                "tie_policy": "prefer_single_interval",
                 "cross_budget_double_interval_one_to_one_required": bool(
-                    GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+                    REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
                 ),
             },
             sets=sets,
@@ -2360,23 +2544,21 @@ def run_build_prune_plan(
     gt_corner_metric: str = "all",
     strategy_selector: Optional[str] = None,
     max_drop_budget: Optional[int] = None,
+    double_gap_comparison_tolerance: float = DOUBLE_GAP_COMPARISON_TOLERANCE,
+    single_double_comparison_tolerance: float = SINGLE_DOUBLE_COMPARISON_TOLERANCE,
 ) -> List[Path]:
     """Build a prune-only span bundle and return the written path."""
+    token_region = normalize_pruning_token_region(token_region)
     max_drop_budget = _normalize_max_drop_budget(max_drop_budget)
-    unit_ids, unit_similarity, similarity_source = load_similarity(
-        experiment=experiment,
-        dataset=dataset,
-        token_region=token_region,
-        metric=metric,
+    double_gap_comparison_tolerance = _normalize_comparison_tolerance(
+        double_gap_comparison_tolerance,
+        name="double_gap_comparison_tolerance",
     )
-    interval_score = build_interval_score_matrix(unit_similarity)
-    num_units = int(interval_score.shape[0])
-    param_accounting = _build_param_accounting(
-        backbone=backbone,
-        num_units=num_units,
-        skip=bool(skip_param_accounting),
+    single_double_comparison_tolerance = _normalize_comparison_tolerance(
+        single_double_comparison_tolerance,
+        name="single_double_comparison_tolerance",
     )
-
+    requested_strategies = _parse_pruning_strategies(strategy_selector)
     plan_root = prune_plan_root or _default_plan_root(backbone)
     plan_root.mkdir(parents=True, exist_ok=True)
     bundle_path = output_path or (plan_root / PRUNE_PLAN_BUNDLE_FILENAME)
@@ -2384,29 +2566,147 @@ def run_build_prune_plan(
         viz_out_dir or (output_path.parent if output_path is not None else plan_root)
     )
     safe_backbone = str(backbone).replace("/", "_").replace(" ", "_")
+    prune_datasets = parse_dataset_list(dataset)
+
+    needs_retention = any(
+        key in requested_strategies
+        for key in ("retention_single", "retention_double")
+    )
+    needs_primary_similarity = any(
+        key in requested_strategies
+        for key in ("CKA_single", "CKA_double", "simpler")
+    )
+    needs_cosine = any(
+        key in requested_strategies
+        for key in ("cosine_single", "cosine_double", "shortgpt")
+    )
+    needs_inv_mse = any(
+        key in requested_strategies
+        for key in ("inv_mse_single", "inv_mse_double")
+    )
+    needs_cca = any(
+        key in requested_strategies
+        for key in ("cca_single", "cca_double")
+    )
+    needs_angular = any(
+        key in requested_strategies
+        for key in ("replaceme_single", "replaceme_double")
+    )
+    needs_gardener = "gardener" in requested_strategies
+
+    unit_ids: Optional[list[str]] = None
+    unit_catalog_source: dict[str, Any] = {}
+    if needs_retention:
+        unit_ids, unit_catalog_source = _load_unit_ids_from_skip_eval_reports(
+            plan_root=plan_root,
+            datasets=prune_datasets,
+            explicit_report=gt_corner_skip_eval_report,
+        )
+
+    gardener_entropy: Optional[np.ndarray] = None
+    gardener_source: dict[str, Any] = {}
+    gardener_total_params: Optional[int] = None
+    if needs_gardener:
+        (
+            gardener_unit_ids,
+            gardener_entropy,
+            gardener_source,
+            gardener_total_params,
+        ) = _load_gardener_weight_entropy(backbone)
+        if unit_ids is None:
+            unit_ids = gardener_unit_ids
+            unit_catalog_source = {
+                "kind": "pretrained_backbone_droppable_unit_catalog",
+                "source": gardener_source,
+            }
+        elif gardener_unit_ids != unit_ids:
+            raise ValueError(
+                "Gardener pretrained-model unit_ids do not match the selected "
+                "pruning datasets"
+            )
+
+    similarity_inputs: dict[
+        str, tuple[list[str], np.ndarray, dict[str, Any]]
+    ] = {}
+
+    def load_requested_similarity(metric_name: str) -> None:
+        nonlocal unit_ids, unit_catalog_source
+        loaded_ids, loaded_similarity, loaded_source = load_similarity(
+            experiment=experiment,
+            dataset=dataset,
+            token_region=token_region,
+            metric=metric_name,
+        )
+        loaded_ids = [str(value) for value in loaded_ids]
+        if unit_ids is None:
+            unit_ids = loaded_ids
+            unit_catalog_source = {
+                "kind": "redundancy_graph_unit_catalog",
+                "metric": str(metric_name),
+                "source": loaded_source,
+            }
+        elif loaded_ids != unit_ids:
+            raise ValueError(
+                f"unit_ids for requested {metric_name} similarity do not match "
+                "the selected pruning datasets"
+            )
+        similarity_inputs[str(metric_name)] = (
+            loaded_ids,
+            loaded_similarity,
+            loaded_source,
+        )
+
+    if needs_primary_similarity:
+        load_requested_similarity(str(metric))
+    if needs_cosine and "cosine" not in similarity_inputs:
+        load_requested_similarity("cosine")
+    if needs_inv_mse and "inv_mse" not in similarity_inputs:
+        load_requested_similarity("inv_mse")
+    if needs_cca and "cca" not in similarity_inputs:
+        load_requested_similarity("cca")
+    if needs_angular and "angular" not in similarity_inputs:
+        load_requested_similarity("angular")
+    if unit_ids is None:
+        raise RuntimeError("requested pruning strategies provide no unit catalog")
+
+    num_units = len(unit_ids)
+    param_accounting = _build_param_accounting(
+        backbone=backbone,
+        num_units=num_units,
+        skip=bool(skip_param_accounting),
+        total_params_override=gardener_total_params,
+    )
+
+    unit_similarity: Optional[np.ndarray] = None
+    similarity_source: dict[str, Any] = {}
+    interval_score: Optional[np.ndarray] = None
+    if needs_primary_similarity:
+        _primary_ids, unit_similarity, similarity_source = similarity_inputs[str(metric)]
+        interval_score = build_interval_score_matrix(unit_similarity)
+
     gt_corner_score: Optional[np.ndarray] = None
     gt_corner_picks: list[TrianglePick] = []
     gt_corner_meta: Optional[dict[str, Any]] = None
-    prune_datasets = parse_dataset_list(dataset)
-    (
-        gt_corner_score,
-        _gt_component_heatmaps,
-        gt_corner_picks,
-        gt_corner_meta,
-        _gt_component_heatmaps_by_dataset,
-        _gt_aggregate_heatmaps_by_dataset,
-    ) = _load_gt_aggregate_for_datasets(
-        plan_root=plan_root,
-        datasets=prune_datasets,
-        unit_ids=unit_ids,
-        metric_selector=str(gt_corner_metric),
-        explicit_report=gt_corner_skip_eval_report,
-    )
-    print(
-        f"Loaded GT aggregate corner heatmap for PRUNE_DATASET={','.join(prune_datasets)} "
-        f"(metrics={len(gt_corner_meta.get('metrics', []))}, spans={len(gt_corner_picks)})",
-        flush=True,
-    )
+    if needs_retention:
+        (
+            gt_corner_score,
+            _gt_component_heatmaps,
+            gt_corner_picks,
+            gt_corner_meta,
+            _gt_component_heatmaps_by_dataset,
+            _gt_aggregate_heatmaps_by_dataset,
+        ) = _load_gt_aggregate_for_datasets(
+            plan_root=plan_root,
+            datasets=prune_datasets,
+            unit_ids=unit_ids,
+            metric_selector=str(gt_corner_metric),
+            explicit_report=gt_corner_skip_eval_report,
+        )
+        print(
+            f"Loaded GT aggregate corner heatmap for PRUNE_DATASET={','.join(prune_datasets)} "
+            f"(metrics={len(gt_corner_meta.get('metrics', []))}, spans={len(gt_corner_picks)})",
+            flush=True,
+        )
 
     interval_records: dict[str, dict[str, Any]] = {}
     set_records: dict[str, dict[str, Any]] = {}
@@ -2415,40 +2715,79 @@ def run_build_prune_plan(
     inv_mse_interval_score: Optional[np.ndarray] = None
     cca_interval_score: Optional[np.ndarray] = None
     angular_interval_distance: Optional[np.ndarray] = None
-    strategies.update(
-        _build_ours_metric_strategy_pair(
-            family_key="ours",
-            display_name="Ours_CKA",
-            metric=str(metric),
-            interval_score=interval_score,
-            similarity_source=similarity_source,
-            token_region=token_region,
-            dataset=dataset,
+    if needs_gardener:
+        assert gardener_entropy is not None
+        (
+            gardener_drops,
+            gardener_scores,
+            gardener_ranking,
+            gardener_extra,
+        ) = _gardener_drop_sets_from_scores(gardener_entropy)
+        strategies["gardener"] = _strategy_from_drop_sets(
+            key="gardener",
+            display_name="Gardener",
+            drops_by_count=gardener_drops,
+            scores_by_count=gardener_scores,
             unit_ids=unit_ids,
             num_units=num_units,
             param_accounting=param_accounting,
+            score_name="selected_unit_weight_number_entropy_sum",
+            source={
+                **gardener_source,
+                "selection": (
+                    "global ascending weight-number entropy ranking prefix; "
+                    "unit index 0 remains protected by the LaRe pruning contract"
+                ),
+                "token_region": "weight_only_not_applicable",
+                "dataset": "data_free_not_applicable",
+                "max_num_intervals": None,
+                "interval_mode": "unconstrained_global_ranking_prefix",
+                "tie_policy": "lower_unit_index_first",
+                "scores_recomputed_after_first_drop": False,
+                "protected_unit_indices": [0],
+            },
             sets=set_records,
+            ranking=gardener_ranking,
+            record_extra_by_count=gardener_extra,
             max_drop_budget=max_drop_budget,
         )
-    )
-    try:
-        cosine_unit_ids, cosine_unit_similarity, cosine_similarity_source = load_similarity(
-            experiment=experiment,
-            dataset=dataset,
-            token_region=token_region,
-            metric="cosine",
-        )
-        if list(cosine_unit_ids) != list(unit_ids):
-            print(
-                "[warn] Skip cosine-based strategies: unit_ids do not match Ours source.",
-                flush=True,
+
+    if any(
+        key in requested_strategies for key in ("CKA_single", "CKA_double")
+    ):
+        assert interval_score is not None
+        strategies.update(
+            _build_similarity_metric_strategy_pair(
+                family_key="CKA",
+                display_name="CKA",
+                metric=str(metric),
+                interval_score=interval_score,
+                similarity_source=similarity_source,
+                token_region=token_region,
+                dataset=dataset,
+                unit_ids=unit_ids,
+                num_units=num_units,
+                param_accounting=param_accounting,
+                sets=set_records,
+                double_gap_comparison_tolerance=double_gap_comparison_tolerance,
+                single_double_comparison_tolerance=single_double_comparison_tolerance,
+                max_drop_budget=max_drop_budget,
             )
-        else:
-            cosine_interval_score = build_interval_score_matrix(cosine_unit_similarity)
+        )
+
+    if needs_cosine:
+        cosine_unit_ids, cosine_unit_similarity, cosine_similarity_source = (
+            similarity_inputs["cosine"]
+        )
+        cosine_interval_score = build_interval_score_matrix(cosine_unit_similarity)
+        if any(
+            key in requested_strategies
+            for key in ("cosine_single", "cosine_double")
+        ):
             strategies.update(
-                _build_ours_metric_strategy_pair(
+                _build_similarity_metric_strategy_pair(
                     family_key="cosine",
-                    display_name="Ours_Cosine",
+                    display_name="Cosine",
                     metric="cosine",
                     interval_score=cosine_interval_score,
                     similarity_source=cosine_similarity_source,
@@ -2458,9 +2797,12 @@ def run_build_prune_plan(
                     num_units=num_units,
                     param_accounting=param_accounting,
                     sets=set_records,
+                    double_gap_comparison_tolerance=double_gap_comparison_tolerance,
+                    single_double_comparison_tolerance=single_double_comparison_tolerance,
                     max_drop_budget=max_drop_budget,
                 )
             )
+        if "shortgpt" in requested_strategies:
             (
                 shortgpt_drops,
                 shortgpt_scores,
@@ -2500,129 +2842,99 @@ def run_build_prune_plan(
                 record_extra_by_count=shortgpt_extra,
                 max_drop_budget=max_drop_budget,
             )
-    except Exception as exc:
-        print(f"[warn] Could not build cosine-based strategies: {exc}", flush=True)
 
-    try:
-        inv_mse_unit_ids, inv_mse_unit_similarity, inv_mse_similarity_source = load_similarity(
-            experiment=experiment,
-            dataset=dataset,
-            token_region=token_region,
-            metric="inv_mse",
+    if needs_inv_mse:
+        inv_mse_unit_ids, inv_mse_unit_similarity, inv_mse_similarity_source = (
+            similarity_inputs["inv_mse"]
         )
-        if list(inv_mse_unit_ids) != list(unit_ids):
-            print(
-                "[warn] Skip INV_MSE strategies: unit_ids do not match Ours source.",
-                flush=True,
+        inv_mse_interval_score = build_interval_score_matrix(inv_mse_unit_similarity)
+        strategies.update(
+            _build_similarity_metric_strategy_pair(
+                family_key="inv_mse",
+                display_name="INV_MSE",
+                metric="inv_mse",
+                interval_score=inv_mse_interval_score,
+                similarity_source=inv_mse_similarity_source,
+                token_region=token_region,
+                dataset=dataset,
+                unit_ids=inv_mse_unit_ids,
+                num_units=num_units,
+                param_accounting=param_accounting,
+                sets=set_records,
+                double_gap_comparison_tolerance=double_gap_comparison_tolerance,
+                single_double_comparison_tolerance=single_double_comparison_tolerance,
+                max_drop_budget=max_drop_budget,
             )
-        else:
-            inv_mse_interval_score = build_interval_score_matrix(inv_mse_unit_similarity)
-            strategies.update(
-                _build_ours_metric_strategy_pair(
-                    family_key="inv_mse",
-                    display_name="Ours_INV_MSE",
-                    metric="inv_mse",
-                    interval_score=inv_mse_interval_score,
-                    similarity_source=inv_mse_similarity_source,
-                    token_region=token_region,
-                    dataset=dataset,
-                    unit_ids=inv_mse_unit_ids,
-                    num_units=num_units,
-                    param_accounting=param_accounting,
-                    sets=set_records,
-                    max_drop_budget=max_drop_budget,
-                )
-            )
-    except Exception as exc:
-        print(f"[warn] Could not build INV_MSE strategies: {exc}", flush=True)
+        )
 
-    try:
-        cca_unit_ids, cca_unit_similarity, cca_similarity_source = load_similarity(
-            experiment=experiment,
-            dataset=dataset,
-            token_region=token_region,
-            metric="cca",
+    if needs_cca:
+        cca_unit_ids, cca_unit_similarity, cca_similarity_source = similarity_inputs["cca"]
+        cca_interval_score = build_interval_score_matrix(cca_unit_similarity)
+        strategies.update(
+            _build_similarity_metric_strategy_pair(
+                family_key="cca",
+                display_name="CCA",
+                metric="cca",
+                interval_score=cca_interval_score,
+                similarity_source=cca_similarity_source,
+                token_region=token_region,
+                dataset=dataset,
+                unit_ids=cca_unit_ids,
+                num_units=num_units,
+                param_accounting=param_accounting,
+                sets=set_records,
+                double_gap_comparison_tolerance=double_gap_comparison_tolerance,
+                single_double_comparison_tolerance=single_double_comparison_tolerance,
+                max_drop_budget=max_drop_budget,
+            )
         )
-        if list(cca_unit_ids) != list(unit_ids):
-            print(
-                "[warn] Skip CCA strategies: unit_ids do not match Ours source.",
-                flush=True,
-            )
-        else:
-            cca_interval_score = build_interval_score_matrix(cca_unit_similarity)
-            strategies.update(
-                _build_ours_metric_strategy_pair(
-                    family_key="cca",
-                    display_name="Ours_CCA",
-                    metric="cca",
-                    interval_score=cca_interval_score,
-                    similarity_source=cca_similarity_source,
-                    token_region=token_region,
-                    dataset=dataset,
-                    unit_ids=cca_unit_ids,
-                    num_units=num_units,
-                    param_accounting=param_accounting,
-                    sets=set_records,
-                    max_drop_budget=max_drop_budget,
-                )
-            )
-    except Exception as exc:
-        print(f"[warn] Could not build CCA strategies: {exc}", flush=True)
 
-    try:
-        angular_unit_ids, angular_unit_distance, angular_distance_source = load_similarity(
-            experiment=experiment,
-            dataset=dataset,
-            token_region=token_region,
-            metric="angular",
+    if needs_angular:
+        angular_unit_ids, angular_unit_distance, angular_distance_source = (
+            similarity_inputs["angular"]
         )
-        if list(angular_unit_ids) != list(unit_ids):
-            print(
-                "[warn] Skip ReplaceMe strategies: unit_ids do not match Ours source.",
-                flush=True,
-            )
-        else:
-            angular_interval_distance = build_interval_score_matrix(angular_unit_distance)
-            (
-                replace_me_single_drops,
-                replace_me_single_scores,
-                replace_me_single_extra,
-            ) = _official_replaceme_drop_sets_from_distance(
-                angular_interval_distance,
-                num_blocks=1,
-                merge_consecutive=False,
-            )
-            (
-                replace_me_double_drops,
-                replace_me_double_scores,
-                replace_me_double_extra,
-            ) = _official_replaceme_drop_sets_from_distance(
-                angular_interval_distance,
-                num_blocks=2,
-                merge_consecutive=False,
-            )
-            replace_me_source = {
-                "kind": "distance",
-                "metric": "angular",
-                "token_region": str(token_region),
-                "dataset": str(dataset),
-                "distance_source": angular_distance_source,
-                "unit_distance": (
-                    "mean token-wise acos(cosine)/pi loaded from unit-output "
-                    "pairwise graph"
-                ),
-                "interval_distance": "derived in memory as D[start,end]=D[start-1,end]",
-                "selection": (
-                    "official ReplaceMe stable distance sort followed by greedy "
-                    "non-overlapping equal-length block selection"
-                ),
-                "optimization_direction": "minimize_each_candidate_distance",
-                "joint_score_optimization": False,
-                "cross_budget_path_constraint": False,
-                "component_gap_policy": "non_overlapping_only; adjacency_allowed",
-                "merge_consecutive": False,
-                "scores_recomputed_after_first_drop": False,
-            }
+        angular_interval_distance = build_interval_score_matrix(angular_unit_distance)
+        (
+            replace_me_single_drops,
+            replace_me_single_scores,
+            replace_me_single_extra,
+        ) = _official_replaceme_drop_sets_from_distance(
+            angular_interval_distance,
+            num_blocks=1,
+            merge_consecutive=False,
+        )
+        (
+            replace_me_double_drops,
+            replace_me_double_scores,
+            replace_me_double_extra,
+        ) = _official_replaceme_drop_sets_from_distance(
+            angular_interval_distance,
+            num_blocks=2,
+            merge_consecutive=False,
+        )
+        replace_me_source = {
+            "kind": "distance",
+            "metric": "angular",
+            "token_region": str(token_region),
+            "dataset": str(dataset),
+            "distance_source": angular_distance_source,
+            "unit_distance": (
+                "mean token-wise acos(cosine)/pi loaded from unit-output "
+                "pairwise graph"
+            ),
+            "interval_distance": "derived in memory as D[start,end]=D[start-1,end]",
+            "selection": (
+                "official ReplaceMe stable distance sort followed by greedy "
+                "non-overlapping equal-length block selection"
+            ),
+            "optimization_direction": "minimize_each_candidate_distance",
+            "joint_score_optimization": False,
+            "cross_budget_path_constraint": False,
+            "component_gap_policy": "non_overlapping_only; adjacency_allowed",
+            "merge_consecutive": False,
+            "scores_recomputed_after_first_drop": False,
+        }
+        if "replaceme_single" in requested_strategies:
             strategies["replaceme_single"] = _strategy_from_drop_sets(
                 key="replaceme_single",
                 display_name="ReplaceMe Single",
@@ -2642,6 +2954,7 @@ def run_build_prune_plan(
                 record_extra_by_count=replace_me_single_extra,
                 max_drop_budget=max_drop_budget,
             )
+        if "replaceme_double" in requested_strategies:
             strategies["replaceme_double"] = _strategy_from_drop_sets(
                 key="replaceme_double",
                 display_name="ReplaceMe Double",
@@ -2663,66 +2976,60 @@ def run_build_prune_plan(
                 record_extra_by_count=replace_me_double_extra,
                 max_drop_budget=max_drop_budget,
             )
-    except Exception as exc:
-        print(f"[warn] Could not build angular ReplaceMe strategies: {exc}", flush=True)
 
-    simpler_scores_by_cutoff, simpler_meta = _simpler_cutoff_scores(unit_similarity)
-    simpler_picks, simpler_score_matrix = _simpler_suffix_picks(
-        scores_by_cutoff=simpler_scores_by_cutoff,
-        unit_ids=unit_ids,
-    )
-    if simpler_picks:
-        strategies["simpler"] = _strategy_from_picks(
-            key="simpler",
-            display_name="SIMPLER",
-            picks=simpler_picks,
+    if "simpler" in requested_strategies:
+        assert unit_similarity is not None
+        simpler_scores_by_cutoff, simpler_meta = _simpler_cutoff_scores(unit_similarity)
+        simpler_picks, simpler_score_matrix = _simpler_suffix_picks(
+            scores_by_cutoff=simpler_scores_by_cutoff,
             unit_ids=unit_ids,
-            num_units=num_units,
-            param_accounting=param_accounting,
-            score=simpler_score_matrix,
-            score_name="simpler_cutoff_score",
-            source={
-                "kind": "simpler",
-                "metric": str(metric),
-                "token_region": str(token_region),
-                "dataset": str(dataset),
-                "similarity_source": similarity_source,
-                "input_similarity": "unit-output pairwise similarity loaded directly from disk",
-                "paper": (
-                    "SIMPLER: Efficient Foundation Model Adaptation via "
-                    "Similarity-Guided Layer Pruning for Earth Observation"
-                ),
-                "selection": "full suffix-pruning curve; cutoff c drops closed interval [c,n-1]",
-                "cross_budget_path_constraint": False,
-                "uses_llm_depth_prior": True,
-                "depth_prior": "redundancy_is_concentrated_in_later_layers",
-                "score": simpler_meta,
-            },
-            intervals=interval_records,
-            max_drop_budget=max_drop_budget,
         )
+        if simpler_picks:
+            strategies["simpler"] = _strategy_from_picks(
+                key="simpler",
+                display_name="SIMPLER",
+                picks=simpler_picks,
+                unit_ids=unit_ids,
+                num_units=num_units,
+                param_accounting=param_accounting,
+                score=simpler_score_matrix,
+                score_name="simpler_cutoff_score",
+                source={
+                    "kind": "simpler",
+                    "metric": str(metric),
+                    "token_region": str(token_region),
+                    "dataset": str(dataset),
+                    "similarity_source": similarity_source,
+                    "input_similarity": "unit-output pairwise similarity loaded directly from disk",
+                    "paper": (
+                        "SIMPLER: Efficient Foundation Model Adaptation via "
+                        "Similarity-Guided Layer Pruning for Earth Observation"
+                    ),
+                    "selection": "full suffix-pruning curve; cutoff c drops closed interval [c,n-1]",
+                    "cross_budget_path_constraint": False,
+                    "uses_llm_depth_prior": True,
+                    "depth_prior": "redundancy_is_concentrated_in_later_layers",
+                    "score": simpler_meta,
+                },
+                intervals=interval_records,
+                max_drop_budget=max_drop_budget,
+            )
     if gt_corner_score is not None and gt_corner_picks:
         (
-            gt_single_drops,
-            gt_single_scores,
-            gt_single_extra,
-        ) = select_gt_single_interval_path(
+            retention_single_drops,
+            retention_single_scores,
+            retention_single_extra,
+        ) = select_retention_single_interval_path(
             gt_corner_score,
             max_drop_budget=max_drop_budget,
         )
         gt_drops, gt_scores, gt_extra = _one_or_two_interval_drop_sets_from_score(
             gt_corner_score,
             maximize=False,
-            two_interval_score_aggregation=GT_TWO_INTERVAL_SCORE_AGGREGATION,
-            comparison_tolerance=GT_OURS_COMPARISON_TOLERANCE,
-            single_double_comparison_tolerance=(
-                GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE
-            ),
             max_drop_budget=max_drop_budget,
             require_cross_budget_interval_overlap=(
-                GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+                REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
             ),
-            limit_double_to_one_split=GT_OURS_DOUBLE_ONE_SPLIT_ONLY,
         )
         gt_source = {
             "kind": "skip_eval_gt",
@@ -2735,22 +3042,21 @@ def run_build_prune_plan(
                     "component_interval_at_drop_count_n_plus_1;"
                     "double_to_double_requires_one_to_one_overlap"
                 )
-                if GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+                if REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
                 else False
             ),
             "cross_budget_scan_direction": "large_to_small",
             "max_drop_budget": max_drop_budget,
-            "double_one_split_only": bool(GT_OURS_DOUBLE_ONE_SPLIT_ONLY),
             "cross_budget_double_interval_one_to_one_required": bool(
-                GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+                REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
             ),
             "component_gap_policy": "at_least_one_retained_unit",
         }
-        strategies["gt_single"] = _strategy_from_drop_sets(
-            key="gt_single",
-            display_name="GT Single",
-            drops_by_count=gt_single_drops,
-            scores_by_count=gt_single_scores,
+        strategies["retention_single"] = _strategy_from_drop_sets(
+            key="retention_single",
+            display_name="Retention Single",
+            drops_by_count=retention_single_drops,
+            scores_by_count=retention_single_scores,
             unit_ids=unit_ids,
             num_units=num_units,
             param_accounting=param_accounting,
@@ -2765,12 +3071,12 @@ def run_build_prune_plan(
                 "interval_mode": "single",
             },
             sets=set_records,
-            record_extra_by_count=gt_single_extra,
+            record_extra_by_count=retention_single_extra,
             max_drop_budget=max_drop_budget,
         )
-        strategies["gt_double"] = _strategy_from_drop_sets(
-            key="gt_double",
-            display_name="GT Double",
+        strategies["retention_double"] = _strategy_from_drop_sets(
+            key="retention_double",
+            display_name="Retention Double",
             drops_by_count=gt_drops,
             scores_by_count=gt_scores,
             unit_ids=unit_ids,
@@ -2782,29 +3088,18 @@ def run_build_prune_plan(
                 "interaction_assumption": (
                     "each interval keeps its original-model degradation after the "
                     "other interval is removed; joint degradation uses "
-                    f"{GT_TWO_INTERVAL_SCORE_AGGREGATION} aggregation"
+                    "sum aggregation"
                 ),
-                "two_interval_score_aggregation": (
-                    GT_TWO_INTERVAL_SCORE_AGGREGATION
-                ),
+                "two_interval_score_aggregation": "sum",
                 "selection": (
                     "descending-drop-count minimum of one-interval degradation or "
-                    f"{GT_TWO_INTERVAL_SCORE_AGGREGATION}-aggregated "
+                    "sum-aggregated "
                     "two-separated-interval degradation, with every component "
                     "overlapping the selected plan at the next larger drop count"
                 ),
                 "max_num_intervals": 2,
                 "interval_mode": "best_of_one_or_two",
                 "tie_policy": "prefer_single_interval",
-                "comparison_tolerance": float(
-                    GT_OURS_COMPARISON_TOLERANCE
-                ),
-                "double_gap_comparison_tolerance": float(
-                    GT_OURS_DOUBLE_GAP_COMPARISON_TOLERANCE
-                ),
-                "single_double_comparison_tolerance": float(
-                    GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE
-                ),
                 "cross_budget_path_constraint": (
                     "each_component_interval_at_drop_count_n_overlaps_at_least_one_"
                     "component_interval_at_drop_count_n_plus_1;"
@@ -2816,7 +3111,6 @@ def run_build_prune_plan(
             max_drop_budget=max_drop_budget,
         )
 
-    requested_strategies = _parse_pruning_strategies(strategy_selector)
     missing_strategies = [
         key for key in requested_strategies if key not in strategies
     ]
@@ -2867,13 +3161,13 @@ def run_build_prune_plan(
         display_name = str(strategy_record.get("display_name", strategy_key))
         drop_grid_items.append((display_name, span_to_drop_indices))
     if drop_grid_items:
-        strategy_evidence: dict[str, dict[str, Any]] = {
-            "Ours_CKA": _similarity_proxy_evidence(
+        strategy_evidence: dict[str, dict[str, Any]] = {}
+        if interval_score is not None:
+            strategy_evidence["CKA"] = _similarity_proxy_evidence(
                 interval_score,
-                display_name="Ours_CKA",
+                display_name="CKA",
                 metric_label="CKA",
-            ),
-        }
+            )
         if gt_corner_score is not None:
             strategy_evidence["GT"] = {
                 "values": gt_corner_score,
@@ -2881,21 +3175,21 @@ def run_build_prune_plan(
                 "colorbar_label": "normalized degradation ↓",
             }
         if cosine_interval_score is not None:
-            strategy_evidence["Ours_Cosine"] = _similarity_proxy_evidence(
+            strategy_evidence["Cosine"] = _similarity_proxy_evidence(
                 cosine_interval_score,
-                display_name="Ours_Cosine",
+                display_name="Cosine",
                 metric_label="cosine",
             )
         if inv_mse_interval_score is not None:
-            strategy_evidence["Ours_INV_MSE"] = _similarity_proxy_evidence(
+            strategy_evidence["INV_MSE"] = _similarity_proxy_evidence(
                 inv_mse_interval_score,
-                display_name="Ours_INV_MSE",
+                display_name="INV_MSE",
                 metric_label="INV_MSE",
             )
         if cca_interval_score is not None:
-            strategy_evidence["Ours_CCA"] = _similarity_proxy_evidence(
+            strategy_evidence["CCA"] = _similarity_proxy_evidence(
                 cca_interval_score,
-                display_name="Ours_CCA",
+                display_name="CCA",
                 metric_label="CCA",
             )
         if angular_interval_distance is not None:
@@ -2906,10 +3200,19 @@ def run_build_prune_plan(
                 "vmin": 0.0,
                 "vmax": 1.0,
             }
+        preferred_grid_methods = (
+            ("retention", "cka")
+            if any(
+                str(strategy).startswith(("retention_", "CKA_"))
+                for strategy in requested_strategies
+            )
+            else None
+        )
         prune_grid_path = render_prune_strategy_drop_grids(
             num_units=num_units,
             strategy_drop_indices=drop_grid_items,
             strategy_evidence=strategy_evidence,
+            display_methods=preferred_grid_methods,
             out_dir=visualization_root,
             backbone=backbone,
             tag=f"prune_plan_{safe_backbone}_drop_grid",
@@ -2917,15 +3220,15 @@ def run_build_prune_plan(
         )
         print(f"Wrote combined prune drop grid {prune_grid_path}", flush=True)
 
-    ours_points = strategies.get("ours_double", {}).get("points", {})
-    ours_drop_counts = sorted(
+    cka_points = strategies.get("CKA_double", {}).get("points", {})
+    cka_drop_counts = sorted(
         int(key)
-        for key in (ours_points if isinstance(ours_points, dict) else {})
+        for key in (cka_points if isinstance(cka_points, dict) else {})
         if str(key).isdigit()
     )
     span_records: dict[str, dict[str, Any]] = {}
-    if isinstance(ours_points, dict):
-        for span_key, plan_key in ours_points.items():
+    if isinstance(cka_points, dict):
+        for span_key, plan_key in cka_points.items():
             if not str(span_key).isdigit():
                 continue
             record = interval_records.get(str(plan_key)) or set_records.get(str(plan_key))
@@ -2969,42 +3272,47 @@ def run_build_prune_plan(
             for span in sorted((int(k) for k in span_records.keys()))
         },
         "extra": {
-            "similarity_source": similarity_source,
+            "unit_catalog_source": unit_catalog_source,
+            "similarity_source": similarity_source or None,
             "metric": str(metric),
             "token_region": str(token_region),
             "max_drop_budget": max_drop_budget,
-            "gt_ours_controls": {
+            "interval_selection_controls": {
                 "gt_component_aggregation": str(GT_COMPONENT_AGGREGATION),
                 "gt_aggregate_metrics": list(GT_AGGREGATE_METRICS),
-                "comparison_tolerance": float(
-                    GT_OURS_COMPARISON_TOLERANCE
-                ),
-                "double_gap_comparison_tolerance": float(
-                    GT_OURS_DOUBLE_GAP_COMPARISON_TOLERANCE
-                ),
-                "single_double_comparison_tolerance": float(
-                    GT_OURS_SINGLE_DOUBLE_COMPARISON_TOLERANCE
-                ),
                 "min_retained_units_between_intervals": int(
                     MIN_RETAINED_UNITS_BETWEEN_INTERVALS
                 ),
                 "require_cross_budget_interval_overlap": bool(
-                    GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+                    REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
                 ),
                 "cross_budget_scan_direction": "large_to_small",
-                "double_one_split_only": bool(
-                    GT_OURS_DOUBLE_ONE_SPLIT_ONLY
-                ),
                 "cross_budget_double_interval_one_to_one_required": bool(
-                    GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
-                ),
-                "gt_two_interval_score_aggregation": str(
-                    GT_TWO_INTERVAL_SCORE_AGGREGATION
-                ),
-                "ours_two_interval_score_aggregation": str(
-                    OURS_TWO_INTERVAL_SCORE_AGGREGATION
+                    REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
                 ),
             },
+            **(
+                {
+                    "similarity_selection_controls": {
+                        "double_gap_comparison_tolerance": float(
+                            double_gap_comparison_tolerance
+                        ),
+                        "single_double_comparison_tolerance": float(
+                            single_double_comparison_tolerance
+                        ),
+                    }
+                }
+                if any(
+                    key in requested_strategies
+                    for key in (
+                        "CKA_double",
+                        "cosine_double",
+                        "inv_mse_double",
+                        "cca_double",
+                    )
+                )
+                else {}
+            ),
             "triangle_legality": "closed_intervals_with_start_at_least_1",
             "multi_interval_legality": (
                 "strategy_specific: ReplaceMe requires only non-overlap and allows "
@@ -3012,18 +3320,22 @@ def run_build_prune_plan(
                 "retained unit between components"
             ),
             "interval_semantics": "closed interval iS_jE drops units S through E",
-            "interval_score": {
-                "matrix": "C[start,end]",
-                "source": "derived from unit-output pairwise similarity S",
-                "start_positive": "C[start,end] stores boundary/start-1 to endpoint/end similarity",
-                "unit_zero_policy": "C[0,:] is NaN because no prior unit output exists",
-            },
+            "interval_score": (
+                {
+                    "matrix": "C[start,end]",
+                    "source": "derived from unit-output pairwise similarity S",
+                    "start_positive": "C[start,end] stores boundary/start-1 to endpoint/end similarity",
+                    "unit_zero_policy": "C[0,:] is NaN because no prior unit output exists",
+                }
+                if interval_score is not None
+                else None
+            ),
             "require_endpoint_linked_spans": False,
             "cross_budget_path_constraint": {
-                "gt_ours_enabled": bool(
-                    GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+                "retention_CKA_enabled": bool(
+                    REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
                 ),
-                "gt_ours_rule": (
+                "retention_CKA_rule": (
                     "component_overlap_with_next_larger_drop_count;"
                     "double_to_double_one_to_one"
                 ),
@@ -3031,20 +3343,16 @@ def run_build_prune_plan(
             },
             "cross_budget_scan_direction": "large_to_small",
             "max_drop_budget": max_drop_budget,
-            "double_one_split_only": {
-                "gt_ours_double": bool(GT_OURS_DOUBLE_ONE_SPLIT_ONLY),
-                "other_strategies": False,
-            },
             "cross_budget_double_interval_one_to_one_required": {
-                "gt_ours_double": bool(
-                    GT_OURS_REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
+                "retention_CKA_double": bool(
+                    REQUIRE_CROSS_BUDGET_INTERVAL_OVERLAP
                 ),
                 "other_strategies": False,
             },
             "triangle_selection": "strategy_specific_best_plan_per_total_drop_count",
             "gt_corner_path": gt_corner_meta,
-            "max_available_span": int(max(ours_drop_counts, default=0)),
-            "available_spans": len(ours_drop_counts),
+            "max_available_span": int(max(cka_drop_counts, default=0)),
+            "available_spans": len(cka_drop_counts),
         },
     }
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3052,8 +3360,8 @@ def run_build_prune_plan(
     print(
         f"Wrote {bundle_path} (intervals={len(interval_records)}, sets={len(set_records)}, "
         f"strategies={len(strategies)}, "
-        f"ours_spans={len(span_records)}, "
-        f"max_available_span={max(ours_drop_counts, default=0)})",
+        f"CKA_spans={len(span_records)}, "
+        f"max_available_span={max(cka_drop_counts, default=0)})",
         flush=True,
     )
 
@@ -3076,6 +3384,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         gt_corner_metric=str(args.gt_corner_metric),
         strategy_selector=str(args.strategies),
         max_drop_budget=args.max_drop_budget,
+        double_gap_comparison_tolerance=args.double_gap_comparison_tolerance,
+        single_double_comparison_tolerance=args.single_double_comparison_tolerance,
     )
 
 
