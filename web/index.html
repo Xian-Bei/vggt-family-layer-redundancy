@@ -3,59 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="LaRe: calibrated layer pruning and recovery for visual geometry transformers. Explore experimental results and use the released models.">
-  <title>LaRe · Efficient visual geometry</title>
-  <link rel="stylesheet" href="style.css">
-  <script src="app.js" defer></script>
+  <meta name="robots" content="noindex,nofollow">
+  <title>Project page temporarily unavailable</title>
+  <style>
+    html,body{height:100%;margin:0}
+    body{display:grid;place-items:center;background:#f7f7f5;color:#1f1f1f;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    main{max-width:680px;padding:48px 28px;text-align:center}
+    h1{font-size:clamp(32px,5vw,56px);line-height:1.05;margin:0 0 20px}
+    p{font-size:18px;line-height:1.6;color:#5b5b57;margin:0}
+  </style>
 </head>
 <body>
-  <header><a class="wordmark" href="#">LaRe<span> / visual geometry</span></a><nav aria-label="Main navigation"><a href="#results">Results</a><a href="#analysis">Analysis</a><a href="#geometry">3D examples</a><a href="#models">Models</a></nav></header>
   <main>
-    <section class="hero">
-      <div class="eyebrow">LAYER PRUNING & RECOVERY</div>
-      <h1>Less computation.<br><em>More room for geometry.</em></h1>
-      <p class="intro">Explore how layer redundancy guides pruning in visual geometry transformers, and how calibrated recovery restores their predictions.</p>
-      <div class="actions"><a class="button" href="#results">Explore the results <span>↗</span></a><a class="text-link" href="#models">Use a calibrated model →</a></div>
-      <div class="pipeline" aria-label="Method: measure redundancy, prune layers, recover the boundary transformation"><div><span>01</span>Measure redundancy</div><i>→</i><div><span>02</span>Prune layers</div><i>→</i><div><span>03</span>Recover geometry</div></div>
-      <div class="backbones"><span>THREE BACKBONES</span><strong>VGGT</strong><strong>π³</strong><strong>VGGT-Ω</strong></div>
-    </section>
-
-    <section id="results" class="section">
-      <div class="section-heading"><div><span class="eyebrow">01 / EVIDENCE</span><h2>Read the results.</h2></div><p>Filter the exported experiment results. All seven geometry metrics are errors: lower is better.</p></div>
-      <div class="controls">
-        <label>Result set<select id="view"><option value="final">Formal experiments</option><option value="analysis">Research analysis</option></select></label>
-        <label>Backbone<select id="backbone"></select></label>
-        <label>Dataset<select id="dataset"></select></label>
-        <label>Dropped layers<select id="drop"></select></label>
-        <label>Recovery<select id="method"></select></label>
-        <label>Compression<select id="compression"></select></label>
-      </div>
-      <div class="table-wrap"><table><caption class="sr-only">Geometry and efficiency results</caption><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div>
-      <div class="table-footer"><span id="row-status" role="status">Loading results…</span><button id="download-csv" type="button">Download this table ↓</button></div>
-      <p class="note" id="policy"></p>
-      <p class="note">Acc. measures point-cloud accuracy error, not classification accuracy. A dash means the corresponding result is unavailable.</p>
-    </section>
-
-    <section id="analysis" class="section">
-      <div class="section-heading"><div><span class="eyebrow">02 / UNDER THE SURFACE</span><h2>From redundancy to recovery.</h2></div><p>Inspect similarity matrices, pruning curves, and recovered performance. Figures use the same Python plotting and normalization paths as the local research interface.</p></div>
-      <div class="controls"><label>Analysis<select id="figure-kind"><option value="recovery">Recovery</option><option value="pruning">Pruning</option><option value="similarity">Similarity</option></select></label><label>Backbone<select id="figure-backbone"></select></label><label>Dataset<select id="figure-dataset"></select></label><label id="region-label">Tokens<select id="figure-region"><option value="all">All</option><option value="special">Special</option><option value="patch">Patch</option></select></label><label id="metric-label">Metric<select id="figure-metric"><option value="cka">CKA</option><option value="cosine">Cosine</option><option value="cca">CCA</option><option value="inv_mse">Inverse MSE</option></select></label></div>
-      <figure class="figure-panel"><img id="analysis-image" alt="Selected experiment analysis" loading="lazy"><figcaption id="figure-caption"></figcaption></figure>
-      <a id="figure-download" class="text-link" download>Download figure ↓</a>
-    </section>
-
-    <section id="geometry" class="section">
-      <div class="section-heading"><div><span class="eyebrow">03 / IN THREE DIMENSIONS</span><h2>Look at the geometry.</h2></div><p>Browse a sampled reconstruction from a held-out scene. Drag to orbit and scroll to zoom.</p></div>
-      <div class="controls"><label>Backbone<select id="scene-backbone"></select></label><label>Prediction<select id="scene-variant"></select></label><label>Point size<input id="point-size" type="range" min="1" max="5" value="2"></label><button id="reset-camera" type="button">Reset view</button></div>
-      <div class="cloud-wrap"><canvas id="point-cloud" aria-label="Interactive 3D point cloud" tabindex="0"></canvas><span id="scene-status" role="status"></span></div>
-      <p class="note">Display samples retain finite points from the upper confidence half, with a fixed random seed. Quantitative results above use the original evaluation data.</p>
-    </section>
-
-    <section id="models" class="section model-section">
-      <div><span class="eyebrow">04 / START BUILDING</span><h2>Skip calibration.<br>Start with a model.</h2><p>The released model definition restores each backbone's pruned structure and recovery operators. Standalone weights load directly; compact recovery checkpoints can also be applied to the original pretrained weights.</p><label>Choose a backbone<select id="model-backbone"></select></label><p id="model-details" class="note"></p><a class="text-link" href="https://github.com/Xian-Bei/vggt-family-layer-redundancy#calibrated-models">Model files & setup →</a></div>
-      <div class="code-panel"><span>PYTHON / MINIMAL INFERENCE</span><pre><code id="model-code"></code></pre><button id="copy-code" type="button">Copy code</button></div>
-    </section>
+    <h1>Project page temporarily unavailable</h1>
+    <p>This page is temporarily offline while we correct and update the project materials. Please check back later.</p>
   </main>
-  <footer><a class="wordmark" href="#">LaRe</a><p>Layer pruning and recovery for visual geometry.</p><a href="https://github.com/Xian-Bei/vggt-family-layer-redundancy">Source & reproduction ↗</a><a href="data/manifest.json">Data manifest ↗</a></footer>
-  <div id="load-error" role="alert" hidden></div>
 </body>
 </html>
