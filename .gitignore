@@ -219,6 +219,9 @@ paper/
 TODO*
 
 # Local research and generated release artifacts
+/experiments/
+/tests/
+/pytest.ini
 /private_research/
 /test_length_results/
 /release_artifacts/

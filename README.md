@@ -23,7 +23,13 @@ extension can be built through the installer when required by your setup.
 ## Calibrated models
 
 The model definition is provided by [`lare/model.py`](lare/model.py), using the
-pinned upstream backbone definitions. Two weight formats are available:
+pinned upstream backbone definitions. The `lare/` package provides the shared
+inference interface (`model.py`) and checkpoint export tool (`export.py`).
+[`lare/metadata/`](lare/metadata/) stores JSON release manifests with filenames,
+sizes, selection provenance, and SHA-256 checksums. Actual weight files are
+kept under the Git-ignored `checkpoints/` directory.
+
+Two weight formats are available:
 
 | Backbone | Dropped units | Selected interval | Standalone weights | Recovery delta |
 |---|---:|---|---:|---:|
@@ -38,8 +44,8 @@ they are applied to the original pretrained model automatically.
 
 The artifacts have been prepared locally. Public download URLs have not yet
 been published. File names, sizes, and SHA-256 checksums are recorded in
-[`models/standalone_manifest.json`](models/standalone_manifest.json) and
-[`models/recovery_manifest.json`](models/recovery_manifest.json). Place the
+[`lare/metadata/standalone_manifest.json`](lare/metadata/standalone_manifest.json) and
+[`lare/metadata/recovery_manifest.json`](lare/metadata/recovery_manifest.json). Place the
 obtained files in this layout:
 
 ```text
@@ -132,9 +138,7 @@ default. The formal experiment calibrates on four training datasets. These
 different scopes are intentional. See [`docs/pipelines.md`](docs/pipelines.md)
 for the stage map, parameters, result layout, and compression settings.
 
-Additional experiments live in [`experiments/`](experiments/): token,
-calibration-sample, and pruning-heuristic ablations, long-sequence evaluation,
-and the ReplaceMe baseline. Maintenance runners are under
+Maintenance runners are under
 [`scripts/maintenance/`](scripts/maintenance/).
 
 ## Visualization
@@ -177,25 +181,23 @@ Missing candidates are not treated as measured comparisons.
 
 See [`docs/release.md`](docs/release.md) for artifact scope and publication steps.
 
-## Tests
+## Upstream projects and licensing
 
-Regression tests are in [`tests/`](tests/). Run them outside the sandbox in
-the `vggt` environment, with CUDA available:
+Third-party sources are pinned in
+[`backbones/backbones.lock.json`](backbones/backbones.lock.json) and referenced
+by `.gitmodules`. Their original license and attribution files remain
+authoritative for those components and their pretrained weights. Refer to
+the upstream repositories for their citation information.
 
-```bash
-conda run --no-capture-output -n vggt python -m pip install -r requirements-dev.txt
-conda run --no-capture-output -n vggt python -c \
-  'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'
-conda run --no-capture-output -n vggt python -m pytest tests -q
-```
+| Component | Source |
+|---|---|
+| VGGT | [facebookresearch/vggt](https://github.com/facebookresearch/vggt) |
+| Pi3 | [yyfz/Pi3](https://github.com/yyfz/Pi3) |
+| VGGT-Omega | [facebookresearch/vggt-omega](https://github.com/facebookresearch/vggt-omega) |
+| MapAnything | [facebookresearch/map-anything](https://github.com/facebookresearch/map-anything) |
+| FastVGGT | [mystorm16/FastVGGT](https://github.com/mystorm16/FastVGGT) |
+| QuantVGGT | [wlfeng0509/QuantVGGT](https://github.com/wlfeng0509/QuantVGGT) |
 
-## Upstream projects
-
-LaRe builds on [VGGT](https://github.com/facebookresearch/vggt),
-[Pi3](https://github.com/yyfz/Pi3),
-[VGGT-Omega](https://github.com/facebookresearch/vggt-omega),
-[FastVGGT](https://github.com/mystorm16/FastVGGT), and
-[QuantVGGT](https://github.com/wlfeng0509/QuantVGGT).
-See [`NOTICE.md`](NOTICE.md) and the upstream repositories for their licenses
-and citation information. The license for LaRe-authored code and the final
-paper citation must be specified before public release.
+The license for LaRe-authored code and the final paper citation must be
+specified before public release. This attribution does not relicense
+third-party code, datasets, or model weights.
