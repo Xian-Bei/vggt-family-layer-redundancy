@@ -1,5 +1,10 @@
 # Does the VGGT Family Need All Its Layers?
 
+<p align="center">
+  <a href="https://arxiv.org/abs/2609.36842"><img src="https://img.shields.io/badge/arXiv-2609.36842-b31b1b" alt="arXiv: 2609.36842"></a>
+  <a href="https://xian-bei.github.io/vggt-family-layer-redundancy/"><img src="https://img.shields.io/badge/Project_Page-Dashboard-2ea44f" alt="Project webpage and dashboard"></a>
+</p>
+
 Layer pruning and calibrated recovery for visual geometry transformers.
 
 This project supports VGGT, Pi3, and VGGT-Omega through a shared analysis, pruning,
@@ -162,6 +167,22 @@ the upstream repositories for their citation information.
 | FastVGGT | [mystorm16/FastVGGT](https://github.com/mystorm16/FastVGGT) |
 | QuantVGGT | [wlfeng0509/QuantVGGT](https://github.com/wlfeng0509/QuantVGGT) |
 
-The license for project-authored code and the final paper citation must be
-specified before public release. This attribution does not relicense
+The license for project-authored code must be specified before public release. This attribution does not relicense
 third-party code, datasets, or model weights.
+
+## Citation
+
+If you find this work useful, please cite our paper:
+
+```bibtex
+@misc{zhang2026vggtfamily,
+  title={Does the VGGT Family Need All Its Layers?},
+  author={Fengyi Zhang and Holger Caesar and Xiangyu Sun and
+          Zheng Zhang and Zi Huang and Yadan Luo},
+  year={2026},
+  eprint={2609.36842},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2609.36842}
+}
+```
