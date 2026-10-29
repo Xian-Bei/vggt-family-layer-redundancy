@@ -68,14 +68,15 @@ From the repository root, with the existing local experiment results:
 conda run --no-capture-output -n vggt python -m analysis.results.export_dashboard
 ```
 
-The exporter reads `analysis_outputs_v3` and `main_results`. The default command
+The exporter reads `analysis_outputs_v3`; the final table is fixed publication data
+in `web/assets/paper-table.json` and does not need `main_results`. The default command
 builds a complete snapshot in a temporary directory, then replaces `web/data/`
 only after export succeeds. It does not rerun experiments or modify result
 roots. `analysis.results.export_web` remains an alias for this command.
 
 For a targeted refresh of an existing snapshot, use `--sections heatmaps`,
-`--sections pruning recovery`, or `--sections tables`. These operate
-in place; use the full command for publication. `--analysis-root`, `--main-root`,
+or `--sections pruning recovery`. These operate
+in place; use the full command for publication. `--analysis-root`,
 and `--output` can override the input/output locations.
 
 The cache contains only:
@@ -83,14 +84,14 @@ The cache contains only:
 - Final display matrices for the mean Similarity scene and each physical
   token region, plus Single-interval and Remaining heatmaps. Symmetric
   matrices are stored as inclusive upper triangles without reducing precision.
-- Original Matplotlib SVG curves, their plotted coordinates, and method IDs.
-- Original display values, raw metrics, and filter metadata for the final table.
+- Matplotlib SVG curves plus the method IDs and legend/filter styling used by the UI.
+- The fixed paper table lives separately in `web/assets/`, outside the result export.
 - Plot palettes and an asset checksum manifest.
 
 The exporter calls the same callbacks and renderers as Gradio. Calibration
 winner selection, normalization profiles, fixed dataset averages, heatmap
 transformations, and MAE/Pearson/Spearman statistics are computed in Python.
-Single-interval overview includes all combinations of its dataset controls;
+Single-interval overview includes only individual datasets and the all-dataset mean;
 its four columns use the callback's `split_pose_metrics=False` option, averaging
 the four trajectory metrics together and the three geometry metrics together.
 The browser does not approximate an average by blending finished images.
@@ -153,3 +154,13 @@ Recovery controls use publication method names, omit Current Target (the plain
 sequential variant), and label the autogroup variant Ours. Both pruning selectors
 call the measured criterion Measured. Remaining plots also discover completed
 points from validated result summaries when an older index omits them.
+
+The exporter omits retired final curves and exploratory tables, unmerged pruning
+curves, arbitrary dataset subsets, and the hidden sequential recovery method.
+Finalization removes unreachable plot/matrix files and regenerates checksums,
+including when refreshing an older snapshot.
+
+SVG cleanup removes the hidden sequential-recovery artists and embedded legends
+(the UI builds one shared legend). Duplicate coordinate arrays are omitted from
+JSON because the visible paths already reside in SVG. A reachability audit checks
+that all data files serve a current control selection or asset integrity check.

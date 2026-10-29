@@ -1,4 +1,4 @@
-"""Export the seven results-panel tabs for a serverless GitHub Pages dashboard.
+"""Export data for the five interactive tabs (the sixth uses fixed paper data) for a serverless GitHub Pages dashboard.
 
 Scientific transformations stay in the local Gradio callbacks and renderers.
 The browser receives final heatmap cells, plotted coordinates and table rows.
@@ -10,12 +10,13 @@ from __future__ import annotations
 import argparse
 import copy
 from contextlib import ExitStack
-from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import io
 import itertools
 import json
+import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
@@ -167,11 +168,10 @@ def export_heatmaps(root, assets, analysis_root, backbones):
     order = [bb for bb in callbacks["backbones"] if bb in backbones]
     datasets = callbacks["single_datasets"]
     output = {"backbones": order, "single_datasets": datasets, "single_overview": [], "remaining": [], "similarity": []}
-    for count in range(1, len(datasets) + 1):
-        for subset in itertools.combinations(datasets, count):
-            print("Single-interval overview", subset, flush=True)
-            raw = callbacks["single_overview"](order, list(subset), split_pose_metrics=False)
-            output["single_overview"].append({"datasets": subset, "rows": [assets.gallery(raw[callbacks["backbones"].index(bb)]) for bb in order], "status": raw[-1]})
+    for subset in [(ds,) for ds in datasets] + [tuple(datasets)]:
+        print("Single-interval overview", subset, flush=True)
+        raw = callbacks["single_overview"](order, list(subset), split_pose_metrics=False)
+        output["single_overview"].append({"datasets": subset, "rows": [assets.gallery(raw[callbacks["backbones"].index(bb)]) for bb in order], "status": raw[-1]})
     for ds in callbacks["datasets"]:
         if ds == "min":
             continue
@@ -221,73 +221,100 @@ def export_pruning(root, assets, analysis_root, backbones):
         scopes.remove("mean")
         scopes.update(p._AVERAGE_SCOPES)
     entries = []
-    for bb, ds, merge, method in itertools.product(["mean", *backbones], sorted(scopes), (False, True), ("baseline", "similarity")):
+    for bb, ds, merge, method in itertools.product(["mean", *backbones], sorted(scopes), (True,), ("baseline", "similarity")):
         print("Pruning", bb, ds, "overview", merge, method, flush=True)
         gallery, status = p.render_pruning_plan_gallery(analysis_root, [bb], [ds], merge_replaceme=merge, view="overview", overview_method=method)
         entries.append({"backbone": bb, "dataset": ds, "detail": False, "merge": merge, "method": method, "cells": [c for c in assets.gallery(gallery) if c["kind"] == "figure"], "status": status})
     write(root / "pruning.json", {"scopes": sorted(scopes), "entries": entries})
 
 
-def export_recovery(root, assets, analysis_root, main_root, backbones):
-    from analysis.vis import recovery_tab as r, final_results_tab as f
+def export_recovery(root, assets, analysis_root, backbones):
+    from analysis.vis import recovery_tab as r
+    _, methods = r.discover_recovery_overview_options(analysis_root)
+    methods = [m for m in methods if m != "recovery_ghost_interval_sequential"]
+    groups = r._OVERVIEW_DATASET_AVERAGE_GROUPS
+    datasets = [ds for ds in r._discover_recovery_generalization_datasets(
+        analysis_root, dataset_average_groups=groups)
+        if ds not in ("7scenes_train", "waymo_training")]
     records = []
-    methods_all = set()
-    methods_by_view = {}
-    for final in (False, True):
-        source = main_root if final else analysis_root
-        _, methods = r.discover_recovery_overview_options(source)
-        methods_by_view["final" if final else "recovery"] = methods
-        methods_all.update(methods)
-        strategies = ["Retention_min"] if final else list(r._RECOVERY_OVERVIEW_PRUNE_STRATEGIES)
-        groups = f.FINAL_OVERVIEW_DATASET_AVERAGE_GROUPS if final else r._OVERVIEW_DATASET_AVERAGE_GROUPS
-        datasets = r._discover_recovery_generalization_datasets(source, dataset_average_groups=groups, allowed_datasets=f.FINAL_DATASETS if final else None)
-        if final:
-            datasets = [ds for ds in datasets if ds in (*f.FINAL_OVERVIEW_DATASETS, f.FINAL_OVERVIEW_AVERAGE)]
-        for bb, ds, strategy in itertools.product(["mean", *backbones], datasets, strategies):
-            print("Final" if final else "Recovery", "overview", bb, ds, strategy, flush=True)
-            gallery, status = r.render_recovery_overview(
-                source, [bb], methods, ds, prune_strategy=strategy, detail=False,
-                dataset_average_groups=groups,
-                comparison_dataset_average_groups=groups,
-                calibration_dataset_average_groups=f.FINAL_CALIBRATION_DATASET_AVERAGE_GROUPS if final else None,
-                comparison_calibration_dataset_average_groups=f.FINAL_CALIBRATION_DATASET_AVERAGE_GROUPS if final else None,
-                comparison_output_root=analysis_root if final else None,
-            )
-            cells = assets.gallery(gallery)
-            # Drop separate raster legend tiles; the browser filters SVG legends.
-            cells = [c for c in cells if c["kind"] == "figure" and assets.figures[c["key"]]["axes"]]
-            records.append({"final": final, "detail": False, "backbone": bb, "dataset": ds, "strategy": strategy, "cells": cells, "status": status})
-            plt.close("all")
-    write(root / "recovery.json", {"methods": sorted(methods_all), "methods_by_view": methods_by_view, "entries": records})
+    for bb, ds, strategy in itertools.product(["mean", *backbones], datasets, r._RECOVERY_OVERVIEW_PRUNE_STRATEGIES):
+        print("Recovery", bb, ds, strategy, flush=True)
+        gallery, status = r.render_recovery_overview(
+            analysis_root, [bb], methods, ds, prune_strategy=strategy, detail=False,
+            dataset_average_groups=groups, comparison_dataset_average_groups=groups,
+        )
+        cells = [c for c in assets.gallery(gallery) if c["kind"] == "figure" and assets.figures[c["key"]]["axes"]]
+        records.append({"final": False, "detail": False, "backbone": bb, "dataset": ds, "strategy": strategy, "cells": cells, "status": status})
+        plt.close("all")
+    write(root / "recovery.json", {"methods": methods, "methods_by_view": {"recovery": methods}, "entries": records})
 
 
-def export_tables(root, analysis_root, main_root):
-    from analysis.vis import summary_tab as s, final_results_tab as f
-    from analysis.vis.dataset_average_warning import GENERALIZATION_DATASET_AVERAGE_GROUPS
-    for final, source in ((True, main_root),):
-        groups = f.FINAL_TABLE_DATASET_AVERAGE_GROUPS if final else GENERALIZATION_DATASET_AVERAGE_GROUPS
-        kwargs = dict(prune_strategies=("retention", "replaceme") if final else s.DEFAULT_SUMMARY_PRUNE_STRATEGIES,
-                      include_compression=final, include_efficiency_metrics=final)
-        header, live, _ = s._load_live_eval_rows(source, **kwargs)
-        training = s._load_training_best_rows(output_root=source, metric_headers=header[3:])
-        variants = {}
-        for include_training in (False, True):
-            rows = s._add_dataset_average_rows([*live, *(training if include_training else [])], header[3:], groups)
-            rows = s._select_best_recovery_rows(rows, include_lower=not final, share_recovery_winner_across_variants=final)
-            variants[str(include_training).lower()] = [
-                {**asdict(row), "group": s._mode_group_for_row(row.mode), "method": s._recovery_method_for_row(row.mode),
-                 "compression": s._compression_for_row(row.mode) or "none", "drop": s._span_value_for_row(row.mode),
-                 "families": s._pruning_families_for_sources(row.pruning_sources), "structures": s._pruning_structures_for_sources(row.pruning_sources),
-                 "numeric": {h: s._numeric_cell_value(row.metrics.get(h, "")) for h in header[3:]}}
-                for row in rows
-            ]
-        write(root / ("final_table.json" if final else "recovery_table.json"), {
-            "header": header, "rows": variants, "one_decimal_headers": sorted(s._ONE_DECIMAL_HEADERS),
-        })
+def trim_retired_views(output):
+    """Apply the current UI scope to existing snapshots and partial exports."""
+    for name in ("final_table.json", "recovery_table.json"):
+        (output / name).unlink(missing_ok=True)
+    path = output / "heatmaps.json"
+    if path.exists():
+        h = json.loads(path.read_text())
+        h["single_overview"] = [e for e in h["single_overview"]
+            if len(e["datasets"]) == 1 or set(e["datasets"]) == set(h["single_datasets"])]
+        write(path, h)
+        referenced = {e["file"] for e in h["similarity"]}
+        for p in (output / "similarity").glob("*.json"):
+            if p.relative_to(output).as_posix() not in referenced:
+                p.unlink()
+    path = output / "pruning.json"
+    if path.exists():
+        p = json.loads(path.read_text())
+        p["entries"] = [e for e in p["entries"] if not e["detail"] and e["merge"]]
+        write(path, p)
+    path = output / "recovery.json"
+    if path.exists():
+        r = json.loads(path.read_text())
+        r["entries"] = [e for e in r["entries"] if not e["final"] and not e["detail"]
+            and e["dataset"] not in ("7scenes_train", "waymo_training")]
+        methods = r.get("methods_by_view", {}).get("recovery", r["methods"])
+        r["methods"] = [m for m in methods if m != "recovery_ghost_interval_sequential"]
+        r["methods_by_view"] = {"recovery": r["methods"]}
+        write(path, r)
+
+
+def trim_plot_payload(output, metadata):
+    """Remove artists hidden unconditionally by the public UI and duplicate data."""
+    hidden_method = "recovery_ghost_interval_sequential"
+    svg_path = output / metadata["file"]
+    svg = ET.fromstring(svg_path.read_text())
+    parents = {child: parent for parent in svg.iter() for child in parent}
+    lines = [line for axis in metadata["axes"] for line in axis["lines"]]
+    hidden = [line for line in lines if line["method"].split("__")[0] == hidden_method]
+    hidden_ids = {line["id"] for line in hidden}
+    colors = {}
+    for line in lines:
+        color = line["color"].lower()
+        colors[color] = colors.get(color, False) or line["id"] not in hidden_ids
+    for node in list(svg.iter()):
+        identifier = node.get("id", "")
+        remove = identifier in hidden_ids or identifier.startswith("legend_")
+        if identifier.startswith("PathCollection_"):
+            used = {color.lower() for child in node.iter()
+                for color in re.findall(r"(?:fill|stroke):\s*(#[\da-fA-F]{6})\b", child.get("style", ""))}
+            used.intersection_update(colors)
+            remove = bool(used) and not any(colors[color] for color in used)
+        if remove and node in parents:
+            parents[node].remove(node)
+    ET.register_namespace("", "http://www.w3.org/2000/svg")
+    ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
+    svg_path.write_text(ET.tostring(svg, encoding="unicode") + "\n")
+    # Coordinates already live in the SVG. JS only needs IDs and legend/filter fields.
+    metadata["axes"] = [{"lines": [
+        {key: line[key] for key in ("id", "label", "method", "color", "style")}
+        for line in axis["lines"] if line["id"] not in hidden_ids
+    ]} for axis in metadata["axes"]]
 
 
 def finalize(output):
     """Keep only assets reachable from the current dashboard, then checksum them."""
+    trim_retired_views(output)
     refs = {"heatmap": set(), "figure": set()}
 
     def walk(value):
@@ -300,7 +327,7 @@ def finalize(output):
             for item in value:
                 walk(item)
 
-    sources = [p for p in output.glob("*.json") if p.name not in ("manifest.json", "figures.json")]
+    sources = [output / name for name in ("heatmaps.json", "pruning.json", "recovery.json") if (output / name).exists()]
     sources.extend((output / "similarity").glob("*.json"))
     for path in sources:
         walk(json.loads(path.read_text()))
@@ -312,6 +339,7 @@ def finalize(output):
             for key, value in raw_meta.items() if key in refs["figure"]}
     pointers = {}
     for key, value in meta.items():
+        trim_plot_payload(output, value)
         filename = f"plots/{key}.json"
         write(output / filename, value)
         pointers[key] = {"file": value["file"], "metadata": filename}
@@ -328,7 +356,7 @@ def finalize(output):
     print("Exported", len(files), "assets,", round(sum(x["bytes"] for x in files) / 1024**2, 2), "MiB", flush=True)
 
 
-def export_dashboard(analysis_root, main_root, output, backbones, sections=None):
+def export_dashboard(analysis_root, output, backbones, sections=None):
     from analysis.vis.display_names import backbone_display_name
     output.mkdir(parents=True, exist_ok=True)
     assets = Assets(output)
@@ -340,7 +368,7 @@ def export_dashboard(analysis_root, main_root, output, backbones, sections=None)
         assets.figures.update({key: json.loads((output / value["metadata"]).read_text()) if "metadata" in value else value for key, value in metadata.items()})
     index.pop("radars", None)
     index.pop("radar_status", None)
-    sections = set(sections or ("heatmaps", "pruning", "recovery", "tables"))
+    sections = set(sections or ("heatmaps", "pruning", "recovery"))
     with ExitStack() as stack:
         assets.patches(stack)
         if "heatmaps" in sections:
@@ -348,9 +376,7 @@ def export_dashboard(analysis_root, main_root, output, backbones, sections=None)
         if "pruning" in sections:
             export_pruning(output, assets, analysis_root, backbones)
         if "recovery" in sections:
-            export_recovery(output, assets, analysis_root, main_root, backbones)
-        if "tables" in sections:
-            export_tables(output, analysis_root, main_root)
+            export_recovery(output, assets, analysis_root, backbones)
     write(output / "figures.json", assets.figures)
     palettes = {name: np.round(matplotlib.colormaps[name](np.arange(256))[:, :3] * 255).astype(int) for name in ("coolwarm", "coolwarm_r", "viridis", "magma", "magma_r")}
     index.update({"schema_version": "dashboard_v2", "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -363,19 +389,18 @@ def export_dashboard(analysis_root, main_root, output, backbones, sections=None)
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis-root", type=Path, default=Path("analysis_outputs_v3"))
-    parser.add_argument("--main-root", type=Path, default=Path("main_results"))
     parser.add_argument("--output", type=Path, default=Path("web/data"))
     parser.add_argument("--backbones", nargs="+", default=["vggt_omega", "pi3", "vggt"])
-    parser.add_argument("--sections", nargs="+", choices=["heatmaps", "pruning", "recovery", "tables"])
+    parser.add_argument("--sections", nargs="+", choices=["heatmaps", "pruning", "recovery"])
     args = parser.parse_args()
     if args.sections:
-        export_dashboard(args.analysis_root, args.main_root, args.output, args.backbones, args.sections)
+        export_dashboard(args.analysis_root, args.output, args.backbones, args.sections)
     else:
         # Never leave a published tree containing a mixture of old and new data.
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".dashboard-", dir=args.output.parent) as temporary:
             stage = Path(temporary) / "data"
-            export_dashboard(args.analysis_root, args.main_root, stage, args.backbones)
+            export_dashboard(args.analysis_root, stage, args.backbones)
             previous = Path(temporary) / "previous"
             if args.output.exists():
                 args.output.rename(previous)
