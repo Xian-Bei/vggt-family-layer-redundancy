@@ -22,10 +22,10 @@ extension can be built through the installer when required by your setup.
 
 ## Calibrated models
 
-The model definition is provided by [`lare/model.py`](lare/model.py), using the
-pinned upstream backbone definitions. The `lare/` package provides the shared
+The model definition is provided by [`models/model.py`](models/model.py), using the
+pinned upstream backbone definitions. The `models/` package provides the shared
 inference interface (`model.py`) and checkpoint export tool (`export.py`).
-[`lare/metadata/`](lare/metadata/) stores JSON release manifests with filenames,
+[`models/metadata/`](models/metadata/) stores JSON release manifests with filenames,
 sizes, selection provenance, and SHA-256 checksums. Actual weight files are
 kept under the Git-ignored `checkpoints/` directory.
 
@@ -44,8 +44,8 @@ they are applied to the original pretrained model automatically.
 
 The artifacts have been prepared locally. Public download URLs have not yet
 been published. File names, sizes, and SHA-256 checksums are recorded in
-[`lare/metadata/standalone_manifest.json`](lare/metadata/standalone_manifest.json) and
-[`lare/metadata/recovery_manifest.json`](lare/metadata/recovery_manifest.json). Place the
+[`models/metadata/standalone_manifest.json`](models/metadata/standalone_manifest.json) and
+[`models/metadata/recovery_manifest.json`](models/metadata/recovery_manifest.json). Place the
 obtained files in this layout:
 
 ```text
@@ -58,7 +58,7 @@ checkpoints/
 ### Minimal inference
 
 ```python
-from lare import LaRe
+from models import LaRe
 
 model = LaRe.from_pretrained(
     "vggt",  # also: "pi3", "vggt_omega"
@@ -95,7 +95,7 @@ PYTHONPATH=. python examples/infer.py \
 ### Using compact recovery checkpoints
 
 ```python
-from lare import load_calibrated
+from models import load_calibrated
 
 model = load_calibrated("pi3", checkpoint="checkpoints/pi3/recovery.pt")
 predictions = model(model.load_images(["image_a.jpg", "image_b.jpg"]))
@@ -149,8 +149,8 @@ The local research interface remains available:
 conda run --no-capture-output -n vggt python -m analysis.view
 ```
 
-[`web/`](web/) contains a static project webpage with result filters, CSV
-download, analysis figures, and sampled interactive 3D examples. It uses only
+[`web/`](web/) contains a static project webpage with the six analysis/formal
+result tabs, their controls, downloadable plots, and filterable tables. It uses only
 the exported visualization data, without a Python or Gradio server.
 See [`docs/webpage.md`](docs/webpage.md) for export and GitHub Pages deployment.
 
@@ -162,13 +162,13 @@ are not bundled.
 
 ```bash
 # Compact recovery checkpoints for the three calibrated operating points.
-conda run --no-capture-output -n vggt python -m lare.export
+conda run --no-capture-output -n vggt python -m models.export
 
 # Complete pruned model weights; requires the original weights once at export.
-conda run --no-capture-output -n vggt python -m lare.export --standalone
+conda run --no-capture-output -n vggt python -m models.export --standalone
 
-# Only the numerical data and sampled geometry needed by the webpage.
-conda run --no-capture-output -n vggt python -m analysis.results.export_web
+# Only the cached matrices, curves and tables needed by the dashboard.
+conda run --no-capture-output -n vggt python -m analysis.results.export_dashboard
 
 # Recovery checkpoints referenced by current public analysis/formal plans.
 conda run --no-capture-output -n vggt python -m analysis.results.export_recovery_checkpoints

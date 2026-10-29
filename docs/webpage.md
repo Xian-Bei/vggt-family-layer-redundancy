@@ -1,40 +1,120 @@
-# Static project webpage
+# Static results dashboard
 
-`web/` is a buildless HTML/CSS/JavaScript site. It runs on GitHub Pages without
-Gradio, a Python server, a package manager, or third-party browser libraries.
-All paths are relative, so repository project URLs are supported.
+`web/` runs entirely on GitHub Pages. It contains a project introduction and
+six tabs featuring the selected parts of `analysis.view` and paper Table 1, named after
+the paper's analyses: Layer Redundancy (four panels per backbone: indoor/outdoor
+trajectory and geometry metrics), Approximate Additivity (the original and first
+marginal landscape per backbone), Representation Proxies, Pruning &
+Generalization (normalized degradation), Post-Pruning
+Recovery (normalized degradation),
+and Accuracy & Efficiency (the fixed paper Table 1). Existing URL identifiers remain
+valid, with removed per-metric pages and the former recovery table redirecting
+to the corresponding overview; the former radar URL redirects to the final table.
+The public dashboard does not include 3D, ablation, attention replay,
+model inference, or training.
 
-## Refresh visualization data
+The project introduction, authors, four findings and BibTeX citation follow
+[the paper on arXiv](https://arxiv.org/abs/2609.36842). The paper section,
+dashboard and citation use the same centered page container. The title wraps
+naturally and the introduction uses the full container width. Author names link
+to their personal pages; Xiangyu Sun links to the Google Scholar profile listed
+on the [UQMM lab page](https://luoyadan.github.io/uqmm/). The arXiv and GitHub
+links appear directly below the author affiliations. Dashboard pages
+show controls and figure labels without repeating the tab title above them;
+normal diagnostic text stays accessible to
+screen readers, and loading failures remain visible.
+Dataset names use ScanNet, nuScenes, 7Scenes, and Waymo in controls, row labels,
+tables while retaining their original split identifiers
+for filtering. Dataset row headings always show the full scope name; the
+former simplified-label option is removed, including from restored shared views.
+Tabs are numbered 1–6. The first three tabs omit dataset split suffixes;
+Layer Redundancy has a single dataset selector (default Mean): Mean retains
+indoor/outdoor averages, while a concrete dataset shows its two metric families.
+Approximate Additivity and Representation Proxies use all four Dev datasets
+(ScanNet, nuScenes, 7Scenes, Waymo) for Mean, matching the local dashboard and
+publication PDF exports. Representation Proxies always uses the mean scene and
+has no scene selector.
+Pruning and recovery group dataset controls and rows by calibration, same-dataset
+test, and cross-dataset test, with consistent Dev/Test suffixes. The recovery
+dataset selector precedes the method selector. Unavailable recovery splits
+(7Scenes Dev and Waymo Dev in `analysis_outputs_v3`) are omitted;
+these splits do have separate final-experiment results under `main_results`. The calibration average remains
+ScanNet Dev + nuScenes Dev, as defined in the experiment.
+Pruning and recovery default to calibration-set,
+same-dataset test, and cross-dataset test averages, with one shared legend above
+all rows. ReplaceMe merging is always enabled for pruning; recovery initially
+selects every available method. Reset controls restores these defaults.
 
-From the repository root:
+The project header uses centered author links and dark, rounded resource
+buttons, following the common research-project layout shown by
+[VGGT](https://vgg-t.github.io/). Introductory paragraphs span the same content
+width as the findings and dashboard. CSS and JavaScript URLs include content
+hashes to bypass stale browser caches after an update. When editing either
+asset, refresh its `?v=` value in `web/index.html` using the first 12 characters
+of its SHA-256 digest. Restarting `python -m http.server` alone does not clear
+the browser's cached assets.
+
+Heatmap axes share fixed display slots. Curve axes are scaled uniformly to
+common plot dimensions. Shared legends replace repeated
+per-figure legends; method filtering toggles both line and scatter artists.
+Column captions use 17px text and curve backbone captions use 19px text.
+These are presentation changes; the cached values and axis scales are unchanged.
+
+## Refresh the cached results
+
+From the repository root, with the existing local experiment results:
 
 ```bash
-conda run --no-capture-output -n vggt python -m lare.export
-conda run --no-capture-output -n vggt python -m analysis.results.export_web
+conda run --no-capture-output -n vggt python -m analysis.results.export_dashboard
 ```
 
-The export reads `analysis_outputs_v3` and `main_results`. It emits only:
+The exporter reads `analysis_outputs_v3` and `main_results`. The default command
+builds a complete snapshot in a temporary directory, then replaces `web/data/`
+only after export succeeds. It does not rerun experiments or modify result
+roots. `analysis.results.export_web` remains an alias for this command.
 
-- Result tables split by view and backbone, including existing display values
-  and raw seven-metric errors.
-- Pruning-curve payloads, similarity mean matrices, and analysis figures.
-- A selected held-out ScanNet scene per backbone, with Original/LaRe point
-  samples of at most 30,000 points each.
-- Small manifests with sizes and SHA-256 checksums.
+For a targeted refresh of an existing snapshot, use `--sections heatmaps`,
+`--sections pruning recovery`, or `--sections tables`. These operate
+in place; use the full command for publication. `--analysis-root`, `--main-root`,
+and `--output` can override the input/output locations.
 
-The table export reuses the Python aggregation and calibration winner rules
-used by Gradio. Compression variants follow the uncompressed recovery winner.
-Final recovery figures reuse the analysis normalization profiles. The browser
-only filters and displays the exported results; it does not compute scientific
-averages, normalize errors, or select pruning winners.
+The cache contains only:
 
-Similarity panels display raw mean similarity, explicitly labeled as such.
-The local Gradio interface additionally supports transformed views and other
-research controls. Point samples use a fixed seed and confidence filtering;
-they are display assets, not the quantitative evaluation input.
+- Final display matrices for the mean Similarity scene and each physical
+  token region, plus Single-interval and Remaining heatmaps. Symmetric
+  matrices are stored as inclusive upper triangles without reducing precision.
+- Original Matplotlib SVG curves, their plotted coordinates, and method IDs.
+- Original display values, raw metrics, and filter metadata for the final table.
+- Plot palettes and an asset checksum manifest.
 
-Large model weights, full-resolution point clouds, activation caches, and
-complete experiment output trees are excluded from `web/`.
+The exporter calls the same callbacks and renderers as Gradio. Calibration
+winner selection, normalization profiles, fixed dataset averages, heatmap
+transformations, and MAE/Pearson/Spearman statistics are computed in Python.
+Single-interval overview includes all combinations of its dataset controls;
+its four columns use the callback's `split_pose_metrics=False` option, averaging
+the four trajectory metrics together and the three geometry metrics together.
+The browser does not approximate an average by blending finished images.
+
+JavaScript filters the cached scopes and table rows, arranges panels, and
+shows/hides methods in the original SVG curves. Method visibility keeps the
+exported axis limits fixed. Tables compute absolute/percentage changes from
+the same displayed numbers used by the Gradio table; absolute changes take
+precedence when both switches are enabled. Empty selections and unavailable
+results remain explicit.
+
+Matrices use the original Matplotlib palettes, one-based layer tick labels,
+lower-left coordinate origin, and the shared 48-layer canvas. Hover exposes
+matrix values; PNG/SVG downloads and shareable
+control selections work without a Python service.
+
+`Refresh published data` reloads the published snapshot. It cannot inspect
+new results on the author's computer; refresh the export and redeploy to
+publish new measurements. `Load training eval best` exposes only training
+results present at export time; it never runs training.
+
+Weights, activation caches, original images, point clouds, backup files, and
+complete experiment trees are excluded. Model export is independent of the
+webpage and is not required to refresh it.
 
 ## Local preview
 
@@ -42,45 +122,34 @@ complete experiment output trees are excluded from `web/`.
 conda run --no-capture-output -n vggt python -m http.server 8000 --directory web
 ```
 
-Open `http://localhost:8000`. Direct `file://` loading cannot fetch the data.
-Stop the server after use. The 3D viewer supports pointer orbit, wheel zoom,
-arrow-key orbit, point-size adjustment, and reset.
+Open <http://localhost:8000>. Direct `file://` loading cannot fetch the cache.
+Stop the server when finished. The frontend has no package-manager build or
+external browser-library dependency.
 
-## GitHub Pages
+## GitHub Pages deployment
 
 Repository: <https://github.com/Xian-Bei/vggt-family-layer-redundancy>
 
-Project webpage after successful deployment:
-<https://xian-bei.github.io/vggt-family-layer-redundancy/>
+Project URL: <https://xian-bei.github.io/vggt-family-layer-redundancy/>
 
-1. Commit and push the prepared public source to the repository's `main`
-   branch. The website deployment requires `.github/workflows/pages.yml`
-   and the complete `web/` directory, including `web/data/` and `.nojekyll`.
-   The model setup link also expects the project README on that branch.
-   Include the `.gitignore` exception for `web/data/scenes/*.bin`: these six
-   sampled point clouds must be committed with the rest of the website data.
-2. Open [Settings → Pages](https://github.com/Xian-Bei/vggt-family-layer-redundancy/settings/pages).
-   Under **Build and deployment → Source**, select **GitHub Actions**.
-   The existing workflow is sufficient; no new template is needed.
-3. Open [Actions](https://github.com/Xian-Bei/vggt-family-layer-redundancy/actions),
-   select **Project webpage**, click **Run workflow**, choose `main`, and
-   confirm **Run workflow**. The workflow file must be on the default branch
-   before its manual trigger is available.
-4. Wait for the `deploy` job to succeed. Its deployment URL should be the
-   project webpage shown above. Open that URL after the job completes.
+1. Commit and push the source plus the complete `web/` directory to `main`.
+2. In Settings → Pages, choose **GitHub Actions** as the deployment source.
+3. In Actions, run **Project webpage** on `main`.
+4. Wait for the deployment to succeed and open the project URL.
 
-The workflow is manual: pushing changes does not publish the site by itself.
-For subsequent updates, push the changed `web/` files and run the same
-workflow again. Editing only HTML/CSS/JavaScript does not require re-exporting
-the numerical data; rerun the export when experiment results change.
+The existing `.github/workflows/pages.yml` uploads only `web/`. It never reads
+local result roots or uploads model checkpoints. All asset paths are relative
+and support the repository URL prefix. No Hugging Face Space, Python server,
+GPU service, custom domain, or separate `xian-bei.github.io` repository is
+required. Pushing alone does not trigger this manual deployment workflow.
 
-This is a repository project site. It does not require a separate
-`xian-bei.github.io` repository or a custom domain/CNAME. The site uses relative
-asset URLs, which already support the `/vggt-family-layer-redundancy/` prefix.
-
-The workflow uploads only `web/`. It never exports research outputs or uploads
-model checkpoints from the working machine. Model download URLs must be added
-after the artifacts have actually been published.
-
-The workflow follows the official
-[GitHub Pages custom-workflow guide](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages).
+The final tab displays the 17 rows of paper Table 1, averaged over four held-out
+splits, without exploratory filters. Publication values, units (including latency
+in seconds), and efficiency reductions are preserved in `web/assets/paper-table.json`.
+This fixed snapshot is independent of live result exports. The former compressed
+models tab redirects here. The teaser below the project links is rendered from
+`docs/teaser.pdf`, with a link to the PDF copy in `web/assets/`.
+Recovery controls use publication method names, omit Current Target (the plain
+sequential variant), and label the autogroup variant Ours. Both pruning selectors
+call the measured criterion Measured. Remaining plots also discover completed
+points from validated result summaries when an older index omits them.

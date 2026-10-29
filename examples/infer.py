@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from lare import load_calibrated
+from models import load_calibrated
 
 
 def main():

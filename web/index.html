@@ -3,20 +3,57 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="robots" content="noindex,nofollow">
-  <title>Project page temporarily unavailable</title>
-  <style>
-    html,body{height:100%;margin:0}
-    body{display:grid;place-items:center;background:#f7f7f5;color:#1f1f1f;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-    main{max-width:680px;padding:48px 28px;text-align:center}
-    h1{font-size:clamp(32px,5vw,56px);line-height:1.05;margin:0 0 20px}
-    p{font-size:18px;line-height:1.6;color:#5b5b57;margin:0}
-  </style>
+  <meta name="description" content="Does the VGGT Family Need All Its Layers? Explore four findings on layer redundancy, structured pruning, and token-aware calibration in VGGT, Pi3, and VGGT-Omega.">
+  <title>Does the VGGT Family Need All Its Layers?</title>
+  <link rel="stylesheet" href="style.css?v=b42ec7ec7b1f">
+  <script src="app.js?v=f1a868408091" defer></script>
 </head>
 <body>
-  <main>
-    <h1>Project page temporarily unavailable</h1>
-    <p>This page is temporarily offline while we correct and update the project materials. Please check back later.</p>
+  <header class="project">
+    <h1>Does the VGGT Family Need All Its Layers?</h1>
+    <p class="authors"><span><a href="https://xian-bei.github.io/">Fengyi Zhang</a><sup>1</sup></span><span><a href="https://sites.google.com/it-caesar.de/homepage/">Holger Caesar</a><sup>2</sup></span><span><a href="https://scholar.google.com/citations?user=Jf8vi_sAAAAJ&amp;hl=en" title="Xiangyu Sun — Google Scholar">Xiangyu Sun</a><sup>1</sup></span><span><a href="https://cszhengzhang.cn/">Zheng Zhang</a><sup>3</sup></span><span><a href="https://staff.itee.uq.edu.au/huang/">Zi Huang</a><sup>1</sup></span><span><a href="https://luoyadan.github.io/">Yadan Luo</a><sup>1</sup></span></p>
+    <p class="affiliations"><span><sup>1</sup> The University of Queensland</span><span><sup>2</sup> Delft University of Technology</span><span><sup>3</sup> Harbin Institute of Technology</span></p>
+    <nav class="project-links" aria-label="Project links">
+      <a href="https://arxiv.org/abs/2609.36842"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8zM14 3v5h5M8 13h8M8 17h6"/></svg><span>Paper</span></a>
+      <a href="https://github.com/Xian-Bei/vggt-family-layer-redundancy"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 6-6 6 6 6m8-12 6 6-6 6m-3-15-2 18"/></svg><span>Code</span></a>
+      <a href="https://github.com/Xian-Bei/vggt-family-layer-redundancy#calibrated-models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 9 5v10l-9 5-9-5V7zm0 10 9-5M12 12 3 7m9 5v10M7.5 4.5l9 5"/></svg><span>Models</span></a>
+      <a href="#dashboard"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3v18h18M7 17v-5m5 5V7m5 10V4"/></svg><span>Dashboard</span></a>
+    </nav>
+
+    <section class="paper-overview" aria-labelledby="overview-title">
+      <h2 id="overview-title">How much depth does visual geometry need?</h2>
+      <p>Scaling feed-forward geometry foundation models improves camera-pose estimation and dense reconstruction. But how much of their trained depth is really necessary? We investigate the multi-view aggregators of VGGT, π³, and VGGT-Ω through 3,018 interval-deletion configurations, evaluated with seven pose and geometry metrics on both indoor and outdoor datasets including ScanNet, 7Scenes, nuScenes, and Waymo.</p>
+      <p>The resulting landscapes connect the location of redundant layers to efficient pruning search and post-pruning recovery. Calibration on only 100 scenes yields models with up to 44% fewer aggregator parameters and accuracy comparable to the intact models, without end-to-end retraining.</p>
+    </section>
+    <figure class="teaser"><a href="assets/teaser.pdf" aria-label="Open teaser PDF"><img src="assets/teaser.png" width="2400" height="1047" alt="Overview of layer redundancy patterns, structured pruning, calibration-based recovery, and accuracy and efficiency across the VGGT family."></a></figure>
+    <section class="findings" aria-label="Four findings">
+      <article><p class="finding-number">Finding 01</p><h2>Two separated redundancy regions</h2><p>A broad early region and a smaller late region recur across backbones, datasets, and metrics; intervals crossing between them are more disruptive.</p></article>
+      <article><p class="finding-number">Finding 02</p><h2>Approximately additive degradation</h2><p>Within these regions, summing the effects of individual deletions approximates joint degradation, reducing pruning-search evaluations from O(L⁴) to O(L²).</p></article>
+      <article><p class="finding-number">Finding 03</p><h2>A practical CKA proxy</h2><p>One intact-model forward pass per calibration input provides representation statistics for CKA-based selection, balancing pruning quality against calibration cost.</p></article>
+      <article><p class="finding-number">Finding 04</p><h2>Token-aware linear recovery</h2><p>Closed-form calibration restores accuracy after pruning. Separate corrections for special and patch tokens address the reconstruction penalty of sharing one map.</p></article>
+    </section>
+  </header>
+  <main id="dashboard">
+    <div class="dashboard-heading"><div><h2>Results dashboard</h2><p id="snapshot" class="visually-hidden">Loading result snapshot…</p></div><button id="share" type="button">Copy view link</button></div>
+    <nav id="tabs" role="tablist" aria-label="Result pages"></nav>
+    <section id="panel" role="tabpanel" aria-labelledby="tab-single-overview">
+      <div class="workspace"><aside id="controls" aria-label="Visualization controls"></aside><div class="results"><p id="status" role="status" aria-live="polite"></p><div id="plots"></div></div></div>
+    </section>
+    <noscript>This dashboard needs JavaScript to display the cached results and respond to controls.</noscript>
   </main>
+  <section class="citation" aria-labelledby="citation-title">
+    <div class="citation-heading"><h2 id="citation-title">Citation</h2><button id="copy-citation" type="button">Copy BibTeX</button></div>
+    <pre><code id="bibtex">@misc{zhang2026vggtfamily,
+  title={Does the VGGT Family Need All Its Layers?},
+  author={Fengyi Zhang and Holger Caesar and Xiangyu Sun and
+          Zheng Zhang and Zi Huang and Yadan Luo},
+  year={2026},
+  eprint={2609.36842},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2609.36842}
+}</code></pre>
+  </section>
+  <footer><span>Does the VGGT Family Need All Its Layers?</span><a href="https://arxiv.org/abs/2609.36842">arXiv:2609.36842</a><a href="https://github.com/Xian-Bei/vggt-family-layer-redundancy">GitHub ↗</a></footer>
 </body>
 </html>

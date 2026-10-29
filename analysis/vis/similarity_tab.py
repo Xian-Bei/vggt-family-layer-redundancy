@@ -36,6 +36,8 @@ SIMILARITY_ROW_GAP = 8
 HEATMAP_REAL_DATASETS: Tuple[str, ...] = (
     "nuscenes_train",
     "scannet_dev50",
+    "7scenes_train",
+    "waymo_training",
 )
 
 SIMILARITY_COLUMN_LABELS: Tuple[str, ...] = (

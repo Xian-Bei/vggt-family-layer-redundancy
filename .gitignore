@@ -229,6 +229,3 @@ TODO*
 .ruff_cache/
 
 .aws/
-
-# Sampled point clouds are intentional static webpage assets, not model weights.
-!/web/data/scenes/*.bin

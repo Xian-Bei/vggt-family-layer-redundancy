@@ -4142,7 +4142,7 @@ def _preferred_stage2_scene(
     return str(scene_ids[0]) if scene_ids else None
 
 
-def _build_ui(controller: PairAttentionController) -> gr.Blocks:
+def _build_ui(controller: PairAttentionController, *, export_only: bool = False) -> gr.Blocks | Dict[str, Any]:
     backbone_display_order = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
 
     def backbone_display_sort_key(name: str) -> Tuple[int, str]:
@@ -5288,6 +5288,24 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
                     except (AttributeError, TypeError, ValueError):
                         continue
                     found.append((str(selector), point))
+                # Older indexes can omit completed points that remain on disk.
+                # Recover only results whose summary identifies this backbone,
+                # dataset and base selector; never infer results from folder names.
+                known = {selector for selector, _ in found}
+                for summary_path in sorted((index_path.parent / REMAINING_INTERNAL_DIR).glob("*/skip_eval_summary_v3.json")):
+                    try:
+                        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                        provenance = summary.get("base_prune_plan", {})
+                        selector = summary_path.parent.name
+                        if (selector in known or summary.get("backbone") != backbone
+                                or summary.get("dataset") != source_dataset
+                                or provenance.get("prune_plan_name") != selector
+                                or not summary.get("num_scenes_completed", 0)
+                                or not (summary_path.parent / "skip_eval_report_v3.json").is_file()):
+                            continue
+                        found.append((selector, int(provenance["expected_drop_count"])))
+                    except (OSError, ValueError, TypeError, KeyError):
+                        continue
                 if found:
                     return sorted(found, key=lambda item: (item[1], item[0]))
             return [("", 0)]
@@ -6186,6 +6204,23 @@ def _build_ui(controller: PairAttentionController) -> gr.Blocks:
             float(sim_cutoff),
             force_gallery_refresh=False,
         )
+
+    if export_only:
+        # The static exporter calls the very same callbacks as the local UI.
+        # Stop before constructing Gradio components or starting any services.
+        return {
+            "single_overview": _refresh_brute_force_overview,
+            "single_detail": _refresh_brute_force,
+            "remaining": _refresh_remaining_tab,
+            "similarity": _refresh_stage2_full,
+            "similarity_bundle": _stage2_visual_bundle,
+            "heatmap_scope": _heatmaps_controller,
+            "datasets": dataset_choices,
+            "single_datasets": brute_force_detail_datasets,
+            "backbones": brute_force_backbones,
+            "modes": stage2_modes_all,
+            "scope": _brute_force_controller,
+        }
 
     with gr.Blocks(
         title="Results Panel",

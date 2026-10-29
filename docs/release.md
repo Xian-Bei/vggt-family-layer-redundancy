@@ -1,7 +1,7 @@
 # Release contents
 
 The public source consists of the two main shell entrypoints, `analysis/`,
-`lare/` (including release manifests in `lare/metadata/`), `examples/`, `scripts/`, `docs/`,
+`models/` (including release manifests in `models/metadata/`), `examples/`, `scripts/`, `docs/`,
 `web/`, dependency specifications, backbone installer/lock, `.gitmodules`,
 dataset setup tools, and publication metadata.
 
@@ -14,13 +14,13 @@ actual release diff rather than relying on ignore rules alone.
 
 ## Model files
 
-`python -m lare.export` exports three selected recovery checkpoints.
-`python -m lare.export --standalone` assembles complete inference weights.
+`python -m models.export` exports three selected recovery checkpoints.
+`python -m models.export --standalone` assembles complete inference weights.
 Neither command reruns calibration or evaluates held-out data to choose a
 winner. The original experiment checkpoints stay in place.
 
 The generated files live in ignored `checkpoints/`. Their small manifests are
-copied into `lare/metadata/` for review. Standalone checkpoints contain the pinned
+copied into `models/metadata/` for review. Standalone checkpoints contain the pinned
 backbone state plus pruning/recovery topology; compact checkpoints rely on
 the original pretrained base. Each format loads through `LaRe.from_pretrained`.
 
@@ -36,12 +36,12 @@ checkpoints referenced by current public pruning strategies and recovery
 methods from both result roots. It excludes obsolete selectors, private
 research outputs, activation caches, and numerical result trees. The local
 directory is `release_artifacts/recovery_checkpoints/`; no compressed archive
-or upload is created. The collection manifest in `lare/metadata/` records checkpoint
+or upload is created. The collection manifest in `models/metadata/` records checkpoint
 paths, sizes, and checksums for review.
 
 ## Visualization files
 
-`python -m analysis.results.export_web` produces the data actually consumed by
+`python -m analysis.results.export_dashboard` produces the data actually consumed by
 the static webpage. Commit `web/data/`, not entire experiment trees. The
 manifest records every asset and its checksum.
 
