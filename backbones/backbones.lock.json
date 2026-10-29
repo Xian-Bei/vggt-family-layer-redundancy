@@ -44,7 +44,9 @@
       }
     },
     "vggt_omega": {
-      "aliases": ["vggt-omega"],
+      "aliases": [
+        "vggt-omega"
+      ],
       "path": "backbones/vggt-omega",
       "url": "https://github.com/facebookresearch/vggt-omega.git",
       "commit": "39a0cb8af88554f15ddcb5354cd52bde588fa014",
@@ -54,29 +56,6 @@
         "filename": "vggt_omega_1b_512.pt",
         "local_path": "backbones/vggt-omega/vggt_omega_1b_512.pt",
         "note": "Gated Hugging Face repo; users may need to request access and run huggingface-cli login."
-      }
-    },
-    "mapanything": {
-      "aliases": ["map-anything"],
-      "path": "backbones/map-anything",
-      "url": "https://github.com/facebookresearch/map-anything.git",
-      "commit": "3d10cf7a3016fc0f9bb13a071ee66c47b10be0d9",
-      "default_weight": {
-        "kind": "huggingface_model_id",
-        "value": "facebook/map-anything",
-        "note": "Loaded lazily by MapAnything.from_pretrained; facebook/map-anything-apache is the Apache-2.0 checkpoint alternative."
-      },
-      "model_variants": {
-        "mapanything": {
-          "aliases": ["map-anything"],
-          "default_weight": "facebook/map-anything",
-          "information_sharing_depth": 16
-        },
-        "mapanything_v1": {
-          "aliases": ["map-anything-v1"],
-          "default_weight": "facebook/map-anything-v1",
-          "information_sharing_depth": 24
-        }
       }
     }
   }

@@ -83,7 +83,7 @@ _PRUNING_DETAIL_METRIC_GRID = (
 
 GalleryItems = List[Any]
 
-_BACKBONE_ORDER = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
+_BACKBONE_ORDER = ("vggt_omega", "pi3", "vggt")
 _AVERAGE_SCOPE_GROUPS = {
     "training": "training average",
     "same_dataset_testing": "same-dataset testing average",

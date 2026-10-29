@@ -6,8 +6,6 @@ _BACKBONE_DISPLAY_NAMES = {
     "vggt_omega": "VGGT-Ω",
     "vggtomega": "VGGT-Ω",
     "pi3": "π³",
-    "mapanything": "MapAnything",
-    "mapanything_v1": "MapAnything V1",
     "mean": "Mean",
 }
 
@@ -28,8 +26,6 @@ _DATASET_DISPLAY_NAMES = {
 }
 
 _BACKBONE_PUBLICATION_ORDER = (
-    "mapanything_v1",
-    "mapanything",
     "vggt_omega",
     "pi3",
     "vggt",

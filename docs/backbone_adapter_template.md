@@ -8,8 +8,7 @@ cp analysis/backbones/adapters/backbone_adapter_template.py analysis/backbones/a
 
 然后把 `NewBackboneAdapter` 改名为 `<Name>Adapter`，把 `name = "new_backbone"` 改成公共 backbone 名，并在 `analysis/backbones/registry.py` 的 `_load_defaults()` 中导入和 `register()`。
 
-模板不会被默认导入，也不会影响现有 `vggt`、`vggt_omega`、`pi3`、
-`mapanything`、`mapanything_v1`。
+模板不会被默认导入，也不会影响现有 `vggt`、`vggt_omega`、`pi3`。
 
 ## 公共路径只认识的东西
 
@@ -37,7 +36,7 @@ cp analysis/backbones/adapters/backbone_adapter_template.py analysis/backbones/a
 
 返回所有可操作单元的 `LayerUnitSpec`，列表顺序必须等于物理执行顺序。`module_path`
 是 adaptor 内部可解释的路径，公共路径只使用 `unit_id`。不要假设新模型一定
-frame-first；MapAnything 的现有实现就是 global-first。
+frame-first，应使用 catalog 指定的执行顺序。
 
 `block_for_unit()` / `apply_unit_operation()`
 

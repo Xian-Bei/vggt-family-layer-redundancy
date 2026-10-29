@@ -1,7 +1,7 @@
 # Backbone Adaptor 公共契约
 
 本文档定义当前 backbone adaptor contract。公共流程不按 `vggt`、`vggt_omega`、
-`pi3`、`mapanything` 或 `mapanything_v1` 分支，而是调用 registry 中 adaptor 暴露的
+`pi3` 分支，而是调用 registry 中 adaptor 暴露的
 能力。新增 backbone 时实现相应接口并注册到 `analysis/backbones/registry.py`。
 FastVGGT、LoRA Merge 与 QuantVGGT 属于推理时压缩，使用
 `analysis/inference_compression` 下的独立 contract。
@@ -19,8 +19,7 @@ FastVGGT、LoRA Merge 与 QuantVGGT 属于推理时压缩，使用
 - `DatasetAdaptor`：scene 读取、CPU 预处理、prediction scoring 与 dataset-specific GT。
 
 backbone adaptor 负责把模型内部结构映射到这些抽象。例如 VGGT-Omega 的
-`inter_frame_blocks` 映射为 `global_i`，Pi3 decoder 映射为 `frame_i/global_i`，
-MapAnything information-sharing blocks 映射为 global-first 的 `global_i/frame_i`。
+`inter_frame_blocks` 映射为 `global_i`，Pi3 decoder 映射为 `frame_i/global_i`。
 线性 unit index 永远是 `layer_unit_catalog()` 返回列表的位置，不能从 unit 名称奇偶
 关系推导。
 
@@ -396,8 +395,7 @@ activations = replay.concat_by_layer
 
 各 backbone 的差异落点在 adaptor / `analysis/backbones/cache_replay/*` 内部。公共训练
 代码传 cache reader、skip intervals、LoRA/alignment layers、seed 与 device state，不直接
-执行 vendor blocks。MapAnything 当前没有 replay engine，因此虽支持 cache/prune/LoRA
-operation，尚不支持这条 cache-first training 路径。
+执行 vendor blocks。
 
 ### 7. 训练目标和 loss
 

@@ -1,7 +1,7 @@
 # Shared backbone list helpers for run_*.sh scripts.
 # Source after REPO_ROOT is set.
 #
-#   BACKBONES=vggt,pi3,vggt_omega,mapanything,mapanything_v1
+#   BACKBONES=vggt,pi3,vggt_omega
 #   MAX_FRAMES=50   # same cap for cache, redundancy, eval (dataset adaptors apply it)
 #   EXPORT_VIS_2D=0 # per-scene plot.png (trajectory)
 #   EXPORT_VIS_3D=0 # vis/pred viser NPZ for analysis.view
@@ -131,13 +131,9 @@ parse_backbones_list() {
     bb="${bb//[[:space:]]/}"
     [[ -z "${bb}" ]] && continue
     case "${bb}" in
-      map-anything) bb="mapanything" ;;
-      map-anything-v1) bb="mapanything_v1" ;;
-    esac
-    case "${bb}" in
-      vggt|pi3|vggt_omega|mapanything|mapanything_v1) ;;
+      vggt|pi3|vggt_omega) ;;
       *)
-        echo "error: unsupported backbone ${bb}; expected vggt, pi3, vggt_omega, mapanything, or mapanything_v1" >&2
+        echo "error: unsupported backbone ${bb}; expected vggt, pi3, or vggt_omega" >&2
         exit 1
         ;;
     esac

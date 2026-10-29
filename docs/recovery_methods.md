@@ -103,8 +103,7 @@ engine 提供。
 
 适用场景：允许训练，希望用少量增量参数恢复中间表示和最终预测。代价是需要多 epoch
 反向传播，并且目标 backbone 必须实现 cache replay engine。当前 VGGT、VGGT-Omega 和
-Pi3 已实现；MapAnything 两个 adaptor 当前未提供 trainable recovery 所需的 replay
-engine。
+Pi3 均已实现。
 
 ### 3.2 `recovery_train`
 
@@ -192,9 +191,7 @@ W_special -> camera + register
 W_patch   -> patch
 ```
 
-若不存在 register，camera 仍归入 `special`。MapAnything 的 `special` 对应 register，
-运行时会将公共 cache 的
-`special→patch` 顺序映射到内部 `patch→special` 顺序。Pi3 只有 `patch`，所以与非 grouped
+若不存在 register，camera 仍归入 `special`。Pi3 只有 `patch`，所以与非 grouped
 sequential Ghost 完全相同并直接链接其结果。
 
 ### 4.6 `recovery_replaceme_ls`

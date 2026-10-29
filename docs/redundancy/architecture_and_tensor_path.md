@@ -36,7 +36,6 @@ token region，ReplaceMe、ShortGPT 和 SIMPLER 固定使用 `all`。
 公共 unit 下标是 `layer_unit_catalog(model)` 返回列表的位置，不由名称公式推导：
 
 - VGGT、VGGT-Omega、Pi3 当前按 `frame_0, global_0, ...` 执行；
-- MapAnything/MapAnything V1 当前按 `global_0, frame_0, ...` 执行。
 
 因此缓存、selector、heatmap 和 recovery plan 必须同时保存 `unit_ids`，公共代码不得
 假设偶数下标总是 frame unit。

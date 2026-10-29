@@ -229,3 +229,16 @@ TODO*
 .ruff_cache/
 
 .aws/
+
+# Publish only the three compact calibrated recovery checkpoints.
+!/checkpoints/
+/checkpoints/*
+!/checkpoints/vggt/
+!/checkpoints/pi3/
+!/checkpoints/vggt_omega/
+/checkpoints/vggt/*
+/checkpoints/pi3/*
+/checkpoints/vggt_omega/*
+!/checkpoints/vggt/recovery.pt
+!/checkpoints/pi3/recovery.pt
+!/checkpoints/vggt_omega/recovery.pt

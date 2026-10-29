@@ -3,7 +3,8 @@
 The public source consists of the two main shell entrypoints, `analysis/`,
 `models/` (including release manifests in `models/metadata/`), `examples/`, `scripts/`, `docs/`,
 `web/`, dependency specifications, backbone installer/lock, `.gitmodules`,
-dataset setup tools, and publication metadata.
+dataset setup tools, publication metadata, and the three selected
+`checkpoints/{vggt,pi3,vggt_omega}/recovery.pt` files.
 
 Keep these local: `experiments/`, `tests/`, `pytest.ini`, `private_research/`,
 `analysis_outputs*/`, `main_results*/`,
@@ -19,14 +20,15 @@ actual release diff rather than relying on ignore rules alone.
 Neither command reruns calibration or evaluates held-out data to choose a
 winner. The original experiment checkpoints stay in place.
 
-The generated files live in ignored `checkpoints/`. Their small manifests are
-copied into `models/metadata/` for review. Standalone checkpoints contain the pinned
-backbone state plus pruning/recovery topology; compact checkpoints rely on
-the original pretrained base. Each format loads through `LaRe.from_pretrained`.
+The three compact recovery checkpoints are versioned in `checkpoints/`, so a
+normal clone includes them. All other files under that directory, including
+multi-GiB standalone weights, remain ignored. Manifests in `models/metadata/`
+record file sizes and SHA-256 checksums. `load_calibrated(backbone)` uses the
+included checkpoint with the official pretrained base by default; standalone
+weights remain an optional local export.
 
 Original upstream weight and code license terms continue to apply to derived
-standalone artifacts. LaRe code licensing, author information, final paper
-citation, and artifact hosting URLs still require project-owner decisions.
+standalone artifacts. Project code licensing remains a project-owner decision.
 No license or publication destination is assumed by the export tools.
 
 ## Recovery checkpoint collection
@@ -51,7 +53,7 @@ They are not archived or uploaded as part of this preparation.
 ## Publication
 
 Review the source changes and the model/visualization manifests, complete local
-GPU validation in the `vggt` environment, choose the project license and citation, and
-publish model files to the selected artifact host. Then add the real download
-URLs and run the manual Pages workflow. No Git commit, remote push, model
+GPU validation in the `vggt` environment, and commit the three compact recovery
+checkpoints with their manifests. Run the manual Pages workflow separately to
+update the website. No Git commit, remote push, model
 upload, or website deployment is performed by these local export commands.

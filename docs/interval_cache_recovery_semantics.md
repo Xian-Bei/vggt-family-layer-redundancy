@@ -22,13 +22,6 @@ unit 2L     = frame_L
 unit 2L + 1 = global_L
 ```
 
-MapAnything 和 MapAnything V1 是 global-first：
-
-```text
-unit 2L     = global_L
-unit 2L + 1 = frame_L
-```
-
 因此公共代码必须使用 plan/cache 中保存的 `unit_ids` 映射 index 和 ID，不得仅根据
 奇偶下标推导 kind。若模型共有 `N` 个 unit，单个下标的取值域是 `[0, N)`。
 
@@ -94,7 +87,7 @@ layer_-1          = catalog 中 unit 0 执行前的真实初始 tokens
 标准 unit activation 形状是 `[B, S, P, C]`。某些 replay engine 可临时构造
 `[B, S, P, 2C]` 的 concat feature，但不改变单个 unit activation 的边界含义。
 
-`layer_-1` 用于从模型起点 replay。当前 VGGT、VGGT-Omega、Pi3 和 MapAnything adaptor
+`layer_-1` 用于从模型起点 replay。当前 VGGT、VGGT-Omega 和 Pi3 adaptor
 都显式捕获或构造真实 unit-0 输入；不得用 unit 0 输出冒充 `layer_-1`。
 
 minimal cache 保存 recovery record 的全部 `cache_unit_ids`，以及方法需要的

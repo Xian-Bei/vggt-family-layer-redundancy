@@ -152,7 +152,7 @@ _RECOVERY_DETAIL_PRUNE_STRATEGY_DISPLAY_NAMES = {
 _DEFAULT_RECOVERY_PRUNE_STRATEGIES = ("Retention_min",)
 
 
-_BACKBONE_ORDER = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
+_BACKBONE_ORDER = ("vggt_omega", "pi3", "vggt")
 _PRUNE_STRATEGIES = (
     "CKA_double", "CKA_single", "retention_double", "retention_single",
 )

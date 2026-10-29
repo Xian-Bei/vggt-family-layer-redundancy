@@ -553,7 +553,7 @@ def _hadamard(size: int, *, device: torch.device) -> torch.Tensor:
     if requested <= 0:
         raise ValueError(f"LinearPatch channels must be positive, got {size}")
     # Sylvester Hadamard matrices exist at powers of two.  For model widths
-    # such as MapAnything's 768, construct the next matrix and orthogonalize
+    # that are not powers of two, construct the next matrix and orthogonalize
     # its leading square submatrix.  Power-of-two widths retain the exact
     # historical transform.
     expanded = 1 << (requested - 1).bit_length()

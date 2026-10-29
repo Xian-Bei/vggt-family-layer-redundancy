@@ -4143,7 +4143,7 @@ def _preferred_stage2_scene(
 
 
 def _build_ui(controller: PairAttentionController, *, export_only: bool = False) -> gr.Blocks | Dict[str, Any]:
-    backbone_display_order = ("mapanything_v1", "mapanything", "vggt_omega", "pi3", "vggt")
+    backbone_display_order = ("vggt_omega", "pi3", "vggt")
 
     def backbone_display_sort_key(name: str) -> Tuple[int, str]:
         return (

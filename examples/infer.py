@@ -1,4 +1,4 @@
-"""Run any calibrated LaRe backbone on a directory of RGB images."""
+"""Run any calibrated backbone on a directory of RGB images."""
 
 import argparse
 from pathlib import Path

@@ -1,8 +1,8 @@
-# LaRe
+# Does the VGGT Family Need All Its Layers?
 
 Layer pruning and calibrated recovery for visual geometry transformers.
 
-LaRe supports VGGT, Pi3, and VGGT-Omega through a shared analysis, pruning,
+This project supports VGGT, Pi3, and VGGT-Omega through a shared analysis, pruning,
 recovery, and evaluation pipeline. You can also use the calibrated models
 directly, without collecting activations or running calibration.
 
@@ -22,93 +22,58 @@ extension can be built through the installer when required by your setup.
 
 ## Calibrated models
 
-The model definition is provided by [`models/model.py`](models/model.py), using the
-pinned upstream backbone definitions. The `models/` package provides the shared
-inference interface (`model.py`) and checkpoint export tool (`export.py`).
-[`models/metadata/`](models/metadata/) stores JSON release manifests with filenames,
-sizes, selection provenance, and SHA-256 checksums. Actual weight files are
-kept under the Git-ignored `checkpoints/` directory.
+Our calibration checkpoints are included in this repository. The
+[model interface](models/model.py) combines the official pretrained weights
+with our checkpoints, removes the selected layers, and applies the calibrated
+recovery operators. No calibration or training is needed to run inference.
+To reproduce the full pipeline, see [Reproduce the experiments](#reproduce-the-experiments).
 
-Two weight formats are available:
+| Backbone | Dropped / total layers | Aggregator params (M), original → calibrated | Calibration checkpoint |
+|---|---:|---:|---|
+| VGGT | 10/48 | 605 → 479 | [8.03 MiB](checkpoints/vggt/recovery.pt) |
+| Pi3 | 16/36 | 454 → 252 | [4.03 MiB](checkpoints/pi3/recovery.pt) |
+| VGGT-Omega | 18/48 | 605 → 378 | [4.03 MiB](checkpoints/vggt_omega/recovery.pt) |
 
-| Backbone | Dropped units | Selected interval | Standalone weights | Recovery delta |
-|---|---:|---|---:|---:|
-| VGGT | 10 | `i8_j17` | 4.11 GiB | 8.03 MiB |
-| Pi3 | 16 | `i3_j18` | 2.83 GiB | 4.03 MiB |
-| VGGT-Omega | 18 | `i1_j18` | 3.43 GiB | 4.03 MiB |
-
-**Standalone weights** contain the complete pruned model and its recovery
-operators. Inference does not download the original pretrained weights.
-**Recovery deltas** contain the pruning definition and calibrated operators;
-they are applied to the original pretrained model automatically.
-
-The artifacts have been prepared locally. Public download URLs have not yet
-been published. File names, sizes, and SHA-256 checksums are recorded in
-[`models/metadata/standalone_manifest.json`](models/metadata/standalone_manifest.json) and
-[`models/metadata/recovery_manifest.json`](models/metadata/recovery_manifest.json). Place the
-obtained files in this layout:
-
-```text
-checkpoints/
-├── vggt/         model.pt  recovery.pt
-├── pi3/          model.pt  recovery.pt
-└── vggt_omega/   model.pt  recovery.pt
-```
-
-### Minimal inference
-
-```python
-from models import LaRe
-
-model = LaRe.from_pretrained(
-    "vggt",  # also: "pi3", "vggt_omega"
-    checkpoint="checkpoints/vggt/model.pt",
-    device="cuda",
-)
-images = model.load_images(["image_a.jpg", "image_b.jpg"])
-predictions = model(images)
-
-points = predictions["points"]
-camera_poses = predictions["camera_poses"]  # camera-to-world matrices
-```
-
-`load_images` applies the appropriate evaluation transform for each backbone
-and returns RGB tensors `[S, 3, H, W]` in `[0, 1]`. Forward also accepts
-`[B, S, 3, H, W]` and handles inference mode and mixed precision. Keep model
-weights in FP32; do not call `.half()` or `.bfloat16()`.
-
-The returned dictionary contains the available geometry fields. VGGT and
-VGGT-Omega provide depth and camera predictions, with points reconstructed
-from camera and depth. Pi3 provides world points, local points, confidence,
-and camera poses; it does not provide a separate `depth` field.
-
-For a directory of images:
-
-```bash
-PYTHONPATH=. python examples/infer.py \
-  --backbone vggt \
-  --checkpoint checkpoints/vggt/model.pt \
-  --images path/to/images \
-  --output outputs/predictions.pt
-```
-
-### Using compact recovery checkpoints
+Parameter counts cover aggregator blocks only, as in Table 1.
+After [installation](#installation), VGGT and Pi3 automatically download their
+official weights on first use. For VGGT-Omega, first [prepare its official
+weights](#prepare-original-weights). Run from the repository root:
 
 ```python
 from models import load_calibrated
 
-model = load_calibrated("pi3", checkpoint="checkpoints/pi3/recovery.pt")
+model = load_calibrated("vggt", device="cuda")  # or "pi3", "vggt_omega"
 predictions = model(model.load_images(["image_a.jpg", "image_b.jpg"]))
+points = predictions["points"]
+camera_poses = predictions["camera_poses"]
 ```
 
-For this format, VGGT and Pi3 load `facebook/VGGT-1B` and `yyfz233/Pi3` through
-Hugging Face. VGGT-Omega expects its original `vggt_omega_1b_512.pt` at
-`backbones/vggt-omega/`, or an explicit `base_model="path/to/base.pt"`.
-The original Omega weights require access through the
-[upstream model page](https://huggingface.co/facebook/VGGT-Omega).
-The standalone format does not require the base file at inference time.
+For a directory of images:
+
+```bash
+PYTHONPATH=. python examples/infer.py --backbone vggt --images path/to/images
+```
 
 ## Reproduce the experiments
+
+### Prepare original weights
+
+- **VGGT:** downloaded automatically from `facebook/VGGT-1B` on first use.
+- **Pi3:** downloaded automatically from `yyfz233/Pi3` on first use.
+- **VGGT-Omega:** obtain access to `facebook/VGGT-Omega`, authenticate with
+  Hugging Face, then download the checkpoint with the repository installer:
+
+  ```bash
+  python backbones/install_backbone.py vggt_omega --download-ckpt --no-build-extensions
+  ```
+
+  The expected path is `backbones/vggt-omega/vggt_omega_1b_512.pt`.
+
+The inference interface combines these official weights with the included
+`checkpoints/<backbone>/recovery.pt`. The pipeline below is only needed to
+reproduce pruning and calibration yourself.
+
+### Run the pipeline
 
 Prepare the datasets with [`data/README_data_setup.md`](data/README_data_setup.md).
 Keep dataset payloads outside Git; `data/` may contain local dataset symlinks.
@@ -194,10 +159,9 @@ the upstream repositories for their citation information.
 | VGGT | [facebookresearch/vggt](https://github.com/facebookresearch/vggt) |
 | Pi3 | [yyfz/Pi3](https://github.com/yyfz/Pi3) |
 | VGGT-Omega | [facebookresearch/vggt-omega](https://github.com/facebookresearch/vggt-omega) |
-| MapAnything | [facebookresearch/map-anything](https://github.com/facebookresearch/map-anything) |
 | FastVGGT | [mystorm16/FastVGGT](https://github.com/mystorm16/FastVGGT) |
 | QuantVGGT | [wlfeng0509/QuantVGGT](https://github.com/wlfeng0509/QuantVGGT) |
 
-The license for LaRe-authored code and the final paper citation must be
+The license for project-authored code and the final paper citation must be
 specified before public release. This attribution does not relicense
 third-party code, datasets, or model weights.

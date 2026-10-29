@@ -3,11 +3,11 @@
 LoRA Merge、FastVGGT 和 QuantVGGT 是注册在 `analysis/inference_compression` 下的
 deployment-only transformation，不是独立 backbone。当前支持矩阵为：
 
-| Transformation | VGGT | Pi3 | VGGT-Omega | MapAnything / V1 |
-|---|---:|---:|---:|---:|
-| `lora_merge` | 支持 | 不支持 | 不支持 | 不支持 |
-| `fastvggt` | 支持 | 支持 | 支持 | 不支持 |
-| `quantvggt` | 支持 | 不支持 | 不支持 | 不支持 |
+| Transformation | VGGT | Pi3 | VGGT-Omega |
+|---|---:|---:|---:|
+| `lora_merge` | 支持 | 不支持 | 不支持 |
+| `fastvggt` | 支持 | 支持 | 支持 |
+| `quantvggt` | 支持 | 不支持 | 不支持 |
 
 The evaluation order is fixed:
 
